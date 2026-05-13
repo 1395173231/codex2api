@@ -374,7 +374,7 @@ curl --request POST \\
       method: 'GET',
       path: '/api/admin/accounts',
       title: '列出账号',
-      description: '列出所有账号的状态、用量和基础元数据。',
+      description: '列出所有账号的状态、用量、标签、账号分组和基础元数据。',
       curl: `curl --request GET \\
   --url ${baseUrl}/api/admin/accounts \\
   --header 'X-Admin-Key: <admin_secret>'`,
@@ -388,12 +388,222 @@ curl --request POST \\
       "plan_type": "team",
       "status": "active",
       "proxy_url": "",
+      "tags": ["team"],
+      "group_ids": [1],
+      "allowed_api_key_ids": [],
       "created_at": "2025-01-01T00:00:00Z",
       "total_requests": 128,
       "success_requests": 125
     }
   ]
 }` },
+      ],
+    },
+    {
+      id: 'admin-update-scheduler',
+      method: 'PATCH',
+      path: '/api/admin/accounts/:id/scheduler',
+      title: '更新账号调度配置',
+      description: '更新账号代理、标签、账号分组、并发/评分覆盖和 API Key 反向授权。字段省略时保持原值；allowed_api_key_ids 传 null 或空数组表示不限制 API Key。',
+      defaultBody: `{
+  "proxy_url": "",
+  "tags": ["team", "paid"],
+  "group_ids": [1, 2],
+  "allowed_api_key_ids": [],
+  "score_bias_override": null,
+  "base_concurrency_override": null
+}`,
+      curl: `curl --request PATCH \\
+  --url ${baseUrl}/api/admin/accounts/1/scheduler \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "tags": ["team", "paid"],
+  "group_ids": [1, 2],
+  "allowed_api_key_ids": []
+}'`,
+      responses: [
+        { code: 200, body: `{"message": "账号调度配置已更新"}` },
+        { code: 400, body: `{"error": "allowed_api_key_ids 包含不存在的 API Key ID: 99"}` },
+        { code: 404, body: `{"error": "账号不存在"}` },
+      ],
+    },
+    {
+      id: 'admin-list-keys',
+      method: 'GET',
+      path: '/api/admin/keys',
+      title: '列出 API 密钥',
+      description: '列出后台创建的下游调用密钥，包含额度、用量、过期时间、状态和允许账号分组。该接口会在 raw_key 返回完整密钥，只能在受信任后台使用。',
+      curl: `curl --request GET \\
+  --url ${baseUrl}/api/admin/keys \\
+  --header 'X-Admin-Key: <admin_secret>'`,
+      responses: [
+        { code: 200, body: `{
+  "keys": [
+    {
+      "id": 1,
+      "name": "Claude Code",
+      "key": "sk-****...abcd",
+      "raw_key": "sk-live-full-key",
+      "quota_limit": 10,
+      "quota_used": 1.25,
+      "expires_at": "2026-06-01T00:00:00Z",
+      "allowed_group_ids": [1],
+      "status": "active",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  ]
+}` },
+      ],
+    },
+    {
+      id: 'admin-create-key',
+      method: 'POST',
+      path: '/api/admin/keys',
+      title: '创建 API 密钥',
+      description: '创建下游客户端使用的 API Key。key 可省略由系统生成；quota_limit 为 0 或省略表示不限额；allowed_group_ids 为空表示可调度全部账号分组。',
+      defaultBody: `{
+  "name": "Claude Code",
+  "quota_limit": 10,
+  "expires_in_days": 30,
+  "allowed_group_ids": [1]
+}`,
+      curl: `curl --request POST \\
+  --url ${baseUrl}/api/admin/keys \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "name": "Claude Code",
+  "quota_limit": 10,
+  "expires_in_days": 30,
+  "allowed_group_ids": [1]
+}'`,
+      responses: [
+        { code: 200, body: `{
+  "id": 2,
+  "key": "sk-...",
+  "name": "Claude Code",
+  "quota_limit": 10,
+  "quota_used": 0,
+  "expires_at": "2026-06-12T00:00:00Z",
+  "allowed_group_ids": [1]
+}` },
+        { code: 400, body: `{"error": "allowed_group_ids 包含不存在的分组 ID: 99"}` },
+      ],
+    },
+    {
+      id: 'admin-update-key',
+      method: 'PATCH',
+      path: '/api/admin/keys/:id',
+      title: '编辑 API 密钥',
+      description: '编辑密钥名称、额度、过期时间和允许账号分组。字段省略时保持原值；quota_limit 传 0/null 清除额度；expires_at 传 null 或 expires_in_days 传 0 清除过期时间。',
+      defaultBody: `{
+  "name": "Cherry Studio",
+  "quota_limit": 25,
+  "expires_at": null,
+  "allowed_group_ids": []
+}`,
+      curl: `curl --request PATCH \\
+  --url ${baseUrl}/api/admin/keys/2 \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "name": "Cherry Studio",
+  "quota_limit": 25,
+  "expires_at": null,
+  "allowed_group_ids": []
+}'`,
+      responses: [
+        { code: 200, body: `{"message": "API Key 已更新"}` },
+        { code: 400, body: `{"error": "额度限制不能小于 0"}` },
+        { code: 404, body: `{"error": "API Key 不存在"}` },
+      ],
+    },
+    {
+      id: 'admin-delete-key',
+      method: 'DELETE',
+      path: '/api/admin/keys/:id',
+      title: '删除 API 密钥',
+      description: '删除 API Key 并立即让使用该密钥的客户端失去访问权限。',
+      curl: `curl --request DELETE \\
+  --url ${baseUrl}/api/admin/keys/2 \\
+  --header 'X-Admin-Key: <admin_secret>'`,
+      responses: [
+        { code: 200, body: `{"message": "已删除"}` },
+      ],
+    },
+    {
+      id: 'admin-list-groups',
+      method: 'GET',
+      path: '/api/admin/account-groups',
+      title: '列出账号分组',
+      description: '列出账号分组、颜色、描述和成员数量。',
+      curl: `curl --request GET \\
+  --url ${baseUrl}/api/admin/account-groups \\
+  --header 'X-Admin-Key: <admin_secret>'`,
+      responses: [
+        { code: 200, body: `{
+  "groups": [
+    {"id": 1, "name": "Team", "description": "付费团队账号", "color": "#2563eb", "member_count": 8, "sort_order": 0}
+  ]
+}` },
+      ],
+    },
+    {
+      id: 'admin-create-group',
+      method: 'POST',
+      path: '/api/admin/account-groups',
+      title: '创建账号分组',
+      description: '创建账号分组。账号可属于多个分组；API Key 可限制只能调度指定分组。',
+      defaultBody: `{
+  "name": "Team",
+  "description": "付费团队账号",
+  "color": "#2563eb"
+}`,
+      curl: `curl --request POST \\
+  --url ${baseUrl}/api/admin/account-groups \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{"name":"Team","description":"付费团队账号","color":"#2563eb"}'`,
+      responses: [
+        { code: 200, body: `{"id": 1, "message": "分组已创建"}` },
+        { code: 400, body: `{"error": "分组名称不能为空"}` },
+      ],
+    },
+    {
+      id: 'admin-update-group',
+      method: 'PATCH',
+      path: '/api/admin/account-groups/:id',
+      title: '编辑账号分组',
+      description: '编辑账号分组名称、描述、颜色和排序。删除或改名分组后，账号和 API Key 的分组关系会按 ID 继续保持。',
+      defaultBody: `{
+  "name": "Team Plus",
+  "description": "高优先级账号",
+  "color": "#16a34a",
+  "sort_order": 10
+}`,
+      curl: `curl --request PATCH \\
+  --url ${baseUrl}/api/admin/account-groups/1 \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{"name":"Team Plus","description":"高优先级账号","color":"#16a34a","sort_order":10}'`,
+      responses: [
+        { code: 200, body: `{"message": "分组已更新"}` },
+        { code: 404, body: `{"error": "分组不存在"}` },
+      ],
+    },
+    {
+      id: 'admin-delete-group',
+      method: 'DELETE',
+      path: '/api/admin/account-groups/:id',
+      title: '删除账号分组',
+      description: '删除空分组。若分组仍有成员，需要追加 ?force=true；删除后会从账号和 API Key 允许分组中清理该 ID。',
+      curl: `curl --request DELETE \\
+  --url '${baseUrl}/api/admin/account-groups/1?force=true' \\
+  --header 'X-Admin-Key: <admin_secret>'`,
+      responses: [
+        { code: 200, body: `{"message": "分组已删除"}` },
+        { code: 409, body: `{"error": "分组仍有账号，确认后可强制删除"}` },
       ],
     },
   ]

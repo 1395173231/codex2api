@@ -15,6 +15,7 @@ import { getErrorMessage } from '../utils/error'
 import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
@@ -57,7 +58,10 @@ function getInitialAccountVisibleColumns(): Record<AccountTableColumn, boolean> 
     const raw = window.localStorage.getItem(ACCOUNT_VISIBLE_COLUMNS_KEY)
     if (!raw) return fallback
     const parsed = JSON.parse(raw) as Partial<Record<AccountTableColumn, boolean>>
-    return Object.fromEntries(ACCOUNT_TABLE_COLUMNS.map((column) => [column, parsed[column] !== false])) as Record<AccountTableColumn, boolean>
+    return Object.fromEntries(ACCOUNT_TABLE_COLUMNS.map((column) => [
+      column,
+      column === 'tags' || column === 'groups' ? parsed[column] === true : parsed[column] !== false,
+    ])) as Record<AccountTableColumn, boolean>
   } catch {
     return fallback
   }
@@ -2978,8 +2982,8 @@ export default function Accounts() {
         <Modal
           show={showGroupManager}
           title={t('accounts.groupManageTitle')}
-          contentClassName="sm:max-w-[760px]"
-          bodyClassName="space-y-4"
+          contentClassName="sm:max-w-[820px]"
+          bodyClassName="space-y-3"
           onClose={() => {
             if (groupSubmitting) return
             setShowGroupManager(false)
@@ -2996,24 +3000,38 @@ export default function Accounts() {
             </>
           )}
         >
-          <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(280px,0.55fr)]">
-            <div className="min-h-[220px] rounded-xl border border-border bg-muted/10 p-3">
+          <div className="flex items-start justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-foreground">{t('accounts.groupManageTitle')}</div>
+              <div className="mt-0.5 text-xs text-muted-foreground">{t('accounts.groupEmptyDesc')}</div>
+            </div>
+            <Badge variant="secondary" className="shrink-0">
+              {t('accounts.groupMembers')} {allGroups.reduce((sum, group) => sum + group.member_count, 0)}
+            </Badge>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(300px,0.55fr)]">
+            <div className="min-h-[260px] overflow-hidden rounded-lg border border-border bg-background">
+              <div className="flex h-10 items-center justify-between border-b border-border px-3">
+                <div className="text-xs font-semibold text-muted-foreground">{t('accounts.groupsLabel')}</div>
+                <Badge variant="outline">{allGroups.length}</Badge>
+              </div>
               {allGroups.length === 0 ? (
-                <div className="flex min-h-[190px] flex-col items-center justify-center rounded-lg border border-dashed border-border px-4 text-center">
+                <div className="flex min-h-[218px] flex-col items-center justify-center px-4 text-center">
                   <FolderOpen className="mb-3 size-8 text-muted-foreground" />
                   <div className="text-sm font-semibold text-foreground">{t('accounts.groupEmpty')}</div>
                   <div className="mt-1 text-xs text-muted-foreground">{t('accounts.groupEmptyDesc')}</div>
                 </div>
               ) : (
-                <div className="space-y-2">
+                <div className="max-h-[360px] overflow-y-auto p-2">
                   {allGroups.map((group) => {
                     const active = groupDraft.id === group.id
                     const color = normalizeGroupColor(group.color)
                     return (
                       <div
                         key={group.id}
-                        className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 transition-colors ${
-                          active ? 'border-primary/40 bg-primary/5' : 'border-border bg-card/70'
+                        className={`flex items-center gap-3 rounded-md border px-3 py-2 transition-colors ${
+                          active ? 'border-primary/40 bg-primary/5 shadow-sm' : 'border-transparent bg-transparent hover:border-border hover:bg-muted/30'
                         }`}
                       >
                         <span className="size-3 shrink-0 rounded-full" style={{ backgroundColor: color }} />
@@ -3041,8 +3059,8 @@ export default function Accounts() {
               )}
             </div>
 
-            <div className="rounded-xl border border-border bg-card p-4">
-              <div className="flex items-center justify-between gap-3">
+            <div className="rounded-lg border border-border bg-background p-3">
+              <div className="flex h-8 items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-foreground">
                   {groupDraft.id === null ? t('accounts.groupCreateTitle') : t('accounts.groupEditTitle')}
                 </div>

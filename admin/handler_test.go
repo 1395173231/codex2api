@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -182,6 +184,124 @@ func TestCreateAPIKeyPersistsQuotaAndExpiration(t *testing.T) {
 	}
 	if row.QuotaLimit != 0.25 || !row.ExpiresAt.Valid {
 		t.Fatalf("row = %#v, want quota and expiration", row)
+	}
+}
+
+func TestUpdateAPIKeyPreservesOmittedFieldsAndUpdatesLimits(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	expiresAt := sql.NullTime{Time: time.Now().AddDate(0, 0, 3), Valid: true}
+	id, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name:       "Client A",
+		Key:        "sk-test-update-client-1234567890",
+		QuotaLimit: 0.25,
+		ExpiresAt:  expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(`{"name":"Client B"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAPIKeyByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID 返回错误: %v", err)
+	}
+	if row.Name != "Client B" || row.QuotaLimit != 0.25 || !row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want renamed with quota/expiration preserved", row)
+	}
+
+	recorder = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(`{"quota_limit":0,"expires_at":null}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err = db.GetAPIKeyByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID 返回错误: %v", err)
+	}
+	if row.Name != "Client B" || row.QuotaLimit != 0 || row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want quota/expiration cleared with name preserved", row)
+	}
+}
+
+func TestUpdateAPIKeyRefreshesRuntimeStoreAndCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+	key := "sk-test-runtime-refresh-1234567890"
+	keyID, err := db.InsertAPIKey(ctx, "Client A", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	store := auth.NewStore(nil, nil, nil)
+	tc := cache.NewMemory(1)
+	handler := &Handler{db: db, store: store, cache: tc}
+	payload, err := json.Marshal(map[string]interface{}{
+		"id":         keyID,
+		"name":       "Client A",
+		"created_at": time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("marshal runtime cache: %v", err)
+	}
+	if err := tc.SetRuntime(ctx, adminAPIKeyCacheNamespace, key, payload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", keyID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(fmt.Sprintf(`{"allowed_group_ids":[%d]}`, groupID)))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := store.GetAPIKeyAllowedGroups(keyID); len(got) != 1 || got[0] != groupID {
+		t.Fatalf("runtime store allowed groups = %v, want [%d]", got, groupID)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCacheNamespace, key); err != nil || ok {
+		t.Fatalf("runtime api key cache after update ok=%v err=%v, want miss", ok, err)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCountNamespace, "all"); err != nil || ok {
+		t.Fatalf("runtime api key count cache after update ok=%v err=%v, want miss", ok, err)
 	}
 }
 

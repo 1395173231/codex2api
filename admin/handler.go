@@ -3281,6 +3281,10 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 type updateAPIKeyReq struct {
 	Name            *string         `json:"name"`
+	QuotaLimit      json.RawMessage `json:"quota_limit"`
+	Quota           json.RawMessage `json:"quota"`
+	ExpiresAt       json.RawMessage `json:"expires_at"`
+	ExpiresInDays   *int            `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
 }
 
@@ -3298,6 +3302,16 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 		return
 	}
 	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	quotaLimit, quotaLimitSet, err := parseOptionalAPIKeyQuota(req.QuotaLimit, req.Quota)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	expiresAt, expiresAtSet, err := parseOptionalAPIKeyExpiration(req.ExpiresAt, req.ExpiresInDays)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -3327,11 +3341,15 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "名称包含非法字符")
 			return
 		}
-		if err := h.db.UpdateAPIKeyName(ctx, id, name); err != nil {
-			writeInternalError(c, err)
+		req.Name = &name
+	}
+	if quotaLimitSet {
+		if quotaLimit > 1000000000 {
+			writeError(c, http.StatusBadRequest, "额度限制不能超过 1000000000")
 			return
 		}
 	}
+	var allowedGroupValues []int64
 	if allowedGroupIDs.Set {
 		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
 		if err != nil {
@@ -3346,17 +3364,69 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
 			return
 		}
-		values := dedupeInt64(allowedGroupIDs.Values)
-		if err := h.db.UpdateAPIKeyAllowedGroupIDs(ctx, id, values); err != nil {
-			writeInternalError(c, err)
-			return
-		}
-		if h.store != nil {
-			h.store.SetAPIKeyAllowedGroups(id, values)
-		}
+		allowedGroupValues = dedupeInt64(allowedGroupIDs.Values)
+	}
+	update := database.APIKeyUpdate{
+		QuotaLimit:         quotaLimit,
+		QuotaLimitSet:      quotaLimitSet,
+		ExpiresAt:          expiresAt,
+		ExpiresAtSet:       expiresAtSet,
+		AllowedGroupIDs:    allowedGroupValues,
+		AllowedGroupIDsSet: allowedGroupIDs.Set,
+	}
+	if req.Name != nil {
+		update.Name = *req.Name
+		update.NameSet = true
+	}
+	if err := h.db.UpdateAPIKey(ctx, id, update); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if allowedGroupIDs.Set && h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
 	writeMessage(c, http.StatusOK, "API Key 已更新")
+}
+
+func parseOptionalAPIKeyQuota(quotaLimitRaw, quotaRaw json.RawMessage) (float64, bool, error) {
+	raw := quotaLimitRaw
+	if len(raw) == 0 {
+		raw = quotaRaw
+	}
+	if len(raw) == 0 {
+		return 0, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, true, nil
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, true, fmt.Errorf("额度限制必须是数字")
+	}
+	if value < 0 {
+		return 0, true, fmt.Errorf("额度限制不能小于 0")
+	}
+	return value, true, nil
+}
+
+func parseOptionalAPIKeyExpiration(raw json.RawMessage, expiresInDays *int) (sql.NullTime, bool, error) {
+	if expiresInDays != nil {
+		expiresAt, err := parseAPIKeyExpiresAt("", expiresInDays)
+		return expiresAt, true, err
+	}
+	if len(raw) == 0 {
+		return sql.NullTime{}, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return sql.NullTime{}, true, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return sql.NullTime{}, true, fmt.Errorf("过期时间格式无效")
+	}
+	expiresAt, err := parseAPIKeyExpiresAt(value, nil)
+	return expiresAt, true, err
 }
 
 func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {

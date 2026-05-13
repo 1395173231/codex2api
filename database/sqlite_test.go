@@ -107,6 +107,95 @@ func TestSQLiteAPIKeyQuotaAndExpiration(t *testing.T) {
 	}
 }
 
+func TestSQLiteUpdateAPIKeyPatchesSelectedFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-patch-1234567890"
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name:            "patch",
+		Key:             key,
+		QuotaLimit:      1,
+		ExpiresAt:       sql.NullTime{Time: expiresAt, Valid: true},
+		AllowedGroupIDs: []int64{1, 2},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	if err := db.UpdateAPIKey(ctx, id, APIKeyUpdate{Name: "patched", NameSet: true}); err != nil {
+		t.Fatalf("UpdateAPIKey name 返回错误: %v", err)
+	}
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.Name != "patched" || row.QuotaLimit != 1 || !row.ExpiresAt.Valid || len(row.AllowedGroupIDs) != 2 {
+		t.Fatalf("row = %#v, want only name patched", row)
+	}
+
+	if err := db.UpdateAPIKey(ctx, id, APIKeyUpdate{
+		QuotaLimitSet:      true,
+		QuotaLimit:         0,
+		ExpiresAtSet:       true,
+		ExpiresAt:          sql.NullTime{},
+		AllowedGroupIDsSet: true,
+		AllowedGroupIDs:    []int64{3},
+	}); err != nil {
+		t.Fatalf("UpdateAPIKey limits 返回错误: %v", err)
+	}
+	row, err = db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue after patch 返回错误: %v", err)
+	}
+	if row.Name != "patched" || row.QuotaLimit != 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) != 1 || row.AllowedGroupIDs[0] != 3 {
+		t.Fatalf("row = %#v, want limits/groups patched", row)
+	}
+}
+
+func TestSQLiteMigratesLegacyAPIKeysColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE api_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		key TEXT UNIQUE NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatalf("create legacy api_keys: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO api_keys (name, key) VALUES ('legacy', 'sk-legacy-1234567890')`); err != nil {
+		t.Fatalf("insert legacy api key: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite legacy) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	row, err := db.GetAPIKeyByValue(context.Background(), "sk-legacy-1234567890")
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue legacy 返回错误: %v", err)
+	}
+	if row.Name != "legacy" || row.QuotaLimit != 0 || row.QuotaUsed != 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) != 0 {
+		t.Fatalf("legacy row = %#v, want migrated defaults", row)
+	}
+}
+
 func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

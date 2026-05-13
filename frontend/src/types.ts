@@ -644,7 +644,17 @@ export interface CreateAPIKeyRequest {
   name: string
   key?: string
   quota_limit?: number
+  quota?: number
   expires_at?: string
+  expires_in_days?: number
+  allowed_group_ids?: number[]
+}
+
+export interface UpdateAPIKeyRequest {
+  name?: string
+  quota_limit?: number | null
+  quota?: number | null
+  expires_at?: string | null
   expires_in_days?: number
   allowed_group_ids?: number[]
 }

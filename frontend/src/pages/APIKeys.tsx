@@ -1,4 +1,4 @@
-import type { ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react'
+import type { ChangeEvent, FormEvent, ReactNode } from 'react'
 import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
@@ -26,7 +26,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import {
-  Check,
   Copy,
   CalendarClock,
   CircleDollarSign,
@@ -39,7 +38,6 @@ import {
   Plus,
   ShieldCheck,
   Trash2,
-  X,
 } from 'lucide-react'
 
 type ExpireMode = 'never' | '7' | '30' | '90' | 'custom'
@@ -47,6 +45,14 @@ type ExpireMode = 'never' | '7' | '30' | '90' | 'custom'
 interface CreateKeyFormState {
   name: string
   key: string
+  quotaLimit: string
+  expireMode: ExpireMode
+  expiresAt: string
+  allowedGroupIds: number[]
+}
+
+interface EditKeyFormState {
+  name: string
   quotaLimit: string
   expireMode: ExpireMode
   expiresAt: string
@@ -62,6 +68,14 @@ const initialCreateForm: CreateKeyFormState = {
   allowedGroupIds: [],
 }
 
+const initialEditForm: EditKeyFormState = {
+  name: '',
+  quotaLimit: '',
+  expireMode: 'never',
+  expiresAt: '',
+  allowedGroupIds: [],
+}
+
 export default function APIKeys() {
   const { t } = useTranslation()
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
@@ -70,10 +84,8 @@ export default function APIKeys() {
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
   const [creating, setCreating] = useState(false)
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set())
-  const [editingId, setEditingId] = useState<number | null>(null)
-  const [editingName, setEditingName] = useState('')
-  const [permissionKey, setPermissionKey] = useState<APIKeyRow | null>(null)
-  const [permissionGroupIds, setPermissionGroupIds] = useState<number[]>([])
+  const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null)
+  const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm)
   const [saving, setSaving] = useState(false)
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
@@ -136,12 +148,13 @@ export default function APIKeys() {
         }
       }
 
+      const expirationPayload = buildExpirationPayload(createForm, t) as { expires_in_days?: number; expires_at?: string }
       const payload = {
         name: createForm.name.trim() || t('apiKeys.defaultName'),
         ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
         ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
         allowed_group_ids: createForm.allowedGroupIds,
-        ...buildExpirationPayload(createForm, t),
+        ...expirationPayload,
       }
 
       const result = await api.createAPIKey(payload)
@@ -226,49 +239,50 @@ export default function APIKeys() {
     })
   }
 
-  const handleRenameKey = async (id: number) => {
-    const trimmed = editingName.trim()
-    if (!trimmed) return
-    setSaving(true)
-    try {
-      await api.updateAPIKey(id, { name: trimmed })
-      showToast(t('apiKeys.keyRenamed')) // TODO: Track B adds i18n key apiKeys.keyRenamed
-      setEditingId(null)
-      void reload()
-    } catch (error) {
-      showToast(`${t('apiKeys.renameFailed')}: ${getErrorMessage(error)}`, 'error') // TODO: Track B adds i18n key apiKeys.renameFailed
-    } finally {
-      setSaving(false)
-    }
-  }
-
   const startEditing = (keyRow: APIKeyRow) => {
-    setEditingId(keyRow.id)
-    setEditingName(keyRow.name)
+    setEditingKey(keyRow)
+    setEditForm({
+      name: keyRow.name,
+      quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : '',
+      expireMode: keyRow.expires_at ? 'custom' : 'never',
+      expiresAt: toDateTimeLocalValue(keyRow.expires_at),
+      allowedGroupIds: keyRow.allowed_group_ids ?? [],
+    })
   }
 
-  const openPermissionEditor = (keyRow: APIKeyRow) => {
-    setPermissionKey(keyRow)
-    setPermissionGroupIds(keyRow.allowed_group_ids ?? [])
-  }
-
-  const closePermissionEditor = () => {
+  const closeEditDialog = () => {
     if (saving) return
-    setPermissionKey(null)
-    setPermissionGroupIds([])
+    setEditingKey(null)
+    setEditForm(initialEditForm)
   }
 
-  const handleSavePermissions = async () => {
-    if (!permissionKey) return
+  const updateEditForm = (patch: Partial<EditKeyFormState>) => {
+    setEditForm((current) => ({ ...current, ...patch }))
+  }
+
+  const handleSaveEdit = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault()
+    if (!editingKey) return
+    const trimmed = editForm.name.trim()
+    if (!trimmed) {
+      showToast(t('apiKeys.nameRequired'), 'error')
+      return
+    }
     setSaving(true)
     try {
-      await api.updateAPIKey(permissionKey.id, { allowed_group_ids: permissionGroupIds })
-      showToast(t('apiKeys.allowedGroupsSaved'))
-      setPermissionKey(null)
-      setPermissionGroupIds([])
+      const quotaLimit = parseQuotaLimit(editForm.quotaLimit, t)
+      await api.updateAPIKey(editingKey.id, {
+        name: trimmed,
+        quota_limit: quotaLimit,
+        allowed_group_ids: editForm.allowedGroupIds,
+        ...buildExpirationPayload(editForm, t, { clearNever: true }),
+      })
+      showToast(t('apiKeys.keyUpdated'))
+      setEditingKey(null)
+      setEditForm(initialEditForm)
       void reload()
     } catch (error) {
-      showToast(`${t('apiKeys.allowedGroupsSaveFailed')}: ${getErrorMessage(error)}`, 'error')
+      showToast(`${t('apiKeys.updateFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSaving(false)
     }
@@ -363,44 +377,19 @@ export default function APIKeys() {
                         return (
                           <TableRow key={keyRow.id} className={isNew ? 'bg-[hsl(var(--success-bg))]' : ''}>
                             <TableCell className="font-medium text-foreground">
-                              {editingId === keyRow.id ? (
-                                <div className="flex items-center gap-1.5">
-                                  <Input
-                                    className="h-7 w-40 text-[13px]"
-                                    value={editingName}
-                                    onChange={(e: ChangeEvent<HTMLInputElement>) => setEditingName(e.target.value)}
-                                    onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
-                                      if (e.key === 'Enter') void handleRenameKey(keyRow.id)
-                                      if (e.key === 'Escape') setEditingId(null)
-                                    }}
-                                    autoFocus
-                                    disabled={saving}
-                                  />
-                                  <Button variant="ghost" size="icon-xs" onClick={() => void handleRenameKey(keyRow.id)} disabled={saving || !editingName.trim()}>
-                                    <Check className="size-3.5" />
-                                  </Button>
-                                  <Button variant="ghost" size="icon-xs" onClick={() => setEditingId(null)} disabled={saving}>
-                                    <X className="size-3.5" />
-                                  </Button>
-                                </div>
-                              ) : (
-                                <div className="flex items-center gap-2">
-                                  <span>{keyRow.name}</span>
-                                  {isNew ? (
-                                    <Badge variant="outline" className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
-                                      {t('apiKeys.newBadge')}
-                                    </Badge>
-                                  ) : null}
-                                  {status !== 'active' ? (
-                                    <Badge variant={status === 'expired' ? 'secondary' : 'destructive'}>
-                                      {t(`apiKeys.status.${status}`)}
-                                    </Badge>
-                                  ) : null}
-                                  <Button variant="ghost" size="icon-xs" onClick={() => startEditing(keyRow)} title={t('apiKeys.renameKey')}> {/* TODO: Track B adds i18n key apiKeys.renameKey */}
-                                    <Pencil className="size-3" />
-                                  </Button>
-                                </div>
-                              )}
+                              <div className="flex items-center gap-2">
+                                <span>{keyRow.name}</span>
+                                {isNew ? (
+                                  <Badge variant="outline" className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
+                                    {t('apiKeys.newBadge')}
+                                  </Badge>
+                                ) : null}
+                                {status !== 'active' ? (
+                                  <Badge variant={status === 'expired' ? 'secondary' : 'destructive'}>
+                                    {t(`apiKeys.status.${status}`)}
+                                  </Badge>
+                                ) : null}
+                              </div>
                             </TableCell>
                             <TableCell>
                               <div className="flex min-w-[260px] items-center gap-2">
@@ -452,10 +441,10 @@ export default function APIKeys() {
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  onClick={() => openPermissionEditor(keyRow)}
+                                  onClick={() => startEditing(keyRow)}
                                 >
-                                  <ShieldCheck className="size-3.5" />
-                                  {t('apiKeys.allowedGroups')}
+                                  <Pencil className="size-3.5" />
+                                  {t('apiKeys.editKey')}
                                 </Button>
                                 <Button
                                   variant="destructive"
@@ -571,7 +560,7 @@ export default function APIKeys() {
               </FormField>
             ) : null}
 
-            <FormField label={t('apiKeys.allowedGroupsLabel')} icon={<ShieldCheck className="size-3.5" />}>
+            <FormField label={t('apiKeys.allowedGroupsLabel')} icon={<ShieldCheck className="size-3.5" />} as="div">
               <GroupMultiSelect
                 groups={groups}
                 value={createForm.allowedGroupIds}
@@ -586,37 +575,95 @@ export default function APIKeys() {
         </Modal>
 
         <Modal
-          show={Boolean(permissionKey)}
-          title={t('apiKeys.permissionTitle')}
-          onClose={closePermissionEditor}
-          contentClassName="sm:max-w-[520px]"
+          show={Boolean(editingKey)}
+          title={t('apiKeys.editTitle')}
+          onClose={closeEditDialog}
+          contentClassName="sm:max-w-[640px]"
           footer={(
             <>
-              <Button type="button" variant="outline" onClick={closePermissionEditor} disabled={saving}>
+              <Button type="button" variant="outline" onClick={closeEditDialog} disabled={saving}>
                 {t('common.cancel')}
               </Button>
-              <Button type="button" onClick={() => void handleSavePermissions()} disabled={saving}>
+              <Button type="submit" form="edit-api-key-form" disabled={saving || !editForm.name.trim()}>
                 {saving ? t('common.saving') : t('common.save')}
               </Button>
             </>
           )}
         >
-          {permissionKey ? (
-            <div className="space-y-4">
-              <div className="rounded-lg border border-border bg-muted/20 p-3">
-                <div className="text-sm font-semibold text-foreground">{permissionKey.name}</div>
-                <p className="mt-1 text-sm text-muted-foreground">{t('apiKeys.permissionDesc')}</p>
+          {editingKey ? (
+            <form id="edit-api-key-form" className="space-y-5" onSubmit={(event) => void handleSaveEdit(event)}>
+              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <Pencil className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold text-foreground">{editingKey.name}</div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{t('apiKeys.editDesc')}</p>
+                </div>
               </div>
-              <GroupMultiSelect
-                groups={groups}
-                value={permissionGroupIds}
-                onChange={setPermissionGroupIds}
-                allLabel={t('apiKeys.allowedGroupsAll')}
-                placeholder={t('apiKeys.allowedGroupsPlaceholder')}
-                emptyLabel={t('accounts.groupsNone')}
-              />
-              <p className="text-xs text-muted-foreground">{t('apiKeys.allowedGroupsHint')}</p>
-            </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <FormField label={t('apiKeys.nameLabel')}>
+                  <Input
+                    placeholder={t('apiKeys.keyNamePlaceholder')}
+                    value={editForm.name}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => updateEditForm({ name: event.target.value })}
+                    autoFocus
+                  />
+                </FormField>
+                <FormField label={t('apiKeys.quotaLimitLabel')} icon={<CircleDollarSign className="size-3.5" />}>
+                  <Input
+                    type="number"
+                    min="0"
+                    step="0.000001"
+                    inputMode="decimal"
+                    placeholder={t('apiKeys.quotaLimitPlaceholder')}
+                    value={editForm.quotaLimit}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => updateEditForm({ quotaLimit: event.target.value })}
+                  />
+                </FormField>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <FormField label={t('apiKeys.expireModeLabel')} icon={<CalendarClock className="size-3.5" />}>
+                  <Select
+                    value={editForm.expireMode}
+                    onValueChange={(value) => updateEditForm({ expireMode: value as ExpireMode })}
+                    options={expireOptions}
+                    compact
+                  />
+                </FormField>
+                {editForm.expireMode === 'custom' ? (
+                  <FormField label={t('apiKeys.expiresAtLabel')}>
+                    <Input
+                      type="datetime-local"
+                      value={editForm.expiresAt}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) => updateEditForm({ expiresAt: event.target.value })}
+                    />
+                  </FormField>
+                ) : editForm.expireMode === 'never' ? (
+                  <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                    {t('apiKeys.clearExpirationHint')}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                    {t('apiKeys.relativeExpirationHint', { days: editForm.expireMode })}
+                  </div>
+                )}
+              </div>
+
+              <FormField label={t('apiKeys.allowedGroupsLabel')} icon={<ShieldCheck className="size-3.5" />} as="div">
+                <GroupMultiSelect
+                  groups={groups}
+                  value={editForm.allowedGroupIds}
+                  onChange={(allowedGroupIds) => updateEditForm({ allowedGroupIds })}
+                  allLabel={t('apiKeys.allowedGroupsAll')}
+                  placeholder={t('apiKeys.allowedGroupsPlaceholder')}
+                  emptyLabel={t('accounts.groupsNone')}
+                />
+                <p className="mt-1.5 text-xs text-muted-foreground">{t('apiKeys.allowedGroupsHint')}</p>
+              </FormField>
+            </form>
           ) : null}
         </Modal>
 
@@ -629,8 +676,22 @@ export default function APIKeys() {
 
 type Translator = (key: string, options?: Record<string, unknown>) => string
 
-function buildExpirationPayload(form: CreateKeyFormState, t: Translator): { expires_in_days?: number; expires_at?: string } {
-  if (form.expireMode === 'never') return {}
+function parseQuotaLimit(raw: string, t: Translator): number {
+  const quotaLimitText = raw.trim()
+  if (!quotaLimitText) return 0
+  const quotaLimit = Number(quotaLimitText)
+  if (!Number.isFinite(quotaLimit) || quotaLimit < 0) {
+    throw new Error(t('apiKeys.quotaInvalid'))
+  }
+  return quotaLimit
+}
+
+function buildExpirationPayload(
+  form: Pick<CreateKeyFormState, 'expireMode' | 'expiresAt'>,
+  t: Translator,
+  options: { clearNever?: boolean } = {}
+): { expires_in_days?: number; expires_at?: string | null } {
+  if (form.expireMode === 'never') return options.clearNever ? { expires_at: null } : {}
   if (form.expireMode !== 'custom') {
     return { expires_in_days: Number(form.expireMode) }
   }
@@ -645,6 +706,14 @@ function buildExpirationPayload(form: CreateKeyFormState, t: Translator): { expi
     throw new Error(t('apiKeys.expiresAtPast'))
   }
   return { expires_at: date.toISOString() }
+}
+
+function toDateTimeLocalValue(value?: string | null) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ''
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+  return local.toISOString().slice(0, 16)
 }
 
 function getAPIKeyStatus(keyRow: APIKeyRow): 'active' | 'expired' | 'quota_exhausted' {
@@ -780,19 +849,22 @@ function FormField({
   label,
   icon,
   children,
+  as = 'label',
 }: {
   label: string
   icon?: ReactNode
   children: ReactNode
+  as?: 'label' | 'div'
 }) {
+  const Component = as
   return (
-    <label className="block min-w-0">
+    <Component className="block min-w-0">
       <span className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
         {icon}
         {label}
       </span>
       {children}
-    </label>
+    </Component>
   )
 }
 

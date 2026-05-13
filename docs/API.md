@@ -882,7 +882,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 #### GET /api/admin/keys
 
-获取所有 API 密钥。
+获取所有 API 密钥。管理接口需要 `X-Admin-Key`，这些接口不属于对外 `/v1/*` 客户端 API。该接口会在 `raw_key` 返回完整密钥，只能在受信任后台使用。
 
 **响应:**
 ```json
@@ -890,8 +890,14 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
   "keys": [
     {
       "id": 1,
-      "name": "default",
-      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "name": "Claude Code",
+      "key": "sk-****...abcd",
+      "raw_key": "sk-live-full-key",
+      "quota_limit": 10,
+      "quota_used": 1.25,
+      "expires_at": "2026-06-01T00:00:00Z",
+      "allowed_group_ids": [1],
+      "status": "active",
       "created_at": "2024-01-01T00:00:00Z"
     }
   ]
@@ -906,16 +912,61 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "name": "production",
-  "key": "sk-custom-key"  // 可选，不填则自动生成
+  "key": "sk-custom-key",
+  "quota_limit": 10,
+  "expires_in_days": 30,
+  "allowed_group_ids": [1]
 }
 ```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| name | string | 是 | 显示名称 |
+| key | string | 否 | 自定义密钥；省略则自动生成 |
+| quota_limit / quota | number | 否 | 额度上限，0 或省略表示不限额 |
+| expires_at | string | 否 | RFC3339 或本地日期时间 |
+| expires_in_days | number | 否 | N 天后过期；0 表示不过期 |
+| allowed_group_ids | integer[] | 否 | 允许调度的账号分组；空数组表示全部分组 |
 
 **响应:**
 ```json
 {
   "id": 2,
   "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
-  "name": "production"
+  "name": "production",
+  "quota_limit": 10,
+  "quota_used": 0,
+  "expires_at": "2026-06-12T00:00:00Z",
+  "allowed_group_ids": [1]
+}
+```
+
+#### PATCH /api/admin/keys/:id
+
+编辑 API 密钥名称、额度、过期时间和允许账号分组。字段省略时保持原值。
+
+**请求:**
+```json
+{
+  "name": "Cherry Studio",
+  "quota_limit": 25,
+  "expires_at": null,
+  "allowed_group_ids": []
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| name | string | 新显示名称 |
+| quota_limit / quota | number/null | 新额度上限；0 或 null 清除额度限制 |
+| expires_at | string/null | 新过期时间；null 清除过期时间 |
+| expires_in_days | number | N 天后过期；0 清除过期时间 |
+| allowed_group_ids | integer[] | 允许调度的账号分组；空数组表示全部分组 |
+
+**响应:**
+```json
+{
+  "message": "API Key 已更新"
 }
 ```
 
@@ -927,6 +978,91 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "message": "已删除"
+}
+```
+
+### 账号分组管理
+
+账号分组用于把账号池划分为多个可调度集合。API Key 的 `allowed_group_ids` 可以限制下游密钥只能使用指定分组；账号自己的 `allowed_api_key_ids` 也可以反向限制哪些 API Key 能调度该账号。
+
+#### GET /api/admin/account-groups
+
+获取账号分组。
+
+**响应:**
+```json
+{
+  "groups": [
+    {
+      "id": 1,
+      "name": "Team",
+      "description": "付费团队账号",
+      "color": "#2563eb",
+      "sort_order": 0,
+      "member_count": 8,
+      "created_at": "2026-05-13T00:00:00Z",
+      "updated_at": "2026-05-13T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### POST /api/admin/account-groups
+
+创建账号分组。
+
+**请求:**
+```json
+{
+  "name": "Team",
+  "description": "付费团队账号",
+  "color": "#2563eb",
+  "sort_order": 0
+}
+```
+
+**响应:**
+```json
+{
+  "id": 1,
+  "message": "分组已创建"
+}
+```
+
+#### PATCH /api/admin/account-groups/:id
+
+编辑账号分组。
+
+**请求:**
+```json
+{
+  "name": "Team Plus",
+  "description": "高优先级账号",
+  "color": "#16a34a",
+  "sort_order": 10
+}
+```
+
+**响应:**
+```json
+{
+  "message": "分组已更新"
+}
+```
+
+#### DELETE /api/admin/account-groups/:id
+
+删除账号分组。分组仍有成员时需要 `?force=true`；删除后会从账号和 API Key 允许分组中清理该 ID。
+
+```bash
+curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
+  -H "X-Admin-Key: your-secret"
+```
+
+**响应:**
+```json
+{
+  "message": "分组已删除"
 }
 ```
 

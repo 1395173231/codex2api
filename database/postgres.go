@@ -472,6 +472,11 @@ func (db *DB) migrate(ctx context.Context) error {
 		created_at  TIMESTAMPTZ DEFAULT NOW(),
 		updated_at  TIMESTAMPTZ DEFAULT NOW()
 	);
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '';
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0;
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 	CREATE TABLE IF NOT EXISTS account_group_members (
 		account_id BIGINT NOT NULL,
@@ -796,6 +801,17 @@ type APIKeyInput struct {
 	AllowedGroupIDs []int64
 }
 
+type APIKeyUpdate struct {
+	Name               string
+	NameSet            bool
+	QuotaLimit         float64
+	QuotaLimitSet      bool
+	ExpiresAt          sql.NullTime
+	ExpiresAtSet       bool
+	AllowedGroupIDs    []int64
+	AllowedGroupIDsSet bool
+}
+
 const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), expires_at, COALESCE(allowed_group_ids, '[]')`
 
 // ListAPIKeys 获取所有 API 密钥
@@ -893,6 +909,41 @@ func (db *DB) UpdateAPIKeyName(ctx context.Context, id int64, name string) error
 	return nil
 }
 
+// UpdateAPIKeyQuotaLimit updates the quota ceiling. A non-positive value clears the limit.
+func (db *DB) UpdateAPIKeyQuotaLimit(ctx context.Context, id int64, quotaLimit float64) error {
+	if quotaLimit < 0 {
+		quotaLimit = 0
+	}
+	res, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET quota_limit = $1 WHERE id = $2`, quotaLimit, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// UpdateAPIKeyExpiresAt updates or clears the key expiration.
+func (db *DB) UpdateAPIKeyExpiresAt(ctx context.Context, id int64, expiresAt sql.NullTime) error {
+	res, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET expires_at = $1 WHERE id = $2`, nullableTimeArg(expiresAt), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // UpdateAPIKeyAllowedGroups persists the allowed-group scope for an API key.
 // Empty slice clears the scope (key may schedule any account).
 func (db *DB) UpdateAPIKeyAllowedGroups(ctx context.Context, id int64, groupIDs []int64) error {
@@ -921,6 +972,64 @@ func (db *DB) UpdateAPIKeyAllowedGroups(ctx context.Context, id int64, groupIDs 
 
 func (db *DB) UpdateAPIKeyAllowedGroupIDs(ctx context.Context, id int64, groupIDs []int64) error {
 	return db.UpdateAPIKeyAllowedGroups(ctx, id, groupIDs)
+}
+
+// UpdateAPIKey applies multiple editable fields in one transaction.
+// Omitted fields keep their existing values.
+func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) error {
+	sets := make([]string, 0, 4)
+	args := make([]interface{}, 0, 5)
+	placeholder := func() string {
+		args = append(args, nil)
+		if db.isSQLite() {
+			return "?"
+		}
+		return fmt.Sprintf("$%d", len(args))
+	}
+	setArg := func(value interface{}) string {
+		ph := placeholder()
+		args[len(args)-1] = value
+		return ph
+	}
+	if update.NameSet {
+		sets = append(sets, "name = "+setArg(update.Name))
+	}
+	if update.QuotaLimitSet {
+		quotaLimit := update.QuotaLimit
+		if quotaLimit < 0 {
+			quotaLimit = 0
+		}
+		sets = append(sets, "quota_limit = "+setArg(quotaLimit))
+	}
+	if update.ExpiresAtSet {
+		sets = append(sets, "expires_at = "+setArg(nullableTimeArg(update.ExpiresAt)))
+	}
+	if update.AllowedGroupIDsSet {
+		payload := encodeInt64SliceJSON(update.AllowedGroupIDs)
+		ph := setArg(payload)
+		if db.isSQLite() {
+			sets = append(sets, "allowed_group_ids = "+ph)
+		} else {
+			sets = append(sets, "allowed_group_ids = "+ph+"::jsonb")
+		}
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	idPlaceholder := placeholder()
+	args[len(args)-1] = id
+	res, err := db.conn.ExecContext(ctx, "UPDATE api_keys SET "+strings.Join(sets, ", ")+" WHERE id = "+idPlaceholder, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // ==================== System Settings ====================

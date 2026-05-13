@@ -38,6 +38,7 @@ import type {
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
+  UpdateAPIKeyRequest,
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
@@ -323,7 +324,7 @@ export const api = {
     }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
-  updateAPIKey: (id: number, data: { name?: string; allowed_group_ids?: number[] }) =>
+  updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {
     const sp = new URLSearchParams()
