@@ -253,6 +253,10 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 	case strings.Contains(compact, "gpt-5.3") || strings.Contains(compact, "gpt5-3") || strings.Contains(compact, "gpt5.3"):
 		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "codex-auto-review"):
+		// Codex internal auto-review model. ChatGPT backend API only
+		// (chatgpt.com/backend-api/codex). Not available via public API.
+		// Official catalog: Plus/Pro/Team/Business only, excludes free.
+		// Specs match gpt-5.4 (272K context, 4 thinking levels).
 		return "gpt-5.4", true
 	case strings.Contains(compact, "codex"):
 		return "gpt-5.3-codex", true

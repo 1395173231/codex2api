@@ -65,7 +65,16 @@ var builtinModelInfos = []ModelInfo{
 	modelInfoForID("gpt-5.3-codex", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.3-codex-spark", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.2", ModelSourceBuiltin),
-	modelInfoForID("codex-auto-review", ModelSourceBuiltin),
+	// codex-auto-review requires ChatGPT backend API (chatgpt.com/backend-api/codex),
+	// NOT the public API. codex2api does not yet proxy to this endpoint.
+	// Available on Plus/Pro/Team/Business, explicitly NOT free.
+	// Pricing mapped to gpt-5.4 ($2.50/$15.00 standard, $5.00/$30.00 priority).
+	// Reference: codex_client_models.json (CLIProxyAPI) — official Codex client catalog.
+	func() ModelInfo {
+		m := modelInfoForID("codex-auto-review", ModelSourceBuiltin)
+		m.Enabled = false // requires backend API routing
+		return m
+	}(),
 	modelInfoForID("gpt-image-2", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-2k", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-4k", ModelSourceBuiltin),
