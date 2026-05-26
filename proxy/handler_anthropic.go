@@ -351,10 +351,13 @@ func (h *Handler) Messages(c *gin.Context) {
 		} else {
 			// 非流式：缓冲所有事件后构建完整 JSON 响应
 			var lastCompletedData []byte
+			translator := newAnthropicStreamTranslator(originalModel)
+			accumulator := newAnthropicResponseAccumulator(originalModel)
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				accumulator.apply(translator.translateEvent(data))
 
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -381,7 +384,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			})
 
 			if lastCompletedData != nil {
-				anthropicResp := buildAnthropicResponseFromCompleted(lastCompletedData, originalModel)
+				anthropicResp := accumulator.build(lastCompletedData)
 				c.JSON(http.StatusOK, anthropicResp)
 			} else {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")

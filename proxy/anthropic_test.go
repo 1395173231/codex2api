@@ -350,6 +350,54 @@ func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
 	}
 }
 
+func TestAnthropicResponseAccumulatorUsesStreamDeltasWhenCompletedOutputIsEmpty(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	acc := newAnthropicResponseAccumulator("claude-sonnet-4-5")
+
+	events := [][]byte{
+		[]byte(`{"type":"response.created"}`),
+		[]byte(`{"type":"response.output_item.added","item":{"type":"reasoning"}}`),
+		[]byte(`{"type":"response.output_item.done"}`),
+		[]byte(`{"type":"response.output_item.added","item":{"type":"message"}}`),
+		[]byte(`{"type":"response.output_text.delta","delta":"O"}`),
+		[]byte(`{"type":"response.output_text.delta","delta":"K"}`),
+		[]byte(`{"type":"response.output_text.done"}`),
+	}
+	for _, event := range events {
+		acc.apply(tr.translateEvent(event))
+	}
+
+	completed := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"status":"completed",
+			"usage":{
+				"input_tokens":10,
+				"output_tokens":2,
+				"input_tokens_details":{"cached_tokens":3}
+			}
+		}
+	}`)
+	acc.apply(tr.translateEvent(completed))
+
+	resp := acc.build(completed)
+	if len(resp.Content) != 1 {
+		t.Fatalf("len(content) = %d, want 1: %+v", len(resp.Content), resp.Content)
+	}
+	if got := resp.Content[0].Text; got != "OK" {
+		t.Fatalf("content text = %q, want OK", got)
+	}
+	if resp.Content[0].Type != "text" {
+		t.Fatalf("content type = %q, want text", resp.Content[0].Type)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn", resp.StopReason)
+	}
+	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 2 || resp.Usage.CacheReadInputTokens != 3 {
+		t.Fatalf("usage = %+v, want input=10 output=2 cache_read=3", resp.Usage)
+	}
+}
+
 func mustJSONString(s string) string {
 	b, err := json.Marshal(s)
 	if err != nil {
