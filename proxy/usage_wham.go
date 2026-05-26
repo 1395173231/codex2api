@@ -114,6 +114,10 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 // ApplyWhamUsage 将 /wham/usage 返回的数据写入账号 state + 持久化。
 // 行为与 SyncCodexUsageState（处理 /responses 响应头时）保持一致：
 //   - plan_type 同步到内存 + DB
+//   - 窗口按 limit_window_seconds 精确分类（18000s→5h，604800s→7d），
+//     未精确匹配时回退到字段位置（primary→5h、secondary→7d）。这与
+//     CPA-Manager 的 pickClassifiedWindows 策略保持一致。
+//     （free 账号只有 7d 窗口，会被后端放在 primary_window 字段里）
 //   - 5h 窗口写入 SetUsageSnapshot5h
 //   - 7d 窗口走 PersistUsageSnapshot
 //   - premium 5h 用尽时走 MarkPremium5hRateLimited
@@ -129,24 +133,24 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	now := time.Now()
 
-	// 5h 主窗口
-	if w := usage.RateLimit.PrimaryWindow; w != nil && w.LimitWindowSeconds > 0 {
-		resetAt := whamWindowResetAt(w, now)
-		account.SetUsageSnapshot5h(w.UsedPercent, resetAt)
-		result.UsagePct5h = w.UsedPercent
+	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow)
+
+	if w5h != nil {
+		resetAt := whamWindowResetAt(w5h, now)
+		account.SetUsageSnapshot5h(w5h.UsedPercent, resetAt)
+		result.UsagePct5h = w5h.UsedPercent
 		result.Reset5hAt = resetAt
 		result.HasUsage5h = true
 		result.Used5hHeaders = true
 	}
 
-	// 7d 次窗口
-	if w := usage.RateLimit.SecondaryWindow; w != nil && w.LimitWindowSeconds > 0 {
-		resetAt := whamWindowResetAt(w, now)
+	if w7d != nil {
+		resetAt := whamWindowResetAt(w7d, now)
 		account.SetReset7dAt(resetAt)
-		result.UsagePct7d = w.UsedPercent
+		result.UsagePct7d = w7d.UsedPercent
 		result.HasUsage7d = true
 		if store != nil {
-			store.PersistUsageSnapshot(account, w.UsedPercent)
+			store.PersistUsageSnapshot(account, w7d.UsedPercent)
 		}
 	} else if result.Used5hHeaders && store != nil {
 		// 只有 5h 数据时，单独持久化 5h 快照
@@ -163,6 +167,50 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	}
 
 	return result
+}
+
+// 已知窗口长度（秒）。和 CPA-Manager src/utils/quota/codexQuota.ts 保持一致。
+const (
+	whamWindow5hSeconds int64 = 18_000
+	whamWindow7dSeconds int64 = 604_800
+)
+
+// pickClassifiedWhamWindows 把 primary/secondary 两个窗口归类到 5h/7d 槽位。
+//
+// 策略对齐 CPA-Manager 的 pickClassifiedWindows：
+//  1. 第一遍：按 limit_window_seconds 精确匹配（18000→5h，604800→7d）
+//  2. 第二遍：把还没分类、且非空的窗口按字段位置兜底（primary→5h、secondary→7d），
+//     但只填补空槽位、并避免与已分类的窗口冲突
+//
+// 这样可同时正确处理：
+//   - plus：primary=18000(5h) + secondary=604800(7d)
+//   - free：primary=604800(7d) + secondary=null（issue #168 报告的场景）
+//   - 字段位置颠倒
+//   - 未来出现的未知窗口长度（按位置兜底，避免数据完全丢失）
+func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow) (w5h, w7d *WhamUsageWindow) {
+	for _, w := range []*WhamUsageWindow{primary, secondary} {
+		if w == nil {
+			continue
+		}
+		switch w.LimitWindowSeconds {
+		case whamWindow5hSeconds:
+			if w5h == nil {
+				w5h = w
+			}
+		case whamWindow7dSeconds:
+			if w7d == nil {
+				w7d = w
+			}
+		}
+	}
+
+	if w5h == nil && primary != nil && primary != w7d {
+		w5h = primary
+	}
+	if w7d == nil && secondary != nil && secondary != w5h {
+		w7d = secondary
+	}
+	return w5h, w7d
 }
 
 func whamWindowResetAt(w *WhamUsageWindow, now time.Time) time.Time {
