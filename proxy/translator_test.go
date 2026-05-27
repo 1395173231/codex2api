@@ -1476,6 +1476,29 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesWebSocketBodyPreservesPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"previous_response_id":"resp_123",
+		"input":"continue"
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesWebSocketBody(raw)
+
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want resp_123; body=%s", prev, got)
+	}
+	if store := gjson.GetBytes(got, "store"); store.Exists() {
+		t.Fatalf("store should not be forced for websocket continuity, got %s; body=%s", store.Raw, got)
+	}
+	if !gjson.GetBytes(got, "stream").Bool() {
+		t.Fatalf("stream should be true; body=%s", got)
+	}
+	if content := gjson.Get(expandedInputRaw, "0.content").String(); content != "continue" {
+		t.Fatalf("expanded input content = %q, want continue; expanded=%s", content, expandedInputRaw)
+	}
+}
+
 func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
 	body := []byte(`{
 		"error":{

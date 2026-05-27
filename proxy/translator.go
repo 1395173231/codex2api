@@ -1322,10 +1322,31 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 	return modified
 }
 
+type responsesBodyPrepareOptions struct {
+	forceStoreFalse            bool
+	expandPreviousResponse     bool
+	preservePreviousResponseID bool
+}
+
 // PrepareResponsesBody 将 Responses API 原始请求转换为上游可接受的格式
 // 采用 Unmarshal→map 操作→Marshal 模式，替代逐字段 sjson 操作
 // 返回: (处理后的 body, 展开后的 input JSON 原始文本)
 func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		forceStoreFalse:        true,
+		expandPreviousResponse: true,
+	})
+}
+
+// PrepareResponsesWebSocketBody keeps upstream response storage linkage for
+// native Responses WebSocket sessions.
+func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		preservePreviousResponseID: true,
+	})
+}
+
+func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOptions) ([]byte, string) {
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
@@ -1333,7 +1354,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 1. 强制设置 Codex 必需字段
 	body["stream"] = true
-	body["store"] = false
+	if opts.forceStoreFalse {
+		body["store"] = false
+	}
 	if _, ok := body["include"]; !ok {
 		body["include"] = []string{"reasoning.encrypted_content"}
 	}
@@ -1428,7 +1451,7 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 6. 展开 previous_response_id
 	prevID, _ := body["previous_response_id"].(string)
-	if prevID != "" {
+	if opts.expandPreviousResponse && prevID != "" {
 		if cached := getResponseCache(prevID); cached != nil {
 			var cachedItems []any
 			for _, item := range cached {
@@ -1462,10 +1485,13 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity", "previous_response_id",
+		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
 		delete(body, field)
+	}
+	if !opts.preservePreviousResponseID {
+		delete(body, "previous_response_id")
 	}
 
 	result, err := json.Marshal(body)

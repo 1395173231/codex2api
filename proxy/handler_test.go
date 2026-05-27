@@ -211,13 +211,19 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","input":"hello"}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","previous_response_id":"resp_prev","input":"hello"}`)); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
 	select {
 	case gotBody := <-bodyCh:
 		if gjson.GetBytes(gotBody, "type").String() != "response.create" {
 			t.Fatalf("upstream type missing: %s", gotBody)
+		}
+		if prev := gjson.GetBytes(gotBody, "previous_response_id").String(); prev != "resp_prev" {
+			t.Fatalf("previous_response_id = %q, want resp_prev; body=%s", prev, gotBody)
+		}
+		if store := gjson.GetBytes(gotBody, "store"); store.Exists() {
+			t.Fatalf("websocket ingress should not force store=false, got %s; body=%s", store.Raw, gotBody)
 		}
 		if !gjson.GetBytes(gotBody, "stream").Bool() {
 			t.Fatalf("upstream stream should be true: %s", gotBody)

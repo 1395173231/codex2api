@@ -167,7 +167,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		c.Set("x-service-tier", serviceTier)
 	}
 
-	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		apiErr = api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest)
 		_ = writeResponsesWSError(conn, apiErr)

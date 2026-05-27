@@ -166,7 +166,6 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	}
 
 	// 2. 清理多余字段
-	wsBody, _ = sjson.DeleteBytes(wsBody, "previous_response_id")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")

@@ -91,6 +91,25 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 	}
 }
 
+func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","previous_response_id":"resp_123","input":[{"role":"user","content":"continue"}]}`), "session-123")
+
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want resp_123; body=%s", prev, got)
+	}
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "session-123" {
+		t.Fatalf("prompt_cache_key = %q, want session-123; body=%s", cacheKey, got)
+	}
+	if typ := gjson.GetBytes(got, "type").String(); typ != "response.create" {
+		t.Fatalf("type = %q, want response.create; body=%s", typ, got)
+	}
+	if !gjson.GetBytes(got, "stream").Bool() {
+		t.Fatalf("stream should be true; body=%s", got)
+	}
+}
+
 func TestNormalizeWebsocketHandshakeResponse(t *testing.T) {
 	t.Run("switching protocols is successful websocket handshake", func(t *testing.T) {
 		statusCode, _, failed := normalizeWebsocketHandshakeResponse(&http.Response{
