@@ -46,13 +46,13 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account) error {
 	usage, resp, err := proxy.QueryWhamUsage(ctx, account, h.store.ResolveProxyForAccount(account))
 	if resp != nil {
-		// QueryWhamUsage 在非 200 时不会读 body；这里关闭，并按状态码做冷却
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// QueryWhamUsage 在非 200 时不会读 body；这里读取一小段用于账号错误详情。
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			h.store.ReportRequestFailure(account, "client", 0)
-			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", fmt.Sprintf("用量探针 wham 上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 		case http.StatusTooManyRequests:
 			h.store.ReportRequestFailure(account, "client", 0)
 		}
@@ -97,7 +97,7 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 		return nil
 	case http.StatusUnauthorized:
 		h.store.ReportRequestFailure(account, "client", 0)
-		h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+		h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 		return nil
 	case http.StatusTooManyRequests:
 		h.store.ReportRequestFailure(account, "client", 0)

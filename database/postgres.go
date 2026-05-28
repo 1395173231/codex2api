@@ -3837,6 +3837,13 @@ func (db *DB) SetCooldown(ctx context.Context, id int64, reason string, until ti
 	return err
 }
 
+// SetCooldownWithError 持久化账号冷却状态，并保留本次错误详情。
+func (db *DB) SetCooldownWithError(ctx context.Context, id int64, reason string, until time.Time, errorMsg string) error {
+	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, error_message = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	_, err := db.conn.ExecContext(ctx, query, reason, until, errorMsg, id)
+	return err
+}
+
 // ClearCooldown 清除账号冷却状态
 func (db *DB) ClearCooldown(ctx context.Context, id int64) error {
 	query := `UPDATE accounts SET cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`

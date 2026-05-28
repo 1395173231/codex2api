@@ -85,6 +85,7 @@ import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecover
 import ChipInput from "../components/ChipInput";
 
 const ACCOUNT_BATCH_CONCURRENCY = 6;
+const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_VISIBLE_COLUMNS_KEY = "codex2api:accounts:visible-columns";
 const ACCOUNT_TABLE_COLUMNS = [
@@ -242,6 +243,30 @@ function formatAccountName(account: AccountRow): string {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
+}
+
+function getMediaQueryMatch(query: string): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return false;
+  }
+  return window.matchMedia(query).matches;
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => getMediaQueryMatch(query));
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
 }
 
 async function runAccountBatch(
@@ -411,6 +436,8 @@ export default function Accounts() {
     useState<OperationProgressState | null>(null);
   const operationProgressHideTimer = useRef<number | null>(null);
   const operationProgressFrame = useRef<number | null>(null);
+  const operationProgressFlushTimer = useRef<number | null>(null);
+  const lastOperationProgressFlushAt = useRef(0);
   const pendingOperationProgress = useRef<{
     title: string;
     event: BatchOperationEvent;
@@ -528,6 +555,7 @@ export default function Accounts() {
   const [viewMode, setViewMode] = useState<AccountViewMode>(
     getInitialAccountViewMode,
   );
+  const isDesktopLayout = useMediaQuery("(min-width: 1024px)");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const jsonAtInputRef = useRef<HTMLInputElement>(null);
@@ -545,6 +573,9 @@ export default function Accounts() {
       }
       if (operationProgressFrame.current !== null) {
         window.cancelAnimationFrame(operationProgressFrame.current);
+      }
+      if (operationProgressFlushTimer.current !== null) {
+        window.clearTimeout(operationProgressFlushTimer.current);
       }
       pendingOperationProgress.current = null;
     };
@@ -596,6 +627,7 @@ export default function Accounts() {
     const pending = pendingOperationProgress.current;
     if (!pending) return;
     pendingOperationProgress.current = null;
+    lastOperationProgressFlushAt.current = performance.now();
     commitOperationProgressEvent(pending.title, pending.event);
   }, [commitOperationProgressEvent]);
 
@@ -613,11 +645,33 @@ export default function Accounts() {
           window.cancelAnimationFrame(operationProgressFrame.current);
           operationProgressFrame.current = null;
         }
+        if (operationProgressFlushTimer.current !== null) {
+          window.clearTimeout(operationProgressFlushTimer.current);
+          operationProgressFlushTimer.current = null;
+        }
         flushOperationProgressEvent();
         return;
       }
 
-      if (operationProgressFrame.current === null) {
+      if (
+        operationProgressFrame.current === null &&
+        operationProgressFlushTimer.current === null
+      ) {
+        const now = performance.now();
+        const delay = Math.max(
+          0,
+          OPERATION_PROGRESS_FLUSH_INTERVAL_MS -
+            (now - lastOperationProgressFlushAt.current),
+        );
+        if (delay > 0) {
+          operationProgressFlushTimer.current = window.setTimeout(() => {
+            operationProgressFlushTimer.current = null;
+            operationProgressFrame.current = window.requestAnimationFrame(
+              flushOperationProgressEvent,
+            );
+          }, delay);
+          return;
+        }
         operationProgressFrame.current = window.requestAnimationFrame(
           flushOperationProgressEvent,
         );
@@ -949,6 +1003,8 @@ export default function Accounts() {
     () => pagedAccounts.map((account) => account.id),
     [pagedAccounts],
   );
+  const shouldRenderMobileCards = viewMode === "grid" || !isDesktopLayout;
+  const shouldRenderDesktopTable = viewMode !== "grid" && isDesktopLayout;
   const pageSelectedCount = useMemo(
     () =>
       pagedAccountIds.reduce(
@@ -2927,48 +2983,49 @@ export default function Accounts() {
                   </Button>
                 }
               >
-                <div
-                  className={
-                    viewMode === "grid"
-                      ? "grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
-                      : "grid gap-3 lg:hidden"
-                  }
-                >
-                  {pagedAccounts.map((account, index) => {
-                    const isSelected = selected.has(account.id);
-                    return (
-                      <AccountMobileCard
-                        key={account.id}
-                        account={account}
-                        sequence={(currentPage - 1) * pageSize + index + 1}
-                        selected={isSelected}
-                        allGroups={allGroups}
-                        lazyMode={lazyMode}
-                        refreshing={refreshingIds.has(account.id)}
-                        authJsonExporting={authJsonExportingIds.has(account.id)}
-                        t={t}
-                        onToggleSelect={() => toggleSelect(account.id)}
-                        onEdit={() => openSchedulerEditor(account)}
-                        onUsage={() => setUsageAccount(account)}
-                        onTest={() => setTestingAccount(account)}
-                        onRefresh={() => void handleRefresh(account)}
-                        onGenerateAuthJson={() =>
-                          void handleGenerateAuthJSON(account)
-                        }
-                        onToggleEnabled={() =>
-                          void handleToggleEnabled(account)
-                        }
-                        onToggleLock={() => void handleToggleLock(account)}
-                        onResetStatus={() => void handleResetStatus(account)}
-                        onDelete={() => void handleDelete(account)}
-                      />
-                    );
-                  })}
-                </div>
+                {shouldRenderMobileCards ? (
+                  <div
+                    className={
+                      viewMode === "grid"
+                        ? "grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
+                        : "grid gap-3 lg:hidden"
+                    }
+                  >
+                    {pagedAccounts.map((account, index) => {
+                      const isSelected = selected.has(account.id);
+                      return (
+                        <AccountMobileCard
+                          key={account.id}
+                          account={account}
+                          sequence={(currentPage - 1) * pageSize + index + 1}
+                          selected={isSelected}
+                          allGroups={allGroups}
+                          lazyMode={lazyMode}
+                          refreshing={refreshingIds.has(account.id)}
+                          authJsonExporting={authJsonExportingIds.has(account.id)}
+                          t={t}
+                          onToggleSelect={() => toggleSelect(account.id)}
+                          onEdit={() => openSchedulerEditor(account)}
+                          onUsage={() => setUsageAccount(account)}
+                          onTest={() => setTestingAccount(account)}
+                          onRefresh={() => void handleRefresh(account)}
+                          onGenerateAuthJson={() =>
+                            void handleGenerateAuthJSON(account)
+                          }
+                          onToggleEnabled={() =>
+                            void handleToggleEnabled(account)
+                          }
+                          onToggleLock={() => void handleToggleLock(account)}
+                          onResetStatus={() => void handleResetStatus(account)}
+                          onDelete={() => void handleDelete(account)}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : null}
 
-                <div
-                  className={`data-table-shell hidden lg:block ${viewMode === "grid" ? "lg:hidden" : ""}`}
-                >
+                {shouldRenderDesktopTable ? (
+                  <div className="data-table-shell hidden lg:block">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -3441,7 +3498,8 @@ export default function Accounts() {
                       })}
                     </TableBody>
                   </Table>
-                </div>
+                  </div>
+                ) : null}
                 <Pagination
                   page={currentPage}
                   totalPages={totalPages}
@@ -6314,7 +6372,7 @@ function AccountMobileCard({
 
           {account.status === "error" && account.error_message && (
             <div
-              className="mt-2 break-words text-[11px] leading-tight text-red-500"
+              className="mt-2 line-clamp-3 break-words text-[11px] leading-tight text-red-500"
               title={account.error_message}
             >
               {account.error_message}

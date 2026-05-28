@@ -94,9 +94,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			proxy.SyncCodexUsageState(h.store, account, resp)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
-			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
 		case http.StatusTooManyRequests:
 			if isOpenAIResponsesAccount {
 				h.store.MarkCooldown(account, time.Minute, "rate_limited")
@@ -104,7 +105,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 			}
 		}
-		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
+		sendTestEvent(c, testEvent{Type: "error", Error: errMsg})
 		return
 	}
 
@@ -754,7 +755,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if !acc.IsOpenAIResponsesAPI() {
 			proxy.SyncCodexUsageState(h.store, acc, resp)
 		}
-		h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 		return "banned", "账号授权失败"
 	case http.StatusTooManyRequests:
 		if acc.IsOpenAIResponsesAPI() {

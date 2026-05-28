@@ -1262,6 +1262,42 @@ func TestListActiveIncludesErrorAccounts(t *testing.T) {
 	}
 }
 
+func TestSetCooldownWithErrorPersistsMessage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "cooldown-account", "rt-cooldown", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	until := time.Now().Add(time.Hour)
+	if err := db.SetCooldownWithError(ctx, id, "unauthorized", until, "上游返回 401: token_invalidated"); err != nil {
+		t.Fatalf("SetCooldownWithError 返回错误: %v", err)
+	}
+
+	var reason string
+	var errorMessage string
+	var cooldownUntil sql.NullTime
+	if err := db.conn.QueryRowContext(ctx, `SELECT cooldown_reason, error_message, cooldown_until FROM accounts WHERE id = $1`, id).Scan(&reason, &errorMessage, &cooldownUntil); err != nil {
+		t.Fatalf("查询账号冷却状态返回错误: %v", err)
+	}
+	if reason != "unauthorized" {
+		t.Fatalf("cooldown_reason = %q, want unauthorized", reason)
+	}
+	if errorMessage != "上游返回 401: token_invalidated" {
+		t.Fatalf("error_message = %q, want recorded upstream error", errorMessage)
+	}
+	if !cooldownUntil.Valid {
+		t.Fatal("cooldown_until 未写入")
+	}
+}
+
 func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

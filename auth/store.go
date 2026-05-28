@@ -3770,12 +3770,33 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 	return true
 }
 
+func normalizeAccountErrorMessage(errorMsg string, fallback string) string {
+	errorMsg = strings.TrimSpace(errorMsg)
+	if errorMsg == "" {
+		errorMsg = strings.TrimSpace(fallback)
+	}
+	if len(errorMsg) > 500 {
+		errorMsg = errorMsg[:500]
+	}
+	return errorMsg
+}
+
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
 func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string) {
+	s.markCooldown(acc, duration, reason, "")
+}
+
+// MarkCooldownWithError 标记账号进入冷却，并同时记录本次上游错误详情。
+func (s *Store) MarkCooldownWithError(acc *Account, duration time.Duration, reason string, errorMsg string) {
+	s.markCooldown(acc, duration, reason, errorMsg)
+}
+
+func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string, errorMsg string) {
 	if acc == nil {
 		return
 	}
 
+	errorMsg = normalizeAccountErrorMessage(errorMsg, "")
 	now := time.Now()
 	acc.mu.Lock()
 	switch reason {
@@ -3801,6 +3822,9 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 			acc.HealthTier = HealthTierRisky
 		}
 	}
+	if errorMsg != "" {
+		acc.ErrorMsg = errorMsg
+	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 
@@ -3815,7 +3839,13 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.SetCooldown(ctx, acc.DBID, reason, until); err != nil {
+	var err error
+	if errorMsg != "" {
+		err = s.db.SetCooldownWithError(ctx, acc.DBID, reason, until, errorMsg)
+	} else {
+		err = s.db.SetCooldown(ctx, acc.DBID, reason, until)
+	}
+	if err != nil {
 		log.Printf("[账号 %d] 持久化冷却状态失败: %v", acc.DBID, err)
 	}
 }
@@ -3917,13 +3947,7 @@ func (s *Store) MarkError(acc *Account, errorMsg string) {
 		return
 	}
 
-	errorMsg = strings.TrimSpace(errorMsg)
-	if errorMsg == "" {
-		errorMsg = "账号测试失败"
-	}
-	if len(errorMsg) > 500 {
-		errorMsg = errorMsg[:500]
-	}
+	errorMsg = normalizeAccountErrorMessage(errorMsg, "账号测试失败")
 
 	now := time.Now()
 	acc.mu.Lock()
