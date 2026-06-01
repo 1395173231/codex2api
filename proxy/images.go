@@ -620,9 +620,17 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -658,7 +666,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, nil, tool)
-	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, responseFormat, "image_generation", stream)
+	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_generation", stream)
 }
 
 func (h *Handler) ImagesEdits(c *gin.Context) {
@@ -726,9 +734,17 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -750,7 +766,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -823,9 +839,17 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -864,7 +888,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -908,7 +932,10 @@ func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model
 	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
 }
 
-func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+	if strings.TrimSpace(logModel) == "" {
+		logModel = requestModel
+	}
 	if err := validateResponsesImageGenerationSizes(responsesBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -978,14 +1005,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
-			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
+			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,
-				Model:             requestModel,
+				Model:             logModel,
+				EffectiveModel:    logEffectiveModel,
 				StatusCode:        resp.StatusCode,
 				DurationMs:        durationMs,
 				InboundEndpoint:   inboundEndpoint,
@@ -1009,7 +1037,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", requestModel)
+		c.Set("x-model", logModel)
 
 		var usage *UsageInfo
 		var firstTokenMs int
@@ -1036,10 +1064,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
 				h.logUsageForRequest(c, &database.UsageLogInput{
-					AccountID: account.ID(),
-					Endpoint:  inboundEndpoint,
-					Model:     requestModel,
-					StatusCode: http.StatusBadGateway,
+					AccountID:      account.ID(),
+					Endpoint:       inboundEndpoint,
+					Model:          logModel,
+					EffectiveModel: logEffectiveModel,
+					StatusCode:     http.StatusBadGateway,
 				})
 				return
 			}
@@ -1066,17 +1095,19 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
 			}
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID: account.ID(),
-				Endpoint:  inboundEndpoint,
-				Model:     requestModel,
-				StatusCode: http.StatusBadGateway,
+				AccountID:      account.ID(),
+				Endpoint:       inboundEndpoint,
+				Model:          logModel,
+				EffectiveModel: logEffectiveModel,
+				StatusCode:     http.StatusBadGateway,
 			})
 			return
 		}
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         inboundEndpoint,
-			Model:            requestModel,
+			Model:            logModel,
+			EffectiveModel:   logEffectiveModel,
 			StatusCode:       statusCode,
 			DurationMs:       int(time.Since(start).Milliseconds()),
 			FirstTokenMs:     firstTokenMs,

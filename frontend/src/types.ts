@@ -539,6 +539,7 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  codex_model_mapping: string
   resin_url: string
   resin_platform_name: string
   prompt_filter_enabled: boolean

@@ -110,6 +110,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
+	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	if isImageOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))

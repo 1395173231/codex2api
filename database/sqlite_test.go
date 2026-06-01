@@ -701,6 +701,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		MaxRetries:                       2,
 		MaxRateLimitRetries:              1,
 		ModelMapping:                     "{}",
+		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
 		PromptFilterMode:                 "monitor",
 		PromptFilterThreshold:            50,
 		PromptFilterStrictThreshold:      90,
@@ -741,6 +742,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
+	}
+	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
+		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
 	}
 }
 

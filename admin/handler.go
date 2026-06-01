@@ -4256,6 +4256,7 @@ type settingsResponse struct {
 	CacheLabel                       string `json:"cache_label"`
 	ExpiredCleaned                   int    `json:"expired_cleaned,omitempty"`
 	ModelMapping                     string `json:"model_mapping"`
+	CodexModelMapping                string `json:"codex_model_mapping"`
 	ResinURL                         string `json:"resin_url"`
 	ResinPlatformName                string `json:"resin_platform_name"`
 	PromptFilterEnabled              bool   `json:"prompt_filter_enabled"`
@@ -4321,6 +4322,7 @@ type updateSettingsReq struct {
 	MaxRateLimitRetries              *int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
 	ModelMapping                     *string `json:"model_mapping"`
+	CodexModelMapping                *string `json:"codex_model_mapping"`
 	ResinURL                         *string `json:"resin_url"`
 	ResinPlatformName                *string `json:"resin_platform_name"`
 	PromptFilterEnabled              *bool   `json:"prompt_filter_enabled"`
@@ -4879,6 +4881,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheDriver:                      h.cacheDriver,
 		CacheLabel:                       h.cacheLabel,
 		ModelMapping:                     h.store.GetModelMapping(),
+		CodexModelMapping:                h.store.GetCodexModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 		PromptFilterEnabled:              promptFilterCfg.Enabled,
@@ -5201,6 +5204,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetModelMapping(*req.ModelMapping)
 		log.Printf("设置已更新: model_mapping")
 	}
+	if req.CodexModelMapping != nil {
+		h.store.SetCodexModelMapping(*req.CodexModelMapping)
+		log.Printf("设置已更新: codex_model_mapping")
+	}
 
 	if req.ClientCompatMode != nil {
 		runtimeCfg.ClientCompatMode = proxy.NormalizeClientCompatMode(*req.ClientCompatMode)
@@ -5423,6 +5430,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                     h.store.GetModelMapping(),
+		CodexModelMapping:                h.store.GetCodexModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 		PromptFilterEnabled:              promptFilterCfg.Enabled,
@@ -5504,6 +5512,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CacheLabel:                       h.cacheLabel,
 		ExpiredCleaned:                   expiredCleaned,
 		ModelMapping:                     h.store.GetModelMapping(),
+		CodexModelMapping:                h.store.GetCodexModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 		PromptFilterEnabled:              promptFilterCfg.Enabled,

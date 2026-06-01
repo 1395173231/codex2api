@@ -1681,7 +1681,7 @@
     "authXApiKey": "x-api-key: <key> (Anthropic SDK default)",
     "authAnthropicToken": "anthropic-auth-token: <key> (fallback)",
     "modelMappingTitle": "Model Mapping",
-    "modelMappingDesc": "When using the /v1/messages endpoint, Claude model names are automatically mapped to Codex model names. Mapping rules can be customized in Settings.",
+    "modelMappingDesc": "Model mapping is split into Claude mapping and Codex model redirects. Codex mapping supports * wildcard rules such as gpt-*, *-mini, or *codex*.",
     "exampleTitle": "Request Examples",
     "responsesExample": "Responses API Example",
     "chatExample": "Chat Completions Example",
@@ -1831,9 +1831,15 @@
   },
   "settings2": {
     "modelMapping": "Model Mapping",
-    "modelMappingDesc": "Configure Anthropic model name to Codex model name mapping (for /v1/messages endpoint)",
-    "anthropicModel": "Anthropic Model",
+    "modelMappingDesc": "Configure model mapping rules. Claude mapping and Codex model redirects are maintained separately.",
+    "anthropicModelMapping": "Claude Model Mapping",
+    "anthropicModelMappingDesc": "Used by /v1/messages to map Claude/Anthropic model names to Codex model names.",
+    "codexModelMapping": "Codex Model Mapping",
+    "codexModelMappingDesc": "Redirect Codex models for Chat, Responses, Messages, and Images, for example gpt-5.2 -> gpt-5.5. The left side supports * wildcards.",
+    "anthropicModel": "Claude Model",
     "codexModel": "Codex Model",
+    "requestedModel": "Requested Model",
+    "targetModel": "Target Model",
     "addMapping": "Add Mapping",
     "messagesEndpoint": "Anthropic Messages API endpoint (Claude Code)"
   },
@@ -1979,7 +1985,7 @@
       "claudeEnvNote": "Environment variables only persist for the current shell session — write them to ~/.bashrc or ~/.zshrc for permanent use.",
       "claudeSettingsNote": "Or edit Claude Code's settings.json directly (pick one approach).",
       "mappingTitle": "Model Mapping",
-      "mappingDesc": "On the /v1/messages endpoint, Claude model names are auto-mapped to Codex names. Customize the mapping in System Settings."
+      "mappingDesc": "Model mapping is split into Claude mapping and Codex model redirects. Codex mapping supports * wildcard rules such as gpt-*, *-mini, or *codex*."
     },
     "authentication": {
       "title": "Authentication",

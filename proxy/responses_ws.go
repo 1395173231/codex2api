@@ -128,9 +128,19 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	if mappedModel != "" {
+		model = mappedModel
+	}
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
+
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(model)
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	if result := validator.ValidateRequest(rules); !result.Valid {
 		apiErr = validator.ToAPIError()
 		_ = writeResponsesWSError(conn, apiErr)
@@ -174,6 +184,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if status, msg := h.enforceAPIKeyLimits(c, effectiveModel); status != 0 {
 		errType := api.ErrorTypeRateLimit
 		errCode := api.ErrCodeRateLimitReached
@@ -295,15 +306,16 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
-				Model:                model,
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
 				StatusCode:           resp.StatusCode,
 				DurationMs:           durationMs,
 				ReasoningEffort:      reasoningEffort,
@@ -331,7 +343,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, model, effectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start); err != nil {
 			if errors.Is(err, errResponsesWSClientGone) {
 				return err
 			}
@@ -353,6 +365,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	affinityKey string,
 	model string,
 	effectiveModel string,
+	logEffectiveModel string,
 	reasoningEffort string,
 	serviceTier string,
 	expandedInputRaw string,
@@ -437,6 +450,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		AccountID:            account.ID(),
 		Endpoint:             "/v1/responses",
 		Model:                model,
+		EffectiveModel:       logEffectiveModel,
 		StatusCode:           outcome.logStatusCode,
 		DurationMs:           totalDuration,
 		FirstTokenMs:         firstTokenMs,

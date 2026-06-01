@@ -400,6 +400,34 @@ func TestResponsesNoAvailableAccountFailsFastWithoutCancelledContext(t *testing.
 	}
 }
 
+func TestResponsesEnforcesAPIKeyModelAllowlistBeforeDispatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = req
+	ginCtx.Set(contextAPIKeyRow, &database.APIKeyRow{
+		ID:   42,
+		Name: "limited",
+		Limits: database.APIKeyLimits{
+			ModelAllow: []string{"gpt-5.5", "gpt-5.4-mini"},
+		},
+	})
+
+	handler.Responses(ginCtx)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusForbidden, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, "gpt-5.4") || !strings.Contains(got, "not allowed") {
+		t.Fatalf("error.message = %q, want model allowlist rejection; body=%s", got, recorder.Body.String())
+	}
+}
+
 func TestExtractResponseImageGenerationOutputDedupes(t *testing.T) {
 	event := []byte(`{"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","result":"` + tinyPNGBase64 + `","output_format":"png"}}`)
 	seen := make(map[string]struct{})

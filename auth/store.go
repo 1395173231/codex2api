@@ -1547,6 +1547,7 @@ type Store struct {
 
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	codexModelMapping    atomic.Value // Codex 模型映射 JSON 字符串
 	schedulerMode        atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode         atomic.Value // string: "bounded" / "off" / "strict"
 	promptFilterConfig   atomic.Value // promptfilter.Config
@@ -1964,6 +1965,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetAffinityMode(settings.AffinityMode)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
+	}
+	if settings.CodexModelMapping != "" {
+		s.codexModelMapping.Store(settings.CodexModelMapping)
 	}
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
@@ -3398,6 +3402,19 @@ func (s *Store) SetModelMapping(mapping string) {
 // GetModelMapping 获取当前模型映射 JSON
 func (s *Store) GetModelMapping() string {
 	if v, ok := s.modelMapping.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
+// SetCodexModelMapping 动态更新 Codex 模型映射 JSON
+func (s *Store) SetCodexModelMapping(mapping string) {
+	s.codexModelMapping.Store(mapping)
+}
+
+// GetCodexModelMapping 获取当前 Codex 模型映射 JSON
+func (s *Store) GetCodexModelMapping() string {
+	if v, ok := s.codexModelMapping.Load().(string); ok && v != "" {
 		return v
 	}
 	return "{}"

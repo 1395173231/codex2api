@@ -390,6 +390,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "codex_model_mapping", "TEXT DEFAULT '{}'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
 		{"system_settings", "resin_platform_name", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_enabled", "INTEGER DEFAULT 0"},

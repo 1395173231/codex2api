@@ -29,15 +29,16 @@ import { cn } from '@/lib/utils'
 import { ExternalLink, RefreshCw, Save, Trash2, Upload, X } from 'lucide-react'
 
 type ModelMappingEntry = [string, string]
+const EMPTY_MODEL_MAPPING_ENTRIES: ModelMappingEntry[] = []
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
 
-const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
+const parseModelMappingEntries = (value: string, fallbackEntries: ModelMappingEntry[] = []): ModelMappingEntry[] => {
   try {
     const parsed = JSON.parse(value || '{}')
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return getDefaultModelMappingEntries()
+      return fallbackEntries
     }
 
     const entries = Object.entries(parsed).map(([key, model]) => [
@@ -45,10 +46,10 @@ const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
       typeof model === 'string' ? model : String(model ?? ''),
     ]) as ModelMappingEntry[]
 
-    // 如果数据库中为空，用默认值填充
-    return entries.length > 0 ? entries : getDefaultModelMappingEntries()
+    // 如果数据库中为空，按调用方提供的默认值填充
+    return entries.length > 0 ? entries : fallbackEntries
   } catch {
-    return getDefaultModelMappingEntries()
+    return fallbackEntries
   }
 }
 
@@ -63,15 +64,31 @@ const serializeModelMappingEntries = (entries: ModelMappingEntry[]) => {
 }
 
 // 模型映射编辑器组件
-function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function ModelMappingEditor({
+  value,
+  onChange,
+  fallbackEntries = EMPTY_MODEL_MAPPING_ENTRIES,
+  sourceLabel,
+  targetLabel,
+  sourcePlaceholder,
+  targetPlaceholder,
+}: {
+  value: string
+  onChange: (v: string) => void
+  fallbackEntries?: ModelMappingEntry[]
+  sourceLabel: string
+  targetLabel: string
+  sourcePlaceholder: string
+  targetPlaceholder: string
+}) {
   const { t } = useTranslation()
-  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value))
+  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value, fallbackEntries))
   const lastEmittedValueRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (value === lastEmittedValueRef.current) return
-    setMappings(parseModelMappingEntries(value))
-  }, [value])
+    setMappings(parseModelMappingEntries(value, fallbackEntries))
+  }, [fallbackEntries, value])
 
   const updateMappings = (entries: ModelMappingEntry[]) => {
     setMappings(entries)
@@ -99,8 +116,8 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] gap-1.5 px-1 text-xs font-semibold text-muted-foreground">
-        <span>{t('settings2.anthropicModel')}</span>
-        <span>{t('settings2.codexModel')}</span>
+        <span>{sourceLabel}</span>
+        <span>{targetLabel}</span>
         <span />
       </div>
       <div className="min-h-[180px] flex-1 space-y-1.5 overflow-y-auto pr-1">
@@ -108,13 +125,13 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
           <div key={i} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-1.5">
             <Input
               className="h-8 px-2 font-mono text-xs"
-              placeholder="claude-opus-4-6"
+              placeholder={sourcePlaceholder}
               value={k}
               onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
             />
             <Input
               className="h-8 px-2 font-mono text-xs"
-              placeholder="gpt-5.5"
+              placeholder={targetPlaceholder}
               value={v}
               onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
             />
@@ -354,6 +371,7 @@ async function compressSiteLogoFile(file: File, mimeType: string) {
 export default function Settings() {
   const { t } = useTranslation()
   const { applyBranding } = useBranding()
+  const defaultClaudeModelMappingEntries = useMemo(() => getDefaultModelMappingEntries(), [])
   const booleanOptions = [
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
@@ -436,6 +454,7 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    codex_model_mapping: '{}',
     resin_url: '',
     resin_platform_name: '',
     prompt_filter_enabled: false,
@@ -1447,14 +1466,35 @@ export default function Settings() {
             </SettingsCard>
 
             <SettingsCard
-              title={t('settings2.modelMapping')}
-              description={t('settings2.modelMappingDesc')}
+              title={t('settings2.anthropicModelMapping')}
+              description={t('settings2.anthropicModelMappingDesc')}
               className="h-full xl:h-[430px]"
               contentClassName="flex h-full min-h-0 flex-col"
             >
               <ModelMappingEditor
                 value={settingsForm.model_mapping}
                 onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+                fallbackEntries={defaultClaudeModelMappingEntries}
+                sourceLabel={t('settings2.anthropicModel')}
+                targetLabel={t('settings2.codexModel')}
+                sourcePlaceholder="claude-opus-4-6"
+                targetPlaceholder="gpt-5.5"
+              />
+            </SettingsCard>
+
+            <SettingsCard
+              title={t('settings2.codexModelMapping')}
+              description={t('settings2.codexModelMappingDesc')}
+              className="h-full xl:h-[430px]"
+              contentClassName="flex h-full min-h-0 flex-col"
+            >
+              <ModelMappingEditor
+                value={settingsForm.codex_model_mapping}
+                onChange={(v) => setSettingsForm(f => ({ ...f, codex_model_mapping: v }))}
+                sourceLabel={t('settings2.requestedModel')}
+                targetLabel={t('settings2.targetModel')}
+                sourcePlaceholder="gpt-5.2"
+                targetPlaceholder="gpt-5.5"
               />
             </SettingsCard>
           </div>

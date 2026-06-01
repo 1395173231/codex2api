@@ -1681,7 +1681,7 @@
     "authXApiKey": "x-api-key: <key>（Anthropic SDK 默认）",
     "authAnthropicToken": "anthropic-auth-token: <key>（备用兼容）",
     "modelMappingTitle": "模型映射",
-    "modelMappingDesc": "当使用 /v1/messages 端点时，Claude 模型名会自动映射为 Codex 模型名。映射规则可在「系统设置」中自定义。",
+    "modelMappingDesc": "模型映射分为 Claude 映射和 Codex 模型重定向；Codex 映射支持 gpt-*、*-mini、*codex* 等 * 通配规则。",
     "exampleTitle": "请求示例",
     "responsesExample": "Responses API 示例",
     "chatExample": "Chat Completions 示例",
@@ -1831,9 +1831,15 @@
   },
   "settings2": {
     "modelMapping": "模型映射",
-    "modelMappingDesc": "配置 Anthropic 模型名到 Codex 模型名的映射关系（用于 /v1/messages 端点）",
-    "anthropicModel": "Anthropic 模型",
+    "modelMappingDesc": "配置模型映射规则；Claude 映射和 Codex 模型重定向分别维护。",
+    "anthropicModelMapping": "Claude 模型映射",
+    "anthropicModelMappingDesc": "用于 /v1/messages，将 Claude/Anthropic 模型名映射为 Codex 模型名。",
+    "codexModelMapping": "Codex 模型映射",
+    "codexModelMappingDesc": "用于 Chat、Responses、Messages 和 Images 的 Codex 模型重定向，例如 gpt-5.2 -> gpt-5.5；左侧支持 * 通配。",
+    "anthropicModel": "Claude 模型",
     "codexModel": "Codex 模型",
+    "requestedModel": "请求模型",
+    "targetModel": "目标模型",
     "addMapping": "添加映射",
     "messagesEndpoint": "Anthropic Messages API 兼容端点（Claude Code）"
   },
@@ -1979,7 +1985,7 @@
       "claudeEnvNote": "环境变量仅在当前终端会话生效；如需永久使用，请写入 ~/.bashrc 或 ~/.zshrc。",
       "claudeSettingsNote": "或直接编辑 Claude Code 的 settings.json 配置文件（与环境变量二选一）。",
       "mappingTitle": "模型映射",
-      "mappingDesc": "当使用 /v1/messages 端点时，Claude 模型名会自动映射为 Codex 模型名。映射规则可在「系统设置」中自定义。"
+      "mappingDesc": "模型映射分为 Claude 映射和 Codex 模型重定向；Codex 映射支持 gpt-*、*-mini、*codex* 等 * 通配规则。"
     },
     "authentication": {
       "title": "认证方式",
