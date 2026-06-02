@@ -1479,6 +1479,9 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 
 	// 7. 删除 Codex 不支持的字段
+	// 注意：prompt_cache_retention 不在此剥离，统一交由 executor 层的
+	// ApplyPromptCacheRetention 处理（保留客户端显式值，否则注入默认 24h），
+	// 避免在更早的预处理阶段丢失客户端意图。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
@@ -1486,7 +1489,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
 		"disable_response_storage", "verbosity",
-		"prompt_cache_retention", "safety_identifier",
+		"safety_identifier",
 	} {
 		delete(body, field)
 	}

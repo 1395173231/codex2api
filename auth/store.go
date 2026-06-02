@@ -1540,6 +1540,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 type Store struct {
 	mu                        sync.RWMutex
 	accounts                  []*Account
+	accountsByID              map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
 	globalProxy               string
 	maxConcurrency            int64        // 每账号最大并发数
 	testConcurrency           int64        // 批量测试并发数
@@ -2632,6 +2633,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		s.accounts = append(s.accounts, account)
 	}
 
+	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
@@ -3213,13 +3215,7 @@ func (s *Store) affinityAccountStillHealthy(accountID int64) bool {
 		return false
 	}
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == accountID {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(accountID)
 	s.mu.RUnlock()
 	if target == nil {
 		return false
@@ -3266,13 +3262,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	}
 
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == id {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(id)
 	s.mu.RUnlock()
 	if target == nil {
 		return nil
@@ -3644,6 +3634,7 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	s.rebuildAccountIndex()
 	s.fastSchedulerUpdate(acc)
 }
 
@@ -3655,6 +3646,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			s.rebuildAccountIndex()
 			s.fastSchedulerRemove(dbID)
 			// 清理 RefreshScheduler 中可能残留的任务
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
@@ -3669,12 +3661,33 @@ func (s *Store) RemoveAccount(dbID int64) {
 func (s *Store) FindByID(dbID int64) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.lookupByIDLocked(dbID)
+}
+
+// lookupByIDLocked 通过索引 O(1) 查找账号；索引缺失时回退到线性扫描。
+// 调用方必须持有 s.mu(读或写锁)。
+func (s *Store) lookupByIDLocked(dbID int64) *Account {
+	if s.accountsByID != nil {
+		return s.accountsByID[dbID]
+	}
 	for _, acc := range s.accounts {
 		if acc.DBID == dbID {
 			return acc
 		}
 	}
 	return nil
+}
+
+// rebuildAccountIndex 根据当前 s.accounts 重建 DBID 索引。
+// 调用方必须持有 s.mu 写锁；在任何修改 s.accounts 的地方调用以保持同步。
+func (s *Store) rebuildAccountIndex() {
+	idx := make(map[int64]*Account, len(s.accounts))
+	for _, acc := range s.accounts {
+		if acc != nil {
+			idx[acc.DBID] = acc
+		}
+	}
+	s.accountsByID = idx
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
@@ -4648,6 +4661,7 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		}
 	}
 	s.accounts = kept
+	s.rebuildAccountIndex()
 	s.mu.Unlock()
 }
 
