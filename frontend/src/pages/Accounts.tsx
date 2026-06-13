@@ -299,6 +299,28 @@ function formatAccountName(account: AccountRow): string {
   return account.email || account.name || `ID ${account.id}`;
 }
 
+function isOAuthAccount(account: AccountRow | null): boolean {
+  return account?.account_type === "oauth";
+}
+
+function parseOAuthCallbackParams(rawUrl: string): { code: string; state: string } {
+  const raw = rawUrl.trim();
+  try {
+    const url = new URL(raw);
+    return {
+      code: url.searchParams.get("code") ?? "",
+      state: url.searchParams.get("state") ?? "",
+    };
+  } catch {
+    const qs = raw.includes("?") ? raw.split("?")[1] : raw;
+    const params = new URLSearchParams(qs);
+    return {
+      code: params.get("code") ?? "",
+      state: params.get("state") ?? "",
+    };
+  }
+}
+
 function formatQuotaAutoPausePercentInput(value?: number | null): string {
   if (typeof value !== "number" || value <= 0) return "";
   const percent = value * 100;
@@ -622,6 +644,17 @@ export default function Accounts() {
   const [oauthName, setOauthName] = useState("");
   const [oauthGenerating, setOauthGenerating] = useState(false);
   const [oauthCompleting, setOauthCompleting] = useState(false);
+  const [editOAuthStep, setEditOAuthStep] = useState<"generate" | "exchange">(
+    "generate",
+  );
+  const [editOAuthSession, setEditOAuthSession] = useState<{
+    session_id: string;
+    auth_url: string;
+  } | null>(null);
+  const [editOAuthProxyUrl, setEditOAuthProxyUrl] = useState("");
+  const [editOAuthCallbackUrl, setEditOAuthCallbackUrl] = useState("");
+  const [editOAuthGenerating, setEditOAuthGenerating] = useState(false);
+  const [editOAuthUpdating, setEditOAuthUpdating] = useState(false);
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
@@ -1545,19 +1578,7 @@ export default function Accounts() {
 
   const handleOAuthComplete = async () => {
     if (!oauthSession) return;
-    let code = "";
-    let state = "";
-    const raw = oauthCallbackUrl.trim();
-    try {
-      const url = new URL(raw);
-      code = url.searchParams.get("code") ?? "";
-      state = url.searchParams.get("state") ?? "";
-    } catch {
-      const qs = raw.includes("?") ? raw.split("?")[1] : raw;
-      const params = new URLSearchParams(qs);
-      code = params.get("code") ?? "";
-      state = params.get("state") ?? "";
-    }
+    const { code, state } = parseOAuthCallbackParams(oauthCallbackUrl);
     if (!code || !state) {
       showToast(t("accounts.oauthParseError"), "error");
       return;
@@ -1590,6 +1611,96 @@ export default function Accounts() {
       );
     } finally {
       setOauthCompleting(false);
+    }
+  };
+
+  const startEditOAuthSession = async () => {
+    const result = await api.generateOAuthURL({
+      proxy_url: editOAuthProxyUrl.trim() || undefined,
+    });
+    setEditOAuthSession(result);
+    setEditOAuthCallbackUrl("");
+    setEditOAuthStep("exchange");
+    return result;
+  };
+
+  const handleEditOAuthGenerate = async () => {
+    setEditOAuthGenerating(true);
+    try {
+      await startEditOAuthSession();
+    } catch (error) {
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthGenerating(false);
+    }
+  };
+
+  const handleEditOAuthRestart = async () => {
+    setEditOAuthGenerating(true);
+    setEditOAuthSession(null);
+    setEditOAuthCallbackUrl("");
+    try {
+      await startEditOAuthSession();
+    } catch (error) {
+      setEditOAuthStep("generate");
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthGenerating(false);
+    }
+  };
+
+  const handleEditOAuthCopyLink = async () => {
+    if (!editOAuthSession?.auth_url) return;
+    try {
+      await copyTextToClipboard(editOAuthSession.auth_url);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
+    }
+  };
+
+  const handleUpdateOAuthAccount = async () => {
+    if (!editingAccount || !isOAuthAccount(editingAccount)) return;
+    if (!editOAuthSession) {
+      showToast(t("accounts.oauthGenerateFirst"), "error");
+      return;
+    }
+    const { code, state } = parseOAuthCallbackParams(editOAuthCallbackUrl);
+    if (!code || !state) {
+      showToast(t("accounts.oauthParseError"), "error");
+      return;
+    }
+
+    setEditSubmitting(true);
+    setEditOAuthUpdating(true);
+    try {
+      const result = await api.updateOAuthAccount(editingAccount.id, {
+        session_id: editOAuthSession.session_id,
+        code,
+        state,
+        proxy_url: editOAuthProxyUrl.trim() || undefined,
+      });
+      showToast(
+        result.email
+          ? t("accounts.oauthUpdateSuccess", { email: result.email })
+          : t("accounts.oauthUpdateSuccessNoEmail"),
+      );
+      await reload();
+      closeSchedulerEditor(true);
+    } catch (error) {
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthUpdating(false);
+      setEditSubmitting(false);
     }
   };
 
@@ -2518,6 +2629,12 @@ export default function Accounts() {
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
+    setEditOAuthStep("generate");
+    setEditOAuthSession(null);
+    setEditOAuthProxyUrl(account.proxy_url ?? "");
+    setEditOAuthCallbackUrl("");
+    setEditOAuthGenerating(false);
+    setEditOAuthUpdating(false);
   };
 
   const closeSchedulerEditor = (force = false) => {
@@ -2545,6 +2662,12 @@ export default function Accounts() {
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
+    setEditOAuthStep("generate");
+    setEditOAuthSession(null);
+    setEditOAuthProxyUrl("");
+    setEditOAuthCallbackUrl("");
+    setEditOAuthGenerating(false);
+    setEditOAuthUpdating(false);
   };
 
   const parsedScoreBias =
@@ -2667,6 +2790,10 @@ export default function Accounts() {
   const handleSaveAccountEditor = async () => {
     if (editingAccount?.openai_responses_api && editTab === "account") {
       await handleSaveOpenAIAccountSettings();
+      return;
+    }
+    if (isOAuthAccount(editingAccount) && editTab === "account") {
+      await handleUpdateOAuthAccount();
       return;
     }
     await handleSaveScheduler();
@@ -4803,24 +4930,48 @@ export default function Accounts() {
                 <Button
                   variant="outline"
                   onClick={() => closeSchedulerEditor()}
-                  disabled={editSubmitting}
+                  disabled={editSubmitting || editOAuthGenerating}
                 >
                   {t("common.cancel")}
                 </Button>
-                <Button
-                  onClick={() => void handleSaveAccountEditor()}
-                  disabled={
-                    editSubmitting ||
-                    (editTab === "scheduler" &&
-                      (scoreInputInvalid ||
-                        concurrencyInputInvalid ||
-                        editAutoPause5hThresholdInvalid ||
-                        editAutoPause7dThresholdInvalid)) ||
-                    openAIAccountInputInvalid
-                  }
-                >
-                  {editSubmitting ? t("common.saving") : t("common.save")}
-                </Button>
+                {isOAuthAccount(editingAccount) && editTab === "account" ? (
+                  <Button
+                    onClick={() =>
+                      editOAuthStep === "generate"
+                        ? void handleEditOAuthGenerate()
+                        : void handleUpdateOAuthAccount()
+                    }
+                    disabled={
+                      editOAuthGenerating ||
+                      editOAuthUpdating ||
+                      (editOAuthStep === "exchange" &&
+                        !editOAuthCallbackUrl.trim())
+                    }
+                  >
+                    {editOAuthStep === "generate"
+                      ? editOAuthGenerating
+                        ? t("accounts.oauthGenerating")
+                        : t("accounts.oauthGenerateBtn")
+                      : editOAuthUpdating
+                        ? t("accounts.oauthCompleting")
+                        : t("accounts.oauthUpdateAuth")}
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={() => void handleSaveAccountEditor()}
+                    disabled={
+                      editSubmitting ||
+                      (editTab === "scheduler" &&
+                        (scoreInputInvalid ||
+                          concurrencyInputInvalid ||
+                          editAutoPause5hThresholdInvalid ||
+                          editAutoPause7dThresholdInvalid)) ||
+                      openAIAccountInputInvalid
+                    }
+                  >
+                    {editSubmitting ? t("common.saving") : t("common.save")}
+                  </Button>
+                )}
               </>
             }
           >
@@ -4837,7 +4988,8 @@ export default function Accounts() {
                   </div>
                 </div>
 
-                {editingAccount.openai_responses_api && (
+                {(editingAccount.openai_responses_api ||
+                  isOAuthAccount(editingAccount)) && (
                   <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
                     <button
                       type="button"
@@ -4986,6 +5138,104 @@ export default function Accounts() {
                           proxy_url: value,
                         })),
                     })}
+                  </div>
+                ) : editTab === "account" && isOAuthAccount(editingAccount) ? (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                      <p className="font-semibold text-foreground mb-1">
+                        {t("accounts.oauthEditIntroTitle")}
+                      </p>
+                      <p>{t("accounts.oauthEditIntroDesc")}</p>
+                    </div>
+                    <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                        {t("accounts.oauthCurrentAccount")}
+                      </label>
+                      <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                        {formatAccountName(editingAccount)}
+                      </div>
+                    </div>
+                    {editOAuthStep === "generate" ? (
+                      <>
+                        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                          <p className="font-semibold text-foreground mb-1">
+                            {t("accounts.oauthStep1Title")}
+                          </p>
+                          <p>{t("accounts.oauthStep1Desc")}</p>
+                        </div>
+                        {renderProxyInput({
+                          value: editOAuthProxyUrl,
+                          testKey: "edit-oauth-generate",
+                          label: t("accounts.oauthProxyUrl"),
+                          placeholder: t("accounts.oauthProxyUrlPlaceholder"),
+                          onChange: setEditOAuthProxyUrl,
+                        })}
+                      </>
+                    ) : (
+                      <>
+                        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                          <p className="font-semibold text-foreground mb-1">
+                            {t("accounts.oauthStep2Title")}
+                          </p>
+                          <p>{t("accounts.oauthStep2Desc")}</p>
+                        </div>
+                        {editOAuthSession && (
+                          <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3">
+                            <p className="text-xs font-semibold text-muted-foreground mb-2">
+                              {t("accounts.oauthAuthLinkLabel")}
+                            </p>
+                            <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
+                              <a
+                                href={editOAuthSession.auth_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={editOAuthSession.auth_url}
+                                className="inline-flex min-h-10 min-w-0 max-w-full flex-1 items-start gap-1.5 overflow-hidden rounded-lg border bg-background px-3 py-2 text-sm font-semibold text-primary hover:bg-muted/50"
+                              >
+                                <ExternalLink className="mt-0.5 size-3.5 shrink-0" />
+                                <span className="block min-w-0 flex-1 break-all leading-relaxed [overflow-wrap:anywhere]">
+                                  {editOAuthSession.auth_url}
+                                </span>
+                              </a>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => void handleEditOAuthCopyLink()}
+                                className="w-full shrink-0 sm:w-auto"
+                              >
+                                <Copy className="size-4" />
+                                {t("common.copy")}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                        <div>
+                          <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                            {t("accounts.oauthCallbackUrlLabel")}
+                          </label>
+                          <Input
+                            placeholder={t("accounts.oauthCallbackUrlPlaceholder")}
+                            value={editOAuthCallbackUrl}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditOAuthCallbackUrl(event.target.value)
+                            }
+                          />
+                          <p className="mt-1.5 text-xs text-muted-foreground">
+                            {t("accounts.oauthCallbackUrlHint")}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleEditOAuthRestart()}
+                          disabled={editOAuthGenerating}
+                          className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                        >
+                          {editOAuthGenerating
+                            ? t("accounts.oauthGenerating")
+                            : t("accounts.oauthRestart")}
+                        </button>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <>
