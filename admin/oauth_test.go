@@ -375,6 +375,58 @@ func TestUpdateOAuthAccountCodeRejectsStateMismatch(t *testing.T) {
 	}
 }
 
+func TestUpdateOAuthAccountCodeDoesNotExposeTokenErrorBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, cache.NewMemory(1), nil)
+	handler := &Handler{db: db, store: store}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","refresh_token":"secret-refresh","access_token":"secret-access","id_token":"secret-id"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	oldResinCfg := proxy.GetResinConfig()
+	oldDecorator := auth.ResinRequestDecorator
+	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	t.Cleanup(func() {
+		proxy.SetResinConfig(oldResinCfg)
+		auth.ResinRequestDecorator = oldDecorator
+	})
+
+	id := insertOAuthEditTestAccount(t, db, "oauth-existing", "old-refresh", "")
+	sessionID := "oauth-edit-token-error"
+	globalOAuthStore.set(sessionID, &oauthSession{
+		State:        "state-token-error",
+		CodeVerifier: "verifier-token-error",
+		RedirectURI:  oauthDefaultRedirectURI,
+		CreatedAt:    time.Now(),
+	})
+	t.Cleanup(func() { globalOAuthStore.delete(sessionID) })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = newOAuthEditRequest(sessionID, "code-token-error", "state-token-error", "")
+
+	handler.UpdateOAuthAccountCode(ctx)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, leaked := range []string{"secret-refresh", "secret-access", "secret-id", "invalid_grant"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("response leaked token exchange error body value %q: %s", leaked, body)
+		}
+	}
+	if !strings.Contains(body, "token 兑换失败 (HTTP 400)") {
+		t.Fatalf("response = %s, want sanitized HTTP status error", body)
+	}
+}
+
 func TestUpdateOAuthAccountCodeUpdatesExistingAccountInPlace(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)

@@ -495,7 +495,7 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("token 兑换失败 (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, nil, fmt.Errorf("token 兑换失败 (HTTP %d)", resp.StatusCode)
 	}
 
 	var tokenResp rawOAuthTokenResp
