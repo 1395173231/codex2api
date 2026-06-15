@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import PageHeader from './PageHeader'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { api } from '../api'
 import type { AccountRow, InviteResult } from '../types'
 import { getErrorMessage } from '../utils/error'
@@ -56,6 +57,41 @@ function parseEmails(text: string): ParsedEmails {
   return { valid, invalid, duplicates }
 }
 
+function accountDisplayName(account: AccountRow): string {
+  return account.email || account.name || `#${account.id}`
+}
+
+function accountSearchText(account: AccountRow): string {
+  return [
+    String(account.id),
+    `#${account.id}`,
+    account.email,
+    account.name,
+    account.status,
+    account.plan_type,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+}
+
+function resolveAccountInput(accounts: AccountRow[], input: string): AccountRow | null {
+  const normalized = input.trim().toLowerCase()
+  if (!normalized) return null
+  return accounts.find((account) => {
+    const id = String(account.id)
+    const name = account.name?.trim().toLowerCase()
+    const normalizedNameWithID = normalized.replace(/\s+#(?=\d+$)/, '#')
+    return (
+      normalized === id ||
+      normalized === `#${id}` ||
+      normalized === account.email?.trim().toLowerCase() ||
+      normalized === name ||
+      (Boolean(name) && normalizedNameWithID === `${name}#${id}`)
+    )
+  }) ?? null
+}
+
 // CodexInviteView 是账号管理页内的「Codex 邀请」视图，入口与回收站一致。
 export default function CodexInviteView({ accounts, onClose }: Props) {
   const { t } = useTranslation()
@@ -66,38 +102,73 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
     () => accounts.filter((a) => !a.openai_responses_api && !a.at_only),
     [accounts],
   )
+  const firstAccount = codexAccounts[0] ?? null
 
-  const [accountId, setAccountId] = useState<number | null>(codexAccounts[0]?.id ?? null)
+  const [accountId, setAccountId] = useState<number | null>(firstAccount?.id ?? null)
+  const [accountQuery, setAccountQuery] = useState(() => firstAccount ? accountDisplayName(firstAccount) : '')
+  const [accountOpen, setAccountOpen] = useState(false)
   const [emailsText, setEmailsText] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [proxyUrl, setProxyUrl] = useState('')
   const [sending, setSending] = useState(false)
   const [result, setResult] = useState<InviteResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const accountPickerRef = useRef<HTMLDivElement>(null)
 
   const parsed = useMemo(() => parseEmails(emailsText), [emailsText])
   const selectedAccount = useMemo(
     () => codexAccounts.find((a) => a.id === accountId) ?? null,
     [codexAccounts, accountId],
   )
+  const filteredAccounts = useMemo(() => {
+    const query = accountQuery.trim().toLowerCase()
+    if (!query) return codexAccounts
+    return codexAccounts.filter((account) => accountSearchText(account).includes(query))
+  }, [accountQuery, codexAccounts])
   const overLimit = parsed.valid.length > MAX_EMAILS
   const canSend =
-    !sending && accountId != null && parsed.valid.length > 0 && !overLimit
+    !sending && accountQuery.trim() !== '' && parsed.valid.length > 0 && !overLimit
+
+  useEffect(() => {
+    if (accountId == null) return
+    if (codexAccounts.some((a) => a.id === accountId)) return
+    setAccountId(null)
+    setAccountQuery('')
+  }, [accountId, codexAccounts])
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && accountPickerRef.current?.contains(target)) return
+      setAccountOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    return () => document.removeEventListener('pointerdown', handlePointerDown)
+  }, [])
 
   const handleSend = async () => {
-    if (accountId == null) {
+    const accountInput = accountQuery.trim()
+    if (!accountInput) {
       setError(t('invite.noAccountSelected'))
+      return
+    }
+    const account = selectedAccount ?? resolveAccountInput(codexAccounts, accountInput)
+    if (!account) {
+      setError(t('invite.accountNotFound'))
+      showToast(t('invite.accountNotFound'), 'error')
       return
     }
     if (parsed.valid.length === 0) {
       setError(t('invite.noValidEmails'))
       return
     }
+    setAccountId(account.id)
+    setAccountQuery(accountDisplayName(account))
     setSending(true)
     setError(null)
     setResult(null)
     try {
-      const res = await api.sendInvite(accountId, {
+      const res = await api.sendInvite(account.id, {
         emails: parsed.valid,
         proxy_url: proxyUrl.trim() || undefined,
       })
@@ -141,17 +212,83 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
                 <UserCircle2 className="size-4 text-muted-foreground" />
                 <label className="text-sm font-semibold">{t('invite.accountLabel')}</label>
               </div>
-              <select
-                value={accountId ?? ''}
-                onChange={(e) => setAccountId(Number(e.target.value))}
-                className="h-10 w-full rounded-lg border bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-              >
-                {codexAccounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.email || a.name || `#${a.id}`}
-                  </option>
-                ))}
-              </select>
+              <div ref={accountPickerRef} className="relative">
+                <div className="relative">
+                  <Input
+                    value={accountQuery}
+                    onFocus={() => setAccountOpen(true)}
+                    onClick={() => setAccountOpen(true)}
+                    onChange={(e) => {
+                      const next = e.target.value
+                      setAccountQuery(next)
+                      setAccountOpen(true)
+                      setAccountId(resolveAccountInput(codexAccounts, next)?.id ?? null)
+                      if (error === t('invite.accountNotFound')) setError(null)
+                    }}
+                    placeholder={t('invite.accountPlaceholder')}
+                    role="combobox"
+                    aria-expanded={accountOpen}
+                    aria-controls="codex-invite-account-list"
+                    className="h-10 pr-9"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setAccountOpen((open) => !open)}
+                    className="absolute inset-y-0 right-0 inline-flex w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                    aria-label={t('invite.accountToggle')}
+                  >
+                    <ChevronDown className={`size-4 transition-transform ${accountOpen ? 'rotate-180' : ''}`} />
+                  </button>
+                </div>
+                {accountOpen && (
+                  <div
+                    id="codex-invite-account-list"
+                    role="listbox"
+                    className="absolute z-30 mt-1.5 max-h-72 w-full overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
+                  >
+                    {filteredAccounts.length > 0 ? (
+                      filteredAccounts.map((account) => {
+                        const active = account.id === accountId
+                        return (
+                          <button
+                            key={account.id}
+                            type="button"
+                            role="option"
+                            aria-selected={active}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => {
+                              setAccountId(account.id)
+                              setAccountQuery(accountDisplayName(account))
+                              setAccountOpen(false)
+                              setError(null)
+                            }}
+                            className={`flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors ${
+                              active ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/70 hover:text-accent-foreground'
+                            }`}
+                          >
+                            <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-[11px] font-semibold text-muted-foreground">
+                              #{account.id}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-medium">{accountDisplayName(account)}</span>
+                              <span className="block truncate text-xs text-muted-foreground">
+                                {[account.name && account.name !== account.email ? account.name : '', account.plan_type, account.status]
+                                  .filter(Boolean)
+                                  .join(' · ') || '-'}
+                              </span>
+                            </span>
+                            {active && <Check className="size-4 shrink-0 text-primary" />}
+                          </button>
+                        )
+                      })
+                    ) : (
+                      <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                        {t('invite.noAccountMatches')}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
               {selectedAccount && (
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
                   {selectedAccount.plan_type && (
