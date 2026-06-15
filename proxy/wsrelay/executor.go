@@ -548,8 +548,13 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 
 		err := wsResp.ReadStream(func(data []byte) bool {
 			// 将数据编码为 SSE 格式
-			line := fmt.Sprintf("data: %s\n\n", string(data))
-			if _, err := pw.Write([]byte(line)); err != nil {
+			if _, err := pw.Write([]byte("data: ")); err != nil {
+				return false
+			}
+			if _, err := pw.Write(data); err != nil {
+				return false
+			}
+			if _, err := pw.Write([]byte("\n\n")); err != nil {
 				return false
 			}
 			return true
