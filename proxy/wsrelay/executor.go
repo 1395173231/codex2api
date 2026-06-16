@@ -290,7 +290,10 @@ type WsResponse struct {
 	manager     *Manager
 	readErrChan chan error
 	closed      bool
-	mu          sync.Mutex
+	// connBroken 标记读流因上游 WS 异常(非正常关闭)而终止；Close() 据此销毁坏连接
+	// 而非归还连接池复用。受 mu 保护。
+	connBroken bool
+	mu         sync.Mutex
 }
 
 // ReadStream 读取 SSE 流
@@ -306,6 +309,9 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				return nil
 			}
+			// 非正常关闭(close 1006/1009/1011、broken pipe、unexpected EOF、读超时等)：
+			// 连接已不可靠，标记为坏连接，Close() 时销毁并移出连接池，避免复用与 CLOSE_WAIT 滞留。
+			r.markConnBroken()
 			return fmt.Errorf("websocket read error: %w", err)
 		}
 
@@ -411,6 +417,13 @@ func normalizeCompletionEvent(payload []byte) []byte {
 	return payload
 }
 
+// markConnBroken 标记底层连接因上游 WS 异常而不可复用（幂等，受 mu 保护）。
+func (r *WsResponse) markConnBroken() {
+	r.mu.Lock()
+	r.connBroken = true
+	r.mu.Unlock()
+}
+
 // Close 关闭响应并归还连接
 func (r *WsResponse) Close() error {
 	r.mu.Lock()
@@ -427,9 +440,16 @@ func (r *WsResponse) Close() error {
 		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
 	}
 
-	// 归还连接至连接池
+	// 根据读流是否异常终止决定连接去向：
+	//   - 正常完成：归还连接池继续复用。
+	//   - 上游 WS 异常(close 1006/1009/1011、broken pipe 等)：销毁坏连接并移出连接池，
+	//     否则坏连接会被误判为可复用，导致后续请求首字变慢/断流，且底层 fd 滞留 CLOSE_WAIT。
 	if r.conn != nil {
-		r.manager.ReleaseConnection(r.conn)
+		if r.connBroken {
+			r.manager.DiscardConnection(r.conn)
+		} else {
+			r.manager.ReleaseConnection(r.conn)
+		}
 	}
 
 	return nil
