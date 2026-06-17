@@ -8,9 +8,11 @@ import (
 	"github.com/codex2api/database"
 )
 
+const quotaAutoPauseFloatTolerance = 1e-6
+
 func nearlyEqualFloat64(a, b float64) bool {
-	const epsilon = 1e-6
-	return math.Abs(a-b) < epsilon
+	diff := math.Abs(a - b)
+	return diff <= quotaAutoPauseFloatTolerance && !math.IsNaN(diff)
 }
 
 func newQuotaAutoPauseTestAccount() *Account {
@@ -279,11 +281,11 @@ func TestQuotaAutoPause5hGuardDoesNotReduceDispatchScoreOutsideBandOrDisabled(t 
 		}
 	})
 
-	t.Run("band disabled", func(t *testing.T) {
+	t.Run("guard concurrency disabled", func(t *testing.T) {
 		acc := newQuotaAutoPauseTestAccount()
 		acc.AutoPause5hThreshold = 0.9
 		acc.SetUsageSnapshot5h(87, time.Now().Add(time.Hour))
-		setAutoPauseThresholdsWithGuard(acc, 0)
+		setAutoPauseThresholdsWithGuardConcurrency(acc, 5, 0)
 		recomputeTestAccount(acc, 4)
 
 		baseline := newQuotaAutoPauseTestAccount()
@@ -293,7 +295,7 @@ func TestQuotaAutoPause5hGuardDoesNotReduceDispatchScoreOutsideBandOrDisabled(t 
 		recomputeTestAccount(baseline, 4)
 
 		if !nearlyEqualFloat64(acc.DispatchScore, baseline.DispatchScore) {
-			t.Fatalf("DispatchScore = %v, want baseline %v when guard band is disabled", acc.DispatchScore, baseline.DispatchScore)
+			t.Fatalf("DispatchScore = %v, want baseline %v when guard concurrency is disabled", acc.DispatchScore, baseline.DispatchScore)
 		}
 	})
 }

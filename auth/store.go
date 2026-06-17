@@ -1010,7 +1010,7 @@ func (a *Account) quotaAutoPause5hGuardConcurrencyLimitLocked(limit int64, now t
 }
 
 func (a *Account) quotaAutoPause5hGuardDispatchPenaltyLocked(now time.Time) float64 {
-	if a.AutoPause5hDisabled || a.effectiveAutoPause5h <= 0 || !a.UsagePercent5hValid || a.autoPause5hGuardBandPercent <= 0 {
+	if a.AutoPause5hDisabled || a.effectiveAutoPause5h <= 0 || !a.UsagePercent5hValid || a.autoPause5hGuardBandPercent <= 0 || a.autoPause5hGuardConcurrency <= 0 {
 		return 0
 	}
 	if !a.Reset5hAt.IsZero() && !now.Before(a.Reset5hAt) {

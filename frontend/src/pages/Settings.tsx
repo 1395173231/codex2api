@@ -1389,8 +1389,14 @@ export default function Settings() {
                   value={settingsForm.auto_pause_5h_guard_band_percent > 0 ? settingsForm.auto_pause_5h_guard_band_percent : ''}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => {
                     const raw = e.target.value
-                    const value = raw === '' ? 0 : Math.max(0, Math.min(100, parseFloat(raw)))
-                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: isNaN(value) ? 5 : value }))
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: 0 }))
+                      return
+                    }
+                    const parsed = parseFloat(raw)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(0, Math.min(100, parsed))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: value }))
                   }}
                   onBlur={() => {
                     void autoSaveSettingsPatch({ auto_pause_5h_guard_band_percent: settingsForm.auto_pause_5h_guard_band_percent })
@@ -1407,9 +1413,14 @@ export default function Settings() {
                   value={settingsForm.auto_pause_5h_guard_concurrency ?? 1}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => {
                     const raw = e.target.value
-                    const parsed = raw === '' ? 0 : Math.floor(parseFloat(raw))
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: 0 }))
+                      return
+                    }
+                    const parsed = Number.parseInt(raw, 10)
+                    if (Number.isNaN(parsed)) return
                     const value = Math.max(0, Math.min(1000, parsed))
-                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: isNaN(value) ? 1 : value }))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: value }))
                   }}
                   onBlur={() => {
                     void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: settingsForm.auto_pause_5h_guard_concurrency })
