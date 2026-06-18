@@ -960,6 +960,13 @@
     "accountToggle": "展开账号列表",
     "accountHint": "邀请将通过该账号的推荐链接发送。",
     "accountNotFound": "账号不存在",
+    "abnormalHint": "该账号当前为「{{state}}」状态，但凭证仍可用，可继续发送邀请。",
+    "state": {
+      "disabled": "已禁用",
+      "locked": "已锁定",
+      "unauthorized": "封禁",
+      "error": "错误"
+    },
     "noAccountMatches": "没有匹配的账号",
     "planLabel": "套餐",
     "statusLabel": "状态",

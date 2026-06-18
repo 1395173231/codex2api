@@ -960,6 +960,13 @@
     "accountToggle": "Toggle account list",
     "accountHint": "Invites are sent through this account's referral link.",
     "accountNotFound": "Account does not exist",
+    "abnormalHint": "This account is currently {{state}}, but its credentials are still usable, so invites can still be sent.",
+    "state": {
+      "disabled": "disabled",
+      "locked": "locked",
+      "unauthorized": "banned",
+      "error": "in error"
+    },
     "noAccountMatches": "No matching accounts",
     "planLabel": "Plan",
     "statusLabel": "Status",
