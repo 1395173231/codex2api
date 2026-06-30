@@ -226,9 +226,9 @@ func main() {
 			BaseURL:      settings.ResinURL,
 			PlatformName: settings.ResinPlatformName,
 		})
-		// 注入 Resin URL 装饰器到 auth 包（避免 auth → proxy 循环依赖）
-		auth.ResinRequestDecorator = func(targetURL, accountID string) string {
-			return proxy.BuildReverseProxyURL(targetURL)
+		// 注入 Resin 正向代理装饰器到 auth 包（避免 auth → proxy 循环依赖）
+		auth.ResinRequestDecorator = func(proxyURL, accountID string) string {
+			return proxy.EffectiveProxyURLForIdentity(accountID, proxyURL)
 		}
 	}
 

@@ -89,7 +89,8 @@ func SendCodexInvite(ctx context.Context, account *auth.Account, proxyURL, refer
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}
 
-	client := &http.Client{Transport: newCodexStandardTransport(proxyURL)}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := &http.Client{Transport: newCodexStandardTransport(effectiveProxyURL)}
 
 	resp, err := client.Do(req)
 	if err != nil {

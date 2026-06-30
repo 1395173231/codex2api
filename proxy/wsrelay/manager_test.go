@@ -3,11 +3,13 @@ package wsrelay
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 )
 
 func TestManagerStopIdempotent(t *testing.T) {
@@ -94,6 +96,33 @@ func TestRemoveConnectionUsesEffectiveProxyKey(t *testing.T) {
 	}
 	if conn.IsConnected() {
 		t.Fatal("expected removed connection to be closed")
+	}
+}
+
+func TestEffectiveProxyURLUsesResinForwardProxy(t *testing.T) {
+	old := proxy.GetResinConfig()
+	proxy.SetResinConfig(nil)
+	t.Cleanup(func() { proxy.SetResinConfig(old) })
+
+	proxy.SetResinConfig(&proxy.ResinConfig{
+		BaseURL:      "http://127.0.0.1:2260/my-token",
+		PlatformName: "codex2api",
+	})
+
+	account := &auth.Account{DBID: 42, ProxyURL: "http://legacy-proxy.example:8080"}
+	got := effectiveProxyURL(account, "")
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("effectiveProxyURL returned invalid URL %q: %v", got, err)
+	}
+	if parsed.Host != "127.0.0.1:2260" {
+		t.Fatalf("host = %q, want 127.0.0.1:2260", parsed.Host)
+	}
+	if username := parsed.User.Username(); username != "codex2api.42" {
+		t.Fatalf("username = %q, want codex2api.42", username)
+	}
+	if password, _ := parsed.User.Password(); password != "my-token" {
+		t.Fatalf("password = %q, want my-token", password)
 	}
 }
 

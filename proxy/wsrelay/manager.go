@@ -69,7 +69,7 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 	if strings.TrimSpace(proxyOverride) != "" {
 		proxyURL = proxyOverride
 	}
-	return strings.TrimSpace(proxyURL)
+	return proxy.EffectiveProxyURLForAccount(account, proxyURL)
 }
 
 // NewWsConnection 创建 WebSocket 连接
@@ -518,10 +518,10 @@ func (m *Manager) createConnection(
 	dialerCopy := *m.dialer
 	dialer := &dialerCopy
 
-	// 配置代理（Resin 反代模式下跳过，URL 已包含 Resin 地址）
+	// 配置代理。Resin 启用时 effectiveProxyURL 已是 Resin 正向代理 URL。
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 
-	if !proxy.IsResinEnabled() && proxyURL != "" {
+	if proxyURL != "" {
 		proxyURLParsed, err := url.Parse(proxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy URL failed: %w", err)

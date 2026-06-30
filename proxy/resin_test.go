@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/url"
 	"testing"
 )
 
@@ -48,6 +49,65 @@ func TestBuildReverseProxyURL(t *testing.T) {
 				t.Fatalf("BuildReverseProxyURL(%q)\n  got:  %q\n  want: %q", tt.targetURL, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBuildForwardProxyURL(t *testing.T) {
+	old := resinCfg.Load()
+	defer func() { resinCfg.Store(old) }()
+
+	SetResinConfig(&ResinConfig{
+		BaseURL:      "http://127.0.0.1:2260/my-token",
+		PlatformName: "codex2api",
+	})
+
+	got := BuildForwardProxyURL("123")
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("BuildForwardProxyURL returned invalid URL %q: %v", got, err)
+	}
+	if parsed.Scheme != "http" {
+		t.Fatalf("scheme = %q, want http", parsed.Scheme)
+	}
+	if parsed.Host != "127.0.0.1:2260" {
+		t.Fatalf("host = %q, want 127.0.0.1:2260", parsed.Host)
+	}
+	if parsed.User == nil {
+		t.Fatal("proxy URL missing userinfo")
+	}
+	if username := parsed.User.Username(); username != "codex2api.123" {
+		t.Fatalf("username = %q, want codex2api.123", username)
+	}
+	if password, _ := parsed.User.Password(); password != "my-token" {
+		t.Fatalf("password = %q, want my-token", password)
+	}
+	if parsed.Path != "" {
+		t.Fatalf("path = %q, want empty path", parsed.Path)
+	}
+}
+
+func TestBuildForwardProxyURLPreservesSpecialAccountIdentity(t *testing.T) {
+	old := resinCfg.Load()
+	defer func() { resinCfg.Store(old) }()
+
+	SetResinConfig(&ResinConfig{
+		BaseURL:      "http://proxy.local:2260/token-value",
+		PlatformName: "Default",
+	})
+
+	got := BuildForwardProxyURL("user.name:with@special")
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("BuildForwardProxyURL returned invalid URL %q: %v", got, err)
+	}
+	if parsed.Host != "proxy.local:2260" {
+		t.Fatalf("host = %q, want proxy.local:2260", parsed.Host)
+	}
+	if username := parsed.User.Username(); username != "Default.user.name:with@special" {
+		t.Fatalf("username = %q, want special account identity preserved", username)
+	}
+	if password, _ := parsed.User.Password(); password != "token-value" {
+		t.Fatalf("password = %q, want token-value", password)
 	}
 }
 

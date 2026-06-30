@@ -1,18 +1,61 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 )
+
+type captureConnectProxy struct {
+	listener net.Listener
+	requests chan *http.Request
+}
+
+func newCaptureConnectProxy(t *testing.T) *captureConnectProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen capture proxy: %v", err)
+	}
+	p := &captureConnectProxy{
+		listener: ln,
+		requests: make(chan *http.Request, 4),
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err == nil {
+					p.requests <- req
+					_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return p
+}
+
+func (p *captureConnectProxy) urlWithToken(token string) string {
+	return "http://" + p.listener.Addr().String() + "/" + token
+}
 
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	input := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\n" +
@@ -115,6 +158,61 @@ func TestShouldFallbackWebsocketMessageTooBigToHTTP(t *testing.T) {
 	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, context.Canceled, nil) {
 		t.Fatal("should not fall back after downstream context is canceled")
+	}
+}
+
+func TestExecuteRequestUsesResinForwardProxyWithoutReverseHeaders(t *testing.T) {
+	oldCfg := GetResinConfig()
+	SetResinConfig(nil)
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
+	clientPool = sync.Map{}
+
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{
+		BaseURL:      proxyServer.urlWithToken("my-token"),
+		PlatformName: "codex2api",
+	})
+
+	account := &auth.Account{
+		DBID:        123,
+		AccessToken: "access-token",
+	}
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+
+	resp, err := ExecuteRequest(context.Background(), account, body, "", "", "api-key", nil, nil, false)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	_ = err
+
+	select {
+	case req := <-proxyServer.requests:
+		if req.Method != http.MethodConnect {
+			t.Fatalf("proxy method = %s, want CONNECT", req.Method)
+		}
+		if req.URL.Host != "chatgpt.com:443" {
+			t.Fatalf("CONNECT host = %q, want chatgpt.com:443", req.URL.Host)
+		}
+		rawAuth := strings.TrimSpace(req.Header.Get("Proxy-Authorization"))
+		if !strings.HasPrefix(rawAuth, "Basic ") {
+			t.Fatal("CONNECT missing Proxy-Authorization basic credentials")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(rawAuth, "Basic "))
+		if err != nil {
+			t.Fatalf("invalid proxy authorization: %v", err)
+		}
+		username, password, ok := strings.Cut(string(decoded), ":")
+		if !ok {
+			t.Fatalf("proxy authorization missing password separator: %q", decoded)
+		}
+		if username != "codex2api.123" || password != "my-token" {
+			t.Fatalf("proxy credentials = %q/%q, want codex2api.123/my-token", username, password)
+		}
+		if got := req.Header.Get("X-Resin-Account"); got != "" {
+			t.Fatalf("CONNECT should not include X-Resin-Account, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
 	}
 }
 

@@ -229,6 +229,8 @@ const (
 	Originator   = "codex-tui"
 )
 
+var codexBaseURLForRequest = CodexBaseURL
+
 var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
@@ -359,16 +361,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
 
-	endpoint := CodexBaseURL + "/responses"
+	endpoint := codexBaseURLForRequest + "/responses"
 
-	// Resin 反向代理模式：改写 URL，使用标准 HTTP 客户端
-	var client *http.Client
-	if IsResinEnabled() {
-		endpoint = BuildReverseProxyURL(endpoint)
-		client = getResinHTTPClient(account)
-	} else {
-		client = getPooledClient(account, proxyURL)
-	}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := getPooledClient(account, effectiveProxyURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
@@ -378,16 +374,12 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	// ==================== 请求头（伪装 Codex CLI） ====================
 	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
 
-	// Resin 反代：注入账号身份头
-	if IsResinEnabled() {
-		req.Header.Set("X-Resin-Account", ResinAccountID(account))
-	}
-	logCodexFingerprintDebug("http", account, proxyURL, req.Header)
+	logCodexFingerprintDebug("http", account, effectiveProxyURL, req.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recyclePooledClient(account, effectiveProxyURL)
 		}
 		return nil, ErrUpstream(0, "请求上游失败", err)
 	}
@@ -418,10 +410,11 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	}
 	applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
 
-	resp, err := getPooledClient(account, proxyURL).Do(req)
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recyclePooledClient(account, effectiveProxyURL)
 		}
 		return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
 	}
@@ -455,10 +448,11 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	}
 	applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
 
-	resp, err := getPooledClient(account, proxyURL).Do(req)
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recyclePooledClient(account, effectiveProxyURL)
 		}
 		return nil, ErrUpstream(0, "请求 OpenAI Responses API compact 失败", err)
 	}
@@ -502,16 +496,10 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 
 	// compact 端点
-	endpoint := CodexBaseURL + "/responses/compact"
+	endpoint := codexBaseURLForRequest + "/responses/compact"
 
-	// Resin 反向代理模式
-	var client *http.Client
-	if IsResinEnabled() {
-		endpoint = BuildReverseProxyURL(endpoint)
-		client = getResinHTTPClient(account)
-	} else {
-		client = getPooledClient(account, proxyURL)
-	}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := getPooledClient(account, effectiveProxyURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
@@ -520,15 +508,12 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 
 	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
 
-	if IsResinEnabled() {
-		req.Header.Set("X-Resin-Account", ResinAccountID(account))
-	}
-	logCodexFingerprintDebug("compact", account, proxyURL, req.Header)
+	logCodexFingerprintDebug("compact", account, effectiveProxyURL, req.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recyclePooledClient(account, effectiveProxyURL)
 		}
 		return nil, ErrUpstream(0, "请求上游失败", err)
 	}

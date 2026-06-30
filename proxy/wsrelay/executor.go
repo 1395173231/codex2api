@@ -105,18 +105,8 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
 	}
 
-	// Resin 反向代理：改写 WS URL 为 Resin 反代地址
-	if proxy.IsResinEnabled() {
-		wsURL = proxy.BuildWebSocketURL(wsURL)
-	}
-
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
-
-	// Resin 反代：注入账号身份头
-	if proxy.IsResinEnabled() {
-		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
-	}
 
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。

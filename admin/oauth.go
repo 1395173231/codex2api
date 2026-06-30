@@ -35,6 +35,9 @@ const (
 	oauthSessionTTL         = 30 * time.Minute
 )
 
+var oauthTokenURLForRequest = oauthTokenURL
+var oauthHTTPClientBuilder = auth.BuildHTTPClient
+
 // ==================== 内存 Session 存储 ====================
 
 type oauthSession struct {
@@ -541,14 +544,10 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", codeVerifier)
 
-	// Resin 反代模式：改写 URL
-	targetURL := oauthTokenURL
+	targetURL := oauthTokenURLForRequest
 	tempID := ""
 	if len(resinTempID) > 0 {
 		tempID = resinTempID[0]
-	}
-	if proxy.IsResinEnabled() && tempID != "" {
-		targetURL = proxy.BuildReverseProxyURL(oauthTokenURL)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(form.Encode()))
@@ -559,17 +558,11 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex-cli/0.91.0")
 
-	// Resin 反代：注入临时账号身份头
+	effectiveProxyURL := proxyURL
 	if proxy.IsResinEnabled() && tempID != "" {
-		req.Header.Set("X-Resin-Account", tempID)
+		effectiveProxyURL = proxy.EffectiveProxyURLForIdentity(tempID, proxyURL)
 	}
-
-	var client *http.Client
-	if proxy.IsResinEnabled() && tempID != "" {
-		client = &http.Client{Timeout: 30 * time.Second}
-	} else {
-		client = auth.BuildHTTPClient(proxyURL)
-	}
+	client := oauthHTTPClientBuilder(effectiveProxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("请求失败: %w", err)

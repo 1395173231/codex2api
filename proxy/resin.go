@@ -45,11 +45,80 @@ func IsResinEnabled() bool {
 	return GetResinConfig() != nil
 }
 
+// ==================== 正向代理 URL 构建 ====================
+
+// BuildForwardProxyURL 将当前 Resin 配置转换为 HTTP 正向代理 URL。
+//
+// Resin 正向代理认证格式为:
+//
+//	username = <Platform>.<Account>
+//	password = <resin_url path 中的 token>
+//
+// 例如:
+//
+//	resin_url=http://127.0.0.1:2260/my-token, platform=codex2api, account=123
+//	-> http://codex2api.123:my-token@127.0.0.1:2260
+func BuildForwardProxyURL(accountID string) string {
+	return BuildForwardProxyURLFromConfig(GetResinConfig(), accountID)
+}
+
+// BuildForwardProxyURLFromConfig 是 BuildForwardProxyURL 的可测试纯函数变体。
+func BuildForwardProxyURLFromConfig(cfg *ResinConfig, accountID string) string {
+	if cfg == nil {
+		return ""
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return ""
+	}
+	parsed, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	token := strings.Trim(strings.TrimSpace(parsed.EscapedPath()), "/")
+	if token == "" {
+		return ""
+	}
+	platform := strings.TrimSpace(cfg.PlatformName)
+	if platform == "" {
+		return ""
+	}
+
+	proxyURL := &url.URL{
+		Scheme: parsed.Scheme,
+		Host:   parsed.Host,
+		User:   url.UserPassword(platform+"."+accountID, token),
+	}
+	return proxyURL.String()
+}
+
+// EffectiveProxyURLForAccount 返回账号请求的有效代理。
+// Resin 启用且账号标识非空时，Resin 正向代理优先于传统 per-account/global proxy。
+func EffectiveProxyURLForAccount(account *auth.Account, fallbackProxyURL string) string {
+	if IsResinEnabled() && account != nil {
+		if resinProxyURL := BuildForwardProxyURL(ResinAccountID(account)); resinProxyURL != "" {
+			return resinProxyURL
+		}
+	}
+	return strings.TrimSpace(fallbackProxyURL)
+}
+
+// EffectiveProxyURLForIdentity 返回临时身份或非 Account 对象请求的有效代理。
+func EffectiveProxyURLForIdentity(accountID, fallbackProxyURL string) string {
+	if IsResinEnabled() {
+		if resinProxyURL := BuildForwardProxyURL(accountID); resinProxyURL != "" {
+			return resinProxyURL
+		}
+	}
+	return strings.TrimSpace(fallbackProxyURL)
+}
+
 // ==================== 反向代理 URL 构建 ====================
 
 // BuildReverseProxyURL 将目标 URL 转换为 Resin 反向代理 URL
 // 例如: https://chatgpt.com/backend-api/codex/responses
-//     → http://127.0.0.1:2260/my-token/codex2api/https/chatgpt.com/backend-api/codex/responses
+//
+//	→ http://127.0.0.1:2260/my-token/codex2api/https/chatgpt.com/backend-api/codex/responses
 func BuildReverseProxyURL(targetURL string) string {
 	cfg := GetResinConfig()
 	if cfg == nil {
@@ -72,7 +141,8 @@ func BuildReverseProxyURL(targetURL string) string {
 
 // BuildWebSocketURL 将目标 WSS URL 转换为 Resin WS 反向代理 URL
 // 例如: wss://chatgpt.com/backend-api/codex/responses
-//     → ws://127.0.0.1:2260/my-token/codex2api/https/chatgpt.com/backend-api/codex/responses
+//
+//	→ ws://127.0.0.1:2260/my-token/codex2api/https/chatgpt.com/backend-api/codex/responses
 //
 // Resin 约定: 客户端到 Resin 只支持 ws://；路径中 protocol 填 http/https 对应目标 ws/wss
 func BuildWebSocketURL(targetURL string) string {

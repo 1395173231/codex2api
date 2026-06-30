@@ -6484,8 +6484,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			PlatformName: resinPlatformName,
 		})
 		if strings.TrimSpace(resinURL) != "" && strings.TrimSpace(resinPlatformName) != "" {
-			auth.ResinRequestDecorator = func(targetURL, accountID string) string {
-				return proxy.BuildReverseProxyURL(targetURL)
+			auth.ResinRequestDecorator = func(proxyURL, accountID string) string {
+				return proxy.EffectiveProxyURLForIdentity(accountID, proxyURL)
 			}
 		} else {
 			auth.ResinRequestDecorator = nil

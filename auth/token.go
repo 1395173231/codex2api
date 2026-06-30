@@ -26,10 +26,14 @@ const (
 	MaxRetries    = 3
 )
 
-// ResinRequestDecorator 由外部（main.go）注入，用于在 Resin 启用时改写请求 URL 和添加 Header。
-// 避免 auth → proxy 循环依赖。参数: (originalURL, accountIdentifier) → (newURL)
-// 调用方需在返回的 req 上设置 X-Resin-Account header。
-var ResinRequestDecorator func(targetURL, accountID string) string
+var (
+	tokenURLForRequest   = TokenURL
+	sessionURLForRequest = SessionURL
+)
+
+// ResinRequestDecorator 由外部（main.go）注入，用于在 Resin 启用时生成账号正向代理 URL。
+// 避免 auth → proxy 循环依赖。参数: (originalProxyURL, accountIdentifier) → (effectiveProxyURL)
+var ResinRequestDecorator func(proxyURL, accountID string) string
 
 // TokenData 保存一次 RT 刷新获得的 token 信息
 type TokenData struct {
@@ -58,14 +62,10 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 		"scope":         {RefreshScopes},
 	}
 
-	// Resin 反代模式：改写 URL
-	targetURL := TokenURL
+	targetURL := tokenURLForRequest
 	accountID := ""
 	if len(resinAccountID) > 0 {
 		accountID = resinAccountID[0]
-	}
-	if ResinRequestDecorator != nil && accountID != "" {
-		targetURL = ResinRequestDecorator(TokenURL, accountID)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(data.Encode()))
@@ -75,18 +75,11 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	// Resin 反代：注入账号身份头
+	effectiveProxyURL := proxyURL
 	if ResinRequestDecorator != nil && accountID != "" {
-		req.Header.Set("X-Resin-Account", accountID)
+		effectiveProxyURL = ResinRequestDecorator(proxyURL, accountID)
 	}
-
-	// Resin 反代模式下使用标准 HTTP client（不走代理，Resin 处理路由）
-	var client *http.Client
-	if ResinRequestDecorator != nil && accountID != "" {
-		client = &http.Client{Timeout: 30 * time.Second}
-	} else {
-		client = buildHTTPClient(proxyURL)
-	}
+	client := buildHTTPClient(effectiveProxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("刷新请求失败: %w", err)
@@ -192,13 +185,10 @@ func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL 
 		return nil, nil, fmt.Errorf("session_token 为空")
 	}
 
-	targetURL := SessionURL
+	targetURL := sessionURLForRequest
 	accountID := ""
 	if len(resinAccountID) > 0 {
 		accountID = resinAccountID[0]
-	}
-	if ResinRequestDecorator != nil && accountID != "" {
-		targetURL = ResinRequestDecorator(SessionURL, accountID)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
@@ -212,15 +202,14 @@ func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL 
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.AddCookie(&http.Cookie{Name: "__Secure-next-auth.session-token", Value: sessionToken})
-	if ResinRequestDecorator != nil && accountID != "" {
-		req.Header.Set("X-Resin-Account", accountID)
-	}
 
-	var client *http.Client
+	effectiveProxyURL := proxyURL
 	if ResinRequestDecorator != nil && accountID != "" {
-		client = &http.Client{Timeout: 30 * time.Second}
-	} else {
-		client = buildUTLSHTTPClient(proxyURL)
+		effectiveProxyURL = ResinRequestDecorator(proxyURL, accountID)
+	}
+	client := buildUTLSHTTPClient(effectiveProxyURL)
+	if parsedTarget, err := url.Parse(targetURL); err == nil && strings.EqualFold(parsedTarget.Scheme, "http") {
+		client = buildHTTPClient(effectiveProxyURL)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

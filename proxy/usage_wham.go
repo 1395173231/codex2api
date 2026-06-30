@@ -168,7 +168,8 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 
 	// 复用网关同款 transport（支持 uTLS Chrome 指纹），而非裸标准 transport，
 	// 让 wham 查询与 /responses 走一致的 TLS 指纹，降低被 Cloudflare 拦截的概率。
-	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := &http.Client{Transport: newCodexTransport(effectiveProxyURL)}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -264,7 +265,8 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	}
 
 	// 与 wham 查询、/responses 一致的 transport（支持 uTLS Chrome 指纹）。
-	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := &http.Client{Transport: newCodexTransport(effectiveProxyURL)}
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -87,11 +87,12 @@ func TestRefreshAccessTokenRejectsEmptyAccessToken(t *testing.T) {
 	defer server.Close()
 
 	oldDecorator := ResinRequestDecorator
-	ResinRequestDecorator = func(targetURL, accountID string) string {
-		return server.URL
-	}
+	oldTokenURL := tokenURLForRequest
+	tokenURLForRequest = server.URL
+	ResinRequestDecorator = func(proxyURL, accountID string) string { return proxyURL }
 	defer func() {
 		ResinRequestDecorator = oldDecorator
+		tokenURLForRequest = oldTokenURL
 	}()
 
 	_, _, err := RefreshAccessToken(context.Background(), "rt-old", "", "account-1")
@@ -118,8 +119,8 @@ func TestRefreshWithSessionToken(t *testing.T) {
 		},
 	})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("X-Resin-Account"); got != "account-1" {
-			t.Fatalf("X-Resin-Account = %q, want account-1", got)
+		if got := r.Header.Get("X-Resin-Account"); got != "" {
+			t.Fatalf("X-Resin-Account = %q, want empty in forward proxy mode", got)
 		}
 		cookie, err := r.Cookie("__Secure-next-auth.session-token")
 		if err != nil {
@@ -134,11 +135,12 @@ func TestRefreshWithSessionToken(t *testing.T) {
 	defer server.Close()
 
 	oldDecorator := ResinRequestDecorator
-	ResinRequestDecorator = func(targetURL, accountID string) string {
-		return server.URL
-	}
+	oldSessionURL := sessionURLForRequest
+	sessionURLForRequest = server.URL
+	ResinRequestDecorator = func(proxyURL, accountID string) string { return proxyURL }
 	defer func() {
 		ResinRequestDecorator = oldDecorator
+		sessionURLForRequest = oldSessionURL
 	}()
 
 	td, info, err := RefreshWithSessionToken(context.Background(), "st-old", "", "account-1")

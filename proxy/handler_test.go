@@ -450,9 +450,11 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 
 	previousExec := WebsocketExecuteFunc
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		WebsocketExecuteFunc = previousExec
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 
 	wsCalls := 0
@@ -468,8 +470,8 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 	httpCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httpCalls++
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -478,7 +480,8 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
@@ -532,10 +535,12 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	previousExec := WebsocketExecuteFunc
 	previousSettings := CurrentRuntimeSettings()
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		WebsocketExecuteFunc = previousExec
 		ApplyRuntimeSettings(previousSettings)
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 	nextSettings := previousSettings
 	nextSettings.CodexForceWebsocket = true
@@ -554,8 +559,8 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	httpCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httpCalls++
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -564,7 +569,8 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
@@ -950,13 +956,15 @@ func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *te
 	gin.SetMode(gin.TestMode)
 
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses/compact") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses/compact", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses/compact" {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses/compact", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", "128")
@@ -966,7 +974,8 @@ func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *te
 		_, _ = w.Write([]byte(`{"id":"truncated"}`))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:      1,

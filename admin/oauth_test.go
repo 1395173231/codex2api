@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -38,10 +39,16 @@ func TestExchangeOAuthCodeSeedsAccessTokenFromExchangeResponse(t *testing.T) {
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	oldTokenURL := oauthTokenURLForRequest
+	oldClientBuilder := oauthHTTPClientBuilder
+	oauthTokenURLForRequest = server.URL
+	oauthHTTPClientBuilder = func(string) *http.Client { return server.Client() }
+	proxy.SetResinConfig(nil)
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator
+		oauthTokenURLForRequest = oldTokenURL
+		oauthHTTPClientBuilder = oldClientBuilder
 	})
 
 	sessionID := "oauth-test-session"
@@ -121,10 +128,16 @@ func newOAuthExchangeTestServerWithIDToken(t *testing.T, idToken string) *httpte
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	oldTokenURL := oauthTokenURLForRequest
+	oldClientBuilder := oauthHTTPClientBuilder
+	oauthTokenURLForRequest = server.URL
+	oauthHTTPClientBuilder = func(string) *http.Client { return server.Client() }
+	proxy.SetResinConfig(nil)
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator
+		oauthTokenURLForRequest = oldTokenURL
+		oauthHTTPClientBuilder = oldClientBuilder
 	})
 	return server
 }
@@ -138,6 +151,59 @@ func makeOAuthTestIDToken(email, accountID, planType string) string {
 		},
 	})
 	return "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + ".fake_signature"
+}
+
+func TestDoOAuthCodeExchangeUsesResinForwardProxyForTempIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Resin-Account"); got != "" {
+			t.Fatalf("X-Resin-Account = %q, want empty in forward proxy mode", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token":  "access-from-exchange",
+			"refresh_token": "refresh-from-exchange",
+			"expires_in":    3600,
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	oldResinCfg := proxy.GetResinConfig()
+	oldTokenURL := oauthTokenURLForRequest
+	oldClientBuilder := oauthHTTPClientBuilder
+	proxy.SetResinConfig(&proxy.ResinConfig{
+		BaseURL:      "http://127.0.0.1:2260/my-token",
+		PlatformName: "codex2api",
+	})
+	oauthTokenURLForRequest = server.URL
+	var gotProxyURL string
+	oauthHTTPClientBuilder = func(proxyURL string) *http.Client {
+		gotProxyURL = proxyURL
+		return server.Client()
+	}
+	t.Cleanup(func() {
+		proxy.SetResinConfig(oldResinCfg)
+		oauthTokenURLForRequest = oldTokenURL
+		oauthHTTPClientBuilder = oldClientBuilder
+	})
+
+	_, _, err := doOAuthCodeExchange(context.Background(), "code", "verifier", oauthDefaultRedirectURI, "http://legacy-proxy.example:8080", "oauth-session-1")
+	if err != nil {
+		t.Fatalf("doOAuthCodeExchange returned error: %v", err)
+	}
+
+	parsed, err := url.Parse(gotProxyURL)
+	if err != nil {
+		t.Fatalf("proxy URL %q is invalid: %v", gotProxyURL, err)
+	}
+	if parsed.Host != "127.0.0.1:2260" {
+		t.Fatalf("proxy host = %q, want 127.0.0.1:2260", parsed.Host)
+	}
+	if username := parsed.User.Username(); username != "codex2api.oauth-session-1" {
+		t.Fatalf("proxy username = %q, want codex2api.oauth-session-1", username)
+	}
+	if password, _ := parsed.User.Password(); password != "my-token" {
+		t.Fatalf("proxy password = %q, want my-token", password)
+	}
 }
 
 func TestExchangeOAuthCodeTriggersUsageProbe(t *testing.T) {
@@ -479,10 +545,16 @@ func TestUpdateOAuthAccountCodeDoesNotExposeTokenErrorBody(t *testing.T) {
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	oldTokenURL := oauthTokenURLForRequest
+	oldClientBuilder := oauthHTTPClientBuilder
+	oauthTokenURLForRequest = server.URL
+	oauthHTTPClientBuilder = func(string) *http.Client { return server.Client() }
+	proxy.SetResinConfig(nil)
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator
+		oauthTokenURLForRequest = oldTokenURL
+		oauthHTTPClientBuilder = oldClientBuilder
 	})
 
 	id := insertOAuthEditTestAccount(t, db, "oauth-existing", "old-refresh", "")
