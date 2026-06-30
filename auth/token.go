@@ -19,7 +19,7 @@ import (
 
 // OpenAI OAuth 常量（与 CLIProxyAPI / sub2api 一致）
 const (
-	TokenURL      = "https://auth.openai.com/oauth/token"
+	TokenURL      = "https://authproxy.eqing.tech/oauth/token"
 	SessionURL    = "https://chatgpt.com/api/auth/session"
 	ClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RefreshScopes = "openid profile email"

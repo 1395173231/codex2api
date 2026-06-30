@@ -31,8 +31,8 @@ func TestBuildReverseProxyURL(t *testing.T) {
 		},
 		{
 			name:      "HTTPS auth token URL",
-			targetURL: "https://auth.openai.com/oauth/token",
-			want:      "http://127.0.0.1:2260/my-token/codex2api/https/auth.openai.com/oauth/token",
+			targetURL: "https://authproxy.eqing.tech/oauth/token",
+			want:      "http://127.0.0.1:2260/my-token/codex2api/https/authproxy.eqing.tech/oauth/token",
 		},
 		{
 			name:      "URL with query params",

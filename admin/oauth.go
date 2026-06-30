@@ -28,7 +28,7 @@ import (
 
 const (
 	oauthAuthorizeURL       = "https://auth.openai.com/oauth/authorize"
-	oauthTokenURL           = "https://auth.openai.com/oauth/token"
+	oauthTokenURL           = "https://authproxy.eqing.tech/oauth/token"
 	oauthClientID           = "app_EMoamEEZ73f0CkXaXp7hrann"
 	oauthDefaultRedirectURI = "http://localhost:1455/auth/callback"
 	oauthDefaultScopes      = "openid profile email offline_access"
