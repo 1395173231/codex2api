@@ -22,8 +22,16 @@ const (
 
 	targetedOperationalIntrusionPattern = `(?i)\b(?:use|run|launch|execute|conduct|perform)\b.{0,96}\b(?:vibe[-_\s]?pentest|nmap|masscan|sqlmap|burp(?:\s+suite)?|metasploit|penetration\s+test(?:ing)?|pentest|vulnerability\s+scan(?:ning)?)\b|(?:使用|运行|启动|执行|发起|进行|开展).{0,64}(?:vibe[-_\s]?pentest|nmap|masscan|sqlmap|burp(?:\s+suite)?|metasploit|渗透测试|漏洞扫描)`
 	targetedIntrusionIntentPattern      = `(?i)\b(?:penetration\s+test(?:ing)?|pentest|exploit|attack|vulnerability\s+scan(?:ning)?)\b|渗透(?:测试)?|入侵|攻击|漏洞扫描`
-	targetedNetworkTargetPattern        = `(?i)(?:\b(?:targets?|target\s+(?:url|ip|host)|url|ip)\b|目标\s*(?:url|ip|地址|主机)?)[^\n。！？；]{0,48}(?:https?://[^\s<>"']+|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9-]+\.)+[a-z]{2,})`
-	targetedIntrusionAuthorization      = `(?i)(?:(?:我(?:自己|们)?的|自有|我方|本公司|本单位|已获授权的?|已经授权的?|经授权的?|授权(?:测试|环境|目标)|靶场|\bctf\b|\bsandbox\b|\btest\s+lab\b|\bmy\s+(?:own\s+)?|\bour\s+(?:own\s+)?|owned\s+by\s+(?:me|us)|\bauthorized\b|with\s+permission).{0,40}(?:网站|站点|服务器|主机|系统|网络|目标|url|ip|domain|host|server|system|network)|(?:网站|站点|服务器|主机|系统|网络|目标|url|ip|domain|host|server|system|network).{0,40}(?:属于我|归我所有|自有|我方|本公司|本单位|已获授权|已经授权|经授权|with\s+permission|\bauthorized\b))`
+	// 目标识别有两条路径。标签式("目标 URL：1.2.3.4"、"target ip: ...")覆盖
+	// 中文与表单式写法;介词式("against 1.2.3.4"、"scan on 1.2.3.4"、"point nmap
+	// at 1.2.3.4")覆盖英文惯用表述——缺少它时,与中文锚点语义完全等价的英文
+	// 定向入侵请求只能拿到 signal-only 分数并被放行。
+	//
+	// 介词式分支刻意只接受 IP 与显式 http(s) URL,不接受裸域名:裸域名正则
+	// (?:[a-z0-9-]+\.)+[a-z]{2,} 会把 main.go、package.json 之类文件名也当作目标,
+	// 配合 on/at 这类高频介词会在普通开发文本上误报。
+	targetedNetworkTargetPattern   = `(?i)(?:\b(?:targets?|target\s+(?:url|ip|host)|url|ip)\b|目标\s*(?:url|ip|地址|主机)?)[^\n。！？；]{0,48}(?:https?://[^\s<>"']+|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9-]+\.)+[a-z]{2,})|\b(?:against|targeting|toward|towards|on|upon|at)\b[^\n。！？；]{0,24}(?:https?://[^\s<>"']+|(?:\d{1,3}\.){3}\d{1,3})`
+	targetedIntrusionAuthorization = `(?i)(?:(?:我(?:自己|们)?的|自有|我方|本公司|本单位|已获授权的?|已经授权的?|经授权的?|授权(?:测试|环境|目标)|靶场|\bctf\b|\bsandbox\b|\btest\s+lab\b|\bmy\s+(?:own\s+)?|\bour\s+(?:own\s+)?|owned\s+by\s+(?:me|us)|\bauthorized\b|with\s+permission).{0,40}(?:网站|站点|服务器|主机|系统|网络|目标|url|ip|domain|host|server|system|network)|(?:网站|站点|服务器|主机|系统|网络|目标|url|ip|domain|host|server|system|network).{0,40}(?:属于我|归我所有|自有|我方|本公司|本单位|已获授权|已经授权|经授权|with\s+permission|\bauthorized\b))`
 
 	selfHarmTargetEN       = `(?:suicide|self[-\s]?harm|self[-\s]?cutting|cutting\s+(?:myself|my\s+(?:wrists?|arms?|thighs?))|starv(?:e|ing)\s+myself)`
 	selfHarmCausalTargetEN = `(?:` + selfHarmTargetEN + `|cutting)`

@@ -18,6 +18,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -39,6 +40,7 @@ type promptCyberRestriction struct {
 }
 
 type promptConversationLockIdentity struct {
+	Kind               string
 	LockKey            string
 	Platform           string
 	NewAPIUserID       string
@@ -57,8 +59,47 @@ func verifiedPromptUserCooldownIdentity(c *gin.Context, policyContext verifiedNe
 	}
 	digest := sha256.Sum256([]byte("prompt-user-cooldown-v1\x00" + platform + "\x00" + userID))
 	return promptConversationLockIdentity{
+		Kind:    database.PromptConversationLockIdentityNewAPI,
 		LockKey: hex.EncodeToString(digest[:]), Platform: platform, NewAPIUserID: userID,
 	}, true
+}
+
+// promptConversationLockFallbackPlatform 标记降级身份来源,避免与真实 NewAPI
+// 平台代码混淆。
+const promptConversationLockFallbackPlatform = "codex-local"
+
+// promptSessionFingerprint32 产出 32 位十六进制会话指纹,与 NewAPI 透传指纹的
+// 长度约定一致,因此降级身份可以复用同一套存储与校验不变量。
+func promptSessionFingerprint32(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("prompt-conversation-session-v1\x00" + strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// promptConversationSessionSignal 提取 Codex 客户端自带的稳定会话标识。Codex
+// 请求必带 x-codex-* 头,其中 window-id / installation-id 与 session-id 头一起
+// 构成不依赖 NewAPI 的会话身份。
+func promptConversationSessionSignal(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if value := promptSessionID(c); value != "" {
+		return value
+	}
+	body := ingressRequestBody(c, nil)
+	for _, path := range []string{"client_metadata.x-codex-window-id", "client_metadata.x-codex-installation-id"} {
+		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); value != "" {
+			return value
+		}
+	}
+	for _, name := range []string{"X-Codex-Window-Id", "X-Codex-Installation-Id", "Thread-Id"} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifiedNewAPIPolicyContext) (promptConversationLockIdentity, bool) {
@@ -73,6 +114,7 @@ func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifi
 	}
 	digest := sha256.Sum256([]byte("prompt-conversation-lock-v1\x00" + platform + "\x00" + userID + "\x00" + fingerprint))
 	return promptConversationLockIdentity{
+		Kind:    database.PromptConversationLockIdentityNewAPI,
 		LockKey: hex.EncodeToString(digest[:]), Platform: platform, NewAPIUserID: userID,
 		SessionFingerprint: fingerprint, SessionHash: hashRiskIdentity(fingerprint),
 	}, true
@@ -213,51 +255,116 @@ func promptCyberRestrictionLock(item *database.PromptConversationLock, exactConv
 	return &copy
 }
 
+// promptConversationLockFallbackIdentity 在没有 NewAPI 透传签名时,用下游
+// API Key 加 Codex 自带会话标识构成锁定身份。没有这条降级路径,未接 NewAPI 的
+// 部署完全无法锁定会话,拦截就只能逐条命中,无法封死一个正在试探的会话。
+func promptConversationLockFallbackIdentity(c *gin.Context) (promptConversationLockIdentity, bool) {
+	if c == nil {
+		return promptConversationLockIdentity{}, false
+	}
+	apiKeyID := requestAPIKeyID(c)
+	fingerprint := promptSessionFingerprint32(promptConversationSessionSignal(c))
+	if apiKeyID == 0 || len(fingerprint) != 32 {
+		return promptConversationLockIdentity{}, false
+	}
+	subject := fmt.Sprintf("apikey:%d", apiKeyID)
+	digest := sha256.Sum256([]byte("prompt-conversation-lock-v1\x00" +
+		database.PromptConversationLockIdentityCodexSession + "\x00" + subject + "\x00" + fingerprint))
+	return promptConversationLockIdentity{
+		Kind:               database.PromptConversationLockIdentityCodexSession,
+		LockKey:            hex.EncodeToString(digest[:]),
+		Platform:           promptConversationLockFallbackPlatform,
+		NewAPIUserID:       subject,
+		SessionFingerprint: fingerprint,
+		SessionHash:        hashRiskIdentity(fingerprint),
+	}, true
+}
+
+// resolvePromptConversationLockIdentity 优先使用已验证的 NewAPI 身份,缺失时
+// 退化到 Codex 会话身份。NewAPI 场景的行为与升级前一致。
+func (h *Handler) resolvePromptConversationLockIdentity(c *gin.Context, cfg promptfilter.Config, signedBody []byte) (promptConversationLockIdentity, bool) {
+	if h == nil || c == nil {
+		return promptConversationLockIdentity{}, false
+	}
+	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody); verified {
+		if identity, ok := verifiedPromptConversationLockIdentity(c, policyContext); ok {
+			return identity, true
+		}
+	}
+	return promptConversationLockFallbackIdentity(c)
+}
+
 func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.Config, signedBody []byte) (*database.PromptConversationLock, bool) {
 	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
 		return nil, false
 	}
+	lockTTL := promptConversationLockTTL(cfg)
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody)
-	if !verified {
-		return nil, false
+	if verified {
+		userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
+		if !ok {
+			return nil, false
+		}
+		conversationIdentity, hasConversationIdentity := verifiedPromptConversationLockIdentity(c, policyContext)
+		lockKey := ""
+		if hasConversationIdentity {
+			lockKey = conversationIdentity.LockKey
+		}
+		if hasConversationIdentity && h.cache != nil {
+			if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey); err == nil && found {
+				var item database.PromptConversationLock
+				if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive && !promptConversationLockExpired(&item, lockTTL) {
+					return promptCyberRestrictionLock(&item, true), true
+				}
+				_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey)
+			}
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		item, exactConversation, err := h.db.GetActivePromptConversationRestriction(
+			ctx, lockKey, userIdentity.Platform, userIdentity.NewAPIUserID,
+			lockTTL, promptUserCyberCooldownTTL(cfg),
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false
+		}
+		if err != nil {
+			log.Printf("check prompt conversation restriction failed identity=%s: %v", userIdentity.LockKey[:12], err)
+			return nil, false
+		}
+		if exactConversation {
+			h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
+		}
+		return promptCyberRestrictionLock(item, exactConversation), true
 	}
-	userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
+
+	// 未接入签名 NewAPI 的部署只按 API Key + Codex 会话锁定当前会话；不应用
+	// 用户级冷却，避免共享 Key 下不同用户相互影响。
+	identity, ok := promptConversationLockFallbackIdentity(c)
 	if !ok {
 		return nil, false
 	}
-	conversationIdentity, hasConversationIdentity := verifiedPromptConversationLockIdentity(c, policyContext)
-	lockKey := ""
-	if hasConversationIdentity {
-		lockKey = conversationIdentity.LockKey
-	}
-	lockTTL := promptConversationLockTTL(cfg)
-	userCooldownTTL := promptUserCyberCooldownTTL(cfg)
-	if hasConversationIdentity && h.cache != nil {
-		if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey); err == nil && found {
+	if h.cache != nil {
+		if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey); err == nil && found {
 			var item database.PromptConversationLock
 			if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive && !promptConversationLockExpired(&item, lockTTL) {
 				return promptCyberRestrictionLock(&item, true), true
 			}
-			_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey)
+			_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey)
 		}
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
-	item, exactConversation, err := h.db.GetActivePromptConversationRestriction(
-		ctx, lockKey, userIdentity.Platform, userIdentity.NewAPIUserID,
-		lockTTL, userCooldownTTL,
-	)
+	item, err := h.db.GetActivePromptConversationLockWithTTL(ctx, identity.LockKey, lockTTL)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false
 	}
 	if err != nil {
-		log.Printf("check prompt conversation restriction failed identity=%s: %v", userIdentity.LockKey[:12], err)
+		log.Printf("check fallback prompt conversation lock failed identity=%s: %v", identity.LockKey[:12], err)
 		return nil, false
 	}
-	if exactConversation {
-		h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
-	}
-	return promptCyberRestrictionLock(item, exactConversation), true
+	h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
+	return promptCyberRestrictionLock(item, true), true
 }
 
 func (h *Handler) cachePromptConversationLock(ctx context.Context, item *database.PromptConversationLock, lockTTL time.Duration) {
@@ -289,22 +396,31 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 		return false
 	}
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil))
-	if !verified {
-		return false
-	}
-	userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
-	if !ok {
-		return false
-	}
-	identity := userIdentity
-	conversationIdentity, hasConversationIdentity := verifiedPromptConversationLockIdentity(c, policyContext)
-	if hasConversationIdentity {
-		identity = conversationIdentity
+	identity := promptConversationLockIdentity{}
+	exactConversation := false
+	if verified {
+		userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
+		if !ok {
+			return false
+		}
+		identity = userIdentity
+		if conversationIdentity, ok := verifiedPromptConversationLockIdentity(c, policyContext); ok {
+			identity = conversationIdentity
+			exactConversation = true
+		}
+	} else {
+		var ok bool
+		identity, ok = promptConversationLockFallbackIdentity(c)
+		if !ok {
+			return false
+		}
+		exactConversation = true
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 	item, _, err := h.db.LockPromptConversation(ctx, database.PromptConversationLockInput{
-		LockKey: identity.LockKey, Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
+		LockKey: identity.LockKey, IdentityKind: identity.Kind,
+		Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
 		SessionFingerprint: identity.SessionFingerprint, SessionHash: identity.SessionHash,
 		IncidentID: incidentID, DecisionID: metadata.DecisionID, RequestID: metadata.RequestID,
 		ReasonCode: metadata.ReasonCode, Endpoint: endpoint, Model: model, LockedAt: time.Now().UTC(),
@@ -313,7 +429,47 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 		log.Printf("persist prompt conversation lock failed decision=%s: %v", metadata.DecisionID, err)
 		return false
 	}
-	if !hasConversationIdentity {
+	if !exactConversation {
+		return false
+	}
+	h.cachePromptConversationLock(c.Request.Context(), item, promptConversationLockTTL(cfg))
+	return item != nil && item.Status == database.PromptConversationLockStatusActive
+}
+
+// lockPromptConversationOnLocalBlock 在本地规则判定 block 时立即锁定会话,
+// 使风险在**发往上游供应商之前**就被扼杀。
+//
+// 为什么必须前置:纯正则单轮命中率有限(见 promptfilter 对抗性基线,12 种绕过
+// 变形仅 3 种被拦),攻击者只要改写措辞、拆词、换语言就能让下一条请求穿透本地
+// 规则打到上游,从而产生真实的 cyber_policy 封号信号。等上游返回 CYB 再锁,
+// 风险已经泄露。会话级封锁把"逐条命中"变成"一次命中即封死整段会话",这是纵深
+// 防御里唯一能覆盖未知变形的一层。
+func (h *Handler) lockPromptConversationOnLocalBlock(c *gin.Context, cfg promptfilter.Config, signedBody []byte, endpoint, model, reasonCode string) bool {
+	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
+		return false
+	}
+	identity, ok := h.resolvePromptConversationLockIdentity(c, cfg, signedBody)
+	if !ok {
+		return false
+	}
+	reasonCode = strings.TrimSpace(reasonCode)
+	if reasonCode == "" {
+		reasonCode = "local_prompt_block"
+	}
+	// 每次本地 block 使用独立的决策 ID,使 trigger_count 如实反映命中次数;
+	// 同一请求重放则保持幂等。
+	decisionID := "local-block:" + ensurePromptPolicyRequestCorrelationID(c)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	item, _, err := h.db.LockPromptConversation(ctx, database.PromptConversationLockInput{
+		LockKey: identity.LockKey, IdentityKind: identity.Kind,
+		Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
+		SessionFingerprint: identity.SessionFingerprint, SessionHash: identity.SessionHash,
+		DecisionID: decisionID, ReasonCode: reasonCode,
+		Endpoint: endpoint, Model: model, LockedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		log.Printf("persist local-block prompt conversation lock failed decision=%s: %v", decisionID, err)
 		return false
 	}
 	h.cachePromptConversationLock(c.Request.Context(), item, promptConversationLockTTL(cfg))
