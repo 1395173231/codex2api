@@ -207,7 +207,7 @@ type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; authorized_pentest_allowed: boolean }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -298,7 +298,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, authorized_pentest_allowed: false },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -406,6 +406,9 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       cyb_strike_enabled: typeof enforcement.cyb_strike_enabled === 'boolean'
         ? enforcement.cyb_strike_enabled
         : defaultAdvancedProtection.enforcement.cyb_strike_enabled,
+      local_severe_strike_enabled: typeof enforcement.local_severe_strike_enabled === 'boolean'
+        ? enforcement.local_severe_strike_enabled
+        : defaultAdvancedProtection.enforcement.local_severe_strike_enabled,
       authorized_pentest_allowed: typeof enforcement.authorized_pentest_allowed === 'boolean'
         ? enforcement.authorized_pentest_allowed
         : defaultAdvancedProtection.enforcement.authorized_pentest_allowed,
@@ -1187,6 +1190,7 @@ function AdvancedProtectionEditor({
               <CompactField label={t('promptFilter.userCyberCooldownMinutes')} hint={t('promptFilter.help.userCyberCooldownMinutes')}><DraftNumberInput min={1} max={1440} value={config.enforcement.user_cyber_cooldown_minutes} onValueChange={(next) => update('enforcement', { user_cyber_cooldown_minutes: next })} /></CompactField>
             </div> : null}
             <SwitchField label={t('promptFilter.cybStrikeEnabled')} hint={t('promptFilter.help.cybStrikeEnabled')} checked={config.enforcement.cyb_strike_enabled} onCheckedChange={(next) => update('enforcement', { cyb_strike_enabled: next })} />
+            <SwitchField label={t('promptFilter.localSevereStrikeEnabled')} hint={t('promptFilter.help.localSevereStrikeEnabled')} checked={config.enforcement.local_severe_strike_enabled} onCheckedChange={(next) => update('enforcement', { local_severe_strike_enabled: next })} />
             <SwitchField label={t('promptFilter.authorizedPentestAllowed')} hint={t('promptFilter.help.authorizedPentestAllowed')} checked={config.enforcement.authorized_pentest_allowed} onCheckedChange={(next) => update('enforcement', { authorized_pentest_allowed: next })} />
           </div>
         </details>

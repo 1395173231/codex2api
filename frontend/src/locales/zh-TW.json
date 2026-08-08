@@ -627,6 +627,7 @@
     "userCyberCooldownMinutes": "跨會話使用者冷卻（分鐘）",
     "cybStrikeEnabled": "允許上游 CYB 計入停用次數",
     "authorizedPentestAllowed": "放行聲明已授權的滲透測試",
+    "localSevereStrikeEnabled": "本地嚴重違規累計 CYB 封號",
     "riskSimplifiedDesc": "依使用者、IP 與會話累計週期風險；預設關閉。",
     "outputSimplifiedDesc": "掃描串流輸出中的嚴格高風險訊號；預設關閉。",
     "extensions": {
@@ -717,6 +718,7 @@
       "userCyberCooldownMinutes": "同一已驗證使用者在上游 CYB 後即使更換會話仍會被攔截的時間。預設 30 分鐘，可設定 1—1440 分鐘；錯誤回應與風險畫像會依目前設定顯示剩餘時間。",
       "cybStrikeEnabled": "預設關閉。開啟後，只有上游明確回傳 cyber_policy 的決策才會簽為可計次；關閉時仍會稽核、提醒並依設定鎖定對話，但 NewAPI 不會因此累計次數或自動停用帳號。",
       "authorizedPentestAllowed": "關閉（預設）：請求裡「我有書面授權」「這是我自己的伺服器」這類無法驗證的自述，不再豁免定向入侵終局規則——加一句授權聲明即可繞過的漏洞由此關閉。開啟：恢復放行，僅當你確實承載已授權滲透測試業務時才開啟。沒有授權聲明的攻擊請求與純防禦性請求的判定不受影響。",
+      "localSevereStrikeEnabled": "開啟（預設）：目前使用者直接發出的最高信賴度嚴重違規（定向入侵、惡意軟體等終局命中）在本地攔截的同時，向 NewAPI 記一次 CYB strike，累計到達閾值即自動封號——無需該請求先打到上游產生真實 cyber_policy。同一會話被鎖後的重複試探不重複累計，低信賴度攔截、工具輸出、歷史脈絡都不累計，以此把誤封面收斂到最高信賴度那一檔。關閉：嚴重違規仍被攔截，但不再記 strike（攔截與封號解耦）。",
       "normalizationPanel": "對常見編碼和壓縮片段進行有界還原；位元組、片段和輪數上限可避免解碼炸彈拖垮服務。",
       "maxDecodedBytes": "單次請求所有還原結果允許占用的最大位元組數，達到上限後停止繼續解碼。",
       "maxEncodedBlocks": "單次請求最多嘗試還原的獨立編碼片段數，限制惡意批量小片段消耗。",

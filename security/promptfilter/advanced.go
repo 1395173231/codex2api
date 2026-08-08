@@ -139,6 +139,16 @@ type EnforcementConfig struct {
 	ConversationLockTTLHours int      `json:"conversation_lock_ttl_hours"`
 	UserCyberCooldownMinutes int      `json:"user_cyber_cooldown_minutes"`
 	CYBStrikeEnabled         bool     `json:"cyb_strike_enabled"`
+	// LocalSevereStrikeEnabled 决定本地判定的**最高置信度**严重违规
+	// (当前用户直接发出 + 敏感意图 + 终局 strict/category 命中)是否累计到
+	// NewAPI 用户身上,从而触发 NewAPI 侧的 CYB 累计与自动封号。
+	//
+	// 打开(默认)时,严重违规无需先到达上游产生真实 cyber_policy,即可在本地
+	// 扼杀的同时把一次 strike 记到人;会话锁保证同一会话不重复累计。误封面被
+	// 收敛到最高置信度那一档:低置信度拦截、工具输出、历史上下文都不累计。
+	//
+	// 关闭时,本地严重违规仍被拦截,但不再记 strike——拦截与封号解耦。
+	LocalSevereStrikeEnabled bool `json:"local_severe_strike_enabled"`
 	// AuthorizedPentestAllowed 决定是否承认请求里的"声明式授权"
 	// ("我有书面授权"、"我自己的服务器"、"with permission")。
 	//
@@ -290,7 +300,7 @@ func DefaultAdvancedConfig() AdvancedConfig {
 		Output:          OutputConfig{BufferBytes: 4096, OverlapBytes: 512, StrictOnly: true},
 		Intelligence:    IntelligenceConfig{IntervalHours: 24, Queries: DefaultIntelligenceQueries(), MaxSearchResults: 20, Model: "gpt-5.4", MaxModelCalls: 1},
 		NewAPI:          NewAPIConfig{MaxClockSkewSeconds: 120},
-		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, ConversationLockTTLHours: 168, UserCyberCooldownMinutes: DefaultUserCyberCooldownMinutes, CYBStrikeEnabled: false},
+		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, ConversationLockTTLHours: 168, UserCyberCooldownMinutes: DefaultUserCyberCooldownMinutes, CYBStrikeEnabled: false, LocalSevereStrikeEnabled: true},
 		Guard:           DefaultGuardConfig(),
 	}
 }
