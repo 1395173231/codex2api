@@ -139,6 +139,16 @@ type EnforcementConfig struct {
 	ConversationLockTTLHours int      `json:"conversation_lock_ttl_hours"`
 	UserCyberCooldownMinutes int      `json:"user_cyber_cooldown_minutes"`
 	CYBStrikeEnabled         bool     `json:"cyb_strike_enabled"`
+	// AuthorizedPentestAllowed 决定是否承认请求里的"声明式授权"
+	// ("我有书面授权"、"我自己的服务器"、"with permission")。
+	//
+	// 授权声明是无法验证的自述:开启时,攻击者只要加一句就能让定向入侵终局规则
+	// 失效(实测 score 100 -> 20 放行)。关闭(默认)时这类声明不再具有豁免效力,
+	// 与 review.go 中 "Authorization is evidence, not an assumption" 的既定策略
+	// 保持一致。
+	//
+	// 仅当部署确实承载已授权渗透测试业务时才开启。
+	AuthorizedPentestAllowed bool `json:"authorized_pentest_allowed"`
 }
 
 const (
