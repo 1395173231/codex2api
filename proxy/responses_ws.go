@@ -1121,6 +1121,10 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	if verdict.Action != promptfilter.ActionBlock {
 		return false, false
 	}
+	// 与 HTTP 入口一致:本地 block 立即锁定会话,使后续绕过本地正则的等价变形
+	// 也无法通过这条 WS 会话到达上游。这条 WS 路径持有独立的 block 逻辑,漏掉
+	// 这一步会让整个前置扼杀在 Codex 的 WebSocket 通道上失效。
+	h.lockPromptConversationOnLocalBlock(c, cfg, nil, endpoint, model, evaluation.Decision.ReasonCode)
 	errorCode := api.ErrorCode("prompt_blocked")
 	errorMessage := "Request contains content blocked by prompt filter"
 	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
