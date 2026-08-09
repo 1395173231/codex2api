@@ -114,3 +114,29 @@ func TestWidenedTargetRecognitionDoesNotFalsePositive(t *testing.T) {
 		})
 	}
 }
+
+// 介词分支("on/at/against 1.2.3.4")放宽了 target 识别,而 terminal 命中在
+// LocalSevereStrikeEnabled 下会累计封号。常见运维/防御语句往往同时含介词与
+// IP/URL,但没有攻击意图动词,绝不能被 block —— 否则直接误封正常用户。
+// 既有误报语料是在旧的窄 target pattern 下编写的,未覆盖这一新面。
+func TestPrepositionTargetWideningDoesNotBlockOpsTraffic(t *testing.T) {
+	cfg := recommendedEnabledConfig()
+
+	benign := []string{
+		"restart the nginx service on 10.0.0.5 and tail the logs.",
+		"deploy the app to https://prod.example.com then run smoke tests.",
+		"the staging API is hosted at 192.168.1.10, document its endpoints.",
+		"monitor inbound traffic on 10.0.0.8 and chart the latency.",
+		"set up TLS on https://api.example.com and renew the certificate.",
+		"write detection rules for port scans against 10.0.0.0/24 on our IDS.",
+		"back up the database on 10.0.0.9 to object storage every night.",
+		"ping 8.8.8.8 to check connectivity, then curl https://example.com/health.",
+		"把部署到 https://prod.example.com 的服务重启一下，并观察日志。",
+		"给 10.0.0.8 上的监控加一个磁盘告警阈值。",
+	}
+	for _, text := range benign {
+		if verdict := InspectText(text, cfg); verdict.Action == ActionBlock {
+			t.Errorf("正常运维语句被拦截(将导致误封号): %q -> matched=%s", text, MatchesJSON(verdict.Matched))
+		}
+	}
+}
