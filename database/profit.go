@@ -1060,7 +1060,10 @@ type profitLedgerMergeRow struct {
 }
 
 func (db *DB) AssignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64) error {
-	return db.assignProfitSettlementGroup(ctx, accountID, groupID, "confirmed", true)
+	// 未聚合日志会在 RefreshProfitDailyLedger 中通过 profit_account_settings
+	// 解析到已确认分组。这里不能同步改写账号的全部历史 usage_logs：生产表很大，
+	// 单次 UPDATE 会长期占用 SQLite 写锁并阻塞 OAuth、日志与账号状态落库。
+	return db.assignProfitSettlementGroup(ctx, accountID, groupID, "confirmed", false)
 }
 
 func (db *DB) assignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64, assignmentSource string, backfillUsageLogs bool) error {

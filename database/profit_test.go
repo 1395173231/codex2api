@@ -224,6 +224,46 @@ func TestProfitDeletedAccountManualAssignmentRestoresTokenUsageGroup(t *testing.
 	}
 }
 
+func TestProfitAssignmentDefersHistoricalUsageRewriteUntilLedgerRefresh(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, groupID := insertProfitTestAccountAndGroup(t, db, false)
+	result, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(account_id, channel, model, effective_model, status_code, total_tokens, account_billed,
+		 settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source, created_at)
+		VALUES ($1, 'codex', 'gpt-5.4', 'gpt-5.4', 200, 321, 1.25, 0, '', 'pending', CURRENT_TIMESTAMP)`, accountID)
+	if err != nil {
+		t.Fatalf("insert historical usage: %v", err)
+	}
+	logID, _ := result.LastInsertId()
+
+	if err := db.AssignProfitSettlementGroup(ctx, accountID, groupID); err != nil {
+		t.Fatalf("assign settlement group: %v", err)
+	}
+	var snapshotGroupID int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT settlement_group_id_snapshot FROM usage_logs WHERE id=$1`, logID).Scan(&snapshotGroupID); err != nil {
+		t.Fatalf("read usage snapshot: %v", err)
+	}
+	if snapshotGroupID != 0 {
+		t.Fatalf("assignment synchronously rewrote historical usage snapshot to %d", snapshotGroupID)
+	}
+
+	refresh, err := db.RefreshProfitDailyLedger(ctx, 100)
+	if err != nil {
+		t.Fatalf("refresh ledger: %v", err)
+	}
+	if !refresh.CaughtUp {
+		t.Fatalf("ledger did not catch up: %+v", refresh)
+	}
+	var ledgerGroupID int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT settlement_group_id FROM profit_daily_ledger WHERE account_id=$1`, accountID).Scan(&ledgerGroupID); err != nil {
+		t.Fatalf("read ledger group: %v", err)
+	}
+	if ledgerGroupID != groupID {
+		t.Fatalf("ledger group = %d, want %d", ledgerGroupID, groupID)
+	}
+}
+
 func TestProfitSQLiteMigrationAvoidsBlockingUsageLogSnapshotIndex(t *testing.T) {
 	db := newProfitTestDB(t)
 	var count int
