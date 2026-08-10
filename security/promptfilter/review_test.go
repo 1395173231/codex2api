@@ -449,6 +449,45 @@ func TestReviewTextAllKeysCoolingDownFailsFastWithoutCallingUpstream(t *testing.
 	}
 }
 
+func TestReviewModelResponseErrorClearsKeyCooldown(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte("{not-json"))
+	}))
+	defer server.Close()
+	cfg := ReviewConfig{
+		Enabled: true, APIKey: "healthy-key", BaseURL: server.URL, Model: "review-model", TimeoutSeconds: 2,
+	}
+	endpoint, err := reviewEndpointForMode(cfg.BaseURL, NormalizeReviewConfig(cfg).Adapter.RequestMode)
+	if err != nil {
+		t.Fatalf("reviewEndpointForMode: %v", err)
+	}
+	// 模拟恢复探针路径：key 曾被隔离且冷却已到期。
+	quarantineReviewKey(endpoint, cfg.Model, "healthy-key", http.StatusPaymentRequired, cfg.Adapter)
+	value, ok := reviewKeyCooldowns.Load(reviewKeyCooldownKey(endpoint, cfg.Model, "healthy-key"))
+	if !ok {
+		t.Fatal("quarantined key state was not stored")
+	}
+	state := value.(*reviewKeyCooldown)
+	state.mu.Lock()
+	state.until = time.Now().Add(-time.Second)
+	state.mu.Unlock()
+	if _, err := (ReviewClient{HTTPClient: server.Client()}).ReviewTextDetailed(context.Background(), "test", cfg); err == nil {
+		t.Fatal("malformed review response unexpectedly succeeded")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("malformed-response attempts = %d, want 2", calls.Load())
+	}
+	// HTTP 2xx 已证明 key 健康：冷却应被清除而非重新计时。
+	health := ReviewKeyPoolStatus(cfg)
+	if health.Available != 1 || health.CoolingDown != 0 || health.Probing != 0 {
+		t.Fatalf("review key pool health = %+v, want key available again", health)
+	}
+}
+
 func TestReviewTextQuarantinesAllServerErrorKeys(t *testing.T) {
 	resetReviewCircuitBreakers()
 	defer resetReviewCircuitBreakers()

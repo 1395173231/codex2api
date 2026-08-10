@@ -667,6 +667,10 @@ func (h *Handler) streamResponsesWSUpstream(
 				clientData = transformed
 			}
 		}
+		// 容量降载码（server_is_overloaded/slow_down）对 Codex CLI 是致命错误：
+		// 一旦要透传给客户端就改写为可重试的 server_error。冷却/计费/日志用的
+		// terminalFailurePayload 取改写前的原始 data，不受影响。
+		clientData = sanitizeCapacityShedEventForClient(eventType, clientData)
 		ttftGuard.MarkProgress(eventType)
 		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 		if !ttftRecorded && isFirstToken {
@@ -695,7 +699,10 @@ func (h *Handler) streamResponsesWSUpstream(
 			gotTerminal = true
 		}
 		if !clientGone {
-			shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+			// 可重试的 error 帧（上游降载先导帧）与生命周期帧一样缓冲：立即写出
+			// 会置位 wroteAnyBody，随后的 response.failed 就进不了首包前静默换号分支。
+			shouldDefer := !ttftRecorded && !gotTerminal &&
+				(isPreContentLifecycleEvent(eventType) || isRetryableUpstreamErrorFrame(eventType, data))
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
 				pendingFirstTokenBytes += len(clientData)

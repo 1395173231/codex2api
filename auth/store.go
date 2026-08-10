@@ -213,13 +213,17 @@ type Account struct {
 	LatencyEWMA              float64
 	SuccessStreak            int
 	FailureStreak            int
-	LastSuccessAt            time.Time
-	LastFailureAt            time.Time
-	LastUnauthorizedAt       time.Time
-	LastRateLimitedAt        time.Time
-	LastTimeoutAt            time.Time
-	LastServerErrorAt        time.Time
-	LastRecoveryProbeAt      time.Time
+	// LastFailureKind 记录最近一次失败的归因（与 ReportRequestFailure 的 kind
+	// 同义），仅内存态。用于把"传输层抖动"与"账号自身有问题"区分开，见
+	// recomputeSchedulerLocked 里对孤立断流的豁免。
+	LastFailureKind     string
+	LastSuccessAt       time.Time
+	LastFailureAt       time.Time
+	LastUnauthorizedAt  time.Time
+	LastRateLimitedAt   time.Time
+	LastTimeoutAt       time.Time
+	LastServerErrorAt   time.Time
+	LastRecoveryProbeAt time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -1112,7 +1116,8 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		tier = HealthTierWarm
 	}
 
-	if a.LastFailureAt.After(a.LastSuccessAt) && !a.LastFailureAt.IsZero() && tier == HealthTierHealthy {
+	if a.LastFailureAt.After(a.LastSuccessAt) && !a.LastFailureAt.IsZero() && tier == HealthTierHealthy &&
+		!a.isolatedTransportFailureLocked() {
 		tier = HealthTierWarm
 	}
 	if !a.LastUnauthorizedAt.IsZero() && now.Sub(a.LastUnauthorizedAt) < 24*time.Hour && tier == HealthTierHealthy {
@@ -7789,6 +7794,22 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	s.fastSchedulerUpdate(acc)
 }
 
+// transportFailureTierDropStreak 是传输层失败开始降档所需的连续失败次数。
+// 成功一次即清零 FailureStreak，因此偶发断流不会累积到这个阈值。
+const transportFailureTierDropStreak = 3
+
+// isolatedTransportFailureLocked 判断"最近一次失败是孤立的传输层断流"。
+//
+// 传输层断流多来自上游边缘重置或链路抖动（对端 RST_STREAM、连接中途被重置），
+// 与账号自身健康无关：一天几次这样的背景噪声本不该让正常账号被削掉一半并发
+// （issue #491）。连续失败达到阈值才认定账号/出口真有问题——那时按分数也已经
+// 掉出 Healthy（每次连击扣 6 分），两条判据自然一致。
+func (a *Account) isolatedTransportFailureLocked() bool {
+	return a.LastFailureKind == transportFailureKind && a.FailureStreak < transportFailureTierDropStreak
+}
+
+const transportFailureKind = "transport"
+
 // ReportRequestFailure 记录一次失败请求，用于动态调度评分
 func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Duration) {
 	if acc == nil {
@@ -7800,6 +7821,7 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(false)
 	acc.LastFailureAt = now
+	acc.LastFailureKind = kind
 	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
 	acc.SuccessStreak = 0
 
@@ -7821,12 +7843,11 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		} else {
 			acc.HealthTier = HealthTierRisky
 		}
-	case "transport":
-		if acc.HealthTier == HealthTierHealthy {
-			acc.HealthTier = HealthTierWarm
-		} else {
-			acc.HealthTier = HealthTierRisky
-		}
+	case transportFailureKind:
+		// 这里刻意不动 HealthTier：本函数结尾的 recomputeSchedulerLocked 会按
+		// 分数重算并覆盖档位，此处赋值是无效的（其它分支的赋值同样如此，只有
+		// unauthorized 的 Banned 会被重算逻辑显式保留）。传输层失败的档位由
+		// 连击扣分 + isolatedTransportFailureLocked 的豁免共同决定。
 	case "client":
 		if acc.HealthTier == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm

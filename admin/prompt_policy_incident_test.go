@@ -134,6 +134,26 @@ func TestPromptPolicyAuditHealthAPI(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || !response.StorageReady || response.Status != "healthy" || response.IncidentCount != 0 || response.ReviewPool.Configured != 1 || response.ReviewPool.Available != 1 || response.Queue.DroppedHigh != 0 || response.Queue.Failed != 0 {
 		t.Fatalf("health response=%s err=%v", recorder.Body.String(), err)
 	}
+
+	// 管理员主动关闭审查/会话锁属于配置选择,不应报 degraded。
+	cfg.Review.Enabled = false
+	cfg.Advanced.Enforcement.ConversationLockEnabled = false
+	store.SetPromptFilterConfig(cfg)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/incidents/health", nil))
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Status != "healthy" {
+		t.Fatalf("disabled-feature health response=%s err=%v", recorder.Body.String(), err)
+	}
+
+	// 审查启用但 key 池为空才是真实故障。
+	cfg.Review.Enabled = true
+	cfg.Review.APIKey = ""
+	store.SetPromptFilterConfig(cfg)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/incidents/health", nil))
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Status != "degraded" {
+		t.Fatalf("empty-pool health response=%s err=%v", recorder.Body.String(), err)
+	}
 }
 
 func TestPromptPolicyIncidentHistoricalRoutingUsesCurrentDirectory(t *testing.T) {

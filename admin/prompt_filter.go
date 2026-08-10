@@ -363,7 +363,10 @@ func (h *Handler) GetPromptPolicyAuditHealth(c *gin.Context) {
 			PendingLow: stats.PendingLow, RetainedBytes: stats.RetainedBytes,
 		},
 	}
-	if !response.PromptFilterEnabled || !response.ReviewEnabled || !response.ConversationLockEnabled || response.ReviewPool.Configured == 0 || response.ReviewPool.Available == 0 || stats.DroppedHigh > 0 || stats.Failed > 0 {
+	// 主动关闭的功能不算故障（面板上已有独立的开关状态展示）；只有真实异常才降级：
+	// 审计队列丢高优/写入失败，或审查已启用但 key 池空配置/全冷却。
+	reviewPoolFault := response.ReviewEnabled && (response.ReviewPool.Configured == 0 || response.ReviewPool.Available == 0)
+	if reviewPoolFault || stats.DroppedHigh > 0 || stats.Failed > 0 {
 		response.OK = false
 		response.Status = "degraded"
 	}

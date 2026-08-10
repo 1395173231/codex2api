@@ -1459,6 +1459,57 @@ func responseFailedRetryable(payload []byte) bool {
 	return classifyResponseFailedOutcome(payload).penalize
 }
 
+// isRetryableUpstreamErrorFrame 判断流内 {"type":"error"} 帧是否为可重试的上游故障。
+// 上游容量降载的真实序列是「event: error → event: response.failed」：error 帧若被
+// 当作首个客户端输出立即写出，wroteAnyBody 一旦置位，随后的 response.failed 就永远
+// 进不了首包前静默换号分支，降载错误只能原样透传——Codex CLI 对
+// server_is_overloaded/slow_down 按闭集判致命并直接终止会话。可重试类 error 帧
+// 必须与生命周期帧一样缓冲；不可重试类（content_policy/invalid_request 等）
+// 维持原样立即转发，保留上游错误细节。
+func isRetryableUpstreamErrorFrame(eventType string, payload []byte) bool {
+	if strings.TrimSpace(eventType) != "error" {
+		return false
+	}
+	return responseFailedRetryable(payload)
+}
+
+// capacityShedRetryableClientCode 是把上游容量降载错误透传给下游时改写使用的
+// 错误码。Codex CLI 按闭集分类：server_is_overloaded / slow_down 被判致命
+// （提示 "Selected model is at capacity. Please try a different model." 并终止
+// 会话），而 server_error 等闭集之外的错误码会进入客户端内置的退避重试。
+const capacityShedRetryableClientCode = "server_error"
+
+// sanitizeCapacityShedEventForClient 把即将写给下游的 error / response.failed
+// 事件中的容量降载错误码改写为客户端可重试的错误码。走到写出这一步说明网关侧
+// 换号重试已不可用（流中途已有输出）或已用尽；保留原始降载码只会让 Codex CLI
+// 就地终止会话。错误消息原样保留；监控、计费与账号冷却均基于改写前的原始
+// payload（terminalFailurePayload 在写出前捕获），不受影响。rate_limit_exceeded
+// 等其他错误码一律不动（客户端依赖原码解析重试延时）。
+func sanitizeCapacityShedEventForClient(eventType string, payload []byte) []byte {
+	switch strings.TrimSpace(eventType) {
+	case "error", "response.failed":
+	default:
+		return payload
+	}
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	updated := payload
+	for _, path := range []string{"error.code", "response.error.code", "response.status_details.error.code"} {
+		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(updated, path).String())) {
+		case "server_is_overloaded", "slow_down":
+		default:
+			continue
+		}
+		next, err := sjson.SetBytes(updated, path, capacityShedRetryableClientCode)
+		if err != nil {
+			return payload
+		}
+		updated = next
+	}
+	return updated
+}
+
 func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []byte, resp *http.Response, model string) codex429Decision {
 	if h == nil || account == nil || len(payload) == 0 {
 		return codex429Decision{}
@@ -2619,6 +2670,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			var readErr error
 			var writeErr error
 			wroteAnyBody := false
+			// 断流现场判据(issue #491):区分下游背压与上游重置。
+			streamDiag := newStreamPhaseDiagnostics()
 			// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 			// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 			abortedForHTTPError := false
@@ -2644,9 +2697,11 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
+				streamWriter.diag = streamDiag
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+					streamDiag.markUpstreamFrame()
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
 					ttftGuard.MarkProgress(eventType)
@@ -2694,8 +2749,12 @@ func (h *Handler) Responses(c *gin.Context) {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 					}
 					if !clientGone {
-						shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
-						wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
+						// 可重试的 error 帧（上游降载先导帧）与生命周期帧一样缓冲：
+						// 立即写出会置位 wroteAnyBody，随后的 response.failed 就进不了
+						// 首包前静默换号分支。必须写出时改写降载码为客户端可重试码。
+						shouldDefer := !ttftRecorded && !gotTerminal &&
+							(isPreContentLifecycleEvent(eventType) || isRetryableUpstreamErrorFrame(eventType, data))
+						wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, sanitizeCapacityShedEventForClient(eventType, data), shouldDefer)
 						if err != nil {
 							writeErr = err
 							clientGone = true
@@ -2738,6 +2797,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
+			outcome = annotateStreamBreakDiagnostics(outcome, streamDiag)
 			ttftGuard.Stop()
 			if outcome.verifyAccountAuth {
 				h.store.VerifyAccountAuthAsync(account)
@@ -3097,6 +3157,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		var streamedOutputItems []json.RawMessage
 		promptPolicyIncidentID := ""
 		upstreamCyberPolicyLogged := false
+		// 断流现场判据(issue #491):区分下游背压拖停上游读取 vs 上游自己重置。
+		streamDiag := newStreamPhaseDiagnostics()
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -3116,6 +3178,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
+			streamWriter.diag = streamDiag
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -3130,6 +3193,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 热更新对新请求生效，流转发中途不切换缓冲策略。
 			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			forward := func(data []byte) bool {
+				streamDiag.markUpstreamFrame()
 				downstreamMu.Lock()
 				defer downstreamMu.Unlock()
 				parsed := gjson.ParseBytes(data)
@@ -3208,8 +3272,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 既无法按真实错误码返回，也无法走超窗压缩重试。
 					// preflightPassthrough（issue #425）恢复旧版语义：元数据事件立即下发，
 					// 管理员显式接受上述代价；生命周期事件（created/in_progress）不受开关影响。
-					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough)
-					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
+					// 可重试的 error 帧（上游降载先导帧）不受 preflightPassthrough 影响，
+					// 始终缓冲：立即写出会置位 wroteAnyBody，随后的 response.failed 就
+					// 进不了首包前静默换号/超窗压缩分支。必须写出时改写降载码。
+					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
+						(!contentTokenSeen && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data))
+					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, sanitizeCapacityShedEventForClient(eventType, data), shouldDefer)
 					if err != nil {
 						writeErr = err
 						clientGone = true
@@ -3380,6 +3448,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
+		outcome = annotateStreamBreakDiagnostics(outcome, streamDiag)
 		ttftGuard.Stop()
 		if outcome.verifyAccountAuth {
 			h.store.VerifyAccountAuthAsync(account)

@@ -521,6 +521,12 @@ func (c ReviewClient) ReviewTextDetailed(ctx context.Context, text string, cfg R
 				return outcome, nil
 			}
 			lastErr = reqErr
+			// 模型响应不可解析时 HTTP 已成功（2xx），key 本身健康：清冷却而非再隔离。
+			var responseErr *reviewModelResponseError
+			isResponseErr := errors.As(reqErr, &responseErr)
+			if isResponseErr {
+				clearReviewKeyCooldown(endpoint, cfg.Model, key)
+			}
 			keyQuarantined := false
 			var statusErr *reviewHTTPStatusError
 			if errors.As(reqErr, &statusErr) {
@@ -529,8 +535,7 @@ func (c ReviewClient) ReviewTextDetailed(ctx context.Context, text string, cfg R
 				quarantineReviewKeyTransient(endpoint, cfg.Model, key, cfg.Adapter)
 				keyQuarantined = true
 			}
-			var responseErr *reviewModelResponseError
-			if responseAttempt == 0 && errors.As(reqErr, &responseErr) {
+			if responseAttempt == 0 && isResponseErr {
 				continue
 			}
 			if candidate.probe && !keyQuarantined {
