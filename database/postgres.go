@@ -244,7 +244,7 @@ const (
 	maxUsageLogFlushIntervalSeconds     = 300
 
 	postgresMaxBindParams       = 65535
-	usageLogInsertColumnCount   = 49
+	usageLogInsertColumnCount   = 52
 	maxUsageLogInsertRowsPerSQL = 1000
 
 	// usageLogBufferHardLimit 内存缓冲的硬上限。PG 长时间不可用时（维护、主从切换、
@@ -290,56 +290,59 @@ func NormalizeUsageLogFlushIntervalSeconds(n int) int {
 
 // usageLogEntry 日志缓冲条目
 type usageLogEntry struct {
-	StoreUsageLog          bool
-	AccountID              int64
-	Channel                string
-	ClientIP               string
-	ClientUserAgent        string
-	UpstreamUserAgent      string
-	UserAgentOverridden    bool
-	InternalReason         string
-	ParentRequestID        string
-	Endpoint               string
-	Model                  string
-	EffectiveModel         string
-	PromptTokens           int
-	CompletionTokens       int
-	TotalTokens            int
-	StatusCode             int
-	DurationMs             int
-	InputTokens            int
-	OutputTokens           int
-	ReasoningTokens        int
-	FirstTokenMs           int
-	WsAcquireMs            int
-	ReasoningEffort        string
-	InboundEndpoint        string
-	UpstreamEndpoint       string
-	Stream                 bool
-	Compact                bool
-	HasCompactionHistory   bool
-	ViaWebsocket           bool
-	CachedTokens           int
-	ServiceTier            string
-	RequestedServiceTier   string
-	ActualServiceTier      string
-	BillingServiceTier     string
-	APIKeyID               int64
-	APIKeyName             string
-	APIKeyMasked           string
-	ImageCount             int
-	ImageWidth             int
-	ImageHeight            int
-	ImageBytes             int
-	ImageFormat            string
-	ImageSize              string
-	AccountBilled          float64
-	UserBilled             float64
-	IsRetryAttempt         bool
-	AttemptIndex           int
-	UpstreamErrorKind      string
-	ErrorMessage           string
-	PromptPolicyIncidentID string
+	StoreUsageLog               bool
+	AccountID                   int64
+	Channel                     string
+	ClientIP                    string
+	ClientUserAgent             string
+	UpstreamUserAgent           string
+	UserAgentOverridden         bool
+	InternalReason              string
+	ParentRequestID             string
+	Endpoint                    string
+	Model                       string
+	EffectiveModel              string
+	PromptTokens                int
+	CompletionTokens            int
+	TotalTokens                 int
+	StatusCode                  int
+	DurationMs                  int
+	InputTokens                 int
+	OutputTokens                int
+	ReasoningTokens             int
+	FirstTokenMs                int
+	WsAcquireMs                 int
+	ReasoningEffort             string
+	InboundEndpoint             string
+	UpstreamEndpoint            string
+	Stream                      bool
+	Compact                     bool
+	HasCompactionHistory        bool
+	ViaWebsocket                bool
+	CachedTokens                int
+	ServiceTier                 string
+	RequestedServiceTier        string
+	ActualServiceTier           string
+	BillingServiceTier          string
+	APIKeyID                    int64
+	APIKeyName                  string
+	APIKeyMasked                string
+	ImageCount                  int
+	ImageWidth                  int
+	ImageHeight                 int
+	ImageBytes                  int
+	ImageFormat                 string
+	ImageSize                   string
+	AccountBilled               float64
+	UserBilled                  float64
+	IsRetryAttempt              bool
+	AttemptIndex                int
+	UpstreamErrorKind           string
+	ErrorMessage                string
+	PromptPolicyIncidentID      string
+	SettlementGroupIDSnapshot   int64
+	SettlementGroupNameSnapshot string
+	SettlementAssignmentSource  string
 }
 
 // New 创建数据库连接并自动建表。
@@ -1456,6 +1459,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer migrateCancel()
 	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
+		return err
+	}
+	if err := db.migrateProfitSettlement(migrateCtx); err != nil {
 		return err
 	}
 	return db.runDataMigrationsWithTimeout()
@@ -3812,6 +3818,10 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	}
 	defer tx.Rollback()
 
+	batch, err = db.populateProfitSettlementSnapshots(ctx, tx, batch)
+	if err != nil {
+		return fmt.Errorf("固化利润结算归属: %w", err)
+	}
 	// usage_log_mode 只过滤审计行；额度仍按完整 batch 在同一事务内更新。
 	logsToStore := storedUsageLogs(batch)
 	if len(logsToStore) > 0 {
@@ -3821,8 +3831,9 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				  requested_service_tier, actual_service_tier, billing_service_tier,
 				  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 				  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)`)
+				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id,
+				  settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52)`)
 		if err != nil {
 			return fmt.Errorf("准备语句: %w", err)
 		}
@@ -3834,7 +3845,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 				e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 				e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID)); err != nil {
+				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID),
+				e.SettlementGroupIDSnapshot, e.SettlementGroupNameSnapshot, e.SettlementAssignmentSource); err != nil {
 				return fmt.Errorf("执行插入: %w", err)
 			}
 		}
@@ -3856,8 +3868,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化。
-// PostgreSQL 单条语句最多 65535 个 bind 参数；usage_logs 当前每行 47 个参数，
-// 因此单条 INSERT 的行数必须稳定低于 floor(65535/47)=1394。
+// PostgreSQL 单条语句最多 65535 个 bind 参数；安全行数按当前列数动态计算。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -3869,6 +3880,10 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
+	batch, err = db.populateProfitSettlementSnapshots(ctx, tx, batch)
+	if err != nil {
+		return fmt.Errorf("固化利润结算归属: %w", err)
+	}
 	logsToStore := storedUsageLogs(batch)
 	maxRowsPerBatch := maxUsageLogInsertRowsPerSQL
 	if paramSafeRows := postgresMaxBindParams / usageLogInsertColumnCount; paramSafeRows > 0 && maxRowsPerBatch > paramSafeRows {
@@ -3924,7 +3939,8 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID))
+			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID),
+			e.SettlementGroupIDSnapshot, e.SettlementGroupNameSnapshot, e.SettlementAssignmentSource)
 		argIdx += usageLogInsertColumnCount
 	}
 
@@ -3933,7 +3949,8 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-		client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
+		client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id,
+		settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := execer.ExecContext(ctx, query, valueArgs...)

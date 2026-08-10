@@ -59,6 +59,7 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
+  CircleDollarSign,
   CircleHelp,
   Database,
   ExternalLink,
@@ -79,6 +80,7 @@ import {
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import ChannelLogo from '../components/ChannelLogo'
+import ProfitCenterSettingsCard from '../components/ProfitCenterSettingsCard'
 
 type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
 
@@ -1814,6 +1816,7 @@ export default function Settings() {
     () =>
       [
         { id: 'settings-overview', label: t('settings.nav.overview'), icon: <Activity className="size-4" /> },
+        { id: 'settings-profit', label: t('profit.settings.nav'), icon: <CircleDollarSign className="size-4" /> },
         { id: 'settings-traffic', label: t('settings.nav.traffic'), icon: <Gauge className="size-4" /> },
         { id: 'settings-grok', label: t('settings.nav.grok'), icon: <ChannelLogo channel="grok" size={16} /> },
         { id: 'settings-runtime', label: t('settings.nav.runtime'), icon: <Wrench className="size-4" /> },
@@ -2004,6 +2007,10 @@ export default function Settings() {
               </StatusTile>
             </div>
           </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection id="settings-profit" title={t('profit.settings.title')} description={t('profit.settings.description')}>
+            <ProfitCenterSettingsCard />
           </SettingsSection>
 
           <SettingsSection id="settings-traffic" title={t('settings.nav.traffic')} description={t('settings.nav.trafficDesc')}>

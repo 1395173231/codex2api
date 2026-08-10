@@ -186,8 +186,8 @@ type chartCacheEntry struct {
 }
 
 const (
-	adminUsageStatsCacheNamespace  = "admin:usage-stats"
-	adminChartCacheNamespace       = "admin:chart-data"
+	adminUsageStatsCacheNamespace = "admin:usage-stats"
+	adminChartCacheNamespace      = "admin:chart-data"
 	// v2:响应结构新增 reconciliation 字段,升版命名空间让 Redis 里
 	// 部署前写入的旧条目失效,避免零值对账在滚动窗口内展示。
 	adminAPIKeyAccountsNamespace   = "admin:api-key-accounts:v2"
@@ -709,6 +709,21 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/profit/settings", h.GetProfitSettings)
+	api.PUT("/profit/settings", h.UpdateProfitSettings)
+	api.GET("/profit/groups", h.ListProfitGroups)
+	api.PUT("/profit/groups/:id", h.UpdateProfitGroup)
+	api.GET("/profit/pending-accounts", h.ListProfitPendingAccounts)
+	api.PUT("/profit/accounts/:id/settlement-group", h.AssignProfitSettlementGroup)
+	api.POST("/profit/ledger/refresh", h.RefreshProfitLedger)
+	api.GET("/profit/dashboard", h.GetProfitDashboard)
+	api.GET("/profit/settlements", h.ListProfitSettlements)
+	api.POST("/profit/settlements", h.CreateProfitSettlement)
+	api.GET("/profit/settlements/:id", h.GetProfitSettlement)
+	api.PATCH("/profit/settlements/:id", h.UpdateProfitSettlement)
+	api.POST("/profit/settlements/:id/confirm", h.ConfirmProfitSettlement)
+	api.POST("/profit/settlements/:id/revise", h.ReviseProfitSettlement)
+	api.GET("/profit/settlements/:id/export", h.ExportProfitSettlement)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)

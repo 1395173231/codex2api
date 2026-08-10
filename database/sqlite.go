@@ -694,6 +694,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	`); err != nil {
 		return err
 	}
+	if err := db.migrateProfitSettlement(ctx); err != nil {
+		return err
+	}
 
 	return db.runDataMigrationsWithTimeout()
 }

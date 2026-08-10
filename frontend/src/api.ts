@@ -72,6 +72,13 @@ import type {
   PromptReviewTestRequest,
   PromptReviewTestResponse,
   PromptReviewAPIKeysResponse,
+  ProfitDashboardResponse,
+  ProfitGroupSetting,
+  ProfitLedgerRefreshResult,
+  ProfitPendingAccount,
+  ProfitSettings,
+  ProfitSettlementDetail,
+  ProfitSettlementRun,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
@@ -980,6 +987,33 @@ export const api = {
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
+	getProfitSettings: () => request<ProfitSettings>('/profit/settings'),
+	updateProfitSettings: (data: Partial<Pick<ProfitSettings, 'enabled' | 'default_settlement_ratio_ppm' | 'default_group_multiplier_ppm'>>) =>
+		request<ProfitSettings>('/profit/settings', { method: 'PUT', body: JSON.stringify(data) }),
+	listProfitGroups: () => request<{ groups: ProfitGroupSetting[] }>('/profit/groups'),
+	updateProfitGroup: (id: number, multiplierPPM: number) =>
+		request<ProfitGroupSetting>(`/profit/groups/${id}`, { method: 'PUT', body: JSON.stringify({ multiplier_ppm: multiplierPPM }) }),
+	listProfitPendingAccounts: () => request<{ accounts: ProfitPendingAccount[] }>('/profit/pending-accounts'),
+	assignProfitSettlementGroup: (accountId: number, groupId: number) =>
+		request<MessageResponse>(`/profit/accounts/${accountId}/settlement-group`, { method: 'PUT', body: JSON.stringify({ group_id: groupId }) }),
+	refreshProfitLedger: (limit = 20000) =>
+		request<ProfitLedgerRefreshResult>('/profit/ledger/refresh', { method: 'POST', body: JSON.stringify({ limit }) }),
+	getProfitDashboard: (params: { startDate: string; endDate: string; ratioPPM?: number }) => {
+		const search = new URLSearchParams({ start_date: params.startDate, end_date: params.endDate })
+		if (params.ratioPPM && params.ratioPPM > 0) search.set('ratio_ppm', String(params.ratioPPM))
+		return request<ProfitDashboardResponse>(`/profit/dashboard?${search.toString()}`)
+	},
+	listProfitSettlements: (limit = 50) => request<{ settlements: ProfitSettlementRun[] }>(`/profit/settlements?limit=${limit}`),
+	createProfitSettlement: (data: { start_date: string; end_date: string; settlement_ratio_ppm: number; notes?: string }) =>
+		request<ProfitSettlementDetail>('/profit/settlements', { method: 'POST', body: JSON.stringify(data) }),
+	getProfitSettlement: (id: string) => request<ProfitSettlementDetail>(`/profit/settlements/${encodeURIComponent(id)}`),
+	updateProfitSettlement: (id: string, data: { settlement_ratio_ppm: number; notes?: string }) =>
+		request<ProfitSettlementDetail>(`/profit/settlements/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	confirmProfitSettlement: (id: string) =>
+		request<ProfitSettlementDetail>(`/profit/settlements/${encodeURIComponent(id)}/confirm`, { method: 'POST' }),
+	reviseProfitSettlement: (id: string, data: { settlement_ratio_ppm: number; notes?: string }) =>
+		request<ProfitSettlementDetail>(`/profit/settlements/${encodeURIComponent(id)}/revise`, { method: 'POST', body: JSON.stringify(data) }),
+	exportProfitSettlement: (id: string) => requestBlob(`/profit/settlements/${encodeURIComponent(id)}/export`),
   getObservedInstructions: () =>
     request<ObservedInstructionsResponse>('/settings/observed-instructions'),
   updateSettings: (data: Partial<SystemSettings>) =>

@@ -2860,3 +2860,129 @@ export interface ObservedInstructionsSample {
 export interface ObservedInstructionsResponse {
   samples: ObservedInstructionsSample[]
 }
+
+export interface ProfitSettings {
+  enabled: boolean
+  default_settlement_ratio_ppm: number
+  default_group_multiplier_ppm: number
+  timezone: string
+  updated_at?: string
+}
+
+export interface ProfitGroupSetting {
+  group_id: number
+  group_name: string
+  multiplier_ppm: number
+  assigned_count: number
+  historical: boolean
+}
+
+export interface ProfitOperationalGroup {
+  id: number
+  name: string
+}
+
+export interface ProfitPendingAccount {
+  account_id: number
+  account_name: string
+  deleted: boolean
+  pending_requests: number
+  official_cost_usd_micros: number
+  first_date: string
+  last_date: string
+  operational_groups: ProfitOperationalGroup[]
+}
+
+export interface ProfitLedgerRefreshResult {
+  processed_logs: number
+  aggregated_logs: number
+  checkpoint_id: number
+  high_water_id: number
+  remaining_logs: number
+  caught_up: boolean
+  updated_at: string
+}
+
+export interface ProfitMoneySummary {
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  margin: number | null
+  request_count: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+}
+
+export interface ProfitDashboardDimension extends ProfitMoneySummary {
+  id: string
+  name: string
+  deleted?: boolean
+  pending?: boolean
+  multiplier_ppm?: number
+}
+
+export interface ProfitDashboardResponse {
+  start_date: string
+  end_date: string
+  timezone: string
+  settlement_ratio_ppm: number
+  ledger: ProfitLedgerRefreshResult
+  overall: ProfitMoneySummary
+  groups: ProfitDashboardDimension[]
+  api_keys: ProfitDashboardDimension[]
+  accounts: ProfitDashboardDimension[]
+  models: ProfitDashboardDimension[]
+}
+
+export interface ProfitSettlementRun {
+  id: string
+  lineage_id: string
+  revision_no: number
+  supersedes_id?: string
+  status: 'draft' | 'confirmed' | 'superseded' | string
+  start_date: string
+  end_date: string
+  settlement_ratio_ppm: number
+  notes: string
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  source_manifest_hash: string
+  created_at: string
+  confirmed_at?: string
+}
+
+export interface ProfitSettlementItem {
+  ledger_row_id: number
+  ledger_version: number
+  ledger_date: string
+  group_id: number
+  group_name: string
+  api_key_id: number
+  api_key_name: string
+  account_id: number
+  account_name: string
+  account_deleted: boolean
+  model: string
+  channel: string
+  multiplier_ppm: number
+  request_count: number
+  total_tokens: number
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  source_first_log_id: number
+  source_last_log_id: number
+  source_hash: string
+}
+
+export interface ProfitSettlementDetail {
+  run: ProfitSettlementRun
+  items: ProfitSettlementItem[]
+}
