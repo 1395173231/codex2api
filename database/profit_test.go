@@ -125,7 +125,7 @@ func TestProfitSnapshotDashboardAndSettlementRevision(t *testing.T) {
 	}
 }
 
-func TestProfitDeletedPendingAccountKeepsOriginalGroupAndBackfills(t *testing.T) {
+func TestProfitDeletedAccountAutomaticallyInheritsOriginalGroup(t *testing.T) {
 	db := newProfitTestDB(t)
 	ctx := context.Background()
 	accountID, groupID := insertProfitTestAccountAndGroup(t, db, true)
@@ -142,21 +142,8 @@ func TestProfitDeletedPendingAccountKeepsOriginalGroupAndBackfills(t *testing.T)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
-	if len(pending) != 1 || !pending[0].Deleted {
-		t.Fatalf("pending = %+v", pending)
-	}
-	if len(pending[0].OperationalGroups) != 1 || pending[0].OperationalGroups[0].ID != groupID {
-		t.Fatalf("original groups = %+v", pending[0].OperationalGroups)
-	}
-	if err := db.AssignProfitSettlementGroup(ctx, accountID, groupID); err != nil {
-		t.Fatalf("assign group: %v", err)
-	}
-	pending, err = db.ListProfitPendingAccounts(ctx)
-	if err != nil {
-		t.Fatalf("list pending after assign: %v", err)
-	}
 	if len(pending) != 0 {
-		t.Fatalf("pending after assign = %+v", pending)
+		t.Fatalf("single original group should be inherited automatically: %+v", pending)
 	}
 	var ledgerGroupID int64
 	var deleted bool
@@ -165,8 +152,74 @@ func TestProfitDeletedPendingAccountKeepsOriginalGroupAndBackfills(t *testing.T)
 		FROM profit_daily_ledger WHERE account_id = $1`, accountID).Scan(&ledgerGroupID, &deleted, &source); err != nil {
 		t.Fatalf("read backfilled ledger: %v", err)
 	}
-	if ledgerGroupID != groupID || !deleted || source != "confirmed_backfill" {
-		t.Fatalf("backfilled ledger = (%d,%v,%q)", ledgerGroupID, deleted, source)
+	if ledgerGroupID != groupID || !deleted || source != "inherited" {
+		t.Fatalf("inherited ledger = (%d,%v,%q)", ledgerGroupID, deleted, source)
+	}
+}
+
+func TestProfitAccountWithMultipleOriginalGroupsRemainsPending(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, _ := insertProfitTestAccountAndGroup(t, db, false)
+	secondGroup, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name, channel) VALUES ('结算二组', 'codex')`)
+	if err != nil {
+		t.Fatalf("insert second group: %v", err)
+	}
+	secondGroupID, _ := secondGroup.LastInsertId()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO account_group_members (account_id, group_id) VALUES ($1,$2)`, accountID, secondGroupID); err != nil {
+		t.Fatalf("insert second membership: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(account_id, channel, model, effective_model, status_code, total_tokens, account_billed,
+		 settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source, created_at)
+		VALUES ($1, 'codex', 'gpt-5.4', 'gpt-5.4', 200, 1000, 2.5, 0, '', 'pending', CURRENT_TIMESTAMP)`, accountID); err != nil {
+		t.Fatalf("insert pending usage: %v", err)
+	}
+	if _, err := db.RefreshProfitDailyLedger(ctx, 100); err != nil {
+		t.Fatalf("refresh ledger: %v", err)
+	}
+	pending, err := db.ListProfitPendingAccounts(ctx)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	if len(pending) != 1 || len(pending[0].OperationalGroups) != 2 {
+		t.Fatalf("multiple original groups must remain explicit: %+v", pending)
+	}
+}
+
+func TestProfitDeletedAccountManualAssignmentRestoresTokenUsageGroup(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, groupID := insertProfitTestAccountAndGroup(t, db, true)
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM account_group_members WHERE account_id = $1`, accountID); err != nil {
+		t.Fatalf("remove retained membership: %v", err)
+	}
+	keyID, err := db.InsertAPIKey(ctx, "profit-history-key", "sk-profit-history-key-1234567890")
+	if err != nil {
+		t.Fatalf("insert api key: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(api_key_id, account_id, channel, model, effective_model, status_code, total_tokens, account_billed,
+		 settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source, created_at)
+		VALUES ($1, $2, 'codex', 'gpt-5.4', 'gpt-5.4', 200, 321, 1.25, 0, '', 'pending', CURRENT_TIMESTAMP)`, keyID, accountID); err != nil {
+		t.Fatalf("insert historical usage: %v", err)
+	}
+	if err := db.AssignProfitSettlementGroup(ctx, accountID, groupID); err != nil {
+		t.Fatalf("assign settlement group: %v", err)
+	}
+	groupIDs, err := db.GetAccountGroupIDs(ctx, accountID)
+	if err != nil {
+		t.Fatalf("get restored groups: %v", err)
+	}
+	if len(groupIDs) != 1 || groupIDs[0] != groupID {
+		t.Fatalf("restored groups = %v, want [%d]", groupIDs, groupID)
+	}
+	items, err := db.ListAPIKeyAccountStats(ctx, keyID, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("list api key account stats: %v", err)
+	}
+	if len(items) != 1 || len(items[0].Groups) != 1 || items[0].Groups[0].ID != groupID {
+		t.Fatalf("token usage groups = %+v, want restored group %d", items, groupID)
 	}
 }
 

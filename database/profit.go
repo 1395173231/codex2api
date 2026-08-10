@@ -487,21 +487,28 @@ func (db *DB) populateProfitSettlementSnapshots(ctx context.Context, tx *sql.Tx,
 		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT pas.account_id, pas.settlement_group_id,
-		COALESCE(NULLIF(g.name, ''), pas.settlement_group_name, '')
+		COALESCE(NULLIF(g.name, ''), pas.settlement_group_name, ''), COALESCE(NULLIF(pas.assignment_source, ''), 'confirmed')
 		FROM profit_account_settings pas LEFT JOIN account_groups g ON g.id = pas.settlement_group_id
-		WHERE pas.account_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		WHERE pas.account_id IN (`+strings.Join(placeholders, ",")+`)
+		UNION ALL
+		SELECT m.account_id, MIN(m.group_id), MAX(g.name), 'inherited'
+		FROM account_group_members m JOIN account_groups g ON g.id = m.group_id
+		LEFT JOIN profit_account_settings pas ON pas.account_id = m.account_id
+		WHERE m.account_id IN (`+strings.Join(placeholders, ",")+`) AND pas.account_id IS NULL
+		GROUP BY m.account_id HAVING COUNT(*) = 1`, args...)
 	if err != nil {
 		return nil, err
 	}
 	type assignment struct {
 		groupID int64
 		name    string
+		source  string
 	}
 	assignments := make(map[int64]assignment)
 	for rows.Next() {
 		var accountID int64
 		var item assignment
-		if err := rows.Scan(&accountID, &item.groupID, &item.name); err != nil {
+		if err := rows.Scan(&accountID, &item.groupID, &item.name, &item.source); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -522,7 +529,7 @@ func (db *DB) populateProfitSettlementSnapshots(ctx context.Context, tx *sql.Tx,
 		}
 		result[i].SettlementGroupIDSnapshot = item.groupID
 		result[i].SettlementGroupNameSnapshot = item.name
-		result[i].SettlementAssignmentSource = "confirmed"
+		result[i].SettlementAssignmentSource = item.source
 	}
 	return result, nil
 }
@@ -620,12 +627,69 @@ func (db *DB) withProfitLedgerTx(ctx context.Context, fn func(*sql.Tx, int64) er
 	return run()
 }
 
+func (db *DB) ensureProfitAccountAssignments(ctx context.Context) error {
+	run := func() error {
+		nowExpr := "NOW()"
+		if db.isSQLite() {
+			nowExpr = "CURRENT_TIMESTAMP"
+		}
+		_, err := db.conn.ExecContext(ctx, `INSERT INTO profit_account_settings
+			(account_id, settlement_group_id, settlement_group_name, assignment_source, updated_at)
+			SELECT m.account_id, MIN(m.group_id), MAX(g.name), 'inherited', `+nowExpr+`
+			FROM account_group_members m JOIN account_groups g ON g.id = m.group_id
+			LEFT JOIN profit_account_settings pas ON pas.account_id = m.account_id
+			WHERE pas.account_id IS NULL
+			GROUP BY m.account_id HAVING COUNT(*) = 1
+			ON CONFLICT (account_id) DO NOTHING`)
+		return err
+	}
+	if db.isSQLite() {
+		return db.withSQLiteWriteLock(ctx, run)
+	}
+	return run()
+}
+
+func (db *DB) autoAssignProfitPendingAccounts(ctx context.Context) error {
+	if err := db.ensureProfitAccountAssignments(ctx); err != nil {
+		return err
+	}
+	rows, err := db.conn.QueryContext(ctx, `SELECT DISTINCT l.account_id, pas.settlement_group_id
+		FROM profit_daily_ledger l JOIN profit_account_settings pas ON pas.account_id = l.account_id
+		WHERE l.settlement_group_id = 0 AND COALESCE(l.claimed_lineage_id, '') = ''
+		ORDER BY l.account_id`)
+	if err != nil {
+		return err
+	}
+	type candidate struct{ accountID, groupID int64 }
+	candidates := make([]candidate, 0)
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.accountID, &item.groupID); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range candidates {
+		if err := db.assignProfitSettlementGroup(ctx, item.accountID, item.groupID, "inherited", false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLedgerRefreshResult, error) {
 	if limit <= 0 {
 		limit = DefaultProfitLedgerRefreshLimit
 	}
 	if limit > MaxProfitLedgerRefreshLimit {
 		limit = MaxProfitLedgerRefreshLimit
+	}
+	if err := db.autoAssignProfitPendingAccounts(ctx); err != nil {
+		return ProfitLedgerRefreshResult{}, err
 	}
 	result := ProfitLedgerRefreshResult{}
 	err := db.withProfitLedgerTx(ctx, func(tx *sql.Tx, checkpoint int64) error {
@@ -638,11 +702,15 @@ func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLe
 				CASE WHEN COALESCE(a.status, '') = 'deleted' OR a.deleted_at IS NOT NULL THEN 1 ELSE 0 END,
 				COALESCE(ul.channel, ''), COALESCE(NULLIF(ul.effective_model, ''), ul.model, ''),
 				COALESCE(ul.api_key_id, 0), COALESCE(ul.api_key_name, ''), COALESCE(ul.api_key_masked, ''),
-				COALESCE(ul.settlement_group_id_snapshot, 0), COALESCE(ul.settlement_group_name_snapshot, ''),
-				COALESCE(ul.settlement_assignment_source, 'pending'), COALESCE(ul.status_code, 0),
+				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN ul.settlement_group_id_snapshot ELSE COALESCE(pas.settlement_group_id, 0) END,
+				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN COALESCE(ul.settlement_group_name_snapshot, '') ELSE COALESCE(NULLIF(g.name, ''), pas.settlement_group_name, '') END,
+				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN COALESCE(ul.settlement_assignment_source, 'pending') ELSE COALESCE(NULLIF(pas.assignment_source, ''), 'pending') END,
+				COALESCE(ul.status_code, 0),
 				COALESCE(ul.input_tokens, 0), COALESCE(ul.output_tokens, 0), COALESCE(ul.cached_tokens, 0),
 				COALESCE(ul.reasoning_tokens, 0), COALESCE(ul.total_tokens, 0), COALESCE(ul.account_billed, 0)
 			FROM usage_logs ul LEFT JOIN accounts a ON a.id = ul.account_id
+			LEFT JOIN profit_account_settings pas ON pas.account_id = ul.account_id
+			LEFT JOIN account_groups g ON g.id = pas.settlement_group_id
 			WHERE ul.id > $1 AND ul.id <= $2 ORDER BY ul.id LIMIT $3
 		`, checkpoint, result.HighWaterID, limit)
 		if err != nil {
@@ -986,13 +1054,38 @@ type profitLedgerMergeRow struct {
 }
 
 func (db *DB) AssignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64) error {
+	return db.assignProfitSettlementGroup(ctx, accountID, groupID, "confirmed", true)
+}
+
+func (db *DB) assignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64, assignmentSource string, backfillUsageLogs bool) error {
 	if accountID <= 0 || groupID <= 0 {
 		return fmt.Errorf("account_id and group_id must be positive")
+	}
+	if strings.TrimSpace(assignmentSource) == "" {
+		assignmentSource = "confirmed"
 	}
 	return db.withProfitLedgerTx(ctx, func(tx *sql.Tx, _ int64) error {
 		var groupName string
 		if err := tx.QueryRowContext(ctx, `SELECT name FROM account_groups WHERE id = $1`, groupID).Scan(&groupName); err != nil {
 			return err
+		}
+		var deletedInt int
+		accountErr := tx.QueryRowContext(ctx, `SELECT CASE WHEN status = 'deleted' OR deleted_at IS NOT NULL THEN 1 ELSE 0 END
+			FROM accounts WHERE id = $1`, accountID).Scan(&deletedInt)
+		if accountErr != nil && !errors.Is(accountErr, sql.ErrNoRows) {
+			return accountErr
+		}
+		if deletedInt != 0 {
+			var membershipCount int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_group_members WHERE account_id = $1`, accountID).Scan(&membershipCount); err != nil {
+				return err
+			}
+			if membershipCount == 0 {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO account_group_members (account_id, group_id)
+					VALUES ($1,$2) ON CONFLICT (account_id, group_id) DO NOTHING`, accountID, groupID); err != nil {
+					return err
+				}
+			}
 		}
 		nowExpr := "NOW()"
 		if db.isSQLite() {
@@ -1000,17 +1093,19 @@ func (db *DB) AssignProfitSettlementGroup(ctx context.Context, accountID int64, 
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO profit_account_settings
 			(account_id, settlement_group_id, settlement_group_name, assignment_source)
-			VALUES ($1,$2,$3,'confirmed') ON CONFLICT (account_id) DO UPDATE SET
+			VALUES ($1,$2,$3,$4) ON CONFLICT (account_id) DO UPDATE SET
 			settlement_group_id = excluded.settlement_group_id,
 			settlement_group_name = excluded.settlement_group_name,
-			assignment_source = 'confirmed', updated_at = `+nowExpr, accountID, groupID, groupName); err != nil {
+			assignment_source = excluded.assignment_source, updated_at = `+nowExpr, accountID, groupID, groupName, assignmentSource); err != nil {
 			return err
 		}
 		// 尚未进入日账本的历史日志与未来日志都使用已确认分组，避免再次出现待确认。
-		if _, err := tx.ExecContext(ctx, `UPDATE usage_logs SET settlement_group_id_snapshot = $1,
-			settlement_group_name_snapshot = $2, settlement_assignment_source = 'confirmed_backfill'
-			WHERE account_id = $3 AND COALESCE(settlement_group_id_snapshot, 0) = 0`, groupID, groupName, accountID); err != nil {
-			return err
+		if backfillUsageLogs {
+			if _, err := tx.ExecContext(ctx, `UPDATE usage_logs SET settlement_group_id_snapshot = $1,
+				settlement_group_name_snapshot = $2, settlement_assignment_source = 'confirmed_backfill'
+				WHERE account_id = $3 AND COALESCE(settlement_group_id_snapshot, 0) = 0`, groupID, groupName, accountID); err != nil {
+				return err
+			}
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT id, CAST(ledger_date AS TEXT), segment, api_key_id, api_key_name_snapshot,
 			api_key_masked_snapshot, account_id, account_name_snapshot, account_deleted, channel, model,

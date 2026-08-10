@@ -37,6 +37,7 @@ import { cn } from '@/lib/utils'
 const PPM = 1_000_000
 type ProfitTab = 'dashboard' | 'pending' | 'groups' | 'settlements'
 type DimensionKey = 'groups' | 'api_keys' | 'accounts' | 'models'
+type ProfitLoadRange = { startDate: string; endDate: string }
 
 function beijingDate(offsetDays = 0) {
   const now = new Date(Date.now() + offsetDays * 86400000)
@@ -99,13 +100,14 @@ export default function ProfitCenter() {
   const [endDate, setEndDate] = useState(addDays(today, 1))
 	const [ratio, setRatio] = useState('')
   const [loading, setLoading] = useState(true)
+  const [autoAggregating, setAutoAggregating] = useState(false)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [pendingSelections, setPendingSelections] = useState<Record<number, string>>({})
   const [groupMultipliers, setGroupMultipliers] = useState<Record<number, string>>({})
   const [settlementNote, setSettlementNote] = useState('')
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (range?: ProfitLoadRange) => {
     setError(null)
     try {
       const profitSettings = await api.getProfitSettings()
@@ -115,9 +117,14 @@ export default function ProfitCenter() {
         setLoading(false)
         return
       }
+      const effectiveStartDate = range?.startDate ?? startDate
+      const effectiveEndDate = range?.endDate ?? endDate
+      setAutoAggregating(true)
+      await api.refreshProfitLedger(20000)
+      setAutoAggregating(false)
       const ratioPPM = Math.max(1, Math.round((Number(ratio) || profitSettings.default_settlement_ratio_ppm / PPM) * PPM))
       const [dashboardResult, groupResult, pendingResult, settlementResult] = await Promise.all([
-        api.getProfitDashboard({ startDate, endDate, ratioPPM }),
+        api.getProfitDashboard({ startDate: effectiveStartDate, endDate: effectiveEndDate, ratioPPM }),
         api.listProfitGroups(),
         api.listProfitPendingAccounts(),
         api.listProfitSettlements(),
@@ -139,11 +146,18 @@ export default function ProfitCenter() {
     } catch (loadError) {
       setError(getErrorMessage(loadError))
     } finally {
+      setAutoAggregating(false)
       setLoading(false)
     }
   }, [endDate, ratio, startDate])
 
 	useEffect(() => { void loadData() }, [])
+
+  useEffect(() => {
+    if (!settings?.enabled || !dashboard || dashboard.ledger.caught_up || autoAggregating || busy || error) return
+    const timer = window.setTimeout(() => { void loadData() }, 2000)
+    return () => window.clearTimeout(timer)
+  }, [autoAggregating, busy, dashboard, error, loadData, settings?.enabled])
 
   const runBusy = async (key: string, action: () => Promise<void>) => {
     setBusy(key)
@@ -157,10 +171,13 @@ export default function ProfitCenter() {
   }
 
   const applyPreset = (preset: 'week' | 'month' | '30d') => {
-    if (preset === 'week') setStartDate(startOfWeek(today))
-    if (preset === 'month') setStartDate(`${today.slice(0, 7)}-01`)
-    if (preset === '30d') setStartDate(addDays(today, -29))
-    setEndDate(addDays(today, 1))
+    let nextStartDate = startOfWeek(today)
+    if (preset === 'month') nextStartDate = `${today.slice(0, 7)}-01`
+    if (preset === '30d') nextStartDate = addDays(today, -29)
+    const nextEndDate = addDays(today, 1)
+    setStartDate(nextStartDate)
+    setEndDate(nextEndDate)
+    void loadData({ startDate: nextStartDate, endDate: nextEndDate })
   }
 
   const refreshLedger = () => runBusy('ledger', async () => {
@@ -273,10 +290,10 @@ export default function ProfitCenter() {
               <label className="space-y-1.5 text-sm font-medium">结束日期（不含）<Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /></label>
               <label className="space-y-1.5 text-sm font-medium">人民币结算比例<Input type="number" min="0.000001" step="0.01" value={ratio} onChange={(event) => setRatio(event.target.value)} /></label>
               <div className="flex flex-wrap items-end gap-2">
-                <Button variant="outline" onClick={() => applyPreset('week')}>本周</Button>
-                <Button variant="outline" onClick={() => applyPreset('month')}>本月</Button>
-                <Button variant="outline" onClick={() => applyPreset('30d')}>30 天</Button>
-                <Button onClick={() => void loadData()}>计算</Button>
+                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('week')}>本周</Button>
+                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('month')}>本月</Button>
+                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('30d')}>30 天</Button>
+                <Button disabled={autoAggregating} onClick={() => void loadData()}>{autoAggregating ? <Loader2 className="size-4 animate-spin" /> : null}{autoAggregating ? '自动同步中' : '计算'}</Button>
               </div>
             </CardContent>
           </Card>
@@ -294,7 +311,7 @@ export default function ProfitCenter() {
                 {dashboard.ledger.caught_up ? <CheckCircle2 className="mt-0.5 size-5 text-emerald-500" /> : <TriangleAlert className="mt-0.5 size-5 text-amber-500" />}
                 <div><div className="font-semibold">{dashboard.ledger.caught_up ? '日账本已追平' : `还有 ${formatNumber(dashboard.ledger.remaining_logs)} 条日志待聚合`}</div><div className="mt-1 text-xs text-muted-foreground">检查点 {dashboard.ledger.checkpoint_id} / {dashboard.ledger.high_water_id}</div></div>
               </div>
-              <Button variant={dashboard.ledger.caught_up ? 'outline' : 'default'} disabled={busy === 'ledger'} onClick={refreshLedger}>
+              <Button variant={dashboard.ledger.caught_up ? 'outline' : 'default'} disabled={busy === 'ledger' || autoAggregating} onClick={refreshLedger}>
                 {busy === 'ledger' ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}{dashboard.ledger.caught_up ? '检查新日志' : '继续聚合'}
               </Button>
             </CardContent>
