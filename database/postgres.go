@@ -3693,7 +3693,9 @@ func (db *DB) insertUsageLogBatch(ctx context.Context, batch []usageLogEntry) er
 	if db.driver == "postgres" {
 		return db.batchInsertLogs(ctx, batch)
 	}
-	return db.insertSQLiteUsageLogBatch(ctx, batch)
+	return db.withSQLiteWriteLock(ctx, func() error {
+		return db.insertSQLiteUsageLogBatch(ctx, batch)
+	})
 }
 
 // isUsageLogDataError 判断失败是不是「这批数据本身写不进去」。PostgreSQL 的 SQLSTATE
