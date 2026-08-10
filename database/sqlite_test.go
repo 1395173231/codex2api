@@ -2685,6 +2685,59 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	}
 }
 
+func TestSQLiteSoftDeleteWaitsForUnifiedWriteLock(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	singleID, err := db.InsertAccount(ctx, "queued-single-delete", "rt-single-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount(single) 返回错误: %v", err)
+	}
+	batchID, err := db.InsertAccount(ctx, "queued-batch-delete", "rt-batch-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount(batch) 返回错误: %v", err)
+	}
+
+	db.sqliteWriteSem <- struct{}{}
+	singleDone := make(chan error, 1)
+	go func() { singleDone <- db.SoftDeleteAccount(ctx, singleID) }()
+	select {
+	case err := <-singleDone:
+		t.Fatalf("SoftDeleteAccount bypassed SQLite write lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-db.sqliteWriteSem
+	if err := <-singleDone; err != nil {
+		t.Fatalf("SoftDeleteAccount after lock release: %v", err)
+	}
+
+	db.sqliteWriteSem <- struct{}{}
+	batchDone := make(chan error, 1)
+	go func() { batchDone <- db.BatchSoftDeleteAccounts(ctx, []int64{batchID}) }()
+	select {
+	case err := <-batchDone:
+		t.Fatalf("BatchSoftDeleteAccounts bypassed SQLite write lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-db.sqliteWriteSem
+	if err := <-batchDone; err != nil {
+		t.Fatalf("BatchSoftDeleteAccounts after lock release: %v", err)
+	}
+
+	var deletedCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts
+		WHERE id IN ($1,$2) AND status = 'deleted'`, singleID, batchID).Scan(&deletedCount); err != nil {
+		t.Fatalf("query deleted accounts: %v", err)
+	}
+	if deletedCount != 2 {
+		t.Fatalf("deleted count = %d, want 2", deletedCount)
+	}
+}
+
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()

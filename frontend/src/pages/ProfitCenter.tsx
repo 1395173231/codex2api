@@ -119,9 +119,6 @@ export default function ProfitCenter() {
       }
       const effectiveStartDate = range?.startDate ?? startDate
       const effectiveEndDate = range?.endDate ?? endDate
-      setAutoAggregating(true)
-      await api.refreshProfitLedger(20000)
-      setAutoAggregating(false)
       const ratioPPM = Math.max(1, Math.round((Number(ratio) || profitSettings.default_settlement_ratio_ppm / PPM) * PPM))
       const [dashboardResult, groupResult, pendingResult, settlementResult] = await Promise.all([
         api.getProfitDashboard({ startDate: effectiveStartDate, endDate: effectiveEndDate, ratioPPM }),
@@ -155,7 +152,13 @@ export default function ProfitCenter() {
 
   useEffect(() => {
     if (!settings?.enabled || !dashboard || dashboard.ledger.caught_up || autoAggregating || busy || error) return
-    const timer = window.setTimeout(() => { void loadData() }, 2000)
+    const timer = window.setTimeout(() => {
+      setAutoAggregating(true)
+      void api.refreshProfitLedger(1000)
+        .then(() => loadData())
+        .catch((refreshError) => setError(getErrorMessage(refreshError)))
+        .finally(() => setAutoAggregating(false))
+    }, 2000)
     return () => window.clearTimeout(timer)
   }, [autoAggregating, busy, dashboard, error, loadData, settings?.enabled])
 
@@ -181,7 +184,7 @@ export default function ProfitCenter() {
   }
 
   const refreshLedger = () => runBusy('ledger', async () => {
-    const result = await api.refreshProfitLedger(50000)
+    const result = await api.refreshProfitLedger(1000)
     showToast(result.caught_up ? `日账本已追平，共处理 ${result.processed_logs} 条日志` : `本批处理 ${result.processed_logs} 条，还剩 ${result.remaining_logs} 条`, 'success')
     await loadData()
   })

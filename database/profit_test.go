@@ -233,4 +233,11 @@ func TestProfitSQLiteMigrationAvoidsBlockingUsageLogSnapshotIndex(t *testing.T) 
 	if count != 0 {
 		t.Fatalf("blocking profit usage index count = %d, want 0", count)
 	}
+	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_profit_daily_ledger_upsert'`).Scan(&count); err != nil {
+		t.Fatalf("query profit upsert index: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("profit upsert index count = %d, want 1", count)
+	}
 }

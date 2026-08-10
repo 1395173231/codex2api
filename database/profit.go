@@ -20,8 +20,8 @@ const (
 	ProfitScalePPM                  int64 = 1_000_000
 	DefaultProfitSettlementRatioPPM int64 = ProfitScalePPM
 	DefaultProfitGroupMultiplierPPM int64 = ProfitScalePPM
-	DefaultProfitLedgerRefreshLimit       = 20_000
-	MaxProfitLedgerRefreshLimit           = 100_000
+	DefaultProfitLedgerRefreshLimit       = 1_000
+	MaxProfitLedgerRefreshLimit           = 1_000
 	ProfitTimezone                        = "Asia/Shanghai"
 )
 
@@ -310,6 +310,9 @@ func profitPostgresSchema() string {
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_range ON profit_daily_ledger(ledger_date, settlement_group_id);
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_account ON profit_daily_ledger(account_id, ledger_date);
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_claim ON profit_daily_ledger(claimed_lineage_id);
+	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_upsert ON profit_daily_ledger(
+		ledger_date, api_key_id, account_id, model, channel, settlement_group_id, segment DESC
+	);
 
 	CREATE TABLE IF NOT EXISTS profit_settlement_runs (
 		id VARCHAR(80) PRIMARY KEY, lineage_id VARCHAR(80) NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
@@ -384,6 +387,9 @@ func profitSQLiteSchemaStatements() []string {
 		`CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_range ON profit_daily_ledger(ledger_date, settlement_group_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_account ON profit_daily_ledger(account_id, ledger_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_claim ON profit_daily_ledger(claimed_lineage_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_upsert ON profit_daily_ledger(
+			ledger_date, api_key_id, account_id, model, channel, settlement_group_id, segment DESC
+		)`,
 		`CREATE TABLE IF NOT EXISTS profit_settlement_runs (
 			id TEXT PRIMARY KEY, lineage_id TEXT NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1, supersedes_id TEXT NULL,
 			status TEXT NOT NULL DEFAULT 'draft', start_date TEXT NOT NULL, end_date TEXT NOT NULL, settlement_ratio_ppm INTEGER NOT NULL,
