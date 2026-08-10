@@ -996,6 +996,10 @@ export const api = {
 	listProfitPendingAccounts: () => request<{ accounts: ProfitPendingAccount[] }>('/profit/pending-accounts'),
 	assignProfitSettlementGroup: (accountId: number, groupId: number) =>
 		request<MessageResponse>(`/profit/accounts/${accountId}/settlement-group`, { method: 'PUT', body: JSON.stringify({ group_id: groupId }) }),
+	ignoreProfitPendingAccount: (accountId: number, data: { purge: boolean; confirm?: string }) =>
+		request<MessageResponse & { purged: boolean }>(`/profit/accounts/${accountId}/ignore`, {
+			method: 'POST', body: JSON.stringify(data),
+		}),
 	refreshProfitLedger: (limit = 20000) =>
 		request<ProfitLedgerRefreshResult>('/profit/ledger/refresh', { method: 'POST', body: JSON.stringify({ limit }) }),
 	getProfitDashboard: (params: { startDate: string; endDate: string; ratioPPM?: number }) => {

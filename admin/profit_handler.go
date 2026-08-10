@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -111,6 +113,77 @@ func (h *Handler) AssignProfitSettlementGroup(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已回填历史待确认用量，并设置未来默认结算分组"})
+}
+
+const purgeProfitAccountConfirmToken = "PURGE-PROFIT-ACCOUNT-DATA"
+
+func (h *Handler) IgnoreProfitPendingAccount(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "账号 ID 无效"})
+		return
+	}
+	var request struct {
+		Purge   bool   `json:"purge"`
+		Confirm string `json:"confirm"`
+	}
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数无效: " + err.Error()})
+			return
+		}
+	}
+	if request.Purge && strings.TrimSpace(request.Confirm) != purgeProfitAccountConfirmToken {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "彻底删除需要完成二次确认"})
+		return
+	}
+
+	if !request.Purge {
+		if err := h.db.IgnoreProfitPendingAccount(c.Request.Context(), accountID); err != nil {
+			h.writeProfitAccountIgnoreError(c, err)
+			return
+		}
+		security.SecurityAuditLog("PROFIT_ACCOUNT_IGNORED", fmt.Sprintf("account_id=%d ip=%s", accountID, c.ClientIP()))
+		c.JSON(http.StatusOK, gin.H{"message": "已忽略该账号，后续不再出现在待确认列表", "purged": false})
+		return
+	}
+
+	h.db.FlushUsageLogs()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	defer cancel()
+	cleanup, err := h.db.PurgeProfitPendingAccountData(ctx, accountID)
+	if err != nil {
+		h.writeProfitAccountIgnoreError(c, err)
+		return
+	}
+	h.store.RemoveAccount(accountID)
+	security.SecurityAuditLog("PROFIT_ACCOUNT_DATA_PURGED", fmt.Sprintf(
+		"account_id=%d usage_logs=%d ledger_rows=%d prompt_incidents=%d prompt_risk_events=%d account_events=%d ip=%s",
+		accountID, cleanup.UsageLogs, cleanup.ProfitLedgerRows, cleanup.PromptPolicyIncidents,
+		cleanup.PromptRiskEvents, cleanup.AccountEvents, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "账号及未结算关联数据已彻底删除",
+		"purged":  true,
+		"cleanup": cleanup,
+	})
+}
+
+func (h *Handler) writeProfitAccountIgnoreError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		c.JSON(http.StatusNotFound, gin.H{"error": "待确认列表中不存在该账号"})
+	case errors.Is(err, database.ErrProfitAccountNotDeleted):
+		c.JSON(http.StatusConflict, gin.H{"error": "只能忽略或清理已删除、已进入回收站的账号", "code": "profit_account_not_deleted"})
+	case errors.Is(err, database.ErrProfitAccountHasSettlement):
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "该账号已有结算草稿或已确认结算记录，不能彻底删除；请保留历史数据或先处理相关草稿",
+			"code":  "profit_account_has_settlement",
+		})
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "清理未在限定时间内完成，可重新执行以继续分批清理"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "账号处理失败: " + err.Error()})
+	}
 }
 
 func (h *Handler) RefreshProfitLedger(c *gin.Context) {

@@ -715,6 +715,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PUT("/profit/groups/:id", h.UpdateProfitGroup)
 	api.GET("/profit/pending-accounts", h.ListProfitPendingAccounts)
 	api.PUT("/profit/accounts/:id/settlement-group", h.AssignProfitSettlementGroup)
+	api.POST("/profit/accounts/:id/ignore", h.IgnoreProfitPendingAccount)
 	api.POST("/profit/ledger/refresh", h.RefreshProfitLedger)
 	api.GET("/profit/dashboard", h.GetProfitDashboard)
 	api.GET("/profit/settlements", h.ListProfitSettlements)

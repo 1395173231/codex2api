@@ -6,10 +6,12 @@ import {
   CircleDollarSign,
   Download,
   FileClock,
+  EyeOff,
   Loader2,
   RefreshCw,
   Save,
   Settings2,
+  Trash2,
   TriangleAlert,
   Users,
 } from 'lucide-react'
@@ -29,6 +31,7 @@ import StateShell from '../components/StateShell'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -38,6 +41,15 @@ const PPM = 1_000_000
 type ProfitTab = 'dashboard' | 'pending' | 'groups' | 'settlements'
 type DimensionKey = 'groups' | 'api_keys' | 'accounts' | 'models'
 type ProfitLoadRange = { startDate: string; endDate: string }
+type IgnoreDialogState = {
+  account: ProfitPendingAccount
+  purge: boolean
+  stage: 'options' | 'confirm-purge'
+  confirmation: string
+}
+
+const PURGE_PROFIT_ACCOUNT_CONFIRM = 'PURGE-PROFIT-ACCOUNT-DATA'
+const PURGE_CONFIRMATION_TEXT = '永久删除'
 
 function beijingDate(offsetDays = 0) {
   const now = new Date(Date.now() + offsetDays * 86400000)
@@ -105,6 +117,7 @@ export default function ProfitCenter() {
   const [pendingSelections, setPendingSelections] = useState<Record<number, string>>({})
   const [groupMultipliers, setGroupMultipliers] = useState<Record<number, string>>({})
   const [settlementNote, setSettlementNote] = useState('')
+  const [ignoreDialog, setIgnoreDialog] = useState<IgnoreDialogState | null>(null)
 
   const loadData = useCallback(async (range?: ProfitLoadRange) => {
     setError(null)
@@ -200,6 +213,25 @@ export default function ProfitCenter() {
     showToast('已回填历史待确认用量，并设为该账号未来默认结算分组', 'success')
     await loadData()
   })
+
+  const submitIgnore = () => {
+    if (!ignoreDialog) return
+    if (ignoreDialog.purge && ignoreDialog.stage === 'options') {
+      setIgnoreDialog((current) => current ? { ...current, stage: 'confirm-purge', confirmation: '' } : current)
+      return
+    }
+    const { account, purge, confirmation } = ignoreDialog
+    if (purge && confirmation.trim() !== PURGE_CONFIRMATION_TEXT) return
+    void runBusy(`ignore-${account.account_id}`, async () => {
+      await api.ignoreProfitPendingAccount(account.account_id, {
+        purge,
+        confirm: purge ? PURGE_PROFIT_ACCOUNT_CONFIRM : undefined,
+      })
+      setIgnoreDialog(null)
+      showToast(purge ? '账号及未结算关联数据已彻底删除' : '已忽略该账号，后续不再出现在待确认列表', 'success')
+      await loadData()
+    })
+  }
 
   const saveGroup = (group: ProfitGroupSetting) => runBusy(`group-${group.group_id}`, async () => {
     const value = Number(groupMultipliers[group.group_id])
@@ -343,7 +375,7 @@ export default function ProfitCenter() {
 
       {activeTab === 'pending' ? (
         <Card>
-          <CardHeader><CardTitle>待确认账号</CardTitle><p className="text-sm text-muted-foreground">确认时会默认带出账号原有业务分组；保存后回填全部未结算历史用量，并设置未来默认分组。</p></CardHeader>
+          <CardHeader><CardTitle>待确认账号</CardTitle><p className="text-sm text-muted-foreground">确认时会默认带出账号原有业务分组；已删除账号也可以忽略，或在二次确认后彻底清理未结算关联数据。</p></CardHeader>
           <CardContent className="space-y-3">
             {pending.length === 0 ? <EmptyState text="当前没有待确认账号" /> : pending.map((account) => {
               const ownOptions = account.operational_groups.map((group) => ({ label: `${group.name}（原有分组）`, value: String(group.id) }))
@@ -352,7 +384,10 @@ export default function ProfitCenter() {
               return <div key={account.account_id} className="grid gap-3 rounded-xl border border-border p-4 lg:grid-cols-[1fr_220px_auto] lg:items-center">
                 <div><div className="flex flex-wrap items-center gap-2 font-semibold">{account.account_name || `账号 #${account.account_id}`}{account.deleted ? <Badge variant="destructive">已删除</Badge> : null}</div><div className="mt-1 text-xs text-muted-foreground">{account.first_date} 至 {account.last_date} · {formatNumber(account.pending_requests)} 次请求 · {formatUSD(account.official_cost_usd_micros)}</div></div>
                 <Select value={pendingSelections[account.account_id] ?? ''} onValueChange={(value) => setPendingSelections((current) => ({ ...current, [account.account_id]: value }))} options={options} placeholder="选择结算分组" />
-                <Button disabled={busy === `account-${account.account_id}`} onClick={() => assignGroup(account)}>{busy === `account-${account.account_id}` ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}确认并回填</Button>
+                <div className="flex flex-wrap gap-2 lg:justify-end">
+                  <Button disabled={busy === `account-${account.account_id}`} onClick={() => assignGroup(account)}>{busy === `account-${account.account_id}` ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}确认并回填</Button>
+                  {account.deleted ? <Button variant="outline" disabled={Boolean(busy)} onClick={() => setIgnoreDialog({ account, purge: false, stage: 'options', confirmation: '' })}><EyeOff className="size-4" />忽略</Button> : null}
+                </div>
               </div>
             })}
           </CardContent>
@@ -388,6 +423,61 @@ export default function ProfitCenter() {
           </CardContent>
         </Card>
       ) : null}
+
+      <Dialog open={Boolean(ignoreDialog)} onOpenChange={(open) => { if (!open && !busy.startsWith('ignore-')) setIgnoreDialog(null) }}>
+        <DialogContent className="sm:max-w-lg" showCloseButton={!busy.startsWith('ignore-')}>
+          {ignoreDialog?.stage === 'options' ? <>
+            <DialogHeader>
+              <DialogTitle>忽略已删除账号</DialogTitle>
+              <DialogDescription>
+                {ignoreDialog.account.account_name || `账号 #${ignoreDialog.account.account_id}`} 将不再出现在利润中心待确认列表。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm text-muted-foreground">
+                仅忽略会保留账号、历史用量和一个轻量忽略标记，并从利润看板及后续结算来源中排除；不会影响 API Key 已累计额度。
+              </div>
+              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-red-500/30 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-1 size-4 accent-red-600"
+                  checked={ignoreDialog.purge}
+                  onChange={(event) => setIgnoreDialog((current) => current ? { ...current, purge: event.target.checked } : current)}
+                />
+                <span>
+                  <span className="block font-semibold text-red-600">同时彻底删除账号及关联数据</span>
+                  <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">清理未结算利润账本、用量日志、账号级统计和审查事件。API Key 已累计总额度不会回退；存在结算草稿或已确认结算时会拒绝删除。</span>
+                </span>
+              </label>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" disabled={busy.startsWith('ignore-')} onClick={() => setIgnoreDialog(null)}>取消</Button>
+              <Button variant={ignoreDialog.purge ? 'destructive' : 'default'} disabled={busy.startsWith('ignore-')} onClick={submitIgnore}>
+                {ignoreDialog.purge ? <Trash2 className="size-4" /> : <EyeOff className="size-4" />}{ignoreDialog.purge ? '继续二次确认' : '确认忽略'}
+              </Button>
+            </DialogFooter>
+          </> : null}
+
+          {ignoreDialog?.stage === 'confirm-purge' ? <>
+            <DialogHeader>
+              <DialogTitle className="text-red-600">二次确认：永久删除</DialogTitle>
+              <DialogDescription>
+                此操作不可恢复。账号 #{ignoreDialog.account.account_id} 及未结算关联数据将被分批清理。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">请输入“{PURGE_CONFIRMATION_TEXT}”以继续</label>
+              <Input autoFocus value={ignoreDialog.confirmation} onChange={(event) => setIgnoreDialog((current) => current ? { ...current, confirmation: event.target.value } : current)} />
+            </div>
+            <DialogFooter>
+              <Button variant="outline" disabled={busy.startsWith('ignore-')} onClick={() => setIgnoreDialog((current) => current ? { ...current, stage: 'options', confirmation: '' } : current)}>返回</Button>
+              <Button variant="destructive" disabled={busy.startsWith('ignore-') || ignoreDialog.confirmation.trim() !== PURGE_CONFIRMATION_TEXT} onClick={submitIgnore}>
+                {busy === `ignore-${ignoreDialog.account.account_id}` ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}确认彻底删除
+              </Button>
+            </DialogFooter>
+          </> : null}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

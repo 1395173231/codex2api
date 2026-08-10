@@ -281,6 +281,11 @@ func profitPostgresSchema() string {
 	);
 	CREATE INDEX IF NOT EXISTS idx_profit_account_settings_group ON profit_account_settings(settlement_group_id);
 
+	CREATE TABLE IF NOT EXISTS profit_ignored_accounts (
+		account_id BIGINT PRIMARY KEY, account_name_snapshot TEXT NOT NULL DEFAULT '',
+		ignored_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+
 	CREATE TABLE IF NOT EXISTS profit_group_settings (
 		group_id BIGINT PRIMARY KEY, group_name_snapshot TEXT NOT NULL DEFAULT '',
 		multiplier_ppm BIGINT NOT NULL DEFAULT 1000000, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -362,6 +367,10 @@ func profitSQLiteSchemaStatements() []string {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_account_settings_group ON profit_account_settings(settlement_group_id)`,
+		`CREATE TABLE IF NOT EXISTS profit_ignored_accounts (
+			account_id INTEGER PRIMARY KEY, account_name_snapshot TEXT NOT NULL DEFAULT '',
+			ignored_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE TABLE IF NOT EXISTS profit_group_settings (
 			group_id INTEGER PRIMARY KEY, group_name_snapshot TEXT NOT NULL DEFAULT '', multiplier_ppm INTEGER NOT NULL DEFAULT 1000000,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -662,6 +671,7 @@ func (db *DB) autoAssignProfitPendingAccounts(ctx context.Context) error {
 	rows, err := db.conn.QueryContext(ctx, `SELECT DISTINCT l.account_id, pas.settlement_group_id
 		FROM profit_daily_ledger l JOIN profit_account_settings pas ON pas.account_id = l.account_id
 		WHERE l.settlement_group_id = 0 AND COALESCE(l.claimed_lineage_id, '') = ''
+		AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)
 		ORDER BY l.account_id`)
 	if err != nil {
 		return err
@@ -977,10 +987,12 @@ func buildProfitInClause(ids []int64, start int) (string, []interface{}) {
 
 func (db *DB) ListProfitPendingAccounts(ctx context.Context) ([]ProfitPendingAccount, error) {
 	rows, err := db.conn.QueryContext(ctx, `SELECT l.account_id, COALESCE(MAX(a.name), MAX(l.account_name_snapshot), ''),
-		MAX(CASE WHEN COALESCE(a.status, '') = 'deleted' OR a.deleted_at IS NOT NULL OR l.account_deleted THEN 1 ELSE 0 END),
+		MAX(CASE WHEN a.id IS NULL OR COALESCE(a.status, '') = 'deleted' OR a.deleted_at IS NOT NULL
+			OR COALESCE(a.error_message, '') = 'deleted' THEN 1 ELSE 0 END),
 		SUM(l.request_count), SUM(l.official_cost_usd_micros), CAST(MIN(l.ledger_date) AS TEXT), CAST(MAX(l.ledger_date) AS TEXT)
 		FROM profit_daily_ledger l LEFT JOIN accounts a ON a.id = l.account_id
 		WHERE l.settlement_group_id = 0 AND COALESCE(l.claimed_lineage_id, '') = ''
+		AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)
 		GROUP BY l.account_id ORDER BY SUM(l.official_cost_usd_micros) DESC, l.account_id`)
 	if err != nil {
 		return nil, err
@@ -1251,7 +1263,8 @@ func (db *DB) GetProfitDashboard(ctx context.Context, startDate string, endDate 
 		account_id, MAX(account_name_snapshot), MAX(CASE WHEN account_deleted THEN 1 ELSE 0 END), model,
 		SUM(request_count), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), SUM(reasoning_tokens),
 		SUM(total_tokens), SUM(official_cost_usd_micros)
-		FROM profit_daily_ledger WHERE ledger_date >= $1 AND ledger_date < $2
+		FROM profit_daily_ledger l WHERE ledger_date >= $1 AND ledger_date < $2
+		AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)
 		GROUP BY settlement_group_id, api_key_id, account_id, model ORDER BY settlement_group_id, account_id`, startDate, endDate)
 	if err != nil {
 		return result, err
@@ -1418,9 +1431,10 @@ func (db *DB) CreateProfitSettlementDraft(ctx context.Context, startDate string,
 			return err
 		}
 		var pendingCount int64
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger
-			WHERE ledger_date >= $1 AND ledger_date < $2 AND settlement_group_id = 0
-			AND COALESCE(claimed_lineage_id, '') = ''`, startDate, endDate).Scan(&pendingCount); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
+			WHERE l.ledger_date >= $1 AND l.ledger_date < $2 AND l.settlement_group_id = 0
+			AND COALESCE(l.claimed_lineage_id, '') = ''
+			AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)`, startDate, endDate).Scan(&pendingCount); err != nil {
 			return err
 		}
 		if pendingCount > 0 {
@@ -1494,7 +1508,8 @@ func (db *DB) rebuildProfitSettlementDraft(ctx context.Context, tx *sql.Tx, run 
 		args = append(args, run.LineageID)
 	} else {
 		query += `WHERE l.ledger_date >= $1 AND l.ledger_date < $2
-			AND l.settlement_group_id > 0 AND COALESCE(l.claimed_lineage_id, '') = '' ORDER BY l.id`
+			AND l.settlement_group_id > 0 AND COALESCE(l.claimed_lineage_id, '') = ''
+			AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id) ORDER BY l.id`
 	}
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1652,12 +1667,14 @@ func (db *DB) ConfirmProfitSettlement(ctx context.Context, runID string) (Profit
 			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
 				LEFT JOIN profit_settlement_items i ON i.run_id = $1 AND i.ledger_row_id = l.id
 				WHERE l.ledger_date >= $2 AND l.ledger_date < $3 AND l.settlement_group_id > 0
-				AND COALESCE(l.claimed_lineage_id, '') = '' AND i.ledger_row_id IS NULL`, run.ID, run.StartDate, run.EndDate).Scan(&missingRows); err != nil {
+				AND COALESCE(l.claimed_lineage_id, '') = '' AND i.ledger_row_id IS NULL
+				AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts x WHERE x.account_id = l.account_id)`, run.ID, run.StartDate, run.EndDate).Scan(&missingRows); err != nil {
 				return err
 			}
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger
-				WHERE ledger_date >= $1 AND ledger_date < $2 AND settlement_group_id = 0
-				AND COALESCE(claimed_lineage_id, '') = ''`, run.StartDate, run.EndDate).Scan(&pendingRows); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
+				WHERE l.ledger_date >= $1 AND l.ledger_date < $2 AND l.settlement_group_id = 0
+				AND COALESCE(l.claimed_lineage_id, '') = ''
+				AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)`, run.StartDate, run.EndDate).Scan(&pendingRows); err != nil {
 				return err
 			}
 			if missingRows > 0 || pendingRows > 0 {
