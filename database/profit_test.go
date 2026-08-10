@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -239,5 +240,25 @@ func TestProfitSQLiteMigrationAvoidsBlockingUsageLogSnapshotIndex(t *testing.T) 
 	}
 	if count != 1 {
 		t.Fatalf("profit upsert index count = %d, want 1", count)
+	}
+}
+
+func TestProfitLedgerRefreshClampsBatchSizeForSQLiteWriteAvailability(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, _ := insertProfitTestAccountAndGroup(t, db, false)
+	for i := 0; i < MaxProfitLedgerRefreshLimit+1; i++ {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, channel, model, effective_model, status_code, total_tokens, account_billed, created_at)
+			VALUES ($1, 'codex', $2, $2, 200, 1, 0.001, CURRENT_TIMESTAMP)`, accountID, fmt.Sprintf("batch-%d", i)); err != nil {
+			t.Fatalf("insert usage log %d: %v", i, err)
+		}
+	}
+	result, err := db.RefreshProfitDailyLedger(ctx, MaxProfitLedgerRefreshLimit*10)
+	if err != nil {
+		t.Fatalf("RefreshProfitDailyLedger: %v", err)
+	}
+	if result.ProcessedLogs != int64(MaxProfitLedgerRefreshLimit) || result.RemainingLogs != 1 || result.CaughtUp {
+		t.Fatalf("clamped refresh = %+v", result)
 	}
 }

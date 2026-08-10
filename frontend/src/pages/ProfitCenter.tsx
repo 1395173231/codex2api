@@ -154,11 +154,11 @@ export default function ProfitCenter() {
     if (!settings?.enabled || !dashboard || dashboard.ledger.caught_up || autoAggregating || busy || error) return
     const timer = window.setTimeout(() => {
       setAutoAggregating(true)
-      void api.refreshProfitLedger(1000)
+      void api.refreshProfitLedger(100)
         .then(() => loadData())
         .catch((refreshError) => setError(getErrorMessage(refreshError)))
         .finally(() => setAutoAggregating(false))
-    }, 2000)
+    }, 3000)
     return () => window.clearTimeout(timer)
   }, [autoAggregating, busy, dashboard, error, loadData, settings?.enabled])
 
@@ -184,7 +184,7 @@ export default function ProfitCenter() {
   }
 
   const refreshLedger = () => runBusy('ledger', async () => {
-    const result = await api.refreshProfitLedger(1000)
+    const result = await api.refreshProfitLedger(100)
     showToast(result.caught_up ? `日账本已追平，共处理 ${result.processed_logs} 条日志` : `本批处理 ${result.processed_logs} 条，还剩 ${result.remaining_logs} 条`, 'success')
     await loadData()
   })

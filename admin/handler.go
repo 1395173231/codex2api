@@ -875,7 +875,7 @@ func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
 
 // GetStats 获取仪表盘统计
 func (h *Handler) GetStats(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	accounts, err := h.db.ListActive(ctx)

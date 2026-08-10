@@ -20,8 +20,8 @@ const (
 	ProfitScalePPM                  int64 = 1_000_000
 	DefaultProfitSettlementRatioPPM int64 = ProfitScalePPM
 	DefaultProfitGroupMultiplierPPM int64 = ProfitScalePPM
-	DefaultProfitLedgerRefreshLimit       = 1_000
-	MaxProfitLedgerRefreshLimit           = 1_000
+	DefaultProfitLedgerRefreshLimit       = 100
+	MaxProfitLedgerRefreshLimit           = 100
 	ProfitTimezone                        = "Asia/Shanghai"
 )
 
