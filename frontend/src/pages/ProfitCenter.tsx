@@ -100,7 +100,6 @@ export default function ProfitCenter() {
   const [endDate, setEndDate] = useState(addDays(today, 1))
 	const [ratio, setRatio] = useState('')
   const [loading, setLoading] = useState(true)
-  const [autoAggregating, setAutoAggregating] = useState(false)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [pendingSelections, setPendingSelections] = useState<Record<number, string>>({})
@@ -143,25 +142,11 @@ export default function ProfitCenter() {
     } catch (loadError) {
       setError(getErrorMessage(loadError))
     } finally {
-      setAutoAggregating(false)
       setLoading(false)
     }
   }, [endDate, ratio, startDate])
 
 	useEffect(() => { void loadData() }, [])
-
-  useEffect(() => {
-    if (!settings?.enabled || !dashboard || dashboard.ledger.caught_up || autoAggregating || busy || error) return
-    const timer = window.setTimeout(() => {
-      setAutoAggregating(true)
-      void api.refreshProfitLedger(100)
-        .then(() => loadData())
-        .catch((refreshError) => setError(getErrorMessage(refreshError)))
-        .finally(() => setAutoAggregating(false))
-    }, 3000)
-    return () => window.clearTimeout(timer)
-  }, [autoAggregating, busy, dashboard, error, loadData, settings?.enabled])
-
   const runBusy = async (key: string, action: () => Promise<void>) => {
     setBusy(key)
     try {
@@ -184,8 +169,27 @@ export default function ProfitCenter() {
   }
 
   const refreshLedger = () => runBusy('ledger', async () => {
-    const result = await api.refreshProfitLedger(100)
-    showToast(result.caught_up ? `日账本已追平，共处理 ${result.processed_logs} 条日志` : `本批处理 ${result.processed_logs} 条，还剩 ${result.remaining_logs} 条`, 'success')
+    let processed = 0
+    let targetHighWaterID: number | null = null
+    for (;;) {
+      const result = await api.refreshProfitLedger(100)
+      targetHighWaterID ??= result.high_water_id
+      processed += result.processed_logs
+      const remainingToTarget = Math.max(0, targetHighWaterID - result.checkpoint_id)
+      setDashboard((current) => current ? {
+        ...current,
+        ledger: {
+          ...result,
+          high_water_id: targetHighWaterID!,
+          remaining_logs: remainingToTarget,
+          caught_up: remainingToTarget === 0,
+        },
+      } : current)
+      if (remainingToTarget === 0) break
+      if (result.processed_logs === 0) throw new Error(`聚合没有取得进展，仍有 ${remainingToTarget} 条日志待处理`)
+      await new Promise((resolve) => window.setTimeout(resolve, 200))
+    }
+    showToast(`已追平到本次点击时的日志截止点，共处理 ${processed} 条`, 'success')
     await loadData()
   })
 
@@ -293,10 +297,10 @@ export default function ProfitCenter() {
               <label className="space-y-1.5 text-sm font-medium">结束日期（不含）<Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /></label>
               <label className="space-y-1.5 text-sm font-medium">人民币结算比例<Input type="number" min="0.000001" step="0.01" value={ratio} onChange={(event) => setRatio(event.target.value)} /></label>
               <div className="flex flex-wrap items-end gap-2">
-                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('week')}>本周</Button>
-                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('month')}>本月</Button>
-                <Button variant="outline" disabled={autoAggregating} onClick={() => applyPreset('30d')}>30 天</Button>
-                <Button disabled={autoAggregating} onClick={() => void loadData()}>{autoAggregating ? <Loader2 className="size-4 animate-spin" /> : null}{autoAggregating ? '自动同步中' : '计算'}</Button>
+                <Button variant="outline" onClick={() => applyPreset('week')}>本周</Button>
+                <Button variant="outline" onClick={() => applyPreset('month')}>本月</Button>
+                <Button variant="outline" onClick={() => applyPreset('30d')}>30 天</Button>
+                <Button onClick={() => void loadData()}>计算</Button>
               </div>
             </CardContent>
           </Card>
@@ -314,8 +318,8 @@ export default function ProfitCenter() {
                 {dashboard.ledger.caught_up ? <CheckCircle2 className="mt-0.5 size-5 text-emerald-500" /> : <TriangleAlert className="mt-0.5 size-5 text-amber-500" />}
                 <div><div className="font-semibold">{dashboard.ledger.caught_up ? '日账本已追平' : `还有 ${formatNumber(dashboard.ledger.remaining_logs)} 条日志待聚合`}</div><div className="mt-1 text-xs text-muted-foreground">检查点 {dashboard.ledger.checkpoint_id} / {dashboard.ledger.high_water_id}</div></div>
               </div>
-              <Button variant={dashboard.ledger.caught_up ? 'outline' : 'default'} disabled={busy === 'ledger' || autoAggregating} onClick={refreshLedger}>
-                {busy === 'ledger' ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}{dashboard.ledger.caught_up ? '检查新日志' : '继续聚合'}
+              <Button variant={dashboard.ledger.caught_up ? 'outline' : 'default'} disabled={busy === 'ledger'} onClick={refreshLedger}>
+                {busy === 'ledger' ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}{busy === 'ledger' ? `正在追平（剩余 ${formatNumber(dashboard.ledger.remaining_logs)}）` : dashboard.ledger.caught_up ? '检查并追平新日志' : '开始追平日志'}
               </Button>
             </CardContent>
           </Card>
