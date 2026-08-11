@@ -18,6 +18,7 @@ type NavDef = {
   icon: ReactNode
   end?: boolean
   activePrefix?: string
+  requiresProfit?: boolean
 }
 
 const navDefs: NavDef[] = [
@@ -30,6 +31,7 @@ const navDefs: NavDef[] = [
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
   { to: '/model-pricing', labelKey: 'nav.modelPricing', icon: <CircleDollarSign className="size-[18px]" /> },
+  { to: '/profit', labelKey: 'nav.profitCenter', icon: <CircleDollarSign className="size-[18px]" />, requiresProfit: true },
   { to: '/payload-rules/editor', labelKey: 'nav.payloadRules', icon: <Braces className="size-[18px]" />, activePrefix: '/payload-rules' },
   { to: '/theme', labelKey: 'nav.theme', icon: <Palette className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
@@ -39,10 +41,6 @@ const navDefs: NavDef[] = [
 // Explicit mobile primary order: dashboard → accounts → usage → ops.
 const MOBILE_PRIMARY_PATHS = ['/', '/accounts', '/usage', '/ops/overview'] as const
 const mobilePrimaryPathSet = new Set<string>(MOBILE_PRIMARY_PATHS)
-const mobilePrimaryNav = MOBILE_PRIMARY_PATHS
-  .map((path) => navDefs.find((item) => item.to === path))
-  .filter((item): item is NavDef => Boolean(item))
-const mobileMoreNav = navDefs.filter((item) => !mobilePrimaryPathSet.has(item.to))
 
 export default function Layout({ children }: PropsWithChildren) {
   const location = useLocation()
@@ -52,6 +50,7 @@ export default function Layout({ children }: PropsWithChildren) {
   const { theme, toggle } = useTheme()
   const { showToast } = useToast()
   const [spinning, setSpinning] = useState(false)
+  const [profitEnabled, setProfitEnabled] = useState(false)
   const logoSrc = siteLogo || DEFAULT_SITE_LOGO
   const [showVersionPopover, setShowVersionPopover] = useState(false)
   const [updatingVersion, setUpdatingVersion] = useState(false)
@@ -69,6 +68,45 @@ export default function Layout({ children }: PropsWithChildren) {
     }
   })
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = () => {
+      void api.getProfitSettings()
+        .then((settings) => {
+          if (!cancelled) setProfitEnabled(settings.enabled)
+        })
+        .catch(() => {
+          if (!cancelled) setProfitEnabled(false)
+        })
+    }
+    const handleSettingsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ enabled?: boolean }>).detail
+      if (typeof detail?.enabled === 'boolean') setProfitEnabled(detail.enabled)
+      else load()
+    }
+    load()
+    window.addEventListener('profit-settings-changed', handleSettingsChanged)
+    return () => {
+      cancelled = true
+      window.removeEventListener('profit-settings-changed', handleSettingsChanged)
+    }
+  }, [])
+
+  const visibleNavDefs = useMemo(
+    () => navDefs.filter((item) => !item.requiresProfit || profitEnabled),
+    [profitEnabled],
+  )
+  const mobilePrimaryNav = useMemo(
+    () => MOBILE_PRIMARY_PATHS
+      .map((path) => visibleNavDefs.find((item) => item.to === path))
+      .filter((item): item is NavDef => Boolean(item)),
+    [visibleNavDefs],
+  )
+  const mobileMoreNav = useMemo(
+    () => visibleNavDefs.filter((item) => !mobilePrimaryPathSet.has(item.to)),
+    [visibleNavDefs],
+  )
   const toggleSidebarCollapsed = () => {
     setSidebarCollapsed((prev) => {
       const next = !prev
@@ -289,7 +327,7 @@ export default function Layout({ children }: PropsWithChildren) {
 
   const mobileMoreActive = useMemo(
     () => mobileMoreNav.some((item) => isNavActive(item)),
-    [isNavActive],
+		[isNavActive, mobileMoreNav],
   )
 
   // Apple HIG-style easing for sidebar choreography:
@@ -487,7 +525,7 @@ export default function Layout({ children }: PropsWithChildren) {
               >
                 {t('nav.console')}
               </span>
-              {navDefs.map((item) => {
+              {visibleNavDefs.map((item) => {
                 const active = isNavActive(item)
                 const label = t(item.labelKey)
                 return (

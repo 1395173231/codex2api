@@ -2860,3 +2860,244 @@ export interface ObservedInstructionsSample {
 export interface ObservedInstructionsResponse {
   samples: ObservedInstructionsSample[]
 }
+
+export interface ProfitSettings {
+  enabled: boolean
+  default_settlement_ratio_ppm: number
+  default_group_multiplier_ppm: number
+  timezone: string
+  updated_at?: string
+}
+
+export interface ProfitGroupSetting {
+  group_id: number
+  group_name: string
+  multiplier_ppm: number
+  assigned_count: number
+  historical: boolean
+}
+
+export interface ProfitOperationalGroup {
+  id: number
+  name: string
+}
+
+export interface ProfitPendingAccount {
+  account_id: number
+  account_name: string
+  deleted: boolean
+  pending_requests: number
+  official_cost_usd_micros: number
+  first_date: string
+  last_date: string
+  operational_groups: ProfitOperationalGroup[]
+}
+
+export interface ProfitLedgerRefreshResult {
+  processed_logs: number
+  aggregated_logs: number
+  checkpoint_id: number
+  high_water_id: number
+  remaining_logs: number
+  caught_up: boolean
+  updated_at: string
+}
+
+export interface ProfitMoneySummary {
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  margin: number | null
+  request_count: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+}
+
+export interface ProfitDashboardDimension extends ProfitMoneySummary {
+  id: string
+  name: string
+  deleted?: boolean
+  pending?: boolean
+  multiplier_ppm?: number
+}
+
+export interface ProfitDashboardResponse {
+  start_date: string
+  end_date: string
+  timezone: string
+  settlement_ratio_ppm: number
+  ledger: ProfitLedgerRefreshResult
+  overall: ProfitMoneySummary
+  groups: ProfitDashboardDimension[]
+  api_keys: ProfitDashboardDimension[]
+  accounts: ProfitDashboardDimension[]
+  models: ProfitDashboardDimension[]
+  settlement: ProfitSettlementOverview
+  settlement_matrix: ProfitSettlementMatrixCell[]
+  group_settlements: ProfitGroupSettlementSummary[]
+  account_roi: ProfitAccountROI[]
+}
+
+export interface ProfitSettlementOverview {
+  official_cost_usd_micros: number
+  cross_group_usd_micros: number
+  self_usage_usd_micros: number
+  non_settleable_usd_micros: number
+  receivable_cny_micros: number
+  payable_cny_micros: number
+  global_net_cny_micros: number
+  pending_consumer_requests: number
+  pending_owner_requests: number
+}
+
+export interface ProfitSettlementMatrixCell {
+  consumer_group_id: number
+  consumer_group_name: string
+  owner_group_id: number
+  owner_group_name: string
+  official_cost_usd_micros: number
+  rate_ppm: number
+  payable_cny_micros: number
+  request_count: number
+  total_tokens: number
+}
+
+export interface ProfitGroupSettlementSummary {
+  group_id: number
+  group_name: string
+  receivable_cny_micros: number
+  payable_cny_micros: number
+  net_cny_micros: number
+  self_usage_usd_micros: number
+}
+
+export interface ProfitAccountCostAllocation {
+  monthly_fixed_cost_usd_micros: number
+  monthly_capacity_usd_micros: number
+  usage_in_manifest_usd_micros: number
+  month_total_usage_usd_micros: number
+  allocated_before_usd_micros: number
+  allocated_in_range_usd_micros: number
+  allocated_after_usd_micros: number
+  remaining_fixed_cost_usd_micros: number
+  allocated_in_range_cny_micros: number
+  utilization_ppm: number
+  cost_coverage_ppm: number
+}
+
+export interface ProfitAccountROI extends ProfitAccountCostAllocation {
+  account_id: number
+  account_name: string
+  account_deleted: boolean
+  owner_group_id: number
+  owner_group_name: string
+  effective_month: string
+  economic_version_id: number
+}
+
+export interface ProfitAPIKeyAssignment {
+  api_key_id: number
+  api_key_name: string
+  assignment_version_id: number
+  consumer_group_id: number
+  consumer_group_name: string
+  assignment_source: string
+  pending: boolean
+  suggested_group_id?: number
+  suggested_group_name?: string
+  updated_at?: string
+}
+
+export interface ProfitPairRateSetting {
+  id: number
+  consumer_group_id: number
+  consumer_group_name: string
+  owner_group_id: number
+  owner_group_name: string
+  rate_ppm: number
+  effective_date: string
+  revision_no: number
+  source: string
+}
+
+export interface ProfitAccountEconomicSetting {
+  id: number
+  account_id: number
+  account_name: string
+  account_deleted: boolean
+  effective_month: string
+  revision_no: number
+  monthly_fixed_cost_usd_micros: number
+  monthly_capacity_usd_micros: number
+  source: string
+  frozen: boolean
+}
+
+export interface ProfitSettlementRun {
+  id: string
+  lineage_id: string
+  revision_no: number
+  supersedes_id?: string
+  status: 'draft' | 'confirmed' | 'superseded' | string
+  start_date: string
+  end_date: string
+  settlement_ratio_ppm: number
+  notes: string
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  payable_cny_micros: number
+  receivable_cny_micros: number
+  fixed_cost_allocated_usd_micros: number
+  fixed_cost_allocated_cny_micros: number
+  source_high_water_id: number
+  build_error?: string
+  source_manifest_hash: string
+  created_at: string
+  confirmed_at?: string
+}
+
+export interface ProfitSettlementItem {
+  ledger_row_id: number
+  ledger_version: number
+  ledger_date: string
+  group_id: number
+  group_name: string
+  consumer_group_id: number
+  consumer_group_name: string
+  owner_group_id: number
+  owner_group_name: string
+  api_key_id: number
+  api_key_name: string
+  account_id: number
+  account_name: string
+  account_deleted: boolean
+  model: string
+  channel: string
+  multiplier_ppm: number
+  rate_ppm: number
+  non_settleable_reason?: string
+  self_usage: boolean
+  request_count: number
+  total_tokens: number
+  official_cost_usd_micros: number
+  settlement_cost_cny_micros: number
+  revenue_cny_micros: number
+  profit_cny_micros: number
+  payable_cny_micros: number
+  receivable_cny_micros: number
+  source_first_log_id: number
+  source_last_log_id: number
+  source_hash: string
+}
+
+export interface ProfitSettlementDetail {
+  run: ProfitSettlementRun
+  items: ProfitSettlementItem[]
+  account_roi: Array<ProfitAccountROI & { cost_fx_ppm: number; status: string }>
+}

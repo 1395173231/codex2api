@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -176,10 +177,11 @@ const (
 )
 
 const (
-	contextAPIKeyID     = "apiKeyID"
-	contextAPIKeyName   = "apiKeyName"
-	contextAPIKeyMasked = "apiKeyMasked"
-	contextAPIKeyRow    = "apiKeyRow"
+	contextAPIKeyID                  = "apiKeyID"
+	contextAPIKeyName                = "apiKeyName"
+	contextAPIKeyMasked              = "apiKeyMasked"
+	contextAPIKeyRow                 = "apiKeyRow"
+	contextProfitConsumerAttribution = "profitConsumerAttribution"
 	// contextScopeBudgetGate 存放本次请求的 scope 预算闸门（issue #439），
 	// 由 enforceAPIKeyLimits 计算一次，供账号过滤链与「无可用账号」分支复用。
 	contextScopeBudgetGate = "apiKeyScopeBudgetGate"
@@ -754,6 +756,12 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 			}
 		}
 	}
+	if input.AccountID > 0 && input.SettlementAssignmentSource == "" {
+		owner := h.db.ProfitAccountAttribution(input.AccountID)
+		input.SettlementGroupIDSnapshot = owner.GroupID
+		input.SettlementGroupNameSnapshot = owner.GroupName
+		input.SettlementAssignmentSource = owner.AssignmentSource
+	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
 
@@ -796,12 +804,65 @@ func populateInternalUsageMetaFromContext(c *gin.Context, input *database.UsageL
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
 	populateInternalUsageMetaFromContext(c, input)
+	h.populateProfitConsumerAttribution(c, input)
 	populateClientIPFromRequest(c, input)
 	populateUserAgentMetaFromRequest(c, input)
 	populateWsAcquireFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
+}
+
+func profitConfigKeySourceID(key string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+func (h *Handler) profitConsumerAttributionForAPIKey(row *database.APIKeyRow, rawKey string) database.ProfitConsumerAttribution {
+	if row != nil && row.ID > 0 && h != nil && h.db != nil {
+		return h.db.ProfitAPIKeyAttribution(row.ID)
+	}
+	return database.ProfitConsumerAttribution{
+		SourceType:          database.ProfitConsumerSourceConfigKey,
+		SourceID:            profitConfigKeySourceID(rawKey),
+		AssignmentSource:    "system",
+		NonSettleableReason: database.ProfitNonSettleableSystemInternal,
+	}
+}
+
+func (h *Handler) populateProfitConsumerAttribution(c *gin.Context, input *database.UsageLogInput) {
+	if input == nil || input.ConsumerSourceType != "" {
+		return
+	}
+	if c != nil {
+		if value, exists := c.Get(contextProfitConsumerAttribution); exists {
+			if attribution, ok := value.(database.ProfitConsumerAttribution); ok {
+				input.ConsumerSourceType = attribution.SourceType
+				input.ConsumerSourceID = attribution.SourceID
+				input.ConsumerAssignmentVersionID = attribution.AssignmentVersionID
+				input.ConsumerGroupIDSnapshot = attribution.GroupID
+				input.ConsumerGroupNameSnapshot = attribution.GroupName
+				input.NonSettleableReason = attribution.NonSettleableReason
+				return
+			}
+		}
+	}
+	if input.APIKeyID > 0 && h != nil && h.db != nil {
+		attribution := h.db.ProfitAPIKeyAttribution(input.APIKeyID)
+		input.ConsumerSourceType = attribution.SourceType
+		input.ConsumerSourceID = attribution.SourceID
+		input.ConsumerAssignmentVersionID = attribution.AssignmentVersionID
+		input.ConsumerGroupIDSnapshot = attribution.GroupID
+		input.ConsumerGroupNameSnapshot = attribution.GroupName
+		input.NonSettleableReason = attribution.NonSettleableReason
+		return
+	}
+	input.ConsumerSourceType = database.ProfitConsumerSourceSystem
+	input.ConsumerSourceID = strings.TrimSpace(input.InternalReason)
+	if input.ConsumerSourceID == "" {
+		input.ConsumerSourceID = "anonymous"
+	}
+	input.NonSettleableReason = database.ProfitNonSettleableSystemInternal
 }
 
 // logContinueThinkingRounds 为思考截断续想中「被折叠隐藏」的上游轮次补记真实用量。
@@ -2020,6 +2081,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		c.Set(contextAPIKeyName, strings.TrimSpace(apiKeyRow.Name))
 		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
 		c.Set(contextAPIKeyRow, apiKeyRow)
+		c.Set(contextProfitConsumerAttribution, h.profitConsumerAttributionForAPIKey(apiKeyRow, key))
 		c.Set("apiKey", key)
 		if h.enforceRequiredNewAPIIdentityAtIngress(c) {
 			c.Abort()
