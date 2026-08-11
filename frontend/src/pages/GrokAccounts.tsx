@@ -379,7 +379,7 @@ function isAccountActive(account: AccountRow): boolean {
   );
 }
 
-export default function GrokAccounts({
+function GrokAccounts({
   headerSlot,
   showOperationResults = false,
   onShowOperationResultsChange,
@@ -4681,3 +4681,6 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+// memo 边界:宿主 Accounts 组件的 codex 侧状态变化不应连带整棵 Grok 视图重渲染。
+export default memo(GrokAccounts);
