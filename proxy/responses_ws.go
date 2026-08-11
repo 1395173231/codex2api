@@ -1091,22 +1091,23 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 		return false, false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
-	if _, locked := h.activePromptConversationLock(c, cfg, nil); locked {
+	if item, locked := h.activePromptConversationLock(c, cfg, nil); locked {
+		reasonCode, message := promptCyberRestrictionDecision(item)
 		profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))
 		switch profile {
 		case promptfilter.GuardProfileBalanced, promptfilter.GuardProfileStrict, promptfilter.GuardProfileResearch:
 		default:
 			profile = promptfilter.GuardProfileBalanced
 		}
-		decision := promptfilter.Decision{Action: promptfilter.ActionBlock, Profile: profile, ReasonCode: promptConversationLockedReasonCode, Terminal: true}
-		verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: promptConversationLockedMessage, FullText: promptConversationLockedReasonCode}
+		decision := promptfilter.Decision{Action: promptfilter.ActionBlock, Profile: profile, ReasonCode: reasonCode, Terminal: true}
+		verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: message, FullText: reasonCode}
 		if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
 			metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, decision, verdict, cfg, rawBody, endpoint, model, policyEventID, policyContext.VerificationSecret)
 			writeNewAPIPolicyDecisionHeaders(c, metadata)
 			_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
 			return true, true
 		}
-		_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrorCode(promptConversationLockedReasonCode), promptConversationLockedMessage, api.ErrorTypeInvalidRequest))
+		_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrorCode(reasonCode), message, api.ErrorTypeInvalidRequest))
 		return true, false
 	}
 	// Keep disabled filters off the WebSocket request-body hot path too.

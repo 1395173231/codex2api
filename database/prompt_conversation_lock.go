@@ -94,6 +94,7 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 		ddl,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_conversation_locks_status ON prompt_conversation_locks(status, updated_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_conversation_locks_session ON prompt_conversation_locks(session_hash, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_conversation_locks_user_cooldown ON prompt_conversation_locks(platform, newapi_user_id, status, locked_at)`,
 	} {
 		if _, err := db.conn.ExecContext(ctx, statement); err != nil {
 			return err
@@ -225,6 +226,42 @@ func (db *DB) GetActivePromptConversationLockWithTTL(ctx context.Context, lockKe
 	return db.expirePromptConversationLockIfNeeded(ctx, item, ttl, func() (*PromptConversationLock, error) {
 		return db.GetActivePromptConversationLock(ctx, lockKey)
 	})
+}
+
+// GetActivePromptConversationRestriction resolves the strongest active CYB
+// restriction for a verified request identity in one database lookup. An exact
+// conversation lock takes precedence; otherwise the latest CYB from the same
+// verified platform user is returned while the bounded user cooldown is live.
+func (db *DB) GetActivePromptConversationRestriction(ctx context.Context, lockKey, platform, newAPIUserID string, conversationTTL, userCooldown time.Duration) (*PromptConversationLock, bool, error) {
+	if err := db.ensurePromptConversationLocksTable(ctx); err != nil {
+		return nil, false, err
+	}
+	lockKey = strings.ToLower(strings.TrimSpace(lockKey))
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	newAPIUserID = strings.TrimSpace(newAPIUserID)
+	if len(lockKey) != 64 || platform == "" || newAPIUserID == "" {
+		return nil, false, sql.ErrNoRows
+	}
+	now := time.Now().UTC()
+	conversationCutoff := time.Unix(0, 0).UTC()
+	if conversationTTL > 0 {
+		conversationCutoff = now.Add(-conversationTTL)
+	}
+	userCutoff := now
+	if userCooldown > 0 {
+		userCutoff = now.Add(-userCooldown)
+	}
+	query := promptConversationLockSelect + ` WHERE status='active' AND (
+		(lock_key=$1 AND locked_at>$4) OR
+		(platform=$2 AND newapi_user_id=$3 AND locked_at>$5)
+	) ORDER BY CASE WHEN lock_key=$1 THEN 0 ELSE 1 END, locked_at DESC LIMIT 1`
+	item, err := scanPromptConversationLock(db.conn.QueryRowContext(ctx, query,
+		lockKey, platform, newAPIUserID, conversationCutoff, userCutoff,
+	))
+	if err != nil {
+		return nil, false, err
+	}
+	return item, item.LockKey == lockKey, nil
 }
 
 func (db *DB) GetActivePromptConversationLockBySessionHash(ctx context.Context, sessionHash string) (*PromptConversationLock, error) {

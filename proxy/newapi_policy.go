@@ -715,6 +715,8 @@ func newAPIPolicyDecisionAPIError(metadata newAPIPolicyDecisionMetadata) *api.AP
 		}
 	} else if metadata.ReasonCode == promptConversationLockedReasonCode {
 		message = promptConversationLockedMessage
+	} else if metadata.ReasonCode == promptUserCyberCooldownReasonCode {
+		message = promptUserCyberCooldownMessage
 	}
 	apiErr := api.NewAPIError(api.ErrorCode("request_policy_violation"), message, api.ErrorTypeInvalidRequest)
 	apiErr.Details = newAPIPolicyDecisionDetails(metadata)

@@ -71,3 +71,47 @@ func TestPromptConversationLockExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("expired stored lock = %#v err=%v", stored, err)
 	}
 }
+
+func TestPromptConversationRestrictionUsesBoundedUserCooldownAcrossSessions(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	input := PromptConversationLockInput{
+		LockKey:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Platform: "newapi", NewAPIUserID: "42",
+		SessionFingerprint: "0123456789abcdef0123456789abcdef", SessionHash: "session-a",
+		IncidentID: "incident-cooldown", DecisionID: "decision-cooldown", ReasonCode: "upstream_cyber_policy",
+		LockedAt: time.Now().UTC(),
+	}
+	if _, _, err := db.LockPromptConversation(ctx, input); err != nil {
+		t.Fatalf("LockPromptConversation: %v", err)
+	}
+
+	otherLockKey := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	item, exact, err := db.GetActivePromptConversationRestriction(ctx, otherLockKey, "newapi", "42", 24*time.Hour, 30*time.Minute)
+	if err != nil || exact || item.DecisionID != input.DecisionID {
+		t.Fatalf("user cooldown restriction = %#v exact=%t err=%v", item, exact, err)
+	}
+
+	if _, _, err := db.GetActivePromptConversationRestriction(ctx, otherLockKey, "newapi", "43", 24*time.Hour, 30*time.Minute); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("different user inherited cooldown: %v", err)
+	}
+	if _, _, err := db.GetActivePromptConversationRestriction(ctx, otherLockKey, "other-platform", "42", 24*time.Hour, 30*time.Minute); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("different platform inherited cooldown: %v", err)
+	}
+
+	if _, _, err := db.GetActivePromptConversationRestriction(ctx, otherLockKey, "newapi", "42", 24*time.Hour, -time.Second); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("disabled cooldown returned restriction: %v", err)
+	}
+}
+
+func TestPromptConversationLockCreatesUserCooldownIndex(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	if err := db.ensurePromptConversationLocksTable(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	err := db.conn.QueryRowContext(t.Context(), `SELECT name FROM sqlite_master WHERE type='index' AND name=$1`, "idx_prompt_conversation_locks_user_cooldown").Scan(&name)
+	if err != nil || name != "idx_prompt_conversation_locks_user_cooldown" {
+		t.Fatalf("user cooldown index = %q err=%v", name, err)
+	}
+}

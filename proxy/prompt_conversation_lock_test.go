@@ -83,10 +83,32 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	}
 
 	otherFingerprint := "fedcba9876543210fedcba9876543210"
-	other := signedBoundNewAPIPolicyContext(t, "cyb-lock-other", identity, body, 101, "gateway-a", "gateway-a-secret", otherFingerprint)
+	other := signedBoundNewAPIPolicyContext(t, "cyb-lock-other", newAPIIdentity{UserID: "43", ClientIP: "203.0.113.9"}, body, 101, "gateway-a", "gateway-a-secret", otherFingerprint)
 	setIngressRequestBodyIfAbsent(other, body)
 	if blocked := handler.inspectPromptFilterOpenAI(other, body, "/v1/responses", "gpt-5.5"); blocked {
-		t.Fatal("new conversation was blocked by another conversation's CYB lock")
+		t.Fatal("different user was blocked by another user's CYB lock")
+	}
+}
+
+func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
+	handler, _ := newPromptConversationLockTestHandler(t)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-first", identity, body, 101, "gateway-a", "gateway-a-secret", "0123456789abcdef0123456789abcdef")
+	setIngressRequestBodyIfAbsent(first, body)
+	handler.logUpstreamCyberPolicy(first, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
+
+	churned := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-churned", identity, body, 101, "gateway-a", "gateway-a-secret", "fedcba9876543210fedcba9876543210")
+	setIngressRequestBodyIfAbsent(churned, body)
+	if blocked := handler.inspectPromptFilterOpenAI(churned, body, "/v1/responses", "gpt-5.5"); !blocked {
+		t.Fatal("verified user bypassed CYB cooldown by changing session fingerprint")
+	}
+	metadata := policyDecisionMetadataFromHeaders(churned.Writer.Header())
+	if metadata.ReasonCode != promptUserCyberCooldownReasonCode || metadata.StrikeEligible {
+		t.Fatalf("user cooldown metadata = %+v", metadata)
+	}
+	if message := newAPIPolicyDecisionAPIError(metadata).Message; !strings.Contains(message, "30 分钟安全冷却期") || !strings.Contains(message, "不会重复累计处罚") {
+		t.Fatalf("user cooldown message = %q", message)
 	}
 }
 
@@ -167,7 +189,7 @@ func TestExpiredConversationLockDoesNotBlockSignedConversation(t *testing.T) {
 	if blocked := handler.inspectPromptFilterOpenAI(c, body, "/v1/responses", "gpt-5.5"); blocked {
 		t.Fatal("expired conversation lock blocked request")
 	}
-	if _, err := db.GetActivePromptConversationLock(t.Context(), identity.LockKey); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := db.GetActivePromptConversationLockWithTTL(t.Context(), identity.LockKey, time.Hour); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expired conversation lock remained active: %v", err)
 	}
 }

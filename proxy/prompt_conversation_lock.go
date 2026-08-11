@@ -21,7 +21,10 @@ import (
 const (
 	promptConversationLockedReasonCode = "conversation_cyber_locked"
 	promptConversationLockedMessage    = "此对话因触发网络安全策略（CYB）已被锁定，请新建对话后继续。本次锁定拦截不会重复累计；在新对话中再次触发 CYB 可能会停用账号。如果确认是误判，请联系管理员解锁。"
+	promptUserCyberCooldownReasonCode  = "user_cyber_cooldown"
+	promptUserCyberCooldownMessage     = "该用户刚刚触发网络安全策略（CYB），现处于 30 分钟安全冷却期。冷却期间的新请求不会继续转发，也不会重复累计处罚；如确认是误判，请联系管理员处理。"
 	promptConversationLockCacheTTL     = 30 * time.Second
+	promptUserCyberCooldownTTL         = 30 * time.Minute
 )
 
 type promptConversationLockIdentity struct {
@@ -58,6 +61,26 @@ func promptConversationLockExpired(item *database.PromptConversationLock, ttl ti
 	return item == nil || (ttl > 0 && !item.LockedAt.After(time.Now().UTC().Add(-ttl)))
 }
 
+func promptCyberRestrictionDecision(item *database.PromptConversationLock) (string, string) {
+	if item != nil && item.ReasonCode == promptUserCyberCooldownReasonCode {
+		return promptUserCyberCooldownReasonCode, promptUserCyberCooldownMessage
+	}
+	return promptConversationLockedReasonCode, promptConversationLockedMessage
+}
+
+func promptCyberRestrictionLock(item *database.PromptConversationLock, exactConversation bool) *database.PromptConversationLock {
+	if item == nil {
+		return nil
+	}
+	copy := *item
+	if exactConversation {
+		copy.ReasonCode = promptConversationLockedReasonCode
+	} else {
+		copy.ReasonCode = promptUserCyberCooldownReasonCode
+	}
+	return &copy
+}
+
 func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.Config, signedBody []byte) (*database.PromptConversationLock, bool) {
 	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
 		return nil, false
@@ -75,14 +98,17 @@ func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.
 		if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey); err == nil && found {
 			var item database.PromptConversationLock
 			if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive && !promptConversationLockExpired(&item, lockTTL) {
-				return &item, true
+				return promptCyberRestrictionLock(&item, true), true
 			}
 			_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey)
 		}
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
-	item, err := h.db.GetActivePromptConversationLockWithTTL(ctx, identity.LockKey, lockTTL)
+	item, exactConversation, err := h.db.GetActivePromptConversationRestriction(
+		ctx, identity.LockKey, identity.Platform, identity.NewAPIUserID,
+		lockTTL, promptUserCyberCooldownTTL,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false
 	}
@@ -90,8 +116,10 @@ func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.
 		log.Printf("check prompt conversation lock failed key=%s: %v", identity.LockKey[:12], err)
 		return nil, false
 	}
-	h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
-	return item, true
+	if exactConversation {
+		h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
+	}
+	return promptCyberRestrictionLock(item, exactConversation), true
 }
 
 func (h *Handler) cachePromptConversationLock(ctx context.Context, item *database.PromptConversationLock, lockTTL time.Duration) {
@@ -147,9 +175,11 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 }
 
 func (h *Handler) rejectLockedPromptConversation(c *gin.Context, cfg promptfilter.Config, signedBody, responseBody []byte, endpoint, model string) bool {
-	if _, locked := h.activePromptConversationLock(c, cfg, signedBody); !locked {
+	item, locked := h.activePromptConversationLock(c, cfg, signedBody)
+	if !locked {
 		return false
 	}
+	reasonCode, message := promptCyberRestrictionDecision(item)
 	profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))
 	switch profile {
 	case promptfilter.GuardProfileBalanced, promptfilter.GuardProfileStrict, promptfilter.GuardProfileResearch:
@@ -158,16 +188,16 @@ func (h *Handler) rejectLockedPromptConversation(c *gin.Context, cfg promptfilte
 	}
 	decision := promptfilter.Decision{
 		Action: promptfilter.ActionBlock, Profile: profile,
-		ReasonCode: promptConversationLockedReasonCode, StrikeEligible: false, Terminal: true,
+		ReasonCode: reasonCode, StrikeEligible: false, Terminal: true,
 	}
-	verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: promptConversationLockedMessage, FullText: promptConversationLockedReasonCode}
+	verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: message, FullText: reasonCode}
 	if h.sendNewAPIPolicyDecision(c, cfg, decision, verdict, responseBody, endpoint, model, signedBody) {
 		return true
 	}
 	if requestUsesAnthropicErrorEnvelope(c) {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptConversationLockedMessage)
+		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", message)
 		return true
 	}
-	api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(promptConversationLockedReasonCode), promptConversationLockedMessage, api.ErrorTypeInvalidRequest), http.StatusBadRequest)
+	api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(reasonCode), message, api.ErrorTypeInvalidRequest), http.StatusBadRequest)
 	return true
 }
