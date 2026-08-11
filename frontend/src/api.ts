@@ -73,6 +73,10 @@ import type {
   PromptReviewTestResponse,
   PromptReviewAPIKeysResponse,
   ProfitDashboardResponse,
+  ProfitDashboardDimension,
+  ProfitAPIKeyAssignment,
+  ProfitPairRateSetting,
+  ProfitAccountEconomicSetting,
   ProfitGroupSetting,
   ProfitLedgerRefreshResult,
   ProfitPendingAccount,
@@ -1007,6 +1011,21 @@ export const api = {
 		if (params.ratioPPM && params.ratioPPM > 0) search.set('ratio_ppm', String(params.ratioPPM))
 		return request<ProfitDashboardResponse>(`/profit/dashboard?${search.toString()}`)
 	},
+	getProfitDashboardDimension: (dimension: 'group' | 'api_key' | 'account' | 'model', params: { startDate: string; endDate: string; page?: number; pageSize?: number }) => {
+		const search = new URLSearchParams({ start_date: params.startDate, end_date: params.endDate })
+		search.set('page', String(params.page ?? 1))
+		search.set('page_size', String(params.pageSize ?? 100))
+		return request<{ items: ProfitDashboardDimension[]; page: number; page_size: number }>(`/profit/dimensions/${dimension}?${search.toString()}`)
+	},
+	listProfitAPIKeyAssignments: () => request<{ api_keys: ProfitAPIKeyAssignment[] }>('/profit/api-key-assignments'),
+	assignProfitAPIKeyConsumerGroup: (id: number, data: { consumer_group_id: number; apply_history: boolean; reason?: string }) =>
+		request<ProfitAPIKeyAssignment>(`/profit/api-key-assignments/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+	listProfitPairRates: () => request<{ rates: ProfitPairRateSetting[]; system_default_rate_ppm: number }>('/profit/pair-rates'),
+	updateProfitPairRate: (data: { consumer_group_id: number; owner_group_id: number; rate_ppm: number; effective_date: string; reason?: string }) =>
+		request<ProfitPairRateSetting>('/profit/pair-rates', { method: 'PUT', body: JSON.stringify(data) }),
+	listProfitAccountEconomics: (month: string) => request<{ accounts: ProfitAccountEconomicSetting[]; defaults: { monthly_fixed_cost_usd_micros: number; monthly_capacity_usd_micros: number } }>(`/profit/account-economics?month=${encodeURIComponent(month)}`),
+	updateProfitAccountEconomic: (id: number, data: { effective_month: string; monthly_fixed_cost_usd_micros: number; monthly_capacity_usd_micros: number; reason?: string }) =>
+		request<ProfitAccountEconomicSetting>(`/profit/account-economics/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
 	listProfitSettlements: (limit = 50) => request<{ settlements: ProfitSettlementRun[] }>(`/profit/settlements?limit=${limit}`),
 	createProfitSettlement: (data: { start_date: string; end_date: string; settlement_ratio_ppm: number; notes?: string }) =>
 		request<ProfitSettlementDetail>('/profit/settlements', { method: 'POST', body: JSON.stringify(data) }),

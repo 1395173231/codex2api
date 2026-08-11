@@ -86,6 +86,119 @@ func (h *Handler) UpdateProfitGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, group)
 }
 
+func (h *Handler) ListProfitAPIKeyAssignments(c *gin.Context) {
+	items, err := h.db.ListProfitAPIKeyAssignments(c.Request.Context())
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"api_keys": items})
+}
+
+func (h *Handler) AssignProfitAPIKeyConsumerGroup(c *gin.Context) {
+	apiKeyID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || apiKeyID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "API Key ID 无效"})
+		return
+	}
+	var request struct {
+		ConsumerGroupID int64  `json:"consumer_group_id" binding:"required"`
+		ApplyHistory    bool   `json:"apply_history"`
+		Reason          string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || request.ConsumerGroupID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "使用方分组无效"})
+		return
+	}
+	item, err := h.db.AssignProfitAPIKeyConsumerGroup(c.Request.Context(), apiKeyID, database.ProfitAPIKeyAssignmentUpdate{
+		ConsumerGroupID: request.ConsumerGroupID,
+		ApplyHistory:    request.ApplyHistory,
+		Actor:           "admin@" + c.ClientIP(),
+		Reason:          request.Reason,
+		Source:          "manual",
+	})
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	security.SecurityAuditLog("PROFIT_API_KEY_OWNER_ASSIGNED", fmt.Sprintf(
+		"api_key_id=%d consumer_group_id=%d apply_history=%t ip=%s", apiKeyID, request.ConsumerGroupID,
+		request.ApplyHistory, c.ClientIP()))
+	c.JSON(http.StatusOK, item)
+}
+
+func (h *Handler) ListProfitPairRates(c *gin.Context) {
+	items, err := h.db.ListProfitPairRates(c.Request.Context())
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rates": items, "system_default_rate_ppm": database.DefaultProfitPairRatePPM})
+}
+
+func (h *Handler) UpdateProfitPairRate(c *gin.Context) {
+	var request struct {
+		ConsumerGroupID int64  `json:"consumer_group_id" binding:"required"`
+		OwnerGroupID    int64  `json:"owner_group_id" binding:"required"`
+		RatePPM         int64  `json:"rate_ppm"`
+		EffectiveDate   string `json:"effective_date"`
+		Reason          string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数无效: " + err.Error()})
+		return
+	}
+	item, err := h.db.UpdateProfitPairRate(c.Request.Context(), request.ConsumerGroupID, request.OwnerGroupID,
+		request.RatePPM, request.EffectiveDate, "admin@"+c.ClientIP(), request.Reason)
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	security.SecurityAuditLog("PROFIT_PAIR_RATE_UPDATED", fmt.Sprintf("consumer_group_id=%d owner_group_id=%d rate_ppm=%d effective_date=%s ip=%s",
+		request.ConsumerGroupID, request.OwnerGroupID, request.RatePPM, item.EffectiveDate, c.ClientIP()))
+	c.JSON(http.StatusOK, item)
+}
+
+func (h *Handler) ListProfitAccountEconomics(c *gin.Context) {
+	items, err := h.db.ListProfitAccountEconomics(c.Request.Context(), c.Query("month"))
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"accounts": items,
+		"defaults": gin.H{"monthly_fixed_cost_usd_micros": database.DefaultProfitAccountCostMicros,
+			"monthly_capacity_usd_micros": database.DefaultProfitAccountCapacityMicros},
+	})
+}
+
+func (h *Handler) UpdateProfitAccountEconomic(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "账号 ID 无效"})
+		return
+	}
+	var request struct {
+		EffectiveMonth            string `json:"effective_month" binding:"required"`
+		MonthlyFixedCostUSDMicros int64  `json:"monthly_fixed_cost_usd_micros"`
+		MonthlyCapacityUSDMicros  int64  `json:"monthly_capacity_usd_micros" binding:"required"`
+		Reason                    string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数无效: " + err.Error()})
+		return
+	}
+	item, err := h.db.UpdateProfitAccountEconomic(c.Request.Context(), accountID, request.EffectiveMonth,
+		request.MonthlyFixedCostUSDMicros, request.MonthlyCapacityUSDMicros, "admin@"+c.ClientIP(), request.Reason)
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	security.SecurityAuditLog("PROFIT_ACCOUNT_ECONOMIC_UPDATED", fmt.Sprintf("account_id=%d effective_month=%s cost=%d capacity=%d ip=%s",
+		accountID, item.EffectiveMonth, item.MonthlyFixedCostUSDMicros, item.MonthlyCapacityUSDMicros, c.ClientIP()))
+	c.JSON(http.StatusOK, item)
+}
+
 func (h *Handler) ListProfitPendingAccounts(c *gin.Context) {
 	items, err := h.db.ListProfitPendingAccounts(c.Request.Context())
 	if err != nil {
@@ -197,7 +310,7 @@ func (h *Handler) RefreshProfitLedger(c *gin.Context) {
 		}
 	}
 	h.db.FlushUsageLogs()
-	result, err := h.db.RefreshProfitDailyLedger(c.Request.Context(), request.Limit)
+	result, err := h.db.RefreshProfitDailyLedgerBatched(c.Request.Context(), request.Limit)
 	if err != nil {
 		writeProfitError(c, err)
 		return
@@ -239,6 +352,24 @@ func (h *Handler) GetProfitDashboard(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetProfitDashboardDimension(c *gin.Context) {
+	startDate, endDate := defaultProfitDateRange()
+	if value := strings.TrimSpace(c.Query("start_date")); value != "" {
+		startDate = value
+	}
+	if value := strings.TrimSpace(c.Query("end_date")); value != "" {
+		endDate = value
+	}
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
+	items, err := h.db.GetProfitDashboardDimension(c.Request.Context(), startDate, endDate, c.Param("dimension"), page, pageSize)
+	if err != nil {
+		writeProfitError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "page": page, "page_size": pageSize})
 }
 
 type profitSettlementRequest struct {
@@ -334,23 +465,42 @@ func (h *Handler) ExportProfitSettlement(c *gin.Context) {
 	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(c.Writer)
-	_ = writer.Write([]string{"日期", "结算分组", "API Key", "上游账号", "账号状态", "模型", "渠道", "请求数", "Token", "官方成本(USD)", "结算成本(CNY)", "收入(CNY)", "利润(CNY)", "结算比例", "分组倍率", "账本行ID", "来源日志范围", "来源哈希"})
+	money := func(value int64) string {
+		return fmt.Sprintf("%.6f", float64(value)/float64(database.ProfitScalePPM))
+	}
+	_ = writer.Write([]string{"结算方向明细"})
+	_ = writer.Write([]string{"日期", "使用方分组", "账号所有方分组", "API Key", "上游账号", "账号状态", "模型", "渠道", "请求数", "Token", "官方用量(USD)", "方向比例(CNY/USD)", "应付(CNY)", "应收(CNY)", "自己账号用量", "不可结算原因", "账本行ID", "账本版本", "来源日志范围", "来源哈希"})
 	for _, item := range detail.Items {
 		accountStatus := "正常"
 		if item.AccountDeleted {
 			accountStatus = "已删除"
 		}
 		_ = writer.Write([]string{
-			item.LedgerDate, item.GroupName, item.APIKeyName, item.AccountName, accountStatus, item.Model, item.Channel,
+			item.LedgerDate, item.ConsumerGroupName, item.OwnerGroupName, item.APIKeyName, item.AccountName,
+			accountStatus, item.Model, item.Channel,
 			strconv.FormatInt(item.RequestCount, 10), strconv.FormatInt(item.TotalTokens, 10),
-			fmt.Sprintf("%.6f", float64(item.OfficialUSDMicros)/float64(database.ProfitScalePPM)),
-			fmt.Sprintf("%.6f", float64(item.SettlementCNYMicros)/float64(database.ProfitScalePPM)),
-			fmt.Sprintf("%.6f", float64(item.RevenueCNYMicros)/float64(database.ProfitScalePPM)),
-			fmt.Sprintf("%.6f", float64(item.ProfitCNYMicros)/float64(database.ProfitScalePPM)),
-			fmt.Sprintf("%.6f", float64(detail.Run.SettlementRatioPPM)/float64(database.ProfitScalePPM)),
-			fmt.Sprintf("%.6f", float64(item.MultiplierPPM)/float64(database.ProfitScalePPM)),
-			strconv.FormatInt(item.LedgerRowID, 10),
+			money(item.OfficialUSDMicros), money(item.RatePPM), money(item.PayableCNYMicros),
+			money(item.ReceivableCNYMicros), strconv.FormatBool(item.SelfUsage), item.NonSettleableReason,
+			strconv.FormatInt(item.LedgerRowID, 10), strconv.FormatInt(item.LedgerVersion, 10),
 			fmt.Sprintf("%d-%d", item.SourceFirstLogID, item.SourceLastLogID), item.SourceHash,
+		})
+	}
+	_ = writer.Write(nil)
+	_ = writer.Write([]string{"账号固定成本回收"})
+	_ = writer.Write([]string{"账号", "账号状态", "账号所有方分组", "月份", "月固定成本(USD)", "月估算额度(USD)", "本范围用量(USD)", "本月总用量(USD)", "此前已回收(USD)", "本次回收(USD)", "本次回收(CNY)", "回收后累计(USD)", "尚未回收(USD)", "额度利用率", "成本覆盖率", "成本折算比例", "状态"})
+	for _, item := range detail.AccountROI {
+		accountStatus := "正常"
+		if item.AccountDeleted {
+			accountStatus = "已删除"
+		}
+		_ = writer.Write([]string{
+			item.AccountName, accountStatus, item.OwnerGroupName, item.EffectiveMonth,
+			money(item.MonthlyFixedCostUSDMicros), money(item.MonthlyCapacityUSDMicros),
+			money(item.UsageInManifestUSDMicros), money(item.MonthTotalUsageUSDMicros),
+			money(item.AllocatedBeforeUSDMicros), money(item.AllocatedInRangeUSDMicros),
+			money(item.AllocatedInRangeCNYMicros), money(item.AllocatedAfterUSDMicros),
+			money(item.RemainingFixedCostUSDMicros), money(item.UtilizationPPM), money(item.CostCoveragePPM),
+			money(item.CostFXPPM), item.Status,
 		})
 	}
 	writer.Flush()

@@ -30,6 +30,7 @@ type internalResponseAttribution struct {
 	APIKeyName                   string
 	APIKeyMasked                 string
 	APIKeyRow                    *database.APIKeyRow
+	ProfitConsumerAttribution    database.ProfitConsumerAttribution
 	ClientIP                     string
 	ClientUserAgent              string
 	Reason                       string
@@ -57,6 +58,9 @@ func internalResponseAttributionFromRequest(c *gin.Context, reason string) *inte
 	if value, exists := c.Get(contextAPIKeyMasked); exists {
 		attribution.APIKeyMasked, _ = value.(string)
 	}
+	if value, exists := c.Get(contextProfitConsumerAttribution); exists {
+		attribution.ProfitConsumerAttribution, _ = value.(database.ProfitConsumerAttribution)
+	}
 	if requestContext := api.GetRequestContext(c); requestContext != nil {
 		attribution.ParentRequestID = strings.TrimSpace(requestContext.RequestID)
 	}
@@ -77,6 +81,9 @@ func applyInternalResponseAttribution(c *gin.Context, req *http.Request, attribu
 	c.Set(contextAPIKeyMasked, strings.TrimSpace(attribution.APIKeyMasked))
 	if attribution.APIKeyRow != nil {
 		c.Set(contextAPIKeyRow, attribution.APIKeyRow)
+	}
+	if attribution.ProfitConsumerAttribution.SourceType != "" {
+		c.Set(contextProfitConsumerAttribution, attribution.ProfitConsumerAttribution)
 	}
 	if clientIP := strings.TrimSpace(attribution.ClientIP); clientIP != "" {
 		req.RemoteAddr = net.JoinHostPort(clientIP, "0")

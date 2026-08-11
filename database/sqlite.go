@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -70,6 +71,29 @@ func (db *DB) withSQLiteWriteLock(ctx context.Context, fn func() error) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// withWriteTx is the single top-level transaction entry point for mutations that
+// can run on SQLite. SQLite callers acquire the process writer gate before BEGIN
+// and release it only after commit/rollback; PostgreSQL callers keep the normal
+// database transaction behavior. Internal helpers must accept the provided tx
+// instead of acquiring the gate again, otherwise nested calls can deadlock.
+func (db *DB) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	if db == nil || db.conn == nil {
+		return errors.New("database is not initialized")
+	}
+	run := func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	return db.withSQLiteWriteLock(ctx, run)
 }
 
 func (db *DB) configureSQLite(ctx context.Context) error {

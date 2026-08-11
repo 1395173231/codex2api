@@ -93,9 +93,11 @@ func TestProfitSnapshotDashboardAndSettlementRevision(t *testing.T) {
 	if dashboard.Overall.OfficialUSDMicros <= 0 {
 		t.Fatalf("official cost should be positive: %+v", dashboard.Overall)
 	}
-	wantRevenue := profitMulDiv(dashboard.Overall.OfficialUSDMicros, 1_200_000, ProfitScalePPM)
-	if dashboard.Overall.RevenueCNYMicros != wantRevenue {
-		t.Fatalf("revenue = %d, want %d", dashboard.Overall.RevenueCNYMicros, wantRevenue)
+	if dashboard.Overall.RevenueCNYMicros != 0 || dashboard.Overall.SettlementCNYMicros != 0 {
+		t.Fatalf("unbound system usage must not create bilateral settlement: %+v", dashboard.Overall)
+	}
+	if dashboard.Settlement.NonSettleableUSDMicros != dashboard.Overall.OfficialUSDMicros {
+		t.Fatalf("non-settleable usage = %d, want %d", dashboard.Settlement.NonSettleableUSDMicros, dashboard.Overall.OfficialUSDMicros)
 	}
 	draft, err := db.CreateProfitSettlementDraft(ctx, startDate, endDate, ProfitScalePPM, "首版")
 	if err != nil {
@@ -124,6 +126,318 @@ func TestProfitSnapshotDashboardAndSettlementRevision(t *testing.T) {
 	}
 	if oldRun.Run.Status != "superseded" {
 		t.Fatalf("old status = %s, want superseded", oldRun.Run.Status)
+	}
+}
+
+func TestProfitDirectionalSettlementAndAccountCostRecovery(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	consumerResult, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name,channel) VALUES ('凡人','codex')`)
+	if err != nil {
+		t.Fatalf("insert consumer group: %v", err)
+	}
+	consumerID, _ := consumerResult.LastInsertId()
+	ownerResult, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name,channel) VALUES ('打铁','codex')`)
+	if err != nil {
+		t.Fatalf("insert owner group: %v", err)
+	}
+	ownerID, _ := ownerResult.LastInsertId()
+	accountResult, err := db.conn.ExecContext(ctx, `INSERT INTO accounts
+		(name,platform,type,credentials,status) VALUES ('Pro20x','openai','oauth','{}','active')`)
+	if err != nil {
+		t.Fatalf("insert owner account: %v", err)
+	}
+	accountID, _ := accountResult.LastInsertId()
+	startDate, endDate := profitTestDateRange()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO profit_daily_ledger
+		(ledger_date,segment,api_key_id,api_key_name_snapshot,consumer_source_type,consumer_source_id,
+		 consumer_assignment_version_id,consumer_group_id,consumer_group_name_snapshot,consumer_assignment_source,
+		 account_id,account_name_snapshot,channel,model,settlement_group_id,settlement_group_name_snapshot,
+		 assignment_source,request_count,total_tokens,official_cost_usd_micros,source_first_log_id,source_last_log_id,source_hash)
+		VALUES ($1,0,101,'凡人-Key','api_key','101',1,$2,'凡人','manual',$3,'Pro20x','codex','gpt-5.4',$4,'打铁','confirmed',1,1000,$5,1,1,'cross')`,
+		startDate, consumerID, accountID, ownerID, int64(4000)*ProfitScalePPM); err != nil {
+		t.Fatalf("insert cross-group ledger: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO profit_daily_ledger
+		(ledger_date,segment,api_key_id,api_key_name_snapshot,consumer_source_type,consumer_source_id,
+		 consumer_assignment_version_id,consumer_group_id,consumer_group_name_snapshot,consumer_assignment_source,
+		 account_id,account_name_snapshot,channel,model,settlement_group_id,settlement_group_name_snapshot,
+		 assignment_source,request_count,total_tokens,official_cost_usd_micros,source_first_log_id,source_last_log_id,source_hash)
+		VALUES ($1,1,102,'打铁-Key','api_key','102',2,$2,'打铁','manual',$3,'Pro20x','codex','gpt-5.4',$2,'打铁','confirmed',1,1000,$4,2,2,'self')`,
+		startDate, ownerID, accountID, int64(1000)*ProfitScalePPM); err != nil {
+		t.Fatalf("insert same-group ledger: %v", err)
+	}
+	draft, err := db.CreateProfitSettlementDraft(ctx, startDate, endDate, ProfitScalePPM, "方向结算")
+	if err != nil {
+		t.Fatalf("create directional draft: %v", err)
+	}
+	wantSettlement := int64(400) * ProfitScalePPM
+	if draft.Run.PayableCNYMicros != wantSettlement || draft.Run.ReceivableCNYMicros != wantSettlement {
+		t.Fatalf("directional settlement payable=%d receivable=%d, want %d", draft.Run.PayableCNYMicros,
+			draft.Run.ReceivableCNYMicros, wantSettlement)
+	}
+	if len(draft.Items) != 2 || draft.Items[0].PayableCNYMicros+draft.Items[1].PayableCNYMicros != wantSettlement {
+		t.Fatalf("unexpected settlement items: %+v", draft.Items)
+	}
+	if len(draft.AccountROI) != 1 {
+		t.Fatalf("account ROI count=%d, want 1", len(draft.AccountROI))
+	}
+	roi := draft.AccountROI[0]
+	if roi.MonthlyFixedCostUSDMicros != 200*ProfitScalePPM || roi.MonthlyCapacityUSDMicros != 10_000*ProfitScalePPM {
+		t.Fatalf("unexpected default account economics: %+v", roi)
+	}
+	if roi.AllocatedInRangeUSDMicros != 100*ProfitScalePPM || roi.RemainingFixedCostUSDMicros != 100*ProfitScalePPM {
+		t.Fatalf("fixed-cost recovery should allocate 100 USD from 5000/10000 usage: %+v", roi)
+	}
+	confirmed, err := db.ConfirmProfitSettlement(ctx, draft.Run.ID)
+	if err != nil {
+		t.Fatalf("confirm directional settlement: %v", err)
+	}
+	if confirmed.AccountROI[0].Status != "confirmed" {
+		t.Fatalf("ROI status=%q, want confirmed", confirmed.AccountROI[0].Status)
+	}
+	var activeAllocation int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT SUM(allocated_usd_micros) FROM profit_account_cost_allocations
+		WHERE account_id=$1 AND active=$2`, accountID, true).Scan(&activeAllocation); err != nil {
+		t.Fatalf("read active account allocation: %v", err)
+	}
+	if activeAllocation != 100*ProfitScalePPM {
+		t.Fatalf("active fixed-cost allocation=%d, want %d", activeAllocation, 100*ProfitScalePPM)
+	}
+}
+
+func TestProfitSettlementRejectsIncompleteIngestionRange(t *testing.T) {
+	db := newProfitTestDB(t)
+	startDate, endDate := profitTestDateRange()
+	if err := db.recordProfitIngestionEvent(context.Background(), "drop", UsageLogModeFull, 3, "test gap"); err != nil {
+		t.Fatalf("record ingestion gap: %v", err)
+	}
+	if _, err := db.CreateProfitSettlementDraft(context.Background(), startDate, endDate, ProfitScalePPM, "不完整范围"); !errors.Is(err, ErrProfitIngestionIncomplete) {
+		t.Fatalf("create draft error = %v, want ErrProfitIngestionIncomplete", err)
+	}
+	var failedRuns int64
+	if err := db.conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM profit_settlement_runs
+		WHERE status='build_failed' AND build_error<>''`).Scan(&failedRuns); err != nil {
+		t.Fatalf("read failed settlement runs: %v", err)
+	}
+	if failedRuns != 1 {
+		t.Fatalf("failed settlement runs=%d, want 1", failedRuns)
+	}
+}
+
+func TestProfitLedgerBatchedCatchUpKeepsFiniteHighWater(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, _ := insertProfitTestAccountAndGroup(t, db, false)
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin usage seed: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO usage_logs
+		(account_id,channel,model,effective_model,status_code,total_tokens,account_billed,created_at)
+		VALUES ($1,'codex',$2,$2,200,1000,1,CURRENT_TIMESTAMP)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare usage seed: %v", err)
+	}
+	for i := 0; i < 250; i++ {
+		if _, err := stmt.ExecContext(ctx, accountID, fmt.Sprintf("gpt-batch-%03d", i)); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert usage seed %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("close usage seed: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit usage seed: %v", err)
+	}
+	result, err := db.RefreshProfitDailyLedgerBatched(ctx, 250)
+	if err != nil {
+		t.Fatalf("batched catch-up: %v", err)
+	}
+	if result.ProcessedLogs != 250 || result.CheckpointID != 250 || result.HighWaterID != 250 || !result.CaughtUp {
+		t.Fatalf("unexpected batched catch-up result: %+v", result)
+	}
+}
+
+func TestProfitHistoryPreventsNormalAccountPurge(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, groupID := insertProfitTestAccountAndGroup(t, db, true)
+	startDate, _ := profitTestDateRange()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO profit_daily_ledger
+		(ledger_date,segment,consumer_source_type,consumer_source_id,consumer_group_id,consumer_group_name_snapshot,
+		 account_id,account_name_snapshot,channel,model,settlement_group_id,settlement_group_name_snapshot,
+		 assignment_source,request_count,total_tokens,official_cost_usd_micros,source_first_log_id,source_last_log_id,source_hash)
+		VALUES ($1,0,'system_internal','test',0,'',$2,'测试账号','codex','gpt-5.4',$3,'结算一组',
+		'confirmed',1,1000,$4,1,1,'purge-guard')`, startDate, accountID, groupID, ProfitScalePPM); err != nil {
+		t.Fatalf("insert protected ledger: %v", err)
+	}
+	if err := db.PurgeAccount(ctx, accountID); !errors.Is(err, ErrProfitAccountHasSettlement) {
+		t.Fatalf("normal purge error = %v, want ErrProfitAccountHasSettlement", err)
+	}
+	count, err := db.PurgeDeletedAccounts(ctx)
+	if err != nil {
+		t.Fatalf("purge recycle bin: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("purged protected account count=%d, want 0", count)
+	}
+	var remaining int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id=$1`, accountID).Scan(&remaining); err != nil {
+		t.Fatalf("read protected account: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("protected account remaining=%d, want 1", remaining)
+	}
+}
+
+func TestProfitAPIKeyAssignmentPreservesRequestSnapshotsAndBackfillsPendingHistory(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, ownerGroupID := insertProfitTestAccountAndGroup(t, db, false)
+	if err := db.AssignProfitSettlementGroup(ctx, accountID, ownerGroupID); err != nil {
+		t.Fatalf("assign account owner: %v", err)
+	}
+	consumerAResult, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name,channel) VALUES ('凡人','codex')`)
+	if err != nil {
+		t.Fatalf("insert consumer A: %v", err)
+	}
+	consumerA, _ := consumerAResult.LastInsertId()
+	consumerBResult, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name,channel) VALUES ('打铁','codex')`)
+	if err != nil {
+		t.Fatalf("insert consumer B: %v", err)
+	}
+	consumerB, _ := consumerBResult.LastInsertId()
+	keyResult, err := db.conn.ExecContext(ctx, `INSERT INTO api_keys (name,key) VALUES ('共享-Key','sk-profit-test')`)
+	if err != nil {
+		t.Fatalf("insert api key: %v", err)
+	}
+	apiKeyID, _ := keyResult.LastInsertId()
+	assignmentA, err := db.AssignProfitAPIKeyConsumerGroup(ctx, apiKeyID, ProfitAPIKeyAssignmentUpdate{ConsumerGroupID: consumerA})
+	if err != nil {
+		t.Fatalf("assign consumer A: %v", err)
+	}
+	if snapshot := db.ProfitAPIKeyAttribution(apiKeyID); snapshot.GroupID != consumerA || snapshot.AssignmentVersionID != assignmentA.AssignmentVersionID {
+		t.Fatalf("consumer A snapshot=%+v", snapshot)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(account_id,api_key_id,api_key_name,channel,model,effective_model,status_code,total_tokens,account_billed,
+		 consumer_source_type,consumer_source_id,consumer_assignment_version_id,consumer_group_id_snapshot,
+		 consumer_group_name_snapshot,settlement_group_id_snapshot,
+		 settlement_group_name_snapshot,settlement_assignment_source,created_at)
+		VALUES ($1,$2,'共享-Key','codex','gpt-5.4','gpt-5.4',200,1000,1,
+		'api_key',$3,$4,$5,'凡人',$6,'结算一组','confirmed',CURRENT_TIMESTAMP)`,
+		accountID, apiKeyID, fmt.Sprint(apiKeyID), assignmentA.AssignmentVersionID, consumerA, ownerGroupID); err != nil {
+		t.Fatalf("insert snapshotted usage: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(account_id,api_key_id,api_key_name,channel,model,effective_model,status_code,total_tokens,account_billed,
+		 settlement_group_id_snapshot,settlement_group_name_snapshot,settlement_assignment_source,created_at)
+		VALUES ($1,$2,'共享-Key','codex','gpt-5.4','gpt-5.4',200,1000,1,$3,'结算一组','confirmed',CURRENT_TIMESTAMP)`,
+		accountID, apiKeyID, ownerGroupID); err != nil {
+		t.Fatalf("insert pending historical usage: %v", err)
+	}
+	assignmentB, err := db.AssignProfitAPIKeyConsumerGroup(ctx, apiKeyID, ProfitAPIKeyAssignmentUpdate{
+		ConsumerGroupID: consumerB,
+		ApplyHistory:    true,
+		Reason:          "confirm pending historical usage",
+	})
+	if err != nil {
+		t.Fatalf("assign consumer B with history: %v", err)
+	}
+	if snapshot := db.ProfitAPIKeyAttribution(apiKeyID); snapshot.GroupID != consumerB || snapshot.AssignmentVersionID != assignmentB.AssignmentVersionID {
+		t.Fatalf("consumer B snapshot=%+v", snapshot)
+	}
+	if _, err := db.RefreshProfitDailyLedger(ctx, 100); err != nil {
+		t.Fatalf("refresh attributed ledger: %v", err)
+	}
+	rows, err := db.conn.QueryContext(ctx, `SELECT consumer_group_id, SUM(request_count) FROM profit_daily_ledger
+		WHERE api_key_id=$1 GROUP BY consumer_group_id ORDER BY consumer_group_id`, apiKeyID)
+	if err != nil {
+		t.Fatalf("query attributed ledger: %v", err)
+	}
+	defer rows.Close()
+	counts := make(map[int64]int64)
+	for rows.Next() {
+		var groupID, count int64
+		if err := rows.Scan(&groupID, &count); err != nil {
+			t.Fatalf("scan attributed ledger: %v", err)
+		}
+		counts[groupID] = count
+	}
+	if counts[consumerA] != 1 || counts[consumerB] != 1 {
+		t.Fatalf("attributed request counts=%v, want one immutable A snapshot and one B history override", counts)
+	}
+}
+
+func TestProfitSettlementBuildYieldsSQLiteWriterBetweenBatches(t *testing.T) {
+	db := newProfitTestDB(t)
+	ctx := context.Background()
+	accountID, groupID := insertProfitTestAccountAndGroup(t, db, false)
+	startDate, endDate := profitTestDateRange()
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin ledger seed: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO profit_daily_ledger
+		(ledger_date,segment,consumer_source_type,consumer_source_id,consumer_group_id,consumer_group_name_snapshot,
+		 account_id,account_name_snapshot,channel,model,settlement_group_id,settlement_group_name_snapshot,
+		 assignment_source,request_count,total_tokens,official_cost_usd_micros,source_first_log_id,source_last_log_id,source_hash)
+		VALUES ($1,$2,'api_key',$3,$4,'结算一组',$5,'测试账号','codex','gpt-5.4',$4,'结算一组',
+		'confirmed',1,1000,$6,$7,$7,$8)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare ledger seed: %v", err)
+	}
+	for i := 1; i <= 2500; i++ {
+		if _, err := stmt.ExecContext(ctx, startDate, i, fmt.Sprint(i), groupID, accountID, ProfitScalePPM, i, fmt.Sprintf("batch-%d", i)); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert ledger seed %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("close ledger seed statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit ledger seed: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, buildErr := db.CreateProfitSettlementDraft(ctx, startDate, endDate, ProfitScalePPM, "批量短事务")
+		done <- buildErr
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var building int64
+		if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_settlement_runs WHERE status='building'`).Scan(&building); err != nil {
+			t.Fatalf("read building settlement: %v", err)
+		}
+		if building > 0 {
+			break
+		}
+		select {
+		case buildErr := <-done:
+			t.Fatalf("settlement finished before concurrency check: %v", buildErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("settlement did not enter building state")
+		}
+	}
+	writerCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := db.conn.ExecContext(writerCtx, `INSERT INTO account_groups (name,channel) VALUES ('并发写入','codex')`); err != nil {
+		t.Fatalf("concurrent SQLite writer could not progress: %v", err)
+	}
+	if buildErr := <-done; buildErr != nil {
+		t.Fatalf("build settlement: %v", buildErr)
 	}
 }
 
@@ -226,8 +540,13 @@ func TestIgnoreProfitPendingAccountHidesPhysicallyMissingDeletedAccount(t *testi
 	accountID, _ := insertProfitTestAccountAndGroup(t, db, true)
 	addSecondProfitTestGroup(t, db, accountID)
 	insertPendingProfitTestUsage(t, db, accountID, 1)
-	if err := db.PurgeAccount(ctx, accountID); err != nil {
-		t.Fatalf("purge account shell: %v", err)
+	// Simulate a legacy database where an old version physically removed the account
+	// shell before profit history gained its current purge protection.
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM account_group_members WHERE account_id=$1`, accountID); err != nil {
+		t.Fatalf("delete legacy account memberships: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM accounts WHERE id=$1`, accountID); err != nil {
+		t.Fatalf("delete legacy account shell: %v", err)
 	}
 	pending, err := db.ListProfitPendingAccounts(ctx)
 	if err != nil {

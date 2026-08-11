@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  ArrowRightLeft,
   Calculator,
   CheckCircle2,
   CircleDollarSign,
   Download,
   FileClock,
   EyeOff,
+  KeyRound,
   ListChecks,
   Loader2,
   RefreshCw,
@@ -15,12 +17,16 @@ import {
   Trash2,
   TriangleAlert,
   Users,
+  WalletCards,
 } from 'lucide-react'
 import { api } from '../api'
 import type {
+  ProfitAccountEconomicSetting,
+  ProfitAPIKeyAssignment,
   ProfitDashboardDimension,
   ProfitDashboardResponse,
   ProfitGroupSetting,
+  ProfitPairRateSetting,
   ProfitPendingAccount,
   ProfitSettings,
   ProfitSettlementRun,
@@ -39,8 +45,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { cn } from '@/lib/utils'
 
 const PPM = 1_000_000
-type ProfitTab = 'dashboard' | 'pending' | 'groups' | 'settlements'
+const DIMENSION_PAGE_SIZE = 50
+type ProfitTab = 'dashboard' | 'pending' | 'keys' | 'rates' | 'economics' | 'settlements'
 type DimensionKey = 'groups' | 'api_keys' | 'accounts' | 'models'
+type DimensionAPIKey = 'group' | 'api_key' | 'account' | 'model'
 type ProfitLoadRange = { startDate: string; endDate: string }
 type PendingActionDialogState =
   | {
@@ -63,6 +71,12 @@ type PendingActionProgress = {
 
 const PURGE_PROFIT_ACCOUNT_CONFIRM = 'PURGE-PROFIT-ACCOUNT-DATA'
 const PURGE_CONFIRMATION_TEXT = '永久删除'
+const dimensionAPIKeys: Record<DimensionKey, DimensionAPIKey> = {
+  groups: 'group',
+  api_keys: 'api_key',
+  accounts: 'account',
+  models: 'model',
+}
 
 function beijingDate(offsetDays = 0) {
   const now = new Date(Date.now() + offsetDays * 86400000)
@@ -119,17 +133,31 @@ export default function ProfitCenter() {
   const [groups, setGroups] = useState<ProfitGroupSetting[]>([])
   const [pending, setPending] = useState<ProfitPendingAccount[]>([])
   const [settlements, setSettlements] = useState<ProfitSettlementRun[]>([])
+  const [apiKeyAssignments, setAPIKeyAssignments] = useState<ProfitAPIKeyAssignment[]>([])
+  const [pairRates, setPairRates] = useState<ProfitPairRateSetting[]>([])
+  const [accountEconomics, setAccountEconomics] = useState<ProfitAccountEconomicSetting[]>([])
   const [activeTab, setActiveTab] = useState<ProfitTab>('dashboard')
   const [dimension, setDimension] = useState<DimensionKey>('groups')
+  const [dimensionRows, setDimensionRows] = useState<ProfitDashboardDimension[]>([])
+  const [dimensionPage, setDimensionPage] = useState(1)
+  const [dimensionHasMore, setDimensionHasMore] = useState(false)
+  const [dimensionLoading, setDimensionLoading] = useState(false)
   const [startDate, setStartDate] = useState(startOfWeek(today))
   const [endDate, setEndDate] = useState(addDays(today, 1))
-	const [ratio, setRatio] = useState('')
+  const [ratio, setRatio] = useState('')
+  const [economicsMonth, setEconomicsMonth] = useState(`${today.slice(0, 7)}-01`)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [pendingSelections, setPendingSelections] = useState<Record<number, string>>({})
   const [selectedPendingIDs, setSelectedPendingIDs] = useState<number[]>([])
-  const [groupMultipliers, setGroupMultipliers] = useState<Record<number, string>>({})
+  const [keySelections, setKeySelections] = useState<Record<number, string>>({})
+  const [keyApplyHistory, setKeyApplyHistory] = useState<Record<number, boolean>>({})
+  const [pairConsumerGroupID, setPairConsumerGroupID] = useState('')
+  const [pairOwnerGroupID, setPairOwnerGroupID] = useState('')
+  const [pairRate, setPairRate] = useState('0.1')
+  const [pairEffectiveDate, setPairEffectiveDate] = useState(today)
+  const [accountEconomicInputs, setAccountEconomicInputs] = useState<Record<number, { cost: string; capacity: string }>>({})
   const [settlementNote, setSettlementNote] = useState('')
   const [pendingActionDialog, setPendingActionDialog] = useState<PendingActionDialogState | null>(null)
   const [pendingActionProgress, setPendingActionProgress] = useState<PendingActionProgress | null>(null)
@@ -147,19 +175,41 @@ export default function ProfitCenter() {
       const effectiveStartDate = range?.startDate ?? startDate
       const effectiveEndDate = range?.endDate ?? endDate
       const ratioPPM = Math.max(1, Math.round((Number(ratio) || profitSettings.default_settlement_ratio_ppm / PPM) * PPM))
-      const [dashboardResult, groupResult, pendingResult, settlementResult] = await Promise.all([
+      const [dashboardResult, dimensionResult, groupResult, pendingResult, settlementResult, keyResult, rateResult, economicResult] = await Promise.all([
         api.getProfitDashboard({ startDate: effectiveStartDate, endDate: effectiveEndDate, ratioPPM }),
+        api.getProfitDashboardDimension(dimensionAPIKeys[dimension], {
+          startDate: effectiveStartDate,
+          endDate: effectiveEndDate,
+          page: 1,
+          pageSize: DIMENSION_PAGE_SIZE,
+        }),
         api.listProfitGroups(),
         api.listProfitPendingAccounts(),
         api.listProfitSettlements(),
+        api.listProfitAPIKeyAssignments(),
+        api.listProfitPairRates(),
+        api.listProfitAccountEconomics(economicsMonth),
       ])
       setDashboard(dashboardResult)
+      setDimensionRows(dimensionResult.items)
+      setDimensionPage(1)
+      setDimensionHasMore(dimensionResult.items.length === DIMENSION_PAGE_SIZE)
       setGroups(groupResult.groups)
       setPending(pendingResult.accounts)
       const pendingIDs = new Set(pendingResult.accounts.map((account) => account.account_id))
       setSelectedPendingIDs((current) => current.filter((accountID) => pendingIDs.has(accountID)))
       setSettlements(settlementResult.settlements)
-      setGroupMultipliers(Object.fromEntries(groupResult.groups.map((group) => [group.group_id, String(group.multiplier_ppm / PPM)])))
+      setAPIKeyAssignments(keyResult.api_keys)
+      setPairRates(rateResult.rates)
+      setAccountEconomics(economicResult.accounts)
+      setKeySelections(Object.fromEntries(keyResult.api_keys.map((item) => [
+        item.api_key_id,
+        String(item.consumer_group_id || item.suggested_group_id || ''),
+      ])))
+      setAccountEconomicInputs(Object.fromEntries(economicResult.accounts.map((item) => [item.account_id, {
+        cost: String(item.monthly_fixed_cost_usd_micros / PPM),
+        capacity: String(item.monthly_capacity_usd_micros / PPM),
+      }])))
       setPendingSelections((current) => {
         const next = { ...current }
         for (const account of pendingResult.accounts) {
@@ -174,9 +224,9 @@ export default function ProfitCenter() {
     } finally {
       setLoading(false)
     }
-  }, [endDate, ratio, startDate])
+  }, [dimension, economicsMonth, endDate, ratio, startDate])
 
-	useEffect(() => { void loadData() }, [])
+  useEffect(() => { void loadData() }, [])
   const runBusy = async (key: string, action: () => Promise<void>) => {
     setBusy(key)
     try {
@@ -187,6 +237,91 @@ export default function ProfitCenter() {
       setBusy('')
     }
   }
+
+  const loadDimensionPage = async (nextDimension: DimensionKey, page: number, append: boolean) => {
+    setDimensionLoading(true)
+    try {
+      const result = await api.getProfitDashboardDimension(dimensionAPIKeys[nextDimension], {
+        startDate,
+        endDate,
+        page,
+        pageSize: DIMENSION_PAGE_SIZE,
+      })
+      setDimensionRows((current) => append ? [...current, ...result.items] : result.items)
+      setDimensionPage(page)
+      setDimensionHasMore(result.items.length === DIMENSION_PAGE_SIZE)
+    } catch (dimensionError) {
+      showToast(getErrorMessage(dimensionError), 'error')
+    } finally {
+      setDimensionLoading(false)
+    }
+  }
+
+  const changeDimension = (value: string) => {
+    const nextDimension = value as DimensionKey
+    setDimension(nextDimension)
+    void loadDimensionPage(nextDimension, 1, false)
+  }
+
+  const loadEconomics = (month: string) => runBusy('economics-month', async () => {
+    const result = await api.listProfitAccountEconomics(month)
+    setEconomicsMonth(month)
+    setAccountEconomics(result.accounts)
+    setAccountEconomicInputs(Object.fromEntries(result.accounts.map((item) => [item.account_id, {
+      cost: String(item.monthly_fixed_cost_usd_micros / PPM),
+      capacity: String(item.monthly_capacity_usd_micros / PPM),
+    }])))
+  })
+
+  const saveAPIKeyAssignment = (item: ProfitAPIKeyAssignment) => runBusy(`key-${item.api_key_id}`, async () => {
+    const consumerGroupID = Number(keySelections[item.api_key_id])
+    if (!consumerGroupID) throw new Error('请选择该 Key 的实际使用方分组')
+    const applyHistory = Boolean(keyApplyHistory[item.api_key_id])
+    const updated = await api.assignProfitAPIKeyConsumerGroup(item.api_key_id, {
+      consumer_group_id: consumerGroupID,
+      apply_history: applyHistory,
+      reason: applyHistory ? '管理员确认并回填未结算历史' : '管理员确认未来使用方',
+    })
+    setAPIKeyAssignments((current) => current.map((candidate) => candidate.api_key_id === updated.api_key_id ? updated : candidate))
+    setKeyApplyHistory((current) => ({ ...current, [item.api_key_id]: false }))
+    showToast(applyHistory ? '已保存使用方，并回填未结算历史' : '已保存 Key 的未来使用方', 'success')
+    if (applyHistory) await loadData()
+  })
+
+  const savePairRate = () => runBusy('pair-rate', async () => {
+    const consumerGroupID = Number(pairConsumerGroupID)
+    const ownerGroupID = Number(pairOwnerGroupID)
+    const rateValue = Number(pairRate)
+    if (!consumerGroupID || !ownerGroupID) throw new Error('请选择使用方和账号所有方')
+    if (consumerGroupID === ownerGroupID) throw new Error('同组使用不产生结算，无需设置比例')
+    if (!Number.isFinite(rateValue) || rateValue <= 0) throw new Error('结算比例必须大于 0')
+    await api.updateProfitPairRate({
+      consumer_group_id: consumerGroupID,
+      owner_group_id: ownerGroupID,
+      rate_ppm: Math.round(rateValue * PPM),
+      effective_date: pairEffectiveDate,
+      reason: '管理员调整方向结算比例',
+    })
+    showToast('方向结算比例已保存；历史正式结算不会被直接改写', 'success')
+    await loadData()
+  })
+
+  const saveAccountEconomic = (item: ProfitAccountEconomicSetting) => runBusy(`economic-${item.account_id}`, async () => {
+    const input = accountEconomicInputs[item.account_id]
+    const monthlyCost = Number(input?.cost)
+    const monthlyCapacity = Number(input?.capacity)
+    if (!Number.isFinite(monthlyCost) || monthlyCost < 0) throw new Error('月固定成本不能小于 0')
+    if (!Number.isFinite(monthlyCapacity) || monthlyCapacity <= 0) throw new Error('月估算额度必须大于 0')
+    const updated = await api.updateProfitAccountEconomic(item.account_id, {
+      effective_month: economicsMonth,
+      monthly_fixed_cost_usd_micros: Math.round(monthlyCost * PPM),
+      monthly_capacity_usd_micros: Math.round(monthlyCapacity * PPM),
+      reason: '管理员调整账号月成本与估算额度',
+    })
+    setAccountEconomics((current) => current.map((candidate) => candidate.account_id === updated.account_id ? updated : candidate))
+    showToast(`已保存 ${item.account_name || `账号 #${item.account_id}`} 的月度成本参数`, 'success')
+    await loadData()
+  })
 
   const applyPreset = (preset: 'week' | 'month' | '30d') => {
     let nextStartDate = startOfWeek(today)
@@ -202,7 +337,7 @@ export default function ProfitCenter() {
     let processed = 0
     let targetHighWaterID: number | null = null
     for (;;) {
-      const result = await api.refreshProfitLedger(100)
+      const result = await api.refreshProfitLedger(20_000)
       targetHighWaterID ??= result.high_water_id
       processed += result.processed_logs
       const remainingToTarget = Math.max(0, targetHighWaterID - result.checkpoint_id)
@@ -300,14 +435,6 @@ export default function ProfitCenter() {
     })
   }
 
-  const saveGroup = (group: ProfitGroupSetting) => runBusy(`group-${group.group_id}`, async () => {
-    const value = Number(groupMultipliers[group.group_id])
-    if (!Number.isFinite(value) || value <= 0) throw new Error('倍率必须大于 0')
-    await api.updateProfitGroup(group.group_id, Math.round(value * PPM))
-    showToast(`已保存 ${group.group_name} 的利润倍率`, 'success')
-    await loadData()
-  })
-
   const createSettlement = () => runBusy('create-settlement', async () => {
     if (pending.length > 0) throw new Error('仍有待确认账号，请先完成分组确认')
     if (!dashboard?.ledger.caught_up) throw new Error('日账本尚未追平，请先继续聚合')
@@ -342,8 +469,12 @@ export default function ProfitCenter() {
     downloadBlob(blob, `利润结算-${run.start_date}-${run.end_date}-R${run.revision_no}.csv`)
   })
 
-  const dimensionRows = useMemo(() => dashboard?.[dimension] ?? [], [dashboard, dimension])
   const allGroupOptions = useMemo(() => groups.filter((group) => !group.historical).map((group) => ({ label: group.group_name, value: String(group.group_id) })), [groups])
+  const fixedCostSummary = useMemo(() => (dashboard?.account_roi ?? []).reduce((summary, item) => ({
+    allocatedUSD: summary.allocatedUSD + item.allocated_in_range_usd_micros,
+    allocatedCNY: summary.allocatedCNY + item.allocated_in_range_cny_micros,
+    remainingUSD: summary.remainingUSD + item.remaining_fixed_cost_usd_micros,
+  }), { allocatedUSD: 0, allocatedCNY: 0, remainingUSD: 0 }), [dashboard])
   const selectedPendingIDSet = useMemo(() => new Set(selectedPendingIDs), [selectedPendingIDs])
   const selectedPendingAccounts = useMemo(
     () => pending.filter((account) => selectedPendingIDSet.has(account.account_id)),
@@ -377,7 +508,7 @@ export default function ProfitCenter() {
   if (settings && !settings.enabled) {
     return (
       <div>
-        <PageHeader title="利润结算中心" description="按官方成本、内部人民币结算比例和分组倍率自动生成可审核的利润账本。" />
+        <PageHeader title="利润结算中心" description="按使用方与账号所有方生成可审核的双边结算和账号成本回收账本。" />
         <Card className="mx-auto mt-16 max-w-2xl">
           <CardContent className="flex flex-col items-center py-12 text-center">
             <CircleDollarSign className="size-12 text-muted-foreground" />
@@ -391,9 +522,11 @@ export default function ProfitCenter() {
   }
 
   const tabs: Array<{ id: ProfitTab; label: string; icon: typeof Calculator; count?: number }> = [
-    { id: 'dashboard', label: '利润看板', icon: Calculator },
+    { id: 'dashboard', label: '结算看板', icon: Calculator },
     { id: 'pending', label: '待确认账号', icon: Users, count: pending.length },
-    { id: 'groups', label: '分组倍率', icon: Settings2 },
+    { id: 'keys', label: 'Key 使用方', icon: KeyRound, count: apiKeyAssignments.filter((item) => item.pending).length },
+    { id: 'rates', label: '方向结算比例', icon: ArrowRightLeft },
+    { id: 'economics', label: '账号成本', icon: WalletCards },
     { id: 'settlements', label: '结算记录', icon: FileClock, count: settlements.filter((run) => run.status === 'draft').length },
   ]
 
@@ -401,7 +534,7 @@ export default function ProfitCenter() {
     <div>
       <PageHeader
         title="利润结算中心"
-        description="美元源成本保持不变；人民币结算比例和分组倍率可调整，正式确认后通过修订留痕。"
+        description="自己使用自己的账号不结算；跨分组按使用方 → 账号所有方的方向比例计算人民币应付和应收。"
         actions={<Button variant="outline" onClick={() => void loadData()} disabled={Boolean(busy)}><RefreshCw className="size-4" />刷新</Button>}
       />
 
@@ -420,7 +553,7 @@ export default function ProfitCenter() {
             <CardContent className="grid gap-3 p-4 lg:grid-cols-[1fr_1fr_160px_auto]">
               <label className="space-y-1.5 text-sm font-medium">开始日期（北京时间）<Input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /></label>
               <label className="space-y-1.5 text-sm font-medium">结束日期（不含）<Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /></label>
-              <label className="space-y-1.5 text-sm font-medium">人民币结算比例<Input type="number" min="0.000001" step="0.01" value={ratio} onChange={(event) => setRatio(event.target.value)} /></label>
+              <label className="space-y-1.5 text-sm font-medium">账号成本折算比例（USD→CNY）<Input type="number" min="0.000001" step="0.01" value={ratio} onChange={(event) => setRatio(event.target.value)} /></label>
               <div className="flex flex-wrap items-end gap-2">
                 <Button variant="outline" onClick={() => applyPreset('week')}>本周</Button>
                 <Button variant="outline" onClick={() => applyPreset('month')}>本月</Button>
@@ -430,11 +563,17 @@ export default function ProfitCenter() {
             </CardContent>
           </Card>
 
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <MetricCard title="官方成本" value={formatUSD(dashboard.overall.official_cost_usd_micros)} hint="源账本 USD" />
-            <MetricCard title="人民币结算成本" value={formatCNY(dashboard.overall.settlement_cost_cny_micros)} hint={`比例 ${dashboard.settlement_ratio_ppm / PPM}:1`} />
-            <MetricCard title="结算收入" value={formatCNY(dashboard.overall.revenue_cny_micros)} hint="按各分组倍率计算" />
-            <MetricCard title="预计利润" value={formatCNY(dashboard.overall.profit_cny_micros)} hint={dashboard.overall.margin === null ? '利润率 N/A' : `利润率 ${(dashboard.overall.margin * 100).toFixed(2)}%`} positive={dashboard.overall.profit_cny_micros >= 0} />
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <MetricCard title="官方用量" value={formatUSD(dashboard.settlement.official_cost_usd_micros)} hint="所选范围内的官方计价金额" />
+            <MetricCard title="跨分组占用" value={formatUSD(dashboard.settlement.cross_group_usd_micros)} hint="仅这部分参与双方人民币结算" />
+            <MetricCard title="自己账号用量" value={formatUSD(dashboard.settlement.self_usage_usd_micros)} hint="计入账号产能，但应付与应收均为 0" />
+            <MetricCard title="总应付" value={formatCNY(dashboard.settlement.payable_cny_micros)} hint="各使用方需要支付的合计" />
+            <MetricCard title="总应收" value={formatCNY(dashboard.settlement.receivable_cny_micros)} hint="各账号所有方应收的合计" />
+            <MetricCard title="已回收账号成本" value={formatCNY(fixedCostSummary.allocatedCNY)} hint={`${formatUSD(fixedCostSummary.allocatedUSD)} · 成本折算 ${dashboard.settlement_ratio_ppm / PPM}:1`} />
+          </div>
+
+          <div className="rounded-xl border border-blue-500/25 bg-blue-500/5 px-4 py-3 text-sm text-muted-foreground">
+            全局总应付与总应收应保持一致（当前差额 {formatCNY(dashboard.settlement.global_net_cny_micros)}），这是双边结算守恒校验，不代表平台利润。账号固定成本回收单独计算，尚未回收 {formatUSD(fixedCostSummary.remainingUSD)}。
           </div>
 
           <Card className={cn(!dashboard.ledger.caught_up && 'border-amber-500/40')}>
@@ -450,8 +589,24 @@ export default function ProfitCenter() {
           </Card>
 
           <Card>
-            <CardHeader className="flex-row items-center justify-between"><CardTitle>多维度审计</CardTitle><Select value={dimension} onValueChange={(value) => setDimension(value as DimensionKey)} options={[{ label: '结算分组', value: 'groups' }, { label: 'API Key', value: 'api_keys' }, { label: '上游账号', value: 'accounts' }, { label: '模型', value: 'models' }]} /></CardHeader>
-            <DimensionTable rows={dimensionRows} />
+            <CardHeader><CardTitle>分组应收 / 应付汇总</CardTitle><p className="text-sm text-muted-foreground">正数表示净应收，负数表示净应付；自己账号用量不参与双方结算。</p></CardHeader>
+            <GroupSettlementTable rows={dashboard.group_settlements ?? []} />
+          </Card>
+
+          <Card>
+            <CardHeader><CardTitle>跨分组结算明细</CardTitle><p className="text-sm text-muted-foreground">方向为“使用方 → 账号所有方”。例如凡人使用打铁账号 4,000 USD，比例 0.1，则凡人应付、打铁应收均为 ¥400。</p></CardHeader>
+            <SettlementMatrixTable rows={dashboard.settlement_matrix ?? []} />
+          </Card>
+
+          <Card>
+            <CardHeader><CardTitle>账号固定成本回收</CardTitle><p className="text-sm text-muted-foreground">默认月成本 200 USD、月估算额度 10,000 USD，可在“账号成本”菜单按月修改。</p></CardHeader>
+            <AccountROITable rows={dashboard.account_roi ?? []} />
+          </Card>
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between gap-3"><CardTitle>多维度用量审计</CardTitle><Select value={dimension} onValueChange={changeDimension} dropdownMinWidth={240} options={[{ label: '结算分组', value: 'groups' }, { label: 'API Key', value: 'api_keys' }, { label: '上游账号', value: 'accounts' }, { label: '模型', value: 'models' }]} /></CardHeader>
+            {dimensionLoading && dimensionRows.length === 0 ? <StateShell loading>{null}</StateShell> : <DimensionTable rows={dimensionRows} />}
+            {dimensionHasMore ? <div className="flex justify-center border-t border-border p-3"><Button variant="outline" disabled={dimensionLoading} onClick={() => void loadDimensionPage(dimension, dimensionPage + 1, true)}>{dimensionLoading ? <Loader2 className="size-4 animate-spin" /> : null}加载更多</Button></div> : null}
           </Card>
 
           <Card>
@@ -527,7 +682,7 @@ export default function ProfitCenter() {
                     onChange={(event) => togglePendingSelection(account.account_id, event.target.checked)}
                   />
                   <div><div className="flex flex-wrap items-center gap-2 font-semibold">{account.account_name || `账号 #${account.account_id}`}{account.deleted ? <Badge variant="destructive">已删除</Badge> : null}</div><div className="mt-1 text-xs text-muted-foreground">{account.first_date} 至 {account.last_date} · {formatNumber(account.pending_requests)} 次请求 · {formatUSD(account.official_cost_usd_micros)}</div></div>
-                  <Select value={pendingSelections[account.account_id] ?? ''} onValueChange={(value) => setPendingSelections((current) => ({ ...current, [account.account_id]: value }))} options={options} placeholder="选择结算分组" />
+                  <Select value={pendingSelections[account.account_id] ?? ''} onValueChange={(value) => setPendingSelections((current) => ({ ...current, [account.account_id]: value }))} options={options} placeholder="选择结算分组" dropdownMinWidth={280} />
                   <div className="flex flex-wrap gap-2 lg:justify-end">
                     <Button disabled={Boolean(busy)} onClick={() => openAssignDialog([account])}><Save className="size-4" />确认并回填</Button>
                     {account.deleted ? <Button variant="outline" disabled={Boolean(busy)} onClick={() => openIgnoreDialog([account])}><EyeOff className="size-4" />忽略</Button> : null}
@@ -539,14 +694,49 @@ export default function ProfitCenter() {
         </Card>
       ) : null}
 
-      {activeTab === 'groups' ? (
+      {activeTab === 'keys' ? (
         <Card>
-          <CardHeader><CardTitle>分组利润倍率</CardTitle><p className="text-sm text-muted-foreground">倍率作用于人民币结算成本。例：1.20 表示按成本的 120% 结算，利润为 20%。</p></CardHeader>
+          <CardHeader><CardTitle>API Key 实际使用方</CardTitle><p className="text-sm text-muted-foreground">这里定义“谁在使用这个 Key”。账号允许路由到哪些分组不等于实际使用方；只有明确归属后，才能判断谁占用了谁的账号。</p></CardHeader>
           <CardContent className="space-y-3">
-            {groups.map((group) => <div key={group.group_id} className="grid gap-3 rounded-xl border border-border p-4 sm:grid-cols-[1fr_160px_auto] sm:items-center">
-              <div><div className="flex items-center gap-2 font-semibold">{group.group_name || `历史分组 #${group.group_id}`}{group.historical ? <Badge variant="secondary">历史分组</Badge> : null}</div><div className="mt-1 text-xs text-muted-foreground">已绑定 {group.assigned_count} 个结算账号</div></div>
-              <Input type="number" min="0.000001" step="0.01" value={groupMultipliers[group.group_id] ?? '1'} onChange={(event) => setGroupMultipliers((current) => ({ ...current, [group.group_id]: event.target.value }))} />
-              <Button variant="outline" disabled={busy === `group-${group.group_id}`} onClick={() => saveGroup(group)}>{busy === `group-${group.group_id}` ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}保存倍率</Button>
+            {apiKeyAssignments.length === 0 ? <EmptyState text="当前没有 API Key" /> : apiKeyAssignments.map((item) => <div key={item.api_key_id} className="grid gap-3 rounded-xl border border-border p-4 xl:grid-cols-[minmax(0,1fr)_240px_220px_auto] xl:items-center">
+              <div className="min-w-0"><div className="flex flex-wrap items-center gap-2 font-semibold"><span className="truncate">{item.api_key_name || `Key #${item.api_key_id}`}</span>{item.pending ? <Badge variant="secondary">待确认</Badge> : <Badge variant="outline">已确认</Badge>}</div><div className="mt-1 text-xs text-muted-foreground">当前：{item.consumer_group_name || '未设置'} · 来源：{assignmentSourceLabel(item.assignment_source)}{item.suggested_group_name ? ` · 建议：${item.suggested_group_name}` : ''}</div></div>
+              <Select value={keySelections[item.api_key_id] ?? ''} onValueChange={(value) => setKeySelections((current) => ({ ...current, [item.api_key_id]: value }))} options={allGroupOptions} placeholder="选择实际使用方" dropdownMinWidth={280} />
+              <label className="flex items-start gap-2 text-sm"><input type="checkbox" className="mt-1 size-4 accent-primary" checked={Boolean(keyApplyHistory[item.api_key_id])} onChange={(event) => setKeyApplyHistory((current) => ({ ...current, [item.api_key_id]: event.target.checked }))} /><span>回填未正式结算历史<span className="block text-xs text-muted-foreground">仅在确认历史归属时勾选</span></span></label>
+              <Button variant="outline" disabled={busy === `key-${item.api_key_id}` || !Number(keySelections[item.api_key_id])} onClick={() => saveAPIKeyAssignment(item)}>{busy === `key-${item.api_key_id}` ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}保存</Button>
+            </div>)}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {activeTab === 'rates' ? (
+        <div className="space-y-4">
+          <Card>
+            <CardHeader><CardTitle>设置方向结算比例</CardTitle><p className="text-sm text-muted-foreground">比例按“使用方 → 账号所有方”分别设置，0.1 表示每使用 1 USD 官方额度结算 ¥0.10；同组使用始终为 0。</p></CardHeader>
+            <CardContent className="grid gap-3 lg:grid-cols-[1fr_auto_1fr_160px_170px_auto] lg:items-end">
+              <label className="space-y-1.5 text-sm font-medium">使用方<Select value={pairConsumerGroupID} onValueChange={setPairConsumerGroupID} options={allGroupOptions} placeholder="选择使用方" dropdownMinWidth={240} /></label>
+              <ArrowRightLeft className="mb-2 hidden size-5 text-muted-foreground lg:block" />
+              <label className="space-y-1.5 text-sm font-medium">账号所有方<Select value={pairOwnerGroupID} onValueChange={setPairOwnerGroupID} options={allGroupOptions} placeholder="选择账号所有方" dropdownMinWidth={240} /></label>
+              <label className="space-y-1.5 text-sm font-medium">人民币比例<Input type="number" min="0.000001" step="0.01" value={pairRate} onChange={(event) => setPairRate(event.target.value)} /></label>
+              <label className="space-y-1.5 text-sm font-medium">生效日期<Input type="date" value={pairEffectiveDate} onChange={(event) => setPairEffectiveDate(event.target.value)} /></label>
+              <Button disabled={busy === 'pair-rate'} onClick={savePairRate}>{busy === 'pair-rate' ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}保存比例</Button>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader><CardTitle>已配置比例版本</CardTitle><p className="text-sm text-muted-foreground">同一方向可按不同日期保留版本；历史已确认结算通过修订处理，不会被静默覆盖。</p></CardHeader>
+            <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>方向</TableHead><TableHead className="text-right">比例</TableHead><TableHead>生效日期</TableHead><TableHead>来源</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader><TableBody>{pairRates.length === 0 ? <TableRow><TableCell colSpan={5} className="py-10 text-center text-muted-foreground">尚未设置，未配置方向默认按 0.1 计算</TableCell></TableRow> : pairRates.map((item) => <TableRow key={item.id}><TableCell className="font-medium">{item.consumer_group_name} <ArrowRightLeft className="mx-1 inline size-3.5" /> {item.owner_group_name}</TableCell><TableCell className="text-right tabular-nums">{formatRate(item.rate_ppm)}</TableCell><TableCell>{item.effective_date}</TableCell><TableCell>{item.source === 'manual' ? '手动设置' : item.source}</TableCell><TableCell className="text-right"><Button size="sm" variant="ghost" onClick={() => { setPairConsumerGroupID(String(item.consumer_group_id)); setPairOwnerGroupID(String(item.owner_group_id)); setPairRate(String(item.rate_ppm / PPM)); setPairEffectiveDate(item.effective_date) }}>复制到编辑区</Button></TableCell></TableRow>)}</TableBody></Table></div>
+          </Card>
+        </div>
+      ) : null}
+
+      {activeTab === 'economics' ? (
+        <Card>
+          <CardHeader className="flex-row items-end justify-between gap-3"><div><CardTitle>账号月固定成本与估算额度</CardTitle><p className="mt-1 text-sm text-muted-foreground">默认月成本 200 USD、月估算额度 10,000 USD。成本回收 = 月成本 × 本次用量 / 月估算额度，并限制不超过尚未回收成本。</p></div><label className="space-y-1.5 text-sm font-medium">查看月份<Input type="month" value={economicsMonth.slice(0, 7)} onChange={(event) => { if (event.target.value) void loadEconomics(`${event.target.value}-01`) }} /></label></CardHeader>
+          <CardContent className="space-y-3">
+            {accountEconomics.length === 0 ? <EmptyState text="当前没有可配置账号" /> : accountEconomics.map((item) => <div key={item.account_id} className="grid gap-3 rounded-xl border border-border p-4 xl:grid-cols-[minmax(0,1fr)_180px_180px_auto] xl:items-end">
+              <div><div className="flex flex-wrap items-center gap-2 font-semibold">{item.account_name || `账号 #${item.account_id}`}{item.account_deleted ? <Badge variant="destructive">已删除</Badge> : null}{item.frozen ? <Badge variant="secondary">本月已结算锁定</Badge> : null}</div><div className="mt-1 text-xs text-muted-foreground">{item.source === 'system_default' ? '系统默认值' : `版本 R${item.revision_no}`} · 生效月 {item.effective_month}</div></div>
+              <label className="space-y-1.5 text-sm font-medium">月固定成本（USD）<Input type="number" min="0" step="1" value={accountEconomicInputs[item.account_id]?.cost ?? '200'} disabled={item.frozen} onChange={(event) => setAccountEconomicInputs((current) => ({ ...current, [item.account_id]: { cost: event.target.value, capacity: current[item.account_id]?.capacity ?? '10000' } }))} /></label>
+              <label className="space-y-1.5 text-sm font-medium">月估算额度（USD）<Input type="number" min="0.01" step="100" value={accountEconomicInputs[item.account_id]?.capacity ?? '10000'} disabled={item.frozen} onChange={(event) => setAccountEconomicInputs((current) => ({ ...current, [item.account_id]: { cost: current[item.account_id]?.cost ?? '200', capacity: event.target.value } }))} /></label>
+              <Button variant="outline" disabled={item.frozen || busy === `economic-${item.account_id}`} onClick={() => saveAccountEconomic(item)}>{busy === `economic-${item.account_id}` ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}{item.frozen ? '已锁定' : '保存'}</Button>
             </div>)}
           </CardContent>
         </Card>
@@ -554,11 +744,11 @@ export default function ProfitCenter() {
 
       {activeTab === 'settlements' ? (
         <Card>
-          <CardHeader><CardTitle>结算与修订记录</CardTitle><p className="text-sm text-muted-foreground">草稿可重新计算；确认后锁定来源清单。后续比例或倍率调整通过新修订保留完整审计链。</p></CardHeader>
+          <CardHeader><CardTitle>结算与修订记录</CardTitle><p className="text-sm text-muted-foreground">草稿生成采用分批短事务；确认后锁定来源清单。后续方向比例或账号成本调整通过新修订保留完整审计链。</p></CardHeader>
           <CardContent className="space-y-3">
             {settlements.length === 0 ? <EmptyState text="尚未创建结算记录" /> : settlements.map((run) => <div key={run.id} className="grid gap-3 rounded-xl border border-border p-4 xl:grid-cols-[1.4fr_1fr_auto] xl:items-center">
-              <div><div className="flex flex-wrap items-center gap-2 font-semibold">{run.start_date} 至 {run.end_date}<StatusBadge status={run.status} /> <Badge variant="outline">R{run.revision_no}</Badge></div><div className="mt-1 break-all text-xs text-muted-foreground">{run.id} · 来源 {run.source_manifest_hash.slice(0, 16)}…</div></div>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm"><span className="text-muted-foreground">收入</span><strong className="text-right text-emerald-600">{formatCNY(run.revenue_cny_micros)}</strong><span className="text-muted-foreground">利润</span><strong className="text-right">{formatCNY(run.profit_cny_micros)}</strong></div>
+              <div><div className="flex flex-wrap items-center gap-2 font-semibold">{run.start_date} 至 {run.end_date}<StatusBadge status={run.status} /> <Badge variant="outline">R{run.revision_no}</Badge></div><div className="mt-1 break-all text-xs text-muted-foreground">{run.id}{run.source_manifest_hash ? ` · 来源 ${run.source_manifest_hash.slice(0, 16)}…` : ''}{run.source_high_water_id ? ` · 截止日志 ${run.source_high_water_id}` : ''}</div>{run.build_error ? <div className="mt-2 text-xs text-red-500">生成失败：{run.build_error}</div> : null}</div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm"><span className="text-muted-foreground">应收</span><strong className="text-right text-emerald-600">{formatCNY(run.receivable_cny_micros)}</strong><span className="text-muted-foreground">应付</span><strong className="text-right text-amber-600">{formatCNY(run.payable_cny_micros)}</strong><span className="text-muted-foreground">成本回收</span><strong className="text-right">{formatUSD(run.fixed_cost_allocated_usd_micros)}</strong></div>
               <div className="flex flex-wrap gap-2">
                 {run.status === 'draft' ? <Button disabled={busy === `confirm-${run.id}`} onClick={() => confirmSettlement(run)}>{busy === `confirm-${run.id}` ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}确认</Button> : null}
                 {run.status === 'confirmed' ? <Button variant="outline" disabled={busy === `revise-${run.id}`} onClick={() => reviseSettlement(run)}><FileClock className="size-4" />创建修订</Button> : null}
@@ -591,6 +781,7 @@ export default function ProfitCenter() {
                   onValueChange={(value) => setPendingActionDialog((current) => current?.action === 'assign' ? { ...current, groupID: value } : current)}
                   options={pendingDialogGroupOptions}
                   placeholder="选择结算分组"
+                  dropdownMinWidth={320}
                 />
               </label>
               <PendingAccountConfirmationList accounts={pendingActionDialog.accounts} />
@@ -713,7 +904,19 @@ function MetricCard({ title, value, hint, positive }: { title: string; value: st
 }
 
 function DimensionTable({ rows }: { rows: ProfitDashboardDimension[] }) {
-  return <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>名称</TableHead><TableHead className="text-right">请求</TableHead><TableHead className="text-right">Token</TableHead><TableHead className="text-right">官方成本</TableHead><TableHead className="text-right">人民币成本</TableHead><TableHead className="text-right">收入</TableHead><TableHead className="text-right">利润</TableHead></TableRow></TableHeader><TableBody>{rows.length === 0 ? <TableRow><TableCell colSpan={7} className="py-10 text-center text-muted-foreground">该范围暂无数据</TableCell></TableRow> : rows.map((row) => <TableRow key={row.id}><TableCell><div className="flex items-center gap-2 font-medium">{row.name || `#${row.id}`}{row.deleted ? <Badge variant="destructive">已删除</Badge> : null}{row.pending ? <Badge variant="secondary">待确认</Badge> : null}</div>{row.multiplier_ppm ? <div className="mt-1 text-xs text-muted-foreground">倍率 {(row.multiplier_ppm / PPM).toFixed(4)}</div> : null}</TableCell><TableCell className="text-right tabular-nums">{formatNumber(row.request_count)}</TableCell><TableCell className="text-right tabular-nums">{formatNumber(row.total_tokens)}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.official_cost_usd_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatCNY(row.settlement_cost_cny_micros)}</TableCell><TableCell className="text-right font-semibold tabular-nums text-emerald-600">{formatCNY(row.revenue_cny_micros)}</TableCell><TableCell className="text-right font-semibold tabular-nums">{formatCNY(row.profit_cny_micros)}</TableCell></TableRow>)}</TableBody></Table></div>
+  return <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>名称</TableHead><TableHead className="text-right">请求</TableHead><TableHead className="text-right">Token</TableHead><TableHead className="text-right">官方用量</TableHead></TableRow></TableHeader><TableBody>{rows.length === 0 ? <TableRow><TableCell colSpan={4} className="py-10 text-center text-muted-foreground">该范围暂无数据</TableCell></TableRow> : rows.map((row) => <TableRow key={row.id}><TableCell><div className="flex items-center gap-2 font-medium">{row.name || `#${row.id}`}{row.deleted ? <Badge variant="destructive">已删除</Badge> : null}{row.pending ? <Badge variant="secondary">待确认</Badge> : null}</div></TableCell><TableCell className="text-right tabular-nums">{formatNumber(row.request_count)}</TableCell><TableCell className="text-right tabular-nums">{formatNumber(row.total_tokens)}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.official_cost_usd_micros)}</TableCell></TableRow>)}</TableBody></Table></div>
+}
+
+function GroupSettlementTable({ rows }: { rows: ProfitDashboardResponse['group_settlements'] }) {
+  return <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>分组</TableHead><TableHead className="text-right">自己账号用量</TableHead><TableHead className="text-right">应收</TableHead><TableHead className="text-right">应付</TableHead><TableHead className="text-right">净额</TableHead></TableRow></TableHeader><TableBody>{rows.length === 0 ? <TableRow><TableCell colSpan={5} className="py-10 text-center text-muted-foreground">该范围暂无可结算分组</TableCell></TableRow> : rows.map((row) => <TableRow key={row.group_id}><TableCell className="font-medium">{row.group_name}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.self_usage_usd_micros)}</TableCell><TableCell className="text-right font-semibold tabular-nums text-emerald-600">{formatCNY(row.receivable_cny_micros)}</TableCell><TableCell className="text-right font-semibold tabular-nums text-amber-600">{formatCNY(row.payable_cny_micros)}</TableCell><TableCell className={cn('text-right font-semibold tabular-nums', row.net_cny_micros > 0 && 'text-emerald-600', row.net_cny_micros < 0 && 'text-amber-600')}>{formatCNY(row.net_cny_micros)}</TableCell></TableRow>)}</TableBody></Table></div>
+}
+
+function SettlementMatrixTable({ rows }: { rows: ProfitDashboardResponse['settlement_matrix'] }) {
+  return <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>使用方</TableHead><TableHead>账号所有方</TableHead><TableHead className="text-right">官方用量</TableHead><TableHead className="text-right">结算比例</TableHead><TableHead className="text-right">应付 / 应收</TableHead><TableHead className="text-right">请求</TableHead></TableRow></TableHeader><TableBody>{rows.length === 0 ? <TableRow><TableCell colSpan={6} className="py-10 text-center text-muted-foreground">该范围没有跨分组占用</TableCell></TableRow> : rows.map((row) => <TableRow key={`${row.consumer_group_id}-${row.owner_group_id}`}><TableCell className="font-medium">{row.consumer_group_name}</TableCell><TableCell className="font-medium">{row.owner_group_name}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.official_cost_usd_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatRate(row.rate_ppm)}</TableCell><TableCell className="text-right font-semibold tabular-nums">{formatCNY(row.payable_cny_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatNumber(row.request_count)}</TableCell></TableRow>)}</TableBody></Table></div>
+}
+
+function AccountROITable({ rows }: { rows: ProfitDashboardResponse['account_roi'] }) {
+  return <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>账号</TableHead><TableHead>所有方</TableHead><TableHead>月份</TableHead><TableHead className="text-right">范围用量</TableHead><TableHead className="text-right">月固定成本</TableHead><TableHead className="text-right">本次回收</TableHead><TableHead className="text-right">尚未回收</TableHead><TableHead className="text-right">额度利用率</TableHead></TableRow></TableHeader><TableBody>{rows.length === 0 ? <TableRow><TableCell colSpan={8} className="py-10 text-center text-muted-foreground">该范围暂无账号成本数据</TableCell></TableRow> : rows.map((row) => <TableRow key={`${row.account_id}-${row.owner_group_id}-${row.effective_month}`}><TableCell><div className="flex items-center gap-2 font-medium">{row.account_name || `账号 #${row.account_id}`}{row.account_deleted ? <Badge variant="destructive">已删除</Badge> : null}</div></TableCell><TableCell>{row.owner_group_name}</TableCell><TableCell>{row.effective_month.slice(0, 7)}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.usage_in_manifest_usd_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.monthly_fixed_cost_usd_micros)}</TableCell><TableCell className="text-right font-semibold tabular-nums text-emerald-600">{formatUSD(row.allocated_in_range_usd_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatUSD(row.remaining_fixed_cost_usd_micros)}</TableCell><TableCell className="text-right tabular-nums">{formatPercentPPM(row.utilization_ppm)}</TableCell></TableRow>)}</TableBody></Table></div>
 }
 
 function EmptyState({ text }: { text: string }) {
@@ -723,5 +926,22 @@ function EmptyState({ text }: { text: string }) {
 function StatusBadge({ status }: { status: string }) {
   if (status === 'confirmed') return <Badge className="bg-emerald-600">已确认</Badge>
   if (status === 'superseded') return <Badge variant="secondary">已被修订</Badge>
+  if (status === 'building') return <Badge variant="secondary">正在分批生成</Badge>
+  if (status === 'build_failed') return <Badge variant="destructive">生成失败</Badge>
   return <Badge variant="outline">草稿</Badge>
+}
+
+function formatRate(ratePPM: number) {
+  return `${new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 6 }).format(ratePPM / PPM)} CNY / USD`
+}
+
+function formatPercentPPM(value: number) {
+  return `${new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value / 10_000)}%`
+}
+
+function assignmentSourceLabel(source: string) {
+  if (source === 'manual') return '手动确认'
+  if (source === 'legacy_key_group') return '原 Key 分组'
+  if (source === 'suggested') return '系统建议'
+  return source || '未设置'
 }

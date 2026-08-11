@@ -70,20 +70,39 @@ func (db *DB) IgnoreProfitPendingAccount(ctx context.Context, accountID int64) e
 }
 
 func (db *DB) ensureProfitAccountCanBePurged(ctx context.Context, accountID int64) error {
-	var settlementItems int64
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_settlement_items WHERE account_id = $1`, accountID).
-		Scan(&settlementItems); err != nil {
+	return ensureProfitAccountCanBePurgedQuery(ctx, db.conn, accountID)
+}
+
+type profitPurgeQueryer interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+func ensureProfitAccountCanBePurgedQuery(ctx context.Context, queryer profitPurgeQueryer, accountID int64) error {
+	var references int64
+	if err := queryer.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM profit_daily_ledger WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_settlement_items WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_settlement_account_roi_items WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_account_cost_allocations WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_account_economic_versions WHERE account_id=$1)`, accountID).Scan(&references); err != nil {
 		return err
 	}
-	if settlementItems > 0 {
+	if references > 0 {
 		return ErrProfitAccountHasSettlement
 	}
-	var claimedRows int64
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger
-		WHERE account_id = $1 AND COALESCE(claimed_lineage_id, '') <> ''`, accountID).Scan(&claimedRows); err != nil {
+	return nil
+}
+
+func ensureProfitPendingAccountCanBeForcePurged(ctx context.Context, queryer profitPurgeQueryer, accountID int64) error {
+	var references int64
+	if err := queryer.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM profit_settlement_items WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_daily_ledger WHERE account_id=$1 AND COALESCE(claimed_lineage_id,'')<>'')+
+		(SELECT COUNT(*) FROM profit_settlement_account_roi_items WHERE account_id=$1)+
+		(SELECT COUNT(*) FROM profit_account_cost_allocations WHERE account_id=$1)`, accountID).Scan(&references); err != nil {
 		return err
 	}
-	if claimedRows > 0 {
+	if references > 0 {
 		return ErrProfitAccountHasSettlement
 	}
 	return nil
@@ -184,7 +203,7 @@ func (db *DB) purgeProfitPendingAccountData(ctx context.Context, accountID int64
 	if _, err := db.profitPendingDeletedAccount(ctx, accountID); err != nil {
 		return cleanup, err
 	}
-	if err := db.ensureProfitAccountCanBePurged(ctx, accountID); err != nil {
+	if err := ensureProfitPendingAccountCanBeForcePurged(ctx, db.conn, accountID); err != nil {
 		return cleanup, err
 	}
 
@@ -203,17 +222,8 @@ func (db *DB) purgeProfitPendingAccountData(ctx context.Context, accountID int64
 	}
 
 	err = db.withProfitLedgerTx(ctx, func(tx *sql.Tx, _ int64) error {
-		var settlementItems, claimedRows int64
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_settlement_items WHERE account_id = $1`, accountID).
-			Scan(&settlementItems); err != nil {
+		if err := ensureProfitPendingAccountCanBeForcePurged(ctx, tx, accountID); err != nil {
 			return err
-		}
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger
-			WHERE account_id = $1 AND COALESCE(claimed_lineage_id, '') <> ''`, accountID).Scan(&claimedRows); err != nil {
-			return err
-		}
-		if settlementItems > 0 || claimedRows > 0 {
-			return ErrProfitAccountHasSettlement
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM api_key_scope_counters
 			WHERE scope_type = 'account' AND scope_id = $1`, accountID)
@@ -224,6 +234,8 @@ func (db *DB) purgeProfitPendingAccountData(ctx context.Context, accountID int64
 		for _, query := range []string{
 			`DELETE FROM account_model_cooldowns WHERE account_id = $1`,
 			`DELETE FROM account_group_members WHERE account_id = $1`,
+			`DELETE FROM profit_account_month_cost_state WHERE account_id = $1`,
+			`DELETE FROM profit_account_economic_versions WHERE account_id = $1`,
 			`DELETE FROM profit_account_settings WHERE account_id = $1`,
 			`DELETE FROM profit_ignored_accounts WHERE account_id = $1`,
 		} {

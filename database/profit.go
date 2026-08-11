@@ -17,19 +17,23 @@ import (
 )
 
 const (
-	ProfitScalePPM                  int64 = 1_000_000
-	DefaultProfitSettlementRatioPPM int64 = ProfitScalePPM
-	DefaultProfitGroupMultiplierPPM int64 = ProfitScalePPM
-	DefaultProfitLedgerRefreshLimit       = 100
-	MaxProfitLedgerRefreshLimit           = 100
-	ProfitTimezone                        = "Asia/Shanghai"
+	ProfitScalePPM                     int64 = 1_000_000
+	DefaultProfitSettlementRatioPPM    int64 = ProfitScalePPM
+	DefaultProfitGroupMultiplierPPM    int64 = ProfitScalePPM
+	DefaultProfitPairRatePPM           int64 = 100_000
+	DefaultProfitAccountCostMicros     int64 = 200 * ProfitScalePPM
+	DefaultProfitAccountCapacityMicros int64 = 10_000 * ProfitScalePPM
+	DefaultProfitLedgerRefreshLimit          = 100
+	MaxProfitLedgerRefreshLimit              = 100
+	ProfitTimezone                           = "Asia/Shanghai"
 )
 
 var (
-	ErrProfitPendingAssignment  = errors.New("profit settlement contains pending account assignments")
-	ErrProfitLedgerBehind       = errors.New("profit daily ledger is not caught up")
-	ErrProfitSettlementEmpty    = errors.New("profit settlement contains no eligible ledger rows")
-	ErrProfitSettlementConflict = errors.New("profit settlement source rows changed or were already claimed")
+	ErrProfitPendingAssignment   = errors.New("profit settlement contains pending account assignments")
+	ErrProfitLedgerBehind        = errors.New("profit daily ledger is not caught up")
+	ErrProfitSettlementEmpty     = errors.New("profit settlement contains no eligible ledger rows")
+	ErrProfitSettlementConflict  = errors.New("profit settlement source rows changed or were already claimed")
+	ErrProfitIngestionIncomplete = errors.New("profit settlement ingestion history is incomplete")
 )
 
 // ProfitSettings 独立于 SystemSettings，避免继续扩大旧设置表的高风险位置参数链。
@@ -106,16 +110,20 @@ type ProfitDashboardDimension struct {
 }
 
 type ProfitDashboardResponse struct {
-	StartDate          string                     `json:"start_date"`
-	EndDate            string                     `json:"end_date"`
-	Timezone           string                     `json:"timezone"`
-	SettlementRatioPPM int64                      `json:"settlement_ratio_ppm"`
-	Ledger             ProfitLedgerRefreshResult  `json:"ledger"`
-	Overall            ProfitMoneySummary         `json:"overall"`
-	Groups             []ProfitDashboardDimension `json:"groups"`
-	APIKeys            []ProfitDashboardDimension `json:"api_keys"`
-	Accounts           []ProfitDashboardDimension `json:"accounts"`
-	Models             []ProfitDashboardDimension `json:"models"`
+	StartDate          string                         `json:"start_date"`
+	EndDate            string                         `json:"end_date"`
+	Timezone           string                         `json:"timezone"`
+	SettlementRatioPPM int64                          `json:"settlement_ratio_ppm"`
+	Ledger             ProfitLedgerRefreshResult      `json:"ledger"`
+	Overall            ProfitMoneySummary             `json:"overall"`
+	Groups             []ProfitDashboardDimension     `json:"groups"`
+	APIKeys            []ProfitDashboardDimension     `json:"api_keys"`
+	Accounts           []ProfitDashboardDimension     `json:"accounts"`
+	Models             []ProfitDashboardDimension     `json:"models"`
+	Settlement         ProfitSettlementOverview       `json:"settlement"`
+	SettlementMatrix   []ProfitSettlementMatrixCell   `json:"settlement_matrix"`
+	GroupSettlements   []ProfitGroupSettlementSummary `json:"group_settlements"`
+	AccountROI         []ProfitAccountROI             `json:"account_roi"`
 }
 
 type ProfitSettlementRun struct {
@@ -132,6 +140,12 @@ type ProfitSettlementRun struct {
 	SettlementCNYMicros int64  `json:"settlement_cost_cny_micros"`
 	RevenueCNYMicros    int64  `json:"revenue_cny_micros"`
 	ProfitCNYMicros     int64  `json:"profit_cny_micros"`
+	PayableCNYMicros    int64  `json:"payable_cny_micros"`
+	ReceivableCNYMicros int64  `json:"receivable_cny_micros"`
+	FixedCostUSDMicros  int64  `json:"fixed_cost_allocated_usd_micros"`
+	FixedCostCNYMicros  int64  `json:"fixed_cost_allocated_cny_micros"`
+	SourceHighWaterID   int64  `json:"source_high_water_id"`
+	BuildError          string `json:"build_error,omitempty"`
 	SourceManifestHash  string `json:"source_manifest_hash"`
 	CreatedAt           string `json:"created_at"`
 	ConfirmedAt         string `json:"confirmed_at,omitempty"`
@@ -143,6 +157,10 @@ type ProfitSettlementItem struct {
 	LedgerDate          string `json:"ledger_date"`
 	GroupID             int64  `json:"group_id"`
 	GroupName           string `json:"group_name"`
+	ConsumerGroupID     int64  `json:"consumer_group_id"`
+	ConsumerGroupName   string `json:"consumer_group_name"`
+	OwnerGroupID        int64  `json:"owner_group_id"`
+	OwnerGroupName      string `json:"owner_group_name"`
 	APIKeyID            int64  `json:"api_key_id"`
 	APIKeyName          string `json:"api_key_name"`
 	AccountID           int64  `json:"account_id"`
@@ -151,20 +169,26 @@ type ProfitSettlementItem struct {
 	Model               string `json:"model"`
 	Channel             string `json:"channel"`
 	MultiplierPPM       int64  `json:"multiplier_ppm"`
+	RatePPM             int64  `json:"rate_ppm"`
+	NonSettleableReason string `json:"non_settleable_reason,omitempty"`
+	SelfUsage           bool   `json:"self_usage"`
 	RequestCount        int64  `json:"request_count"`
 	TotalTokens         int64  `json:"total_tokens"`
 	OfficialUSDMicros   int64  `json:"official_cost_usd_micros"`
 	SettlementCNYMicros int64  `json:"settlement_cost_cny_micros"`
 	RevenueCNYMicros    int64  `json:"revenue_cny_micros"`
 	ProfitCNYMicros     int64  `json:"profit_cny_micros"`
+	PayableCNYMicros    int64  `json:"payable_cny_micros"`
+	ReceivableCNYMicros int64  `json:"receivable_cny_micros"`
 	SourceFirstLogID    int64  `json:"source_first_log_id"`
 	SourceLastLogID     int64  `json:"source_last_log_id"`
 	SourceHash          string `json:"source_hash"`
 }
 
 type ProfitSettlementDetail struct {
-	Run   ProfitSettlementRun    `json:"run"`
-	Items []ProfitSettlementItem `json:"items"`
+	Run        ProfitSettlementRun              `json:"run"`
+	Items      []ProfitSettlementItem           `json:"items"`
+	AccountROI []ProfitSettlementAccountROIItem `json:"account_roi"`
 }
 
 func profitLocation() *time.Location {
@@ -247,17 +271,69 @@ func (db *DB) migrateProfitSettlement(ctx context.Context) error {
 		if err := db.ensureSQLiteColumn(ctx, "usage_logs", "settlement_assignment_source", "TEXT NOT NULL DEFAULT 'pending'"); err != nil {
 			return err
 		}
+		for _, column := range []struct{ name, ddl string }{
+			{"consumer_source_type", "TEXT NOT NULL DEFAULT ''"},
+			{"consumer_source_id", "TEXT NOT NULL DEFAULT ''"},
+			{"consumer_assignment_version_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"consumer_group_id_snapshot", "INTEGER NOT NULL DEFAULT 0"},
+			{"consumer_group_name_snapshot", "TEXT NOT NULL DEFAULT ''"},
+			{"non_settleable_reason", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := db.ensureSQLiteColumn(ctx, "usage_logs", column.name, column.ddl); err != nil {
+				return err
+			}
+		}
 		for _, stmt := range profitSQLiteSchemaStatements() {
 			if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("创建利润结算 SQLite 表失败: %w", err)
 			}
 		}
-		return nil
+		for _, column := range []struct{ name, ddl string }{
+			{"consumer_source_type", "TEXT NOT NULL DEFAULT ''"},
+			{"consumer_source_id", "TEXT NOT NULL DEFAULT ''"},
+			{"consumer_assignment_version_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"consumer_group_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"consumer_group_name_snapshot", "TEXT NOT NULL DEFAULT ''"},
+			{"consumer_assignment_source", "TEXT NOT NULL DEFAULT 'pending'"},
+			{"non_settleable_reason", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := db.ensureSQLiteColumn(ctx, "profit_daily_ledger", column.name, column.ddl); err != nil {
+				return err
+			}
+		}
+		for _, column := range []struct{ name, ddl string }{
+			{"payable_cny_micros", "INTEGER NOT NULL DEFAULT 0"},
+			{"receivable_cny_micros", "INTEGER NOT NULL DEFAULT 0"},
+			{"fixed_cost_allocated_usd_micros", "INTEGER NOT NULL DEFAULT 0"},
+			{"fixed_cost_allocated_cny_micros", "INTEGER NOT NULL DEFAULT 0"},
+			{"source_high_water_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"build_error", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := db.ensureSQLiteColumn(ctx, "profit_settlement_runs", column.name, column.ddl); err != nil {
+				return err
+			}
+		}
+		for _, column := range []struct{ name, ddl string }{
+			{"consumer_group_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"consumer_group_name", "TEXT NOT NULL DEFAULT ''"},
+			{"owner_group_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"owner_group_name", "TEXT NOT NULL DEFAULT ''"},
+			{"rate_ppm", "INTEGER NOT NULL DEFAULT 0"},
+			{"non_settleable_reason", "TEXT NOT NULL DEFAULT ''"},
+			{"self_usage", "INTEGER NOT NULL DEFAULT 0"},
+			{"payable_cny_micros", "INTEGER NOT NULL DEFAULT 0"},
+			{"receivable_cny_micros", "INTEGER NOT NULL DEFAULT 0"},
+		} {
+			if err := db.ensureSQLiteColumn(ctx, "profit_settlement_items", column.name, column.ddl); err != nil {
+				return err
+			}
+		}
+		return db.reloadProfitAttributionSnapshot(ctx)
 	}
 	if _, err := db.conn.ExecContext(ctx, profitPostgresSchema()); err != nil {
 		return fmt.Errorf("创建利润结算 PostgreSQL 表失败: %w", err)
 	}
-	return nil
+	return db.reloadProfitAttributionSnapshot(ctx)
 }
 
 func profitPostgresSchema() string {
@@ -265,6 +341,12 @@ func profitPostgresSchema() string {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS settlement_group_id_snapshot BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS settlement_group_name_snapshot TEXT NOT NULL DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS settlement_assignment_source VARCHAR(32) NOT NULL DEFAULT 'pending';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS consumer_source_type VARCHAR(32) NOT NULL DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS consumer_source_id VARCHAR(96) NOT NULL DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS consumer_assignment_version_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS consumer_group_id_snapshot BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS consumer_group_name_snapshot TEXT NOT NULL DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS non_settleable_reason VARCHAR(64) NOT NULL DEFAULT '';
 
 	CREATE TABLE IF NOT EXISTS profit_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1), enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -281,14 +363,87 @@ func profitPostgresSchema() string {
 	);
 	CREATE INDEX IF NOT EXISTS idx_profit_account_settings_group ON profit_account_settings(settlement_group_id);
 
+	CREATE TABLE IF NOT EXISTS profit_api_key_assignment_versions (
+		id BIGSERIAL PRIMARY KEY, api_key_id BIGINT NOT NULL, consumer_group_id BIGINT NOT NULL,
+		consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', assignment_source VARCHAR(32) NOT NULL DEFAULT 'manual',
+		actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_api_key_assignment_versions_key ON profit_api_key_assignment_versions(api_key_id, id DESC);
+	CREATE TABLE IF NOT EXISTS profit_api_key_current_assignments (
+		api_key_id BIGINT PRIMARY KEY, assignment_version_id BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS profit_api_key_assignment_overrides (
+		id BIGSERIAL PRIMARY KEY, api_key_id BIGINT NOT NULL, from_log_id BIGINT NOT NULL, to_log_id BIGINT NOT NULL,
+		assignment_version_id BIGINT NOT NULL, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK (to_log_id > from_log_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_api_key_assignment_overrides_lookup ON profit_api_key_assignment_overrides(api_key_id, from_log_id, to_log_id);
+
 	CREATE TABLE IF NOT EXISTS profit_ignored_accounts (
 		account_id BIGINT PRIMARY KEY, account_name_snapshot TEXT NOT NULL DEFAULT '',
 		ignored_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	CREATE TABLE IF NOT EXISTS profit_ingestion_events (
+		id BIGSERIAL PRIMARY KEY, event_type VARCHAR(32) NOT NULL, mode VARCHAR(16) NOT NULL DEFAULT '',
+		dropped_count BIGINT NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '', event_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_ingestion_events_time ON profit_ingestion_events(event_at, id);
 
 	CREATE TABLE IF NOT EXISTS profit_group_settings (
 		group_id BIGINT PRIMARY KEY, group_name_snapshot TEXT NOT NULL DEFAULT '',
 		multiplier_ppm BIGINT NOT NULL DEFAULT 1000000, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS profit_pair_rate_versions (
+		id BIGSERIAL PRIMARY KEY, consumer_group_id BIGINT NOT NULL, owner_group_id BIGINT NOT NULL,
+		consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', owner_group_name_snapshot TEXT NOT NULL DEFAULT '',
+		rate_ppm BIGINT NOT NULL, effective_date DATE NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+		active BOOLEAN NOT NULL DEFAULT TRUE, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK (consumer_group_id <> owner_group_id), CHECK (rate_ppm >= 0)
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_pair_rate_lookup ON profit_pair_rate_versions(consumer_group_id, owner_group_id, effective_date DESC, active);
+	CREATE TABLE IF NOT EXISTS profit_owner_default_rate_versions (
+		id BIGSERIAL PRIMARY KEY, owner_group_id BIGINT NOT NULL, owner_group_name_snapshot TEXT NOT NULL DEFAULT '',
+		rate_ppm BIGINT NOT NULL, effective_date DATE NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+		active BOOLEAN NOT NULL DEFAULT TRUE, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK (rate_ppm >= 0)
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_owner_rate_lookup ON profit_owner_default_rate_versions(owner_group_id, effective_date DESC, active);
+	CREATE TABLE IF NOT EXISTS profit_system_default_rate_versions (
+		id BIGSERIAL PRIMARY KEY, rate_ppm BIGINT NOT NULL, effective_date DATE NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+		active BOOLEAN NOT NULL DEFAULT TRUE, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK (rate_ppm >= 0)
+	);
+	INSERT INTO profit_system_default_rate_versions (rate_ppm, effective_date, actor, reason)
+	SELECT 100000, DATE '1970-01-01', 'system', 'initial default' WHERE NOT EXISTS (SELECT 1 FROM profit_system_default_rate_versions);
+	CREATE TABLE IF NOT EXISTS profit_account_economic_versions (
+		id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, effective_month DATE NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+		active BOOLEAN NOT NULL DEFAULT TRUE, monthly_fixed_cost_usd_micros BIGINT NOT NULL DEFAULT 200000000,
+		monthly_capacity_usd_micros BIGINT NOT NULL DEFAULT 10000000000, source VARCHAR(32) NOT NULL DEFAULT 'manual',
+		actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', revision_batch_id VARCHAR(80) NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK (monthly_fixed_cost_usd_micros >= 0), CHECK (monthly_capacity_usd_micros > 0)
+	);
+	CREATE INDEX IF NOT EXISTS idx_profit_account_economic_lookup ON profit_account_economic_versions(account_id, effective_month DESC, active);
+	CREATE TABLE IF NOT EXISTS profit_account_month_cost_state (
+		account_id BIGINT NOT NULL, effective_month DATE NOT NULL, economic_version_id BIGINT NOT NULL,
+		allocated_usd_micros BIGINT NOT NULL DEFAULT 0, generation BIGINT NOT NULL DEFAULT 0,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (account_id, effective_month)
+	);
+	CREATE TABLE IF NOT EXISTS profit_settlement_account_roi_items (
+		run_id VARCHAR(80) NOT NULL, account_id BIGINT NOT NULL, effective_month DATE NOT NULL,
+		owner_group_id BIGINT NOT NULL DEFAULT 0, owner_group_name TEXT NOT NULL DEFAULT '', economic_version_id BIGINT NOT NULL DEFAULT 0,
+		monthly_fixed_cost_usd_micros BIGINT NOT NULL, monthly_capacity_usd_micros BIGINT NOT NULL,
+		usage_in_manifest_usd_micros BIGINT NOT NULL, month_total_usage_usd_micros BIGINT NOT NULL,
+		allocated_before_usd_micros BIGINT NOT NULL DEFAULT 0, allocated_in_run_usd_micros BIGINT NOT NULL DEFAULT 0,
+		remaining_fixed_cost_usd_micros BIGINT NOT NULL DEFAULT 0, cost_fx_ppm BIGINT NOT NULL DEFAULT 1000000,
+		allocated_in_run_cny_micros BIGINT NOT NULL DEFAULT 0, status VARCHAR(24) NOT NULL DEFAULT 'pending',
+		revision_batch_id VARCHAR(80) NOT NULL DEFAULT '', PRIMARY KEY (run_id, account_id, effective_month)
+	);
+	CREATE TABLE IF NOT EXISTS profit_account_cost_allocations (
+		id BIGSERIAL PRIMARY KEY, run_id VARCHAR(80) NOT NULL, account_id BIGINT NOT NULL, effective_month DATE NOT NULL,
+		economic_version_id BIGINT NOT NULL, allocated_usd_micros BIGINT NOT NULL, active BOOLEAN NOT NULL DEFAULT FALSE,
+		revision_batch_id VARCHAR(80) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE (run_id, account_id, effective_month)
 	);
 
 	CREATE TABLE IF NOT EXISTS profit_ledger_state (
@@ -300,6 +455,10 @@ func profitPostgresSchema() string {
 	CREATE TABLE IF NOT EXISTS profit_daily_ledger (
 		id BIGSERIAL PRIMARY KEY, ledger_date DATE NOT NULL, segment INTEGER NOT NULL DEFAULT 0,
 		api_key_id BIGINT NOT NULL DEFAULT 0, api_key_name_snapshot TEXT NOT NULL DEFAULT '', api_key_masked_snapshot TEXT NOT NULL DEFAULT '',
+		consumer_source_type VARCHAR(32) NOT NULL DEFAULT '', consumer_source_id VARCHAR(96) NOT NULL DEFAULT '',
+		consumer_assignment_version_id BIGINT NOT NULL DEFAULT 0, consumer_group_id BIGINT NOT NULL DEFAULT 0,
+		consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', consumer_assignment_source VARCHAR(32) NOT NULL DEFAULT 'pending',
+		non_settleable_reason VARCHAR(64) NOT NULL DEFAULT '',
 		account_id BIGINT NOT NULL DEFAULT 0, account_name_snapshot TEXT NOT NULL DEFAULT '', account_deleted BOOLEAN NOT NULL DEFAULT FALSE,
 		channel VARCHAR(32) NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
 		settlement_group_id BIGINT NOT NULL DEFAULT 0, settlement_group_name_snapshot TEXT NOT NULL DEFAULT '',
@@ -312,6 +471,13 @@ func profitPostgresSchema() string {
 		claimed_lineage_id VARCHAR(80) NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		UNIQUE (ledger_date, segment, api_key_id, account_id, model, channel, settlement_group_id)
 	);
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_source_type VARCHAR(32) NOT NULL DEFAULT '';
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_source_id VARCHAR(96) NOT NULL DEFAULT '';
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_assignment_version_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_group_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_group_name_snapshot TEXT NOT NULL DEFAULT '';
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS consumer_assignment_source VARCHAR(32) NOT NULL DEFAULT 'pending';
+	ALTER TABLE profit_daily_ledger ADD COLUMN IF NOT EXISTS non_settleable_reason VARCHAR(64) NOT NULL DEFAULT '';
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_range ON profit_daily_ledger(ledger_date, settlement_group_id);
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_account ON profit_daily_ledger(account_id, ledger_date);
 	CREATE INDEX IF NOT EXISTS idx_profit_daily_ledger_claim ON profit_daily_ledger(claimed_lineage_id);
@@ -324,24 +490,46 @@ func profitPostgresSchema() string {
 		supersedes_id VARCHAR(80) NULL, status VARCHAR(24) NOT NULL DEFAULT 'draft', start_date DATE NOT NULL, end_date DATE NOT NULL,
 		settlement_ratio_ppm BIGINT NOT NULL, notes TEXT NOT NULL DEFAULT '', official_cost_usd_micros BIGINT NOT NULL DEFAULT 0,
 		settlement_cost_cny_micros BIGINT NOT NULL DEFAULT 0, revenue_cny_micros BIGINT NOT NULL DEFAULT 0,
-		profit_cny_micros BIGINT NOT NULL DEFAULT 0, source_manifest_hash VARCHAR(64) NOT NULL DEFAULT '',
+		profit_cny_micros BIGINT NOT NULL DEFAULT 0, payable_cny_micros BIGINT NOT NULL DEFAULT 0,
+		receivable_cny_micros BIGINT NOT NULL DEFAULT 0, fixed_cost_allocated_usd_micros BIGINT NOT NULL DEFAULT 0,
+		fixed_cost_allocated_cny_micros BIGINT NOT NULL DEFAULT 0, source_high_water_id BIGINT NOT NULL DEFAULT 0,
+		build_error TEXT NOT NULL DEFAULT '', source_manifest_hash VARCHAR(64) NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), confirmed_at TIMESTAMPTZ NULL
 	);
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS payable_cny_micros BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS receivable_cny_micros BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS fixed_cost_allocated_usd_micros BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS fixed_cost_allocated_cny_micros BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS source_high_water_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_runs ADD COLUMN IF NOT EXISTS build_error TEXT NOT NULL DEFAULT '';
 	CREATE INDEX IF NOT EXISTS idx_profit_settlement_runs_lineage ON profit_settlement_runs(lineage_id, revision_no DESC);
 	CREATE INDEX IF NOT EXISTS idx_profit_settlement_runs_range ON profit_settlement_runs(start_date, end_date);
 
 	CREATE TABLE IF NOT EXISTS profit_settlement_items (
 		run_id VARCHAR(80) NOT NULL, ledger_row_id BIGINT NOT NULL, ledger_version BIGINT NOT NULL,
 		ledger_date DATE NOT NULL, group_id BIGINT NOT NULL, group_name TEXT NOT NULL DEFAULT '',
+		consumer_group_id BIGINT NOT NULL DEFAULT 0, consumer_group_name TEXT NOT NULL DEFAULT '',
+		owner_group_id BIGINT NOT NULL DEFAULT 0, owner_group_name TEXT NOT NULL DEFAULT '',
 		api_key_id BIGINT NOT NULL DEFAULT 0, api_key_name TEXT NOT NULL DEFAULT '', account_id BIGINT NOT NULL DEFAULT 0,
 		account_name TEXT NOT NULL DEFAULT '', account_deleted BOOLEAN NOT NULL DEFAULT FALSE,
 		model TEXT NOT NULL DEFAULT '', channel VARCHAR(32) NOT NULL DEFAULT '', multiplier_ppm BIGINT NOT NULL,
+		rate_ppm BIGINT NOT NULL DEFAULT 0, non_settleable_reason VARCHAR(64) NOT NULL DEFAULT '', self_usage BOOLEAN NOT NULL DEFAULT FALSE,
 		request_count BIGINT NOT NULL DEFAULT 0, total_tokens BIGINT NOT NULL DEFAULT 0,
 		official_cost_usd_micros BIGINT NOT NULL DEFAULT 0, settlement_cost_cny_micros BIGINT NOT NULL DEFAULT 0,
 		revenue_cny_micros BIGINT NOT NULL DEFAULT 0, profit_cny_micros BIGINT NOT NULL DEFAULT 0,
+		payable_cny_micros BIGINT NOT NULL DEFAULT 0, receivable_cny_micros BIGINT NOT NULL DEFAULT 0,
 		source_first_log_id BIGINT NOT NULL DEFAULT 0, source_last_log_id BIGINT NOT NULL DEFAULT 0, source_hash VARCHAR(64) NOT NULL DEFAULT '',
 		PRIMARY KEY (run_id, ledger_row_id)
 	);
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS consumer_group_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS consumer_group_name TEXT NOT NULL DEFAULT '';
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS owner_group_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS owner_group_name TEXT NOT NULL DEFAULT '';
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS rate_ppm BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS non_settleable_reason VARCHAR(64) NOT NULL DEFAULT '';
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS self_usage BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS payable_cny_micros BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE profit_settlement_items ADD COLUMN IF NOT EXISTS receivable_cny_micros BIGINT NOT NULL DEFAULT 0;
 	CREATE INDEX IF NOT EXISTS idx_profit_settlement_items_ledger ON profit_settlement_items(ledger_row_id);
 
 	CREATE TABLE IF NOT EXISTS profit_ledger_claims (
@@ -367,13 +555,87 @@ func profitSQLiteSchemaStatements() []string {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_account_settings_group ON profit_account_settings(settlement_group_id)`,
+		`CREATE TABLE IF NOT EXISTS profit_api_key_assignment_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, api_key_id INTEGER NOT NULL, consumer_group_id INTEGER NOT NULL,
+			consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', assignment_source TEXT NOT NULL DEFAULT 'manual',
+			actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_api_key_assignment_versions_key ON profit_api_key_assignment_versions(api_key_id, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS profit_api_key_current_assignments (
+			api_key_id INTEGER PRIMARY KEY, assignment_version_id INTEGER NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS profit_api_key_assignment_overrides (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, api_key_id INTEGER NOT NULL, from_log_id INTEGER NOT NULL, to_log_id INTEGER NOT NULL,
+			assignment_version_id INTEGER NOT NULL, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK (to_log_id > from_log_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_api_key_assignment_overrides_lookup ON profit_api_key_assignment_overrides(api_key_id, from_log_id, to_log_id)`,
 		`CREATE TABLE IF NOT EXISTS profit_ignored_accounts (
 			account_id INTEGER PRIMARY KEY, account_name_snapshot TEXT NOT NULL DEFAULT '',
 			ignored_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS profit_ingestion_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, mode TEXT NOT NULL DEFAULT '',
+			dropped_count INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '',
+			event_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_ingestion_events_time ON profit_ingestion_events(event_at, id)`,
 		`CREATE TABLE IF NOT EXISTS profit_group_settings (
 			group_id INTEGER PRIMARY KEY, group_name_snapshot TEXT NOT NULL DEFAULT '', multiplier_ppm INTEGER NOT NULL DEFAULT 1000000,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS profit_pair_rate_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, consumer_group_id INTEGER NOT NULL, owner_group_id INTEGER NOT NULL,
+			consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', owner_group_name_snapshot TEXT NOT NULL DEFAULT '',
+			rate_ppm INTEGER NOT NULL, effective_date TEXT NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+			active INTEGER NOT NULL DEFAULT 1, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK (consumer_group_id <> owner_group_id), CHECK (rate_ppm >= 0)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_pair_rate_lookup ON profit_pair_rate_versions(consumer_group_id, owner_group_id, effective_date DESC, active)`,
+		`CREATE TABLE IF NOT EXISTS profit_owner_default_rate_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, owner_group_id INTEGER NOT NULL, owner_group_name_snapshot TEXT NOT NULL DEFAULT '',
+			rate_ppm INTEGER NOT NULL, effective_date TEXT NOT NULL, revision_no INTEGER NOT NULL DEFAULT 1,
+			active INTEGER NOT NULL DEFAULT 1, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK (rate_ppm >= 0)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_owner_rate_lookup ON profit_owner_default_rate_versions(owner_group_id, effective_date DESC, active)`,
+		`CREATE TABLE IF NOT EXISTS profit_system_default_rate_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, rate_ppm INTEGER NOT NULL, effective_date TEXT NOT NULL,
+			revision_no INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1, actor TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK (rate_ppm >= 0)
+		)`,
+		`INSERT INTO profit_system_default_rate_versions (rate_ppm, effective_date, actor, reason)
+		 SELECT 100000, '1970-01-01', 'system', 'initial default' WHERE NOT EXISTS (SELECT 1 FROM profit_system_default_rate_versions)`,
+		`CREATE TABLE IF NOT EXISTS profit_account_economic_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, effective_month TEXT NOT NULL,
+			revision_no INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1,
+			monthly_fixed_cost_usd_micros INTEGER NOT NULL DEFAULT 200000000,
+			monthly_capacity_usd_micros INTEGER NOT NULL DEFAULT 10000000000, source TEXT NOT NULL DEFAULT 'manual',
+			actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', revision_batch_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK (monthly_fixed_cost_usd_micros >= 0), CHECK (monthly_capacity_usd_micros > 0)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profit_account_economic_lookup ON profit_account_economic_versions(account_id, effective_month DESC, active)`,
+		`CREATE TABLE IF NOT EXISTS profit_account_month_cost_state (
+			account_id INTEGER NOT NULL, effective_month TEXT NOT NULL, economic_version_id INTEGER NOT NULL,
+			allocated_usd_micros INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (account_id, effective_month)
+		)`,
+		`CREATE TABLE IF NOT EXISTS profit_settlement_account_roi_items (
+			run_id TEXT NOT NULL, account_id INTEGER NOT NULL, effective_month TEXT NOT NULL,
+			owner_group_id INTEGER NOT NULL DEFAULT 0, owner_group_name TEXT NOT NULL DEFAULT '', economic_version_id INTEGER NOT NULL DEFAULT 0,
+			monthly_fixed_cost_usd_micros INTEGER NOT NULL, monthly_capacity_usd_micros INTEGER NOT NULL,
+			usage_in_manifest_usd_micros INTEGER NOT NULL, month_total_usage_usd_micros INTEGER NOT NULL,
+			allocated_before_usd_micros INTEGER NOT NULL DEFAULT 0, allocated_in_run_usd_micros INTEGER NOT NULL DEFAULT 0,
+			remaining_fixed_cost_usd_micros INTEGER NOT NULL DEFAULT 0, cost_fx_ppm INTEGER NOT NULL DEFAULT 1000000,
+			allocated_in_run_cny_micros INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+			revision_batch_id TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, account_id, effective_month)
+		)`,
+		`CREATE TABLE IF NOT EXISTS profit_account_cost_allocations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, account_id INTEGER NOT NULL, effective_month TEXT NOT NULL,
+			economic_version_id INTEGER NOT NULL, allocated_usd_micros INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
+			revision_batch_id TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (run_id, account_id, effective_month)
 		)`,
 		`CREATE TABLE IF NOT EXISTS profit_ledger_state (
 			id INTEGER PRIMARY KEY CHECK (id = 1), last_usage_log_id INTEGER NOT NULL DEFAULT 0,
@@ -383,6 +645,10 @@ func profitSQLiteSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS profit_daily_ledger (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, ledger_date TEXT NOT NULL, segment INTEGER NOT NULL DEFAULT 0,
 			api_key_id INTEGER NOT NULL DEFAULT 0, api_key_name_snapshot TEXT NOT NULL DEFAULT '', api_key_masked_snapshot TEXT NOT NULL DEFAULT '',
+			consumer_source_type TEXT NOT NULL DEFAULT '', consumer_source_id TEXT NOT NULL DEFAULT '',
+			consumer_assignment_version_id INTEGER NOT NULL DEFAULT 0, consumer_group_id INTEGER NOT NULL DEFAULT 0,
+			consumer_group_name_snapshot TEXT NOT NULL DEFAULT '', consumer_assignment_source TEXT NOT NULL DEFAULT 'pending',
+			non_settleable_reason TEXT NOT NULL DEFAULT '',
 			account_id INTEGER NOT NULL DEFAULT 0, account_name_snapshot TEXT NOT NULL DEFAULT '', account_deleted INTEGER NOT NULL DEFAULT 0,
 			channel TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', settlement_group_id INTEGER NOT NULL DEFAULT 0,
 			settlement_group_name_snapshot TEXT NOT NULL DEFAULT '', assignment_source TEXT NOT NULL DEFAULT 'pending', request_count INTEGER NOT NULL DEFAULT 0,
@@ -404,18 +670,25 @@ func profitSQLiteSchemaStatements() []string {
 			status TEXT NOT NULL DEFAULT 'draft', start_date TEXT NOT NULL, end_date TEXT NOT NULL, settlement_ratio_ppm INTEGER NOT NULL,
 			notes TEXT NOT NULL DEFAULT '', official_cost_usd_micros INTEGER NOT NULL DEFAULT 0, settlement_cost_cny_micros INTEGER NOT NULL DEFAULT 0,
 			revenue_cny_micros INTEGER NOT NULL DEFAULT 0, profit_cny_micros INTEGER NOT NULL DEFAULT 0,
+			payable_cny_micros INTEGER NOT NULL DEFAULT 0, receivable_cny_micros INTEGER NOT NULL DEFAULT 0,
+			fixed_cost_allocated_usd_micros INTEGER NOT NULL DEFAULT 0, fixed_cost_allocated_cny_micros INTEGER NOT NULL DEFAULT 0,
+			source_high_water_id INTEGER NOT NULL DEFAULT 0, build_error TEXT NOT NULL DEFAULT '',
 			source_manifest_hash TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, confirmed_at TIMESTAMP NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_settlement_runs_lineage ON profit_settlement_runs(lineage_id, revision_no DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_settlement_runs_range ON profit_settlement_runs(start_date, end_date)`,
 		`CREATE TABLE IF NOT EXISTS profit_settlement_items (
 			run_id TEXT NOT NULL, ledger_row_id INTEGER NOT NULL, ledger_version INTEGER NOT NULL, ledger_date TEXT NOT NULL,
-			group_id INTEGER NOT NULL, group_name TEXT NOT NULL DEFAULT '', api_key_id INTEGER NOT NULL DEFAULT 0, api_key_name TEXT NOT NULL DEFAULT '',
+			group_id INTEGER NOT NULL, group_name TEXT NOT NULL DEFAULT '', consumer_group_id INTEGER NOT NULL DEFAULT 0,
+			consumer_group_name TEXT NOT NULL DEFAULT '', owner_group_id INTEGER NOT NULL DEFAULT 0, owner_group_name TEXT NOT NULL DEFAULT '',
+			api_key_id INTEGER NOT NULL DEFAULT 0, api_key_name TEXT NOT NULL DEFAULT '',
 			account_id INTEGER NOT NULL DEFAULT 0, account_name TEXT NOT NULL DEFAULT '', account_deleted INTEGER NOT NULL DEFAULT 0,
-			model TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', multiplier_ppm INTEGER NOT NULL,
+			model TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', multiplier_ppm INTEGER NOT NULL, rate_ppm INTEGER NOT NULL DEFAULT 0,
+			non_settleable_reason TEXT NOT NULL DEFAULT '', self_usage INTEGER NOT NULL DEFAULT 0,
 			request_count INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, official_cost_usd_micros INTEGER NOT NULL DEFAULT 0,
 			settlement_cost_cny_micros INTEGER NOT NULL DEFAULT 0, revenue_cny_micros INTEGER NOT NULL DEFAULT 0,
-			profit_cny_micros INTEGER NOT NULL DEFAULT 0, source_first_log_id INTEGER NOT NULL DEFAULT 0,
+			profit_cny_micros INTEGER NOT NULL DEFAULT 0, payable_cny_micros INTEGER NOT NULL DEFAULT 0,
+			receivable_cny_micros INTEGER NOT NULL DEFAULT 0, source_first_log_id INTEGER NOT NULL DEFAULT 0,
 			source_last_log_id INTEGER NOT NULL DEFAULT 0, source_hash TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, ledger_row_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profit_settlement_items_ledger ON profit_settlement_items(ledger_row_id)`,
@@ -480,71 +753,38 @@ func (db *DB) populateProfitSettlementSnapshots(ctx context.Context, tx *sql.Tx,
 	if len(batch) == 0 {
 		return batch, nil
 	}
-	ids := make([]int64, 0)
-	seen := make(map[int64]struct{})
-	for _, entry := range batch {
-		if entry.AccountID <= 0 {
-			continue
-		}
-		if _, ok := seen[entry.AccountID]; ok {
-			continue
-		}
-		seen[entry.AccountID] = struct{}{}
-		ids = append(ids, entry.AccountID)
-	}
-	if len(ids) == 0 {
-		return batch, nil
-	}
-	args := make([]interface{}, 0, len(ids))
-	placeholders := make([]string, 0, len(ids))
-	for i, id := range ids {
-		args = append(args, id)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT pas.account_id, pas.settlement_group_id,
-		COALESCE(NULLIF(g.name, ''), pas.settlement_group_name, ''), COALESCE(NULLIF(pas.assignment_source, ''), 'confirmed')
-		FROM profit_account_settings pas LEFT JOIN account_groups g ON g.id = pas.settlement_group_id
-		WHERE pas.account_id IN (`+strings.Join(placeholders, ",")+`)
-		UNION ALL
-		SELECT m.account_id, MIN(m.group_id), MAX(g.name), 'inherited'
-		FROM account_group_members m JOIN account_groups g ON g.id = m.group_id
-		LEFT JOIN profit_account_settings pas ON pas.account_id = m.account_id
-		WHERE m.account_id IN (`+strings.Join(placeholders, ",")+`) AND pas.account_id IS NULL
-		GROUP BY m.account_id HAVING COUNT(*) = 1`, args...)
-	if err != nil {
-		return nil, err
-	}
-	type assignment struct {
-		groupID int64
-		name    string
-		source  string
-	}
-	assignments := make(map[int64]assignment)
-	for rows.Next() {
-		var accountID int64
-		var item assignment
-		if err := rows.Scan(&accountID, &item.groupID, &item.name, &item.source); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		assignments[accountID] = item
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
+	_ = ctx
+	_ = tx
 	result := make([]usageLogEntry, len(batch))
 	copy(result, batch)
 	for i := range result {
-		item, ok := assignments[result[i].AccountID]
-		if !ok {
-			result[i].SettlementGroupIDSnapshot = 0
-			result[i].SettlementGroupNameSnapshot = ""
-			result[i].SettlementAssignmentSource = "pending"
-			continue
+		if result[i].SettlementAssignmentSource == "" || result[i].SettlementGroupIDSnapshot <= 0 {
+			owner := db.ProfitAccountAttribution(result[i].AccountID)
+			result[i].SettlementGroupIDSnapshot = owner.GroupID
+			result[i].SettlementGroupNameSnapshot = owner.GroupName
+			result[i].SettlementAssignmentSource = owner.AssignmentSource
 		}
-		result[i].SettlementGroupIDSnapshot = item.groupID
-		result[i].SettlementGroupNameSnapshot = item.name
-		result[i].SettlementAssignmentSource = item.source
+		if result[i].ConsumerSourceType == "" {
+			if result[i].APIKeyID > 0 {
+				consumer := db.ProfitAPIKeyAttribution(result[i].APIKeyID)
+				result[i].ConsumerSourceType = consumer.SourceType
+				result[i].ConsumerSourceID = consumer.SourceID
+				result[i].ConsumerAssignmentVersionID = consumer.AssignmentVersionID
+				result[i].ConsumerGroupIDSnapshot = consumer.GroupID
+				result[i].ConsumerGroupNameSnapshot = consumer.GroupName
+				result[i].NonSettleableReason = consumer.NonSettleableReason
+			} else {
+				result[i].ConsumerSourceType = ProfitConsumerSourceSystem
+				result[i].ConsumerSourceID = strings.TrimSpace(result[i].InternalReason)
+				if result[i].ConsumerSourceID == "" {
+					result[i].ConsumerSourceID = "anonymous"
+				}
+				result[i].NonSettleableReason = ProfitNonSettleableSystemInternal
+			}
+		}
+		if result[i].SettlementAssignmentSource == "" {
+			result[i].SettlementAssignmentSource = "pending"
+		}
 	}
 	return result, nil
 }
@@ -560,6 +800,13 @@ type profitUsageSource struct {
 	APIKeyID            int64
 	APIKeyName          string
 	APIKeyMasked        string
+	ConsumerSourceType  string
+	ConsumerSourceID    string
+	ConsumerVersionID   int64
+	ConsumerGroupID     int64
+	ConsumerGroupName   string
+	ConsumerSource      string
+	NonSettleableReason string
 	SettlementGroupID   int64
 	SettlementGroupName string
 	AssignmentSource    string
@@ -577,6 +824,13 @@ type profitLedgerAggregate struct {
 	APIKeyID            int64
 	APIKeyName          string
 	APIKeyMasked        string
+	ConsumerSourceType  string
+	ConsumerSourceID    string
+	ConsumerVersionID   int64
+	ConsumerGroupID     int64
+	ConsumerGroupName   string
+	ConsumerSource      string
+	NonSettleableReason string
 	AccountID           int64
 	AccountName         string
 	AccountDeleted      bool
@@ -718,6 +972,13 @@ func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLe
 				CASE WHEN COALESCE(a.status, '') = 'deleted' OR a.deleted_at IS NOT NULL THEN 1 ELSE 0 END,
 				COALESCE(ul.channel, ''), COALESCE(NULLIF(ul.effective_model, ''), ul.model, ''),
 				COALESCE(ul.api_key_id, 0), COALESCE(ul.api_key_name, ''), COALESCE(ul.api_key_masked, ''),
+				COALESCE(NULLIF(ul.consumer_source_type, ''), CASE WHEN COALESCE(ul.api_key_id, 0) > 0 THEN 'api_key' ELSE 'system_internal' END),
+				COALESCE(NULLIF(ul.consumer_source_id, ''), CASE WHEN COALESCE(ul.api_key_id, 0) > 0 THEN CAST(ul.api_key_id AS TEXT) ELSE COALESCE(NULLIF(ul.internal_reason, ''), 'anonymous') END),
+				CASE WHEN COALESCE(ul.consumer_assignment_version_id, 0) > 0 THEN ul.consumer_assignment_version_id ELSE COALESCE(ov.id, 0) END,
+				CASE WHEN COALESCE(ul.consumer_assignment_version_id, 0) > 0 THEN COALESCE(ul.consumer_group_id_snapshot, 0) ELSE COALESCE(ov.consumer_group_id, 0) END,
+				CASE WHEN COALESCE(ul.consumer_assignment_version_id, 0) > 0 THEN COALESCE(ul.consumer_group_name_snapshot, '') ELSE COALESCE(ov.consumer_group_name_snapshot, '') END,
+				COALESCE(NULLIF(cv.assignment_source, ''), NULLIF(ov.assignment_source, ''), CASE WHEN COALESCE(ul.api_key_id, 0) > 0 THEN 'pending' ELSE 'system' END),
+				COALESCE(NULLIF(ul.non_settleable_reason, ''), CASE WHEN COALESCE(ul.api_key_id, 0) <= 0 THEN 'system_internal' ELSE '' END),
 				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN ul.settlement_group_id_snapshot ELSE COALESCE(pas.settlement_group_id, 0) END,
 				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN COALESCE(ul.settlement_group_name_snapshot, '') ELSE COALESCE(NULLIF(g.name, ''), pas.settlement_group_name, '') END,
 				CASE WHEN COALESCE(ul.settlement_group_id_snapshot, 0) > 0 THEN COALESCE(ul.settlement_assignment_source, 'pending') ELSE COALESCE(NULLIF(pas.assignment_source, ''), 'pending') END,
@@ -725,6 +986,9 @@ func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLe
 				COALESCE(ul.input_tokens, 0), COALESCE(ul.output_tokens, 0), COALESCE(ul.cached_tokens, 0),
 				COALESCE(ul.reasoning_tokens, 0), COALESCE(ul.total_tokens, 0), COALESCE(ul.account_billed, 0)
 			FROM usage_logs ul LEFT JOIN accounts a ON a.id = ul.account_id
+			LEFT JOIN profit_api_key_assignment_versions cv ON cv.id = ul.consumer_assignment_version_id
+			LEFT JOIN profit_api_key_assignment_overrides ao ON ao.api_key_id = ul.api_key_id AND ul.id >= ao.from_log_id AND ul.id < ao.to_log_id
+			LEFT JOIN profit_api_key_assignment_versions ov ON ov.id = ao.assignment_version_id
 			LEFT JOIN profit_account_settings pas ON pas.account_id = ul.account_id
 			LEFT JOIN account_groups g ON g.id = pas.settlement_group_id
 			WHERE ul.id > $1 AND ul.id <= $2 ORDER BY ul.id LIMIT $3
@@ -740,6 +1004,8 @@ func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLe
 			var createdRaw interface{}
 			if err := rows.Scan(&source.ID, &createdRaw, &source.AccountID, &source.AccountName, &source.AccountDeleted,
 				&source.Channel, &source.Model, &source.APIKeyID, &source.APIKeyName, &source.APIKeyMasked,
+				&source.ConsumerSourceType, &source.ConsumerSourceID, &source.ConsumerVersionID, &source.ConsumerGroupID,
+				&source.ConsumerGroupName, &source.ConsumerSource, &source.NonSettleableReason,
 				&source.SettlementGroupID, &source.SettlementGroupName, &source.AssignmentSource, &source.StatusCode,
 				&source.InputTokens, &source.OutputTokens, &source.CachedTokens, &source.ReasoningTokens,
 				&source.TotalTokens, &source.AccountBilled); err != nil {
@@ -758,14 +1024,19 @@ func (db *DB) RefreshProfitDailyLedger(ctx context.Context, limit int) (ProfitLe
 				continue
 			}
 			ledgerDate := created.In(loc).Format("2006-01-02")
-			key := strings.Join([]string{ledgerDate, strconv.FormatInt(source.APIKeyID, 10),
+			key := strings.Join([]string{ledgerDate, strconv.FormatInt(source.APIKeyID, 10), source.ConsumerSourceType,
+				source.ConsumerSourceID, strconv.FormatInt(source.ConsumerVersionID, 10), strconv.FormatInt(source.ConsumerGroupID, 10),
 				strconv.FormatInt(source.AccountID, 10), source.Model, source.Channel,
 				strconv.FormatInt(source.SettlementGroupID, 10)}, "\x1f")
 			aggregate := aggregates[key]
 			if aggregate == nil {
 				aggregate = &profitLedgerAggregate{
 					LedgerDate: ledgerDate, APIKeyID: source.APIKeyID, APIKeyName: source.APIKeyName,
-					APIKeyMasked: source.APIKeyMasked, AccountID: source.AccountID, AccountName: source.AccountName,
+					APIKeyMasked: source.APIKeyMasked, ConsumerSourceType: source.ConsumerSourceType,
+					ConsumerSourceID: source.ConsumerSourceID, ConsumerVersionID: source.ConsumerVersionID,
+					ConsumerGroupID: source.ConsumerGroupID, ConsumerGroupName: source.ConsumerGroupName,
+					ConsumerSource: source.ConsumerSource, NonSettleableReason: source.NonSettleableReason,
+					AccountID: source.AccountID, AccountName: source.AccountName,
 					AccountDeleted: source.AccountDeleted, Channel: source.Channel, Model: source.Model,
 					SettlementGroupID: source.SettlementGroupID, SettlementGroupName: source.SettlementGroupName,
 					AssignmentSource: source.AssignmentSource,
@@ -815,31 +1086,45 @@ func (db *DB) upsertProfitLedgerAggregate(ctx context.Context, tx *sql.Tx, item 
 	var oldHash string
 	err := tx.QueryRowContext(ctx, `SELECT id, segment, ledger_version, claimed_lineage_id, source_hash
 		FROM profit_daily_ledger WHERE ledger_date = $1 AND api_key_id = $2 AND account_id = $3
-		AND model = $4 AND channel = $5 AND settlement_group_id = $6 ORDER BY segment DESC LIMIT 1`,
-		item.LedgerDate, item.APIKeyID, item.AccountID, item.Model, item.Channel, item.SettlementGroupID).
+		AND model = $4 AND channel = $5 AND settlement_group_id = $6
+		AND consumer_source_type = $7 AND consumer_source_id = $8
+		AND consumer_assignment_version_id = $9 AND consumer_group_id = $10
+		ORDER BY segment DESC LIMIT 1`,
+		item.LedgerDate, item.APIKeyID, item.AccountID, item.Model, item.Channel, item.SettlementGroupID,
+		item.ConsumerSourceType, item.ConsumerSourceID, item.ConsumerVersionID, item.ConsumerGroupID).
 		Scan(&existingID, &segment, &version, &claimed, &oldHash)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	chunkHash := hex.EncodeToString(item.SourceHash[:])
 	if errors.Is(err, sql.ErrNoRows) || claimed.Valid && claimed.String != "" {
-		if claimed.Valid && claimed.String != "" {
-			segment++
-		} else {
-			segment = 0
+		var maxSegment sql.NullInt64
+		if maxErr := tx.QueryRowContext(ctx, `SELECT MAX(segment) FROM profit_daily_ledger
+			WHERE ledger_date = $1 AND api_key_id = $2 AND account_id = $3 AND model = $4
+			AND channel = $5 AND settlement_group_id = $6`, item.LedgerDate, item.APIKeyID,
+			item.AccountID, item.Model, item.Channel, item.SettlementGroupID).Scan(&maxSegment); maxErr != nil {
+			return maxErr
+		}
+		segment = 0
+		if maxSegment.Valid {
+			segment = maxSegment.Int64 + 1
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO profit_daily_ledger (
 			ledger_date, segment, api_key_id, api_key_name_snapshot, api_key_masked_snapshot,
+			consumer_source_type, consumer_source_id, consumer_assignment_version_id, consumer_group_id,
+			consumer_group_name_snapshot, consumer_assignment_source, non_settleable_reason,
 			account_id, account_name_snapshot, account_deleted, channel, model,
 			settlement_group_id, settlement_group_name_snapshot, assignment_source,
 			request_count, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 			official_cost_usd_micros, source_first_log_id, source_last_log_id, source_hash, ledger_version
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,1)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,1)`,
 			item.LedgerDate, segment, item.APIKeyID, item.APIKeyName, item.APIKeyMasked,
+			item.ConsumerSourceType, item.ConsumerSourceID, item.ConsumerVersionID, item.ConsumerGroupID,
+			item.ConsumerGroupName, item.ConsumerSource, item.NonSettleableReason,
 			item.AccountID, item.AccountName, item.AccountDeleted, item.Channel, item.Model,
-			item.SettlementGroupID, item.SettlementGroupName, item.AssignmentSource,
-			item.RequestCount, item.InputTokens, item.OutputTokens, item.CachedTokens, item.ReasoningTokens,
-			item.TotalTokens, item.OfficialUSDMicros, item.SourceFirstLogID, item.SourceLastLogID, chunkHash)
+			item.SettlementGroupID, item.SettlementGroupName, item.AssignmentSource, item.RequestCount,
+			item.InputTokens, item.OutputTokens, item.CachedTokens, item.ReasoningTokens, item.TotalTokens,
+			item.OfficialUSDMicros, item.SourceFirstLogID, item.SourceLastLogID, chunkHash)
 		return err
 	}
 	combined := sha256.Sum256([]byte(oldHash + "|" + chunkHash))
@@ -850,20 +1135,23 @@ func (db *DB) upsertProfitLedgerAggregate(ctx context.Context, tx *sql.Tx, item 
 	_, err = tx.ExecContext(ctx, `UPDATE profit_daily_ledger SET
 		api_key_name_snapshot = CASE WHEN api_key_name_snapshot = '' THEN $1 ELSE api_key_name_snapshot END,
 		api_key_masked_snapshot = CASE WHEN api_key_masked_snapshot = '' THEN $2 ELSE api_key_masked_snapshot END,
-		account_name_snapshot = CASE WHEN account_name_snapshot = '' THEN $3 ELSE account_name_snapshot END,
-		account_deleted = CASE WHEN $4 THEN $4 ELSE account_deleted END,
-		settlement_group_name_snapshot = CASE WHEN settlement_group_name_snapshot = '' THEN $5 ELSE settlement_group_name_snapshot END,
-		assignment_source = CASE WHEN assignment_source = 'pending' AND $6 <> 'pending' THEN $6 ELSE assignment_source END,
-		request_count = request_count + $7, input_tokens = input_tokens + $8, output_tokens = output_tokens + $9,
-		cached_tokens = cached_tokens + $10, reasoning_tokens = reasoning_tokens + $11, total_tokens = total_tokens + $12,
-		official_cost_usd_micros = official_cost_usd_micros + $13,
-		source_first_log_id = CASE WHEN source_first_log_id = 0 OR $14 < source_first_log_id THEN $14 ELSE source_first_log_id END,
-		source_last_log_id = CASE WHEN $15 > source_last_log_id THEN $15 ELSE source_last_log_id END,
-		source_hash = $16, ledger_version = ledger_version + 1, updated_at = `+nowExpr+` WHERE id = $17`,
-		item.APIKeyName, item.APIKeyMasked, item.AccountName, item.AccountDeleted, item.SettlementGroupName,
-		item.AssignmentSource, item.RequestCount, item.InputTokens, item.OutputTokens, item.CachedTokens,
-		item.ReasoningTokens, item.TotalTokens, item.OfficialUSDMicros, item.SourceFirstLogID,
-		item.SourceLastLogID, hex.EncodeToString(combined[:]), existingID)
+		consumer_group_name_snapshot = CASE WHEN consumer_group_name_snapshot = '' THEN $3 ELSE consumer_group_name_snapshot END,
+		consumer_assignment_source = CASE WHEN consumer_assignment_source = 'pending' AND $4 <> 'pending' THEN $4 ELSE consumer_assignment_source END,
+		non_settleable_reason = CASE WHEN non_settleable_reason = '' THEN $5 ELSE non_settleable_reason END,
+		account_name_snapshot = CASE WHEN account_name_snapshot = '' THEN $6 ELSE account_name_snapshot END,
+		account_deleted = CASE WHEN $7 THEN $7 ELSE account_deleted END,
+		settlement_group_name_snapshot = CASE WHEN settlement_group_name_snapshot = '' THEN $8 ELSE settlement_group_name_snapshot END,
+		assignment_source = CASE WHEN assignment_source = 'pending' AND $9 <> 'pending' THEN $9 ELSE assignment_source END,
+		request_count = request_count + $10, input_tokens = input_tokens + $11, output_tokens = output_tokens + $12,
+		cached_tokens = cached_tokens + $13, reasoning_tokens = reasoning_tokens + $14, total_tokens = total_tokens + $15,
+		official_cost_usd_micros = official_cost_usd_micros + $16,
+		source_first_log_id = CASE WHEN source_first_log_id = 0 OR $17 < source_first_log_id THEN $17 ELSE source_first_log_id END,
+		source_last_log_id = CASE WHEN $18 > source_last_log_id THEN $18 ELSE source_last_log_id END,
+		source_hash = $19, ledger_version = ledger_version + 1, updated_at = `+nowExpr+` WHERE id = $20`,
+		item.APIKeyName, item.APIKeyMasked, item.ConsumerGroupName, item.ConsumerSource, item.NonSettleableReason,
+		item.AccountName, item.AccountDeleted, item.SettlementGroupName, item.AssignmentSource, item.RequestCount,
+		item.InputTokens, item.OutputTokens, item.CachedTokens, item.ReasoningTokens, item.TotalTokens,
+		item.OfficialUSDMicros, item.SourceFirstLogID, item.SourceLastLogID, hex.EncodeToString(combined[:]), existingID)
 	return err
 }
 
@@ -1047,35 +1335,45 @@ func (db *DB) ListProfitPendingAccounts(ctx context.Context) ([]ProfitPendingAcc
 }
 
 type profitLedgerMergeRow struct {
-	ID                int64
-	LedgerDate        string
-	Segment           int64
-	APIKeyID          int64
-	APIKeyName        string
-	APIKeyMasked      string
-	AccountID         int64
-	AccountName       string
-	AccountDeleted    bool
-	Channel           string
-	Model             string
-	RequestCount      int64
-	InputTokens       int64
-	OutputTokens      int64
-	CachedTokens      int64
-	ReasoningTokens   int64
-	TotalTokens       int64
-	OfficialUSDMicros int64
-	SourceFirstLogID  int64
-	SourceLastLogID   int64
-	SourceHash        string
-	LedgerVersion     int64
+	ID                  int64
+	LedgerDate          string
+	Segment             int64
+	APIKeyID            int64
+	APIKeyName          string
+	APIKeyMasked        string
+	ConsumerSourceType  string
+	ConsumerSourceID    string
+	ConsumerVersionID   int64
+	ConsumerGroupID     int64
+	ConsumerGroupName   string
+	ConsumerSource      string
+	NonSettleableReason string
+	AccountID           int64
+	AccountName         string
+	AccountDeleted      bool
+	Channel             string
+	Model               string
+	RequestCount        int64
+	InputTokens         int64
+	OutputTokens        int64
+	CachedTokens        int64
+	ReasoningTokens     int64
+	TotalTokens         int64
+	OfficialUSDMicros   int64
+	SourceFirstLogID    int64
+	SourceLastLogID     int64
+	SourceHash          string
+	LedgerVersion       int64
 }
 
 func (db *DB) AssignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64) error {
 	// 未聚合日志会在 RefreshProfitDailyLedger 中通过 profit_account_settings
 	// 解析到已确认分组。这里不能同步改写账号的全部历史 usage_logs：生产表很大，
 	// 单次 UPDATE 会长期占用 SQLite 写锁并阻塞 OAuth、日志与账号状态落库。
-	return db.assignProfitSettlementGroup(ctx, accountID, groupID, "confirmed", false)
+	if err := db.assignProfitSettlementGroup(ctx, accountID, groupID, "confirmed", false); err != nil {
+		return err
+	}
+	return db.reloadProfitAttributionSnapshot(ctx)
 }
 
 func (db *DB) assignProfitSettlementGroup(ctx context.Context, accountID int64, groupID int64, assignmentSource string, backfillUsageLogs bool) error {
@@ -1129,7 +1427,9 @@ func (db *DB) assignProfitSettlementGroup(ctx context.Context, accountID int64, 
 			}
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT id, CAST(ledger_date AS TEXT), segment, api_key_id, api_key_name_snapshot,
-			api_key_masked_snapshot, account_id, account_name_snapshot, account_deleted, channel, model,
+			api_key_masked_snapshot, consumer_source_type, consumer_source_id, consumer_assignment_version_id,
+			consumer_group_id, consumer_group_name_snapshot, consumer_assignment_source, non_settleable_reason,
+			account_id, account_name_snapshot, account_deleted, channel, model,
 			request_count, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 			official_cost_usd_micros, source_first_log_id, source_last_log_id, source_hash, ledger_version
 			FROM profit_daily_ledger WHERE account_id = $1 AND settlement_group_id = 0
@@ -1141,7 +1441,9 @@ func (db *DB) assignProfitSettlementGroup(ctx context.Context, accountID int64, 
 		for rows.Next() {
 			var row profitLedgerMergeRow
 			if err := rows.Scan(&row.ID, &row.LedgerDate, &row.Segment, &row.APIKeyID, &row.APIKeyName,
-				&row.APIKeyMasked, &row.AccountID, &row.AccountName, &row.AccountDeleted, &row.Channel,
+				&row.APIKeyMasked, &row.ConsumerSourceType, &row.ConsumerSourceID, &row.ConsumerVersionID,
+				&row.ConsumerGroupID, &row.ConsumerGroupName, &row.ConsumerSource, &row.NonSettleableReason,
+				&row.AccountID, &row.AccountName, &row.AccountDeleted, &row.Channel,
 				&row.Model, &row.RequestCount, &row.InputTokens, &row.OutputTokens, &row.CachedTokens,
 				&row.ReasoningTokens, &row.TotalTokens, &row.OfficialUSDMicros, &row.SourceFirstLogID,
 				&row.SourceLastLogID, &row.SourceHash, &row.LedgerVersion); err != nil {
@@ -1167,8 +1469,10 @@ func (db *DB) mergePendingProfitLedgerRow(ctx context.Context, tx *sql.Tx, row p
 	var claimed sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id, segment, claimed_lineage_id FROM profit_daily_ledger
 		WHERE ledger_date = $1 AND api_key_id = $2 AND account_id = $3 AND model = $4 AND channel = $5
-		AND settlement_group_id = $6 ORDER BY segment DESC LIMIT 1`, row.LedgerDate, row.APIKeyID,
-		row.AccountID, row.Model, row.Channel, groupID).Scan(&targetID, &targetSegment, &claimed)
+		AND settlement_group_id = $6 AND consumer_source_type = $7 AND consumer_source_id = $8
+		AND consumer_assignment_version_id = $9 AND consumer_group_id = $10 ORDER BY segment DESC LIMIT 1`,
+		row.LedgerDate, row.APIKeyID, row.AccountID, row.Model, row.Channel, groupID, row.ConsumerSourceType,
+		row.ConsumerSourceID, row.ConsumerVersionID, row.ConsumerGroupID).Scan(&targetID, &targetSegment, &claimed)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -1186,12 +1490,16 @@ func (db *DB) mergePendingProfitLedgerRow(ctx context.Context, tx *sql.Tx, row p
 		targetSegment++
 		_, err = tx.ExecContext(ctx, `INSERT INTO profit_daily_ledger (
 			ledger_date, segment, api_key_id, api_key_name_snapshot, api_key_masked_snapshot,
+			consumer_source_type, consumer_source_id, consumer_assignment_version_id, consumer_group_id,
+			consumer_group_name_snapshot, consumer_assignment_source, non_settleable_reason,
 			account_id, account_name_snapshot, account_deleted, channel, model,
 			settlement_group_id, settlement_group_name_snapshot, assignment_source,
 			request_count, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 			official_cost_usd_micros, source_first_log_id, source_last_log_id, source_hash, ledger_version
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'confirmed_backfill',$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'confirmed_backfill',$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
 			row.LedgerDate, targetSegment, row.APIKeyID, row.APIKeyName, row.APIKeyMasked,
+			row.ConsumerSourceType, row.ConsumerSourceID, row.ConsumerVersionID, row.ConsumerGroupID,
+			row.ConsumerGroupName, row.ConsumerSource, row.NonSettleableReason,
 			row.AccountID, row.AccountName, row.AccountDeleted, row.Channel, row.Model,
 			groupID, groupName, row.RequestCount, row.InputTokens, row.OutputTokens, row.CachedTokens,
 			row.ReasoningTokens, row.TotalTokens, row.OfficialUSDMicros, row.SourceFirstLogID,
@@ -1242,81 +1550,7 @@ type profitDashboardSourceRow struct {
 }
 
 func (db *DB) GetProfitDashboard(ctx context.Context, startDate string, endDate string, ratioPPM int64) (ProfitDashboardResponse, error) {
-	settings, err := db.GetProfitSettings(ctx)
-	if err != nil {
-		return ProfitDashboardResponse{}, err
-	}
-	if _, _, err := parseProfitDateRange(startDate, endDate); err != nil {
-		return ProfitDashboardResponse{}, err
-	}
-	ratioPPM = normalizeProfitPPM(ratioPPM, settings.DefaultSettlementRatioPPM)
-	result := ProfitDashboardResponse{StartDate: startDate, EndDate: endDate, Timezone: ProfitTimezone, SettlementRatioPPM: ratioPPM}
-	if result.Ledger, err = db.GetProfitLedgerStatus(ctx); err != nil {
-		return result, err
-	}
-	multipliers, err := db.profitMultiplierMap(ctx, settings.DefaultGroupMultiplierPPM)
-	if err != nil {
-		return result, err
-	}
-	rows, err := db.conn.QueryContext(ctx, `SELECT settlement_group_id, MAX(settlement_group_name_snapshot),
-		api_key_id, MAX(COALESCE(NULLIF(api_key_name_snapshot, ''), NULLIF(api_key_masked_snapshot, ''), '未命名 Key')),
-		account_id, MAX(account_name_snapshot), MAX(CASE WHEN account_deleted THEN 1 ELSE 0 END), model,
-		SUM(request_count), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), SUM(reasoning_tokens),
-		SUM(total_tokens), SUM(official_cost_usd_micros)
-		FROM profit_daily_ledger l WHERE ledger_date >= $1 AND ledger_date < $2
-		AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)
-		GROUP BY settlement_group_id, api_key_id, account_id, model ORDER BY settlement_group_id, account_id`, startDate, endDate)
-	if err != nil {
-		return result, err
-	}
-	groupMap := make(map[string]*ProfitDashboardDimension)
-	keyMap := make(map[string]*ProfitDashboardDimension)
-	accountMap := make(map[string]*ProfitDashboardDimension)
-	modelMap := make(map[string]*ProfitDashboardDimension)
-	for rows.Next() {
-		var source profitDashboardSourceRow
-		var deletedInt int
-		if err := rows.Scan(&source.GroupID, &source.GroupName, &source.APIKeyID, &source.APIKeyName,
-			&source.AccountID, &source.AccountName, &deletedInt, &source.Model, &source.RequestCount,
-			&source.InputTokens, &source.OutputTokens, &source.CachedTokens, &source.ReasoningTokens,
-			&source.TotalTokens, &source.OfficialUSDMicros); err != nil {
-			rows.Close()
-			return result, err
-		}
-		source.AccountDeleted = deletedInt != 0
-		multiplier := multipliers[source.GroupID]
-		if multiplier <= 0 {
-			multiplier = settings.DefaultGroupMultiplierPPM
-		}
-		addProfitDimension(groupMap, strconv.FormatInt(source.GroupID, 10), profitGroupDisplayName(source.GroupID, source.GroupName), source, ratioPPM, multiplier, source.GroupID == 0, false, true)
-		addProfitDimension(keyMap, strconv.FormatInt(source.APIKeyID, 10), source.APIKeyName, source, ratioPPM, multiplier, false, false, false)
-		addProfitDimension(accountMap, strconv.FormatInt(source.AccountID, 10), source.AccountName, source, ratioPPM, multiplier, false, source.AccountDeleted, false)
-		addProfitDimension(modelMap, source.Model, source.Model, source, ratioPPM, multiplier, false, false, false)
-		result.Overall.OfficialUSDMicros += source.OfficialUSDMicros
-		result.Overall.RequestCount += source.RequestCount
-		result.Overall.InputTokens += source.InputTokens
-		result.Overall.OutputTokens += source.OutputTokens
-		result.Overall.CachedTokens += source.CachedTokens
-		result.Overall.ReasoningTokens += source.ReasoningTokens
-		result.Overall.TotalTokens += source.TotalTokens
-		settlement := profitMulDiv(source.OfficialUSDMicros, ratioPPM, ProfitScalePPM)
-		revenue := profitMulDiv(settlement, multiplier, ProfitScalePPM)
-		result.Overall.SettlementCNYMicros += settlement
-		result.Overall.RevenueCNYMicros += revenue
-		result.Overall.ProfitCNYMicros += revenue - settlement
-	}
-	if err := rows.Close(); err != nil {
-		return result, err
-	}
-	if result.Overall.RevenueCNYMicros != 0 {
-		margin := float64(result.Overall.ProfitCNYMicros) / float64(result.Overall.RevenueCNYMicros)
-		result.Overall.Margin = &margin
-	}
-	result.Groups = sortedProfitDimensions(groupMap)
-	result.APIKeys = sortedProfitDimensions(keyMap)
-	result.Accounts = sortedProfitDimensions(accountMap)
-	result.Models = sortedProfitDimensions(modelMap)
-	return result, nil
+	return db.getProfitDashboardV2(ctx, startDate, endDate, ratioPPM)
 }
 
 func parseProfitDateRange(startDate string, endDate string) (time.Time, time.Time, error) {
@@ -1407,8 +1641,7 @@ func sortedProfitDimensions(source map[string]*ProfitDashboardDimension) []Profi
 }
 
 func (db *DB) CreateProfitSettlementDraft(ctx context.Context, startDate string, endDate string, ratioPPM int64, notes string) (ProfitSettlementDetail, error) {
-	start, end, err := parseProfitDateRange(startDate, endDate)
-	if err != nil {
+	if _, _, err := parseProfitDateRange(startDate, endDate); err != nil {
 		return ProfitSettlementDetail{}, err
 	}
 	settings, err := db.GetProfitSettings(ctx)
@@ -1424,31 +1657,27 @@ func (db *DB) CreateProfitSettlementDraft(ctx context.Context, startDate string,
 	if err != nil {
 		return ProfitSettlementDetail{}, err
 	}
-	run := ProfitSettlementRun{ID: runID, LineageID: lineageID, RevisionNo: 1, Status: "draft",
+	run := ProfitSettlementRun{ID: runID, LineageID: lineageID, RevisionNo: 1, Status: "building",
 		StartDate: startDate, EndDate: endDate, SettlementRatioPPM: ratioPPM, Notes: strings.TrimSpace(notes)}
-	err = db.withProfitLedgerTx(ctx, func(tx *sql.Tx, checkpoint int64) error {
-		if err := db.ensureProfitLedgerRangeReady(ctx, tx, checkpoint, start, end); err != nil {
-			return err
-		}
-		var pendingCount int64
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
-			WHERE l.ledger_date >= $1 AND l.ledger_date < $2 AND l.settlement_group_id = 0
-			AND COALESCE(l.claimed_lineage_id, '') = ''
-			AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)`, startDate, endDate).Scan(&pendingCount); err != nil {
-			return err
-		}
-		if pendingCount > 0 {
-			return ErrProfitPendingAssignment
-		}
+	err = db.withWriteTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO profit_settlement_runs
 			(id, lineage_id, revision_no, status, start_date, end_date, settlement_ratio_ppm, notes)
-			VALUES ($1,$2,1,'draft',$3,$4,$5,$6)`, run.ID, run.LineageID, run.StartDate, run.EndDate,
+			VALUES ($1,$2,1,'building',$3,$4,$5,$6)`, run.ID, run.LineageID, run.StartDate, run.EndDate,
 			run.SettlementRatioPPM, run.Notes); err != nil {
 			return err
 		}
-		return db.rebuildProfitSettlementDraft(ctx, tx, &run)
+		return nil
 	})
 	if err != nil {
+		return ProfitSettlementDetail{}, err
+	}
+	if err := db.rebuildProfitSettlementDraft(ctx, &run); err != nil {
+		if errors.Is(err, ErrProfitSettlementEmpty) {
+			_ = db.withWriteTx(ctx, func(tx *sql.Tx) error {
+				_, deleteErr := tx.ExecContext(ctx, `DELETE FROM profit_settlement_runs WHERE id=$1 AND status IN ('building','build_failed')`, run.ID)
+				return deleteErr
+			})
+		}
 		return ProfitSettlementDetail{}, err
 	}
 	return db.GetProfitSettlement(ctx, run.ID)
@@ -1484,97 +1713,12 @@ func (db *DB) profitMultiplierMapTx(ctx context.Context, tx *sql.Tx, fallback in
 	return result, rows.Close()
 }
 
-func (db *DB) rebuildProfitSettlementDraft(ctx context.Context, tx *sql.Tx, run *ProfitSettlementRun) error {
-	settings, err := db.getProfitSettingsTx(ctx, tx)
+func (db *DB) rebuildProfitSettlementDraft(ctx context.Context, run *ProfitSettlementRun) error {
+	manifest, err := db.buildProfitSettlementManifest(ctx, *run)
 	if err != nil {
-		return err
+		return db.markProfitSettlementBuildFailed(ctx, run.ID, err)
 	}
-	multipliers, err := db.profitMultiplierMapTx(ctx, tx, settings.DefaultGroupMultiplierPPM)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM profit_settlement_items WHERE run_id = $1`, run.ID); err != nil {
-		return err
-	}
-	query := `SELECT l.id, l.ledger_version, CAST(l.ledger_date AS TEXT), l.settlement_group_id,
-		l.settlement_group_name_snapshot, l.api_key_id, l.api_key_name_snapshot, l.account_id,
-		l.account_name_snapshot, l.account_deleted, l.model, l.channel, l.request_count, l.total_tokens,
-		l.official_cost_usd_micros, l.source_first_log_id, l.source_last_log_id, l.source_hash
-		FROM profit_daily_ledger l `
-	args := []interface{}{run.StartDate, run.EndDate}
-	if run.RevisionNo > 1 {
-		query += `JOIN profit_ledger_claims c ON c.ledger_row_id = l.id AND c.lineage_id = $3
-			WHERE l.ledger_date >= $1 AND l.ledger_date < $2 ORDER BY l.id`
-		args = append(args, run.LineageID)
-	} else {
-		query += `WHERE l.ledger_date >= $1 AND l.ledger_date < $2
-			AND l.settlement_group_id > 0 AND COALESCE(l.claimed_lineage_id, '') = ''
-			AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id) ORDER BY l.id`
-	}
-	rows, err := tx.QueryContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	items := make([]ProfitSettlementItem, 0)
-	for rows.Next() {
-		var item ProfitSettlementItem
-		if err := rows.Scan(&item.LedgerRowID, &item.LedgerVersion, &item.LedgerDate, &item.GroupID,
-			&item.GroupName, &item.APIKeyID, &item.APIKeyName, &item.AccountID, &item.AccountName,
-			&item.AccountDeleted, &item.Model, &item.Channel, &item.RequestCount, &item.TotalTokens,
-			&item.OfficialUSDMicros, &item.SourceFirstLogID, &item.SourceLastLogID, &item.SourceHash); err != nil {
-			rows.Close()
-			return err
-		}
-		item.MultiplierPPM = multipliers[item.GroupID]
-		if item.MultiplierPPM <= 0 {
-			item.MultiplierPPM = settings.DefaultGroupMultiplierPPM
-		}
-		item.SettlementCNYMicros = profitMulDiv(item.OfficialUSDMicros, run.SettlementRatioPPM, ProfitScalePPM)
-		item.RevenueCNYMicros = profitMulDiv(item.SettlementCNYMicros, item.MultiplierPPM, ProfitScalePPM)
-		item.ProfitCNYMicros = item.RevenueCNYMicros - item.SettlementCNYMicros
-		items = append(items, item)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if len(items) == 0 {
-		return ErrProfitSettlementEmpty
-	}
-	hasher := sha256.New()
-	run.OfficialUSDMicros = 0
-	run.SettlementCNYMicros = 0
-	run.RevenueCNYMicros = 0
-	run.ProfitCNYMicros = 0
-	for _, item := range items {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO profit_settlement_items (
-			run_id, ledger_row_id, ledger_version, ledger_date, group_id, group_name,
-			api_key_id, api_key_name, account_id, account_name, account_deleted, model, channel,
-			multiplier_ppm, request_count, total_tokens, official_cost_usd_micros,
-			settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros,
-			source_first_log_id, source_last_log_id, source_hash
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-			run.ID, item.LedgerRowID, item.LedgerVersion, item.LedgerDate, item.GroupID, item.GroupName,
-			item.APIKeyID, item.APIKeyName, item.AccountID, item.AccountName, item.AccountDeleted,
-			item.Model, item.Channel, item.MultiplierPPM, item.RequestCount, item.TotalTokens,
-			item.OfficialUSDMicros, item.SettlementCNYMicros, item.RevenueCNYMicros, item.ProfitCNYMicros,
-			item.SourceFirstLogID, item.SourceLastLogID, item.SourceHash); err != nil {
-			return err
-		}
-		fmt.Fprintf(hasher, "%d|%d|%s|%d|%d|%d|%d|%s\n", item.LedgerRowID, item.LedgerVersion,
-			item.SourceHash, item.MultiplierPPM, item.OfficialUSDMicros, item.SettlementCNYMicros,
-			item.RevenueCNYMicros, item.LedgerDate)
-		run.OfficialUSDMicros += item.OfficialUSDMicros
-		run.SettlementCNYMicros += item.SettlementCNYMicros
-		run.RevenueCNYMicros += item.RevenueCNYMicros
-		run.ProfitCNYMicros += item.ProfitCNYMicros
-	}
-	run.SourceManifestHash = hex.EncodeToString(hasher.Sum(nil))
-	_, err = tx.ExecContext(ctx, `UPDATE profit_settlement_runs SET settlement_ratio_ppm = $1, notes = $2,
-		official_cost_usd_micros = $3, settlement_cost_cny_micros = $4, revenue_cny_micros = $5,
-		profit_cny_micros = $6, source_manifest_hash = $7, created_at = created_at
-		WHERE id = $8 AND status = 'draft'`, run.SettlementRatioPPM, run.Notes, run.OfficialUSDMicros,
-		run.SettlementCNYMicros, run.RevenueCNYMicros, run.ProfitCNYMicros, run.SourceManifestHash, run.ID)
-	return err
+	return db.persistProfitSettlementManifest(ctx, run, manifest)
 }
 
 func (db *DB) getProfitSettingsTx(ctx context.Context, tx *sql.Tx) (ProfitSettings, error) {
@@ -1588,28 +1732,16 @@ func (db *DB) getProfitSettingsTx(ctx context.Context, tx *sql.Tx) (ProfitSettin
 }
 
 func (db *DB) UpdateProfitSettlementDraft(ctx context.Context, runID string, ratioPPM int64, notes string) (ProfitSettlementDetail, error) {
-	err := db.withProfitLedgerTx(ctx, func(tx *sql.Tx, checkpoint int64) error {
-		run, err := scanProfitSettlementRun(tx.QueryRowContext(ctx, `SELECT id, lineage_id, revision_no,
-			COALESCE(supersedes_id, ''), status, CAST(start_date AS TEXT), CAST(end_date AS TEXT), settlement_ratio_ppm, notes,
-			official_cost_usd_micros, settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros,
-			source_manifest_hash, created_at, confirmed_at FROM profit_settlement_runs WHERE id = $1`, runID))
-		if err != nil {
-			return err
-		}
-		if run.Status != "draft" {
-			return fmt.Errorf("only draft settlements can be updated")
-		}
-		start, end, err := parseProfitDateRange(run.StartDate, run.EndDate)
-		if err != nil {
-			return err
-		}
-		if err := db.ensureProfitLedgerRangeReady(ctx, tx, checkpoint, start, end); err != nil {
-			return err
-		}
-		run.SettlementRatioPPM = normalizeProfitPPM(ratioPPM, run.SettlementRatioPPM)
-		run.Notes = strings.TrimSpace(notes)
-		return db.rebuildProfitSettlementDraft(ctx, tx, &run)
-	})
+	run, err := db.getProfitSettlementRun(ctx, runID)
+	if err != nil {
+		return ProfitSettlementDetail{}, err
+	}
+	if !profitSettlementStatusCanBuild(run.Status) {
+		return ProfitSettlementDetail{}, fmt.Errorf("only draft settlements can be updated")
+	}
+	run.SettlementRatioPPM = normalizeProfitPPM(ratioPPM, run.SettlementRatioPPM)
+	run.Notes = strings.TrimSpace(notes)
+	err = db.rebuildProfitSettlementDraft(ctx, &run)
 	if err != nil {
 		return ProfitSettlementDetail{}, err
 	}
@@ -1617,11 +1749,8 @@ func (db *DB) UpdateProfitSettlementDraft(ctx context.Context, runID string, rat
 }
 
 func (db *DB) ConfirmProfitSettlement(ctx context.Context, runID string) (ProfitSettlementDetail, error) {
-	err := db.withProfitLedgerTx(ctx, func(tx *sql.Tx, checkpoint int64) error {
-		run, err := scanProfitSettlementRun(tx.QueryRowContext(ctx, `SELECT id, lineage_id, revision_no,
-			COALESCE(supersedes_id, ''), status, CAST(start_date AS TEXT), CAST(end_date AS TEXT), settlement_ratio_ppm, notes,
-			official_cost_usd_micros, settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros,
-			source_manifest_hash, created_at, confirmed_at FROM profit_settlement_runs WHERE id = $1`, runID))
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		run, err := scanProfitSettlementRun(tx.QueryRowContext(ctx, profitSettlementRunSelect+` WHERE id=$1`, runID))
 		if err != nil {
 			return err
 		}
@@ -1632,74 +1761,92 @@ func (db *DB) ConfirmProfitSettlement(ctx context.Context, runID string) (Profit
 		if err != nil {
 			return err
 		}
+		if err := db.validateProfitIngestionCompletenessTx(ctx, tx, start, end); err != nil {
+			return err
+		}
+		var checkpoint, highWater int64
+		if err := tx.QueryRowContext(ctx, `SELECT last_usage_log_id FROM profit_ledger_state WHERE id=1`).Scan(&checkpoint); err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM usage_logs`).Scan(&highWater); err != nil {
+			return err
+		}
 		if err := db.ensureProfitLedgerRangeReady(ctx, tx, checkpoint, start, end); err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT i.ledger_row_id, i.ledger_version, l.ledger_version,
-			COALESCE(l.claimed_lineage_id, ''), COALESCE(c.lineage_id, '')
-			FROM profit_settlement_items i JOIN profit_daily_ledger l ON l.id = i.ledger_row_id
-			LEFT JOIN profit_ledger_claims c ON c.ledger_row_id = i.ledger_row_id WHERE i.run_id = $1 ORDER BY i.ledger_row_id`, runID)
+		if highWater < run.SourceHighWaterID {
+			return ErrProfitSettlementConflict
+		}
+		var itemCount, mismatchCount int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), SUM(CASE WHEN i.ledger_version<>l.ledger_version
+			OR (COALESCE(l.claimed_lineage_id,'')<>'' AND COALESCE(l.claimed_lineage_id,'')<>$2)
+			OR (COALESCE(c.lineage_id,'')<>'' AND COALESCE(c.lineage_id,'')<>$2) THEN 1 ELSE 0 END)
+			FROM profit_settlement_items i JOIN profit_daily_ledger l ON l.id=i.ledger_row_id
+			LEFT JOIN profit_ledger_claims c ON c.ledger_row_id=i.ledger_row_id WHERE i.run_id=$1`,
+			run.ID, run.LineageID).Scan(&itemCount, &mismatchCount); err != nil {
+			return err
+		}
+		if itemCount == 0 {
+			return ErrProfitSettlementEmpty
+		}
+		if mismatchCount > 0 {
+			return ErrProfitSettlementConflict
+		}
+		var eligibleCount, pendingCount int64
+		eligibleQuery := `SELECT COUNT(*) FROM profit_daily_ledger l WHERE l.ledger_date >= $1 AND l.ledger_date < $2
+			AND l.settlement_group_id>0 AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts x WHERE x.account_id=l.account_id)`
+		eligibleArgs := []interface{}{run.StartDate, run.EndDate}
+		if run.RevisionNo > 1 {
+			eligibleQuery += ` AND EXISTS (SELECT 1 FROM profit_ledger_claims c WHERE c.ledger_row_id=l.id AND c.lineage_id=$3)`
+			eligibleArgs = append(eligibleArgs, run.LineageID)
+		} else {
+			eligibleQuery += ` AND COALESCE(l.claimed_lineage_id,'')=''`
+		}
+		if err := tx.QueryRowContext(ctx, eligibleQuery, eligibleArgs...).Scan(&eligibleCount); err != nil {
+			return err
+		}
+		pendingQuery := `SELECT COUNT(*) FROM profit_daily_ledger l WHERE l.ledger_date >= $1 AND l.ledger_date < $2
+			AND (l.settlement_group_id=0 OR (l.consumer_group_id=0 AND COALESCE(l.non_settleable_reason,'')=''))
+			AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts x WHERE x.account_id=l.account_id)`
+		pendingArgs := []interface{}{run.StartDate, run.EndDate}
+		if run.RevisionNo > 1 {
+			pendingQuery += ` AND EXISTS (SELECT 1 FROM profit_ledger_claims c WHERE c.ledger_row_id=l.id AND c.lineage_id=$3)`
+			pendingArgs = append(pendingArgs, run.LineageID)
+		} else {
+			pendingQuery += ` AND COALESCE(l.claimed_lineage_id,'')=''`
+		}
+		if err := tx.QueryRowContext(ctx, pendingQuery, pendingArgs...).Scan(&pendingCount); err != nil {
+			return err
+		}
+		if eligibleCount != itemCount || pendingCount > 0 {
+			return ErrProfitSettlementConflict
+		}
+		if run.RevisionNo == 1 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO profit_ledger_claims (ledger_row_id,lineage_id,run_id)
+				SELECT ledger_row_id,$1,$2 FROM profit_settlement_items WHERE run_id=$2`, run.LineageID, run.ID); err != nil {
+				return ErrProfitSettlementConflict
+			}
+		} else {
+			res, err := tx.ExecContext(ctx, `UPDATE profit_ledger_claims SET run_id=$1 WHERE lineage_id=$2
+				AND ledger_row_id IN (SELECT ledger_row_id FROM profit_settlement_items WHERE run_id=$1)`, run.ID, run.LineageID)
+			if err != nil {
+				return err
+			}
+			if affected, _ := res.RowsAffected(); affected != itemCount {
+				return ErrProfitSettlementConflict
+			}
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE profit_daily_ledger SET claimed_lineage_id=$1
+			WHERE id IN (SELECT ledger_row_id FROM profit_settlement_items WHERE run_id=$2)
+			AND (COALESCE(claimed_lineage_id,'')='' OR claimed_lineage_id=$1)`, run.LineageID, run.ID)
 		if err != nil {
 			return err
 		}
-		ledgerIDs := make([]int64, 0)
-		for rows.Next() {
-			var ledgerID, itemVersion, ledgerVersion int64
-			var ledgerLineage, claimLineage string
-			if err := rows.Scan(&ledgerID, &itemVersion, &ledgerVersion, &ledgerLineage, &claimLineage); err != nil {
-				rows.Close()
-				return err
-			}
-			if itemVersion != ledgerVersion || ledgerLineage != "" && ledgerLineage != run.LineageID || claimLineage != "" && claimLineage != run.LineageID {
-				rows.Close()
-				return ErrProfitSettlementConflict
-			}
-			ledgerIDs = append(ledgerIDs, ledgerID)
+		if affected, _ := res.RowsAffected(); affected != itemCount {
+			return ErrProfitSettlementConflict
 		}
-		if err := rows.Close(); err != nil {
+		if err := db.confirmProfitROIAllocationsTx(ctx, tx, run); err != nil {
 			return err
-		}
-		if len(ledgerIDs) == 0 {
-			return ErrProfitSettlementEmpty
-		}
-		if run.RevisionNo == 1 {
-			var missingRows, pendingRows int64
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
-				LEFT JOIN profit_settlement_items i ON i.run_id = $1 AND i.ledger_row_id = l.id
-				WHERE l.ledger_date >= $2 AND l.ledger_date < $3 AND l.settlement_group_id > 0
-				AND COALESCE(l.claimed_lineage_id, '') = '' AND i.ledger_row_id IS NULL
-				AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts x WHERE x.account_id = l.account_id)`, run.ID, run.StartDate, run.EndDate).Scan(&missingRows); err != nil {
-				return err
-			}
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profit_daily_ledger l
-				WHERE l.ledger_date >= $1 AND l.ledger_date < $2 AND l.settlement_group_id = 0
-				AND COALESCE(l.claimed_lineage_id, '') = ''
-				AND NOT EXISTS (SELECT 1 FROM profit_ignored_accounts i WHERE i.account_id = l.account_id)`, run.StartDate, run.EndDate).Scan(&pendingRows); err != nil {
-				return err
-			}
-			if missingRows > 0 || pendingRows > 0 {
-				return ErrProfitSettlementConflict
-			}
-		}
-		for _, ledgerID := range ledgerIDs {
-			if run.RevisionNo == 1 {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO profit_ledger_claims (ledger_row_id, lineage_id, run_id)
-					VALUES ($1,$2,$3)`, ledgerID, run.LineageID, run.ID); err != nil {
-					return ErrProfitSettlementConflict
-				}
-			} else {
-				res, err := tx.ExecContext(ctx, `UPDATE profit_ledger_claims SET run_id = $1
-					WHERE ledger_row_id = $2 AND lineage_id = $3`, run.ID, ledgerID, run.LineageID)
-				if err != nil {
-					return err
-				}
-				if affected, _ := res.RowsAffected(); affected != 1 {
-					return ErrProfitSettlementConflict
-				}
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE profit_daily_ledger SET claimed_lineage_id = $1 WHERE id = $2`, run.LineageID, ledgerID); err != nil {
-				return err
-			}
 		}
 		nowExpr := "NOW()"
 		if db.isSQLite() {
@@ -1709,7 +1856,7 @@ func (db *DB) ConfirmProfitSettlement(ctx context.Context, runID string) (Profit
 			WHERE lineage_id = $1 AND status = 'confirmed' AND id <> $2`, run.LineageID, run.ID); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE profit_settlement_runs SET status = 'confirmed', confirmed_at = `+nowExpr+`
+		res, err = tx.ExecContext(ctx, `UPDATE profit_settlement_runs SET status = 'confirmed', confirmed_at = `+nowExpr+`
 			WHERE id = $1 AND status = 'draft'`, run.ID)
 		if err != nil {
 			return err
@@ -1731,11 +1878,8 @@ func (db *DB) CreateProfitSettlementRevision(ctx context.Context, confirmedRunID
 		return ProfitSettlementDetail{}, err
 	}
 	var newRun ProfitSettlementRun
-	err = db.withProfitLedgerTx(ctx, func(tx *sql.Tx, _ int64) error {
-		base, err := scanProfitSettlementRun(tx.QueryRowContext(ctx, `SELECT id, lineage_id, revision_no,
-			COALESCE(supersedes_id, ''), status, CAST(start_date AS TEXT), CAST(end_date AS TEXT), settlement_ratio_ppm, notes,
-			official_cost_usd_micros, settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros,
-			source_manifest_hash, created_at, confirmed_at FROM profit_settlement_runs WHERE id = $1`, confirmedRunID))
+	err = db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		base, err := scanProfitSettlementRun(tx.QueryRowContext(ctx, profitSettlementRunSelect+` WHERE id=$1`, confirmedRunID))
 		if err != nil {
 			return err
 		}
@@ -1750,17 +1894,20 @@ func (db *DB) CreateProfitSettlementRevision(ctx context.Context, confirmedRunID
 			return fmt.Errorf("a draft revision already exists")
 		}
 		newRun = ProfitSettlementRun{ID: newRunID, LineageID: base.LineageID, RevisionNo: base.RevisionNo + 1,
-			SupersedesID: base.ID, Status: "draft", StartDate: base.StartDate, EndDate: base.EndDate,
+			SupersedesID: base.ID, Status: "building", StartDate: base.StartDate, EndDate: base.EndDate,
 			SettlementRatioPPM: normalizeProfitPPM(ratioPPM, base.SettlementRatioPPM), Notes: strings.TrimSpace(notes)}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO profit_settlement_runs
 			(id, lineage_id, revision_no, supersedes_id, status, start_date, end_date, settlement_ratio_ppm, notes)
-			VALUES ($1,$2,$3,$4,'draft',$5,$6,$7,$8)`, newRun.ID, newRun.LineageID, newRun.RevisionNo,
+			VALUES ($1,$2,$3,$4,'building',$5,$6,$7,$8)`, newRun.ID, newRun.LineageID, newRun.RevisionNo,
 			newRun.SupersedesID, newRun.StartDate, newRun.EndDate, newRun.SettlementRatioPPM, newRun.Notes); err != nil {
 			return err
 		}
-		return db.rebuildProfitSettlementDraft(ctx, tx, &newRun)
+		return nil
 	})
 	if err != nil {
+		return ProfitSettlementDetail{}, err
+	}
+	if err := db.rebuildProfitSettlementDraft(ctx, &newRun); err != nil {
 		return ProfitSettlementDetail{}, err
 	}
 	return db.GetProfitSettlement(ctx, newRun.ID)
@@ -1770,13 +1917,22 @@ type profitRowScanner interface {
 	Scan(dest ...interface{}) error
 }
 
+const profitSettlementRunSelect = `SELECT id,lineage_id,revision_no,COALESCE(supersedes_id,''),status,
+	CAST(start_date AS TEXT),CAST(end_date AS TEXT),settlement_ratio_ppm,notes,
+	official_cost_usd_micros,settlement_cost_cny_micros,revenue_cny_micros,profit_cny_micros,
+	payable_cny_micros,receivable_cny_micros,fixed_cost_allocated_usd_micros,
+	fixed_cost_allocated_cny_micros,source_high_water_id,build_error,source_manifest_hash,created_at,confirmed_at
+	FROM profit_settlement_runs`
+
 func scanProfitSettlementRun(scanner profitRowScanner) (ProfitSettlementRun, error) {
 	var run ProfitSettlementRun
 	var createdRaw interface{}
 	var confirmedRaw interface{}
 	err := scanner.Scan(&run.ID, &run.LineageID, &run.RevisionNo, &run.SupersedesID, &run.Status,
 		&run.StartDate, &run.EndDate, &run.SettlementRatioPPM, &run.Notes, &run.OfficialUSDMicros,
-		&run.SettlementCNYMicros, &run.RevenueCNYMicros, &run.ProfitCNYMicros, &run.SourceManifestHash,
+		&run.SettlementCNYMicros, &run.RevenueCNYMicros, &run.ProfitCNYMicros,
+		&run.PayableCNYMicros, &run.ReceivableCNYMicros, &run.FixedCostUSDMicros,
+		&run.FixedCostCNYMicros, &run.SourceHighWaterID, &run.BuildError, &run.SourceManifestHash,
 		&createdRaw, &confirmedRaw)
 	if err != nil {
 		return run, err
@@ -1789,17 +1945,19 @@ func scanProfitSettlementRun(scanner profitRowScanner) (ProfitSettlementRun, err
 			run.ConfirmedAt = confirmed.Format(time.RFC3339)
 		}
 	}
+	normalizeProfitSettlementLegacyFields(&run)
 	return run, nil
+}
+
+func (db *DB) getProfitSettlementRun(ctx context.Context, runID string) (ProfitSettlementRun, error) {
+	return scanProfitSettlementRun(db.conn.QueryRowContext(ctx, profitSettlementRunSelect+` WHERE id=$1`, runID))
 }
 
 func (db *DB) ListProfitSettlements(ctx context.Context, limit int) ([]ProfitSettlementRun, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, lineage_id, revision_no, COALESCE(supersedes_id, ''),
-		status, CAST(start_date AS TEXT), CAST(end_date AS TEXT), settlement_ratio_ppm, notes, official_cost_usd_micros,
-		settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros, source_manifest_hash,
-		created_at, confirmed_at FROM profit_settlement_runs ORDER BY created_at DESC LIMIT $1`, limit)
+	rows, err := db.conn.QueryContext(ctx, profitSettlementRunSelect+` ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1816,17 +1974,16 @@ func (db *DB) ListProfitSettlements(ctx context.Context, limit int) ([]ProfitSet
 }
 
 func (db *DB) GetProfitSettlement(ctx context.Context, runID string) (ProfitSettlementDetail, error) {
-	run, err := scanProfitSettlementRun(db.conn.QueryRowContext(ctx, `SELECT id, lineage_id, revision_no,
-		COALESCE(supersedes_id, ''), status, CAST(start_date AS TEXT), CAST(end_date AS TEXT), settlement_ratio_ppm, notes,
-		official_cost_usd_micros, settlement_cost_cny_micros, revenue_cny_micros, profit_cny_micros,
-		source_manifest_hash, created_at, confirmed_at FROM profit_settlement_runs WHERE id = $1`, runID))
+	run, err := db.getProfitSettlementRun(ctx, runID)
 	if err != nil {
 		return ProfitSettlementDetail{}, err
 	}
-	rows, err := db.conn.QueryContext(ctx, `SELECT ledger_row_id, ledger_version, CAST(ledger_date AS TEXT), group_id,
-		group_name, api_key_id, api_key_name, account_id, account_name, account_deleted, model, channel,
-		multiplier_ppm, request_count, total_tokens, official_cost_usd_micros, settlement_cost_cny_micros,
-		revenue_cny_micros, profit_cny_micros, source_first_log_id, source_last_log_id, source_hash
+	rows, err := db.conn.QueryContext(ctx, `SELECT ledger_row_id,ledger_version,CAST(ledger_date AS TEXT),group_id,
+		group_name,consumer_group_id,consumer_group_name,owner_group_id,owner_group_name,
+		api_key_id,api_key_name,account_id,account_name,account_deleted,model,channel,
+		multiplier_ppm,rate_ppm,non_settleable_reason,self_usage,request_count,total_tokens,
+		official_cost_usd_micros,settlement_cost_cny_micros,revenue_cny_micros,profit_cny_micros,
+		payable_cny_micros,receivable_cny_micros,source_first_log_id,source_last_log_id,source_hash
 		FROM profit_settlement_items WHERE run_id = $1 ORDER BY ledger_date, group_id, account_id, ledger_row_id`, runID)
 	if err != nil {
 		return ProfitSettlementDetail{}, err
@@ -1835,10 +1992,13 @@ func (db *DB) GetProfitSettlement(ctx context.Context, runID string) (ProfitSett
 	for rows.Next() {
 		var item ProfitSettlementItem
 		if err := rows.Scan(&item.LedgerRowID, &item.LedgerVersion, &item.LedgerDate, &item.GroupID,
-			&item.GroupName, &item.APIKeyID, &item.APIKeyName, &item.AccountID, &item.AccountName,
-			&item.AccountDeleted, &item.Model, &item.Channel, &item.MultiplierPPM, &item.RequestCount,
-			&item.TotalTokens, &item.OfficialUSDMicros, &item.SettlementCNYMicros, &item.RevenueCNYMicros,
-			&item.ProfitCNYMicros, &item.SourceFirstLogID, &item.SourceLastLogID, &item.SourceHash); err != nil {
+			&item.GroupName, &item.ConsumerGroupID, &item.ConsumerGroupName, &item.OwnerGroupID, &item.OwnerGroupName,
+			&item.APIKeyID, &item.APIKeyName, &item.AccountID, &item.AccountName, &item.AccountDeleted,
+			&item.Model, &item.Channel, &item.MultiplierPPM, &item.RatePPM, &item.NonSettleableReason,
+			&item.SelfUsage, &item.RequestCount, &item.TotalTokens, &item.OfficialUSDMicros,
+			&item.SettlementCNYMicros, &item.RevenueCNYMicros, &item.ProfitCNYMicros,
+			&item.PayableCNYMicros, &item.ReceivableCNYMicros, &item.SourceFirstLogID,
+			&item.SourceLastLogID, &item.SourceHash); err != nil {
 			rows.Close()
 			return ProfitSettlementDetail{}, err
 		}
@@ -1847,5 +2007,9 @@ func (db *DB) GetProfitSettlement(ctx context.Context, runID string) (ProfitSett
 	if err := rows.Close(); err != nil {
 		return ProfitSettlementDetail{}, err
 	}
-	return ProfitSettlementDetail{Run: run, Items: items}, nil
+	roi, err := db.loadProfitSettlementROI(ctx, runID)
+	if err != nil {
+		return ProfitSettlementDetail{}, err
+	}
+	return ProfitSettlementDetail{Run: run, Items: items, AccountROI: roi}, nil
 }
