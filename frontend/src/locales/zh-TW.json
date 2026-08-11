@@ -286,7 +286,17 @@
         "unlock": "解鎖此對話",
         "confirm": "確認解鎖此對話？原視窗中的上下文仍會保留，僅應在確認誤判後操作。",
         "unlocked": "對話已解鎖",
+        "conversationUnlockReason": "管理員確認後手動解鎖會話",
+        "userCooldownTitle": "CYB 使用者安全冷卻",
+        "userCooldownActive": "使用者冷卻中",
+        "userCooldownDescription": "此可信使用者近期收到過上游 CYB。冷卻期間其所有會話都會被本地拒絕且不會重複累計處罰；解除操作會一次清除該使用者目前全部活動 CY 鎖。",
+        "unlockUserCooldown": "解除使用者冷卻",
+        "confirmUserCooldown": "確認解除該使用者的安全冷卻？這會同時清除該使用者目前全部活動 CY 會話鎖，僅應在確認誤判或完成人工審核後操作。",
+        "userCooldownUnlocked": "使用者安全冷卻已解除，共清除 {{count}} 條活動鎖",
+        "userCooldownUnlockReason": "管理員人工審核後解除使用者安全冷卻",
         "lockedAt": "鎖定時間",
+        "expiresAt": "自動解除時間",
+        "remaining": "剩餘時間",
         "reason": "鎖定原因"
       },
       "trust": {

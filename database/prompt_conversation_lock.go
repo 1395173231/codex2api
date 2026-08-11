@@ -11,9 +11,12 @@ import (
 )
 
 const (
-	PromptConversationLockStatusActive   = "active"
-	PromptConversationLockStatusUnlocked = "unlocked"
-	PromptConversationLockCacheNamespace = "prompt-conversation-lock"
+	PromptConversationLockStatusActive             = "active"
+	PromptConversationLockStatusUnlocked           = "unlocked"
+	PromptConversationLockCacheNamespace           = "prompt-conversation-lock"
+	PromptConversationRestrictionScopeConversation = "conversation"
+	PromptConversationRestrictionScopeUserCooldown = "user_cooldown"
+	PromptUserCyberCooldownTTL                     = 30 * time.Minute
 )
 
 type PromptConversationLock struct {
@@ -35,6 +38,9 @@ type PromptConversationLock struct {
 	LockedAt           time.Time  `json:"locked_at"`
 	UnlockedAt         *time.Time `json:"unlocked_at,omitempty"`
 	UnlockReason       string     `json:"unlock_reason,omitempty"`
+	RestrictionScope   string     `json:"restriction_scope,omitempty"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	RemainingSeconds   int64      `json:"remaining_seconds,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
@@ -149,7 +155,9 @@ func normalizePromptConversationLockInput(input PromptConversationLockInput) (Pr
 	input.ReasonCode = truncateCandidateRunes(strings.TrimSpace(input.ReasonCode), 100)
 	input.Endpoint = truncateCandidateRunes(strings.TrimSpace(input.Endpoint), 255)
 	input.Model = truncateCandidateRunes(strings.TrimSpace(input.Model), 128)
-	if len(input.LockKey) != 64 || input.Platform == "" || input.NewAPIUserID == "" || len(input.SessionFingerprint) != 32 || input.DecisionID == "" {
+	if len(input.LockKey) != 64 || input.Platform == "" || input.NewAPIUserID == "" || input.DecisionID == "" ||
+		(input.SessionFingerprint == "" && input.SessionHash != "") ||
+		(input.SessionFingerprint != "" && len(input.SessionFingerprint) != 32) {
 		return PromptConversationLockInput{}, errors.New("invalid prompt conversation lock identity")
 	}
 	if input.LockedAt.IsZero() {
@@ -239,7 +247,7 @@ func (db *DB) GetActivePromptConversationRestriction(ctx context.Context, lockKe
 	lockKey = strings.ToLower(strings.TrimSpace(lockKey))
 	platform = strings.ToLower(strings.TrimSpace(platform))
 	newAPIUserID = strings.TrimSpace(newAPIUserID)
-	if len(lockKey) != 64 || platform == "" || newAPIUserID == "" {
+	if (lockKey != "" && len(lockKey) != 64) || platform == "" || newAPIUserID == "" {
 		return nil, false, sql.ErrNoRows
 	}
 	now := time.Now().UTC()
@@ -252,16 +260,16 @@ func (db *DB) GetActivePromptConversationRestriction(ctx context.Context, lockKe
 		userCutoff = now.Add(-userCooldown)
 	}
 	query := promptConversationLockSelect + ` WHERE status='active' AND (
-		(lock_key=$1 AND locked_at>$4) OR
+		($1<>'' AND lock_key=$1 AND locked_at>$4) OR
 		(platform=$2 AND newapi_user_id=$3 AND locked_at>$5)
-	) ORDER BY CASE WHEN lock_key=$1 THEN 0 ELSE 1 END, locked_at DESC LIMIT 1`
+	) ORDER BY CASE WHEN $1<>'' AND lock_key=$1 THEN 0 ELSE 1 END, locked_at DESC LIMIT 1`
 	item, err := scanPromptConversationLock(db.conn.QueryRowContext(ctx, query,
 		lockKey, platform, newAPIUserID, conversationCutoff, userCutoff,
 	))
 	if err != nil {
 		return nil, false, err
 	}
-	return item, item.LockKey == lockKey, nil
+	return item, lockKey != "" && item.LockKey == lockKey, nil
 }
 
 func (db *DB) GetActivePromptConversationLockBySessionHash(ctx context.Context, sessionHash string) (*PromptConversationLock, error) {
@@ -331,4 +339,48 @@ func (db *DB) UnlockPromptConversation(ctx context.Context, lockKey, reason stri
 		return nil, sql.ErrNoRows
 	}
 	return db.GetPromptConversationLock(ctx, lockKey)
+}
+
+// UnlockPromptConversationUserCooldown releases every active CYB restriction
+// for one verified platform user. Clearing the complete user scope prevents an
+// older active conversation row from immediately re-applying the cooldown.
+// The returned keys allow callers to invalidate any exact-session cache rows.
+func (db *DB) UnlockPromptConversationUserCooldown(ctx context.Context, platform, newAPIUserID, reason string) ([]string, error) {
+	if err := db.ensurePromptConversationLocksTable(ctx); err != nil {
+		return nil, err
+	}
+	platform = strings.ToLower(truncateCandidateRunes(strings.TrimSpace(platform), 100))
+	newAPIUserID = truncateCandidateRunes(strings.TrimSpace(newAPIUserID), 255)
+	reason = truncateCandidateRunes(strings.TrimSpace(reason), 1000)
+	if platform == "" || newAPIUserID == "" {
+		return nil, sql.ErrNoRows
+	}
+	if reason == "" {
+		reason = "管理员解除用户安全冷却"
+	}
+	now := time.Now().UTC()
+	rows, err := db.conn.QueryContext(ctx, `UPDATE prompt_conversation_locks SET
+		status='unlocked', unlock_count=unlock_count+1, unlocked_at=$3,
+		unlock_reason=$4, updated_at=$3
+		WHERE platform=$1 AND newapi_user_id=$2 AND status='active'
+		RETURNING lock_key`, platform, newAPIUserID, now, reason)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := make([]string, 0, 4)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return keys, nil
 }

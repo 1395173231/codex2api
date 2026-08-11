@@ -4022,6 +4022,16 @@ function promptRiskIdentityPrimary(profile: Pick<PromptRiskProfile, 'subject_dis
   return profile.newapi_user_name || profile.newapi_user_email || profile.subject_display || '-'
 }
 
+function formatPromptRestrictionRemaining(seconds?: number) {
+  const total = Math.max(0, Math.ceil(Number(seconds) || 0))
+  if (total <= 0) return '-'
+  const minutes = Math.ceil(total / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  return remainder > 0 ? `${hours}h ${remainder}m` : `${hours}h`
+}
+
 function RiskProfilesTable({ profiles }: { profiles: PromptRiskProfile[] }) {
   const { t } = useTranslation()
   return (
@@ -4041,7 +4051,7 @@ function RiskProfilesTable({ profiles }: { profiles: PromptRiskProfile[] }) {
             <TableCell>
               <div className="flex items-center gap-2"><Users className="size-4 text-muted-foreground" /><span className="font-medium">{promptRiskIdentityPrimary(profile)}</span></div>
               {profile.newapi_user_id || profile.newapi_user_email ? <div className="mt-1 text-xs text-muted-foreground">{profile.newapi_user_id ? `${t('promptFilter.risk.userId')} #${profile.newapi_user_id}` : ''}{profile.newapi_user_id && profile.newapi_user_email ? ' · ' : ''}{profile.newapi_user_email || ''}</div> : null}
-              <div className="mt-1 flex flex-wrap gap-1"><Badge variant={profile.is_person ? 'default' : 'outline'}>{profile.is_person ? t('promptFilter.risk.person') : t('promptFilter.risk.nonPerson')}</Badge><Badge variant={profile.has_activity ? 'secondary' : 'outline'}>{t(profile.has_activity ? 'promptFilter.risk.activeProfile' : 'promptFilter.risk.identityOnly')}</Badge><Badge variant="outline">{t(`promptFilter.risk.subjects.${profile.subject_type}`)}</Badge>{profile.platform ? <Badge variant="secondary">{profile.platform}</Badge> : null}{profile.newapi_user_group ? <Badge variant="secondary">{t('promptFilter.risk.userGroup')}: {profile.newapi_user_group}</Badge> : null}{profile.trust_policy ? <Badge variant={profile.trust_policy.status === 'active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.status.${profile.trust_policy.status}`, { defaultValue: profile.trust_policy.status })}</Badge> : null}{profile.conversation_lock?.status === 'active' ? <Badge variant="destructive">{t('promptFilter.risk.conversationLock.active')}</Badge> : null}</div>
+              <div className="mt-1 flex flex-wrap gap-1"><Badge variant={profile.is_person ? 'default' : 'outline'}>{profile.is_person ? t('promptFilter.risk.person') : t('promptFilter.risk.nonPerson')}</Badge><Badge variant={profile.has_activity ? 'secondary' : 'outline'}>{t(profile.has_activity ? 'promptFilter.risk.activeProfile' : 'promptFilter.risk.identityOnly')}</Badge><Badge variant="outline">{t(`promptFilter.risk.subjects.${profile.subject_type}`)}</Badge>{profile.platform ? <Badge variant="secondary">{profile.platform}</Badge> : null}{profile.newapi_user_group ? <Badge variant="secondary">{t('promptFilter.risk.userGroup')}: {profile.newapi_user_group}</Badge> : null}{profile.trust_policy ? <Badge variant={profile.trust_policy.status === 'active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.status.${profile.trust_policy.status}`, { defaultValue: profile.trust_policy.status })}</Badge> : null}{profile.conversation_lock?.status === 'active' ? <Badge variant="destructive">{t(profile.conversation_lock.restriction_scope === 'user_cooldown' ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge> : null}</div>
               <div className="mt-1 font-mono text-[11px] text-muted-foreground">{profile.subject_key.slice(0, 18)}</div>
             </TableCell>
             <TableCell><div className="flex items-center gap-2"><span className="font-mono text-lg font-semibold">{profile.risk_score}</span><Badge className={promptRiskBadgeClass(profile.risk_level)}>{t(`promptFilter.risk.levels.${profile.risk_level}`)}</Badge></div><div className="text-xs text-muted-foreground">{t('promptFilter.risk.identityConfidence')} {profile.identity_confidence}%</div></TableCell>
@@ -4121,11 +4131,13 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
   }
   const unlockConversation = async () => {
     const lock = item.conversation_lock
-    if (!lock || !window.confirm(t('promptFilter.risk.conversationLock.confirm'))) return
+    const userCooldown = lock?.restriction_scope === 'user_cooldown' || item.subject_type === 'newapi_user'
+    const scope = userCooldown ? 'user_cooldown' : 'conversation'
+    if (!lock || !window.confirm(t(userCooldown ? 'promptFilter.risk.conversationLock.confirmUserCooldown' : 'promptFilter.risk.conversationLock.confirm'))) return
     setUnlockingConversation(true)
     try {
-      await api.unlockPromptConversation(lock.lock_key)
-      showToast(t('promptFilter.risk.conversationLock.unlocked'))
+      const result = await api.unlockPromptConversation(lock.lock_key, userCooldown ? t('promptFilter.risk.conversationLock.userCooldownUnlockReason') : t('promptFilter.risk.conversationLock.conversationUnlockReason'), scope)
+      showToast(t(userCooldown ? 'promptFilter.risk.conversationLock.userCooldownUnlocked' : 'promptFilter.risk.conversationLock.unlocked', { count: result.unlocked_count }))
       await loadDetail()
     } catch (err) {
       showToast(getErrorMessage(err), 'error')
@@ -4133,6 +4145,8 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
       setUnlockingConversation(false)
     }
   }
+  const activeRestriction = item.conversation_lock
+  const isUserCooldown = activeRestriction?.restriction_scope === 'user_cooldown' || item.subject_type === 'newapi_user'
   return <>
     <Button size="sm" variant="outline" onClick={() => { setEventPage(1); setTrustEventPage(1); setOpen(true) }}>{t('promptFilter.cyberDetail')}</Button>
     <Dialog open={open} onOpenChange={setOpen}>
@@ -4142,10 +4156,10 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
           <div className="rounded-lg border border-[hsl(var(--warning))]/30 bg-[hsl(var(--warning-bg))] p-3 text-sm text-[hsl(var(--warning))]">{detail?.guardrail || t('promptFilter.risk.guardrail')}</div>
           {item.conversation_lock?.status === 'active' ? <div className="rounded-lg border border-destructive/35 bg-destructive/5 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
-              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t('promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t('promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.conversationLock.description')}</p></div>
-              <Button size="sm" variant="destructive" disabled={unlockingConversation} onClick={() => void unlockConversation()}>{t('promptFilter.risk.conversationLock.unlock')}</Button>
+              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownTitle' : 'promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownDescription' : 'promptFilter.risk.conversationLock.description')}</p></div>
+              <Button size="sm" variant="destructive" disabled={unlockingConversation} onClick={() => void unlockConversation()}>{t(isUserCooldown ? 'promptFilter.risk.conversationLock.unlockUserCooldown' : 'promptFilter.risk.conversationLock.unlock')}</Button>
             </div>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={item.conversation_lock.reason_code} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /></div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.expiresAt')} value={item.conversation_lock.expires_at ? formatBeijingTime(item.conversation_lock.expires_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.remaining')} value={formatPromptRestrictionRemaining(item.conversation_lock.remaining_seconds)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={isUserCooldown ? 'user_cyber_cooldown' : 'conversation_cyber_locked'} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /></div>
           </div> : null}
           <div className="rounded-lg border bg-muted/20 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">

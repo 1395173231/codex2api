@@ -1092,22 +1092,23 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	}
 	cfg := h.promptFilterConfigForRequest(c)
 	if item, locked := h.activePromptConversationLock(c, cfg, nil); locked {
-		reasonCode, message := promptCyberRestrictionDecision(item)
+		restriction := promptCyberRestrictionDecision(item, cfg)
 		profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))
 		switch profile {
 		case promptfilter.GuardProfileBalanced, promptfilter.GuardProfileStrict, promptfilter.GuardProfileResearch:
 		default:
 			profile = promptfilter.GuardProfileBalanced
 		}
-		decision := promptfilter.Decision{Action: promptfilter.ActionBlock, Profile: profile, ReasonCode: reasonCode, Terminal: true}
-		verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: message, FullText: reasonCode}
+		decision := promptfilter.Decision{Action: promptfilter.ActionBlock, Profile: profile, ReasonCode: restriction.ReasonCode, Terminal: true}
+		verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: restriction.Message, FullText: restriction.ReasonCode}
 		if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
 			metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, decision, verdict, cfg, rawBody, endpoint, model, policyEventID, policyContext.VerificationSecret)
 			writeNewAPIPolicyDecisionHeaders(c, metadata)
-			_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
+			writePromptCyberRestrictionHeaders(c, restriction)
+			_ = writeResponsesWSError(conn, promptCyberRestrictionAPIError(restriction, newAPIPolicyDecisionDetails(metadata)))
 			return true, true
 		}
-		_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrorCode(reasonCode), message, api.ErrorTypeInvalidRequest))
+		_ = writeResponsesWSError(conn, promptCyberRestrictionAPIError(restriction, nil))
 		return true, false
 	}
 	// Keep disabled filters off the WebSocket request-body hot path too.

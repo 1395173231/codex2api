@@ -1899,7 +1899,17 @@
         "unlock": "解锁此对话",
         "confirm": "确认解锁此对话？原窗口中的上下文仍会保留，仅应在确认误判后操作。",
         "unlocked": "对话已解锁",
+        "conversationUnlockReason": "管理员确认后手动解锁会话",
+        "userCooldownTitle": "CYB 用户安全冷却",
+        "userCooldownActive": "用户冷却中",
+        "userCooldownDescription": "该可信用户近期收到过上游 CYB。冷却期间其所有会话都会被本地拒绝且不会重复累计处罚；解除操作会一次清除该用户当前全部活动 CY 锁。",
+        "unlockUserCooldown": "解除用户冷却",
+        "confirmUserCooldown": "确认解除该用户的安全冷却？这会同时清除该用户当前全部活动 CY 会话锁，仅应在确认误判或已经完成人工审核后操作。",
+        "userCooldownUnlocked": "用户安全冷却已解除，共清除 {{count}} 条活动锁",
+        "userCooldownUnlockReason": "管理员人工审核后解除用户安全冷却",
         "lockedAt": "锁定时间",
+        "expiresAt": "自动解除时间",
+        "remaining": "剩余时间",
         "reason": "锁定原因"
       },
       "trust": {

@@ -234,13 +234,47 @@ func (h *Handler) attachPromptConversationLocks(ctx context.Context, profiles []
 		lockTTL = time.Duration(promptfilter.NormalizeAdvancedConfig(cfg.Advanced).Enforcement.ConversationLockTTLHours) * time.Hour
 	}
 	for _, profile := range profiles {
-		if profile == nil || profile.SubjectType != database.PromptRiskSubjectSession || strings.TrimSpace(profile.SubjectKey) == "" {
+		if profile == nil {
 			continue
 		}
-		item, err := h.db.GetActivePromptConversationLockBySessionHashWithTTL(ctx, profile.SubjectKey, lockTTL)
-		if err == nil {
-			profile.ConversationLock = item
+		switch profile.SubjectType {
+		case database.PromptRiskSubjectSession:
+			if strings.TrimSpace(profile.SubjectKey) == "" {
+				continue
+			}
+			item, err := h.db.GetActivePromptConversationLockBySessionHashWithTTL(ctx, profile.SubjectKey, lockTTL)
+			if err == nil {
+				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeConversation, lockTTL)
+				profile.ConversationLock = item
+			}
+		case database.PromptRiskSubjectNewAPIUser:
+			if strings.TrimSpace(profile.Platform) == "" || strings.TrimSpace(profile.NewAPIUserID) == "" {
+				continue
+			}
+			item, _, err := h.db.GetActivePromptConversationRestriction(
+				ctx, "", profile.Platform, profile.NewAPIUserID, lockTTL, database.PromptUserCyberCooldownTTL,
+			)
+			if err == nil {
+				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeUserCooldown, database.PromptUserCyberCooldownTTL)
+				profile.ConversationLock = item
+			}
 		}
+	}
+}
+
+func decoratePromptConversationRestriction(item *database.PromptConversationLock, scope string, ttl time.Duration) {
+	if item == nil {
+		return
+	}
+	item.RestrictionScope = scope
+	if ttl <= 0 || item.LockedAt.IsZero() {
+		return
+	}
+	expiresAt := item.LockedAt.UTC().Add(ttl)
+	item.ExpiresAt = &expiresAt
+	remaining := time.Until(expiresAt)
+	if remaining > 0 {
+		item.RemainingSeconds = int64((remaining + time.Second - 1) / time.Second)
 	}
 }
 

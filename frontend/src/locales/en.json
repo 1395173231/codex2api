@@ -1899,7 +1899,17 @@
         "unlock": "Unlock conversation",
         "confirm": "Unlock this conversation? Its original context remains present, so do this only after confirming a false positive.",
         "unlocked": "Conversation unlocked",
+        "conversationUnlockReason": "Conversation manually unlocked after administrator review",
+        "userCooldownTitle": "CYB user safety cooldown",
+        "userCooldownActive": "User in cooldown",
+        "userCooldownDescription": "This verified user recently received an upstream CYB response. All sessions are rejected locally without adding duplicate penalties; releasing the cooldown clears every currently active CY lock for this user.",
+        "unlockUserCooldown": "Release user cooldown",
+        "confirmUserCooldown": "Release this user's safety cooldown? This also clears every currently active CY conversation lock for the user. Do this only after confirming a false positive or completing manual review.",
+        "userCooldownUnlocked": "User safety cooldown released; {{count}} active locks cleared",
+        "userCooldownUnlockReason": "User safety cooldown released after administrator review",
         "lockedAt": "Locked at",
+        "expiresAt": "Automatic release",
+        "remaining": "Time remaining",
         "reason": "Lock reason"
       },
       "trust": {
