@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.7.6 - 2026-08-12
+
+### Features
+
+- **Shared Codex OAuth accounts can converge downstream device fingerprints at an explicit per-account level.** A new `off` / `device` / `session` / `full` policy deterministically rewrites only identifiers already present in `X-Codex-Turn-Metadata` and `client_metadata`, keeping values stable across restarts without storing new state. The outbound `Session_id` header and prompt-cache isolation remain independent, relay/Grok accounts stay off, and existing accounts default to unchanged passthrough behavior. The policy is available in single- and batch-account editing, while a new quick-configuration sheet brings fingerprinting, dispatch score, concurrency, scheduler priority, warm-tier handling, proxy, custom headers, tags and groups into one focused workflow.
+- **Official settlement usage refreshes on a status-aware cadence instead of a six-hour full sweep.** The scheduler now checks due accounts every 30 minutes, refreshes healthy OAuth accounts approximately hourly, and keeps rate-limited or exhausted accounts on a six-hour cadence because their usage cannot move in the short term. Attempts are bounded to four concurrent probes, deleted accounts are removed from the in-memory schedule, and a manual refresh immediately resynchronizes the account page's stats.
+- **The administration console gets a broader interaction and visual polish pass.** Dashboard summaries and charts, settings, account configuration, API keys, usage, operations, proxies and model pricing now use clearer grouping, denser responsive layouts, stronger state feedback and more consistent controls. English and Chinese copy was expanded for the new auto-refresh, pricing and proxy-management actions.
+
+### Fixes
+
+- **Account request statistics converge promptly and no longer scan the other upstream channel.** Request-count aggregation and caches are split by Codex/Grok channel, a completed refresh expires the corresponding list snapshot, and account pages use bounded catch-up polling while statistics are warming or stale. This clears the persistent “statistics refreshing” state introduced when silent-refresh backoff was added, keeps manual official-usage refreshes in sync, and replaces Grok's raw `warming` / `stale` enum with localized labels.
+
 ## v2.7.5 - 2026-08-12
 
 ### Features

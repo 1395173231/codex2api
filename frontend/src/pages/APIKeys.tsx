@@ -1199,13 +1199,21 @@ export default function APIKeys() {
                       type="button"
                       onClick={() => setStatusFilter(key)}
                       className={cn(
-                        "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors",
+                        "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-all duration-150",
                         statusFilter === key
-                          ? "bg-primary text-primary-foreground"
-                          : "bg-muted/50 text-muted-foreground hover:bg-muted",
+                          ? "bg-primary text-primary-foreground shadow-2xs ring-1 ring-primary/20 scale-[1.02]"
+                          : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
                       )}
                     >
-                      {label} {count}
+                      <span>{label}</span>
+                      <span className={cn(
+                        "rounded-full px-1.5 py-0.2 text-[10px] font-mono tabular-nums font-bold",
+                        statusFilter === key
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : "bg-muted/80 text-muted-foreground",
+                      )}>
+                        {count}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -2687,9 +2695,9 @@ function resetAPIKeyQuotaUsage(keyRow: APIKeyRow): APIKeyRow {
 }
 
 function usageToneClass(pct: number) {
-  if (pct >= 90) return "bg-destructive";
-  if (pct >= 70) return "bg-[hsl(var(--warning))]";
-  return "bg-[hsl(var(--success))]";
+  if (pct >= 90) return "bg-rose-500 shadow-2xs";
+  if (pct >= 70) return "bg-amber-500 shadow-2xs";
+  return "bg-emerald-500 shadow-2xs";
 }
 
 function UsageBar({
@@ -2706,16 +2714,19 @@ function UsageBar({
   if (!limit || limit <= 0) return null;
   const pct = Math.min(100, Math.max(0, (used / limit) * 100));
   return (
-    <div className={cn("space-y-1", className)}>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+    <div className={cn("space-y-1.5", className)}>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted/80 shadow-inner">
         <div
-          className={cn("h-full rounded-full transition-all", usageToneClass(pct))}
+          className={cn("h-full rounded-full transition-all duration-300", usageToneClass(pct))}
           style={{ width: `${pct}%` }}
         />
       </div>
       {showPercent ? (
-        <div className="text-[10px] font-medium tabular-nums text-muted-foreground">
-          {pct.toFixed(0)}%
+        <div className="flex items-center justify-between text-[10px] font-semibold tabular-nums text-muted-foreground">
+          <span>用量比例</span>
+          <span className={cn(pct >= 90 ? "text-rose-500 font-bold" : pct >= 70 ? "text-amber-500 font-bold" : "text-emerald-600 dark:text-emerald-400 font-bold")}>
+            {pct.toFixed(0)}%
+          </span>
         </div>
       ) : null}
     </div>
@@ -2731,24 +2742,24 @@ function KeyStatusBadge({
 }) {
   const config = {
     active: {
-      dot: "bg-[hsl(var(--success))]",
+      dot: "bg-emerald-500 animate-pulse",
       className:
-        "border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
+        "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
     },
     expired: {
       dot: "bg-muted-foreground",
       className: "border-transparent bg-muted text-muted-foreground",
     },
     quota_exhausted: {
-      dot: "bg-destructive",
-      className: "border-transparent bg-destructive/10 text-destructive",
+      dot: "bg-rose-500 animate-pulse",
+      className: "border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-400",
     },
   }[status];
 
   return (
     <Badge
       variant="outline"
-      className={cn("gap-1.5 px-1.5 py-0 text-[11px] font-semibold", config.className)}
+      className={cn("gap-1.5 px-2 py-0.5 text-[11px] font-semibold rounded-full shadow-2xs", config.className)}
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
@@ -2906,24 +2917,24 @@ function WindowCostBars({
   }
   if (bars.length === 0) return null;
   return (
-    <div className="mt-1.5 space-y-1">
+    <div className="mt-2 rounded-lg border border-border/60 bg-muted/20 p-2 space-y-1.5">
       {bars.map((bar) => {
         const pct = Math.min(100, Math.max(0, (bar.used / bar.limit) * 100));
         return (
-          <div key={bar.label} className="flex items-center gap-1.5">
-            <span className="w-6 text-[10px] font-medium text-muted-foreground">
+          <div key={bar.label} className="flex items-center justify-between gap-2 text-[10px]">
+            <span className="w-6 font-semibold font-mono text-muted-foreground">
               {bar.label}
             </span>
-            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted shadow-inner">
               <div
                 className={cn(
-                  "h-full rounded-full transition-all",
+                  "h-full rounded-full transition-all duration-300",
                   usageToneClass(pct),
                 )}
                 style={{ width: `${pct}%` }}
               />
             </div>
-            <span className="text-[10px] tabular-nums text-muted-foreground">
+            <span className="font-mono tabular-nums font-semibold text-muted-foreground shrink-0">
               {formatUSD(bar.used)}/{formatUSD(bar.limit)}
             </span>
           </div>
@@ -3361,16 +3372,16 @@ function LimitSection({
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border/80 bg-muted/15 p-3">
-      <div className="mb-3 flex items-start gap-2.5">
-        <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-background text-primary shadow-sm ring-1 ring-border/70">
+    <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3">
+      <div className="flex items-start gap-3 border-b border-border/50 pb-2.5">
+        <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
           {icon}
         </div>
         <div className="min-w-0">
-          <div className="text-xs font-semibold uppercase tracking-wide text-foreground">
+          <div className="text-xs font-bold uppercase tracking-wider text-foreground">
             {title}
           </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground/90">
             {description}
           </p>
         </div>

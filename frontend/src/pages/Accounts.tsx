@@ -156,6 +156,7 @@ import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import AccountQuickConfigSheet from "../components/AccountQuickConfigSheet";
 import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
@@ -839,6 +840,7 @@ interface AccountRowActions {
   toggleSelect: (id: number) => void;
   openDetail: (account: AccountRow) => void;
   openSchedulerEditor: (account: AccountRow) => void;
+  openQuickConfig: (account: AccountRow) => void;
   openQuickGroupEditor: (account: AccountRow) => void;
   openUsage: (account: AccountRow) => void;
   // 直接打开用量弹窗的官方统计 tab（成本列的官方胶囊）。
@@ -1254,6 +1256,15 @@ const AccountTableRow = memo(function AccountTableRow({
                                   <Button
                                     variant="ghost"
                                     size="icon-sm"
+                                    className="size-8 text-muted-foreground hover:text-primary"
+                                    onClick={() => actions.openQuickConfig(account)}
+                                    title="账号指纹与快捷配置"
+                                  >
+                                    <Fingerprint className="size-3.5 text-primary" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon-sm"
                                     className="size-8"
                                     onClick={() => actions.openSchedulerEditor(account)}
                                     title={t("accounts.editScheduler")}
@@ -1506,6 +1517,7 @@ export default function Accounts() {
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false);
   const [cleaningError, setCleaningError] = useState(false);
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
+  const [quickConfigAccount, setQuickConfigAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   // 用量弹窗打开时停在哪个 tab。列表里点「官方 7d」成本直接落到官方统计,
   // 其余入口保持默认的概览。
@@ -2712,16 +2724,19 @@ export default function Accounts() {
   const openAccountDetail = useCallback((account: AccountRow) => {
     setDetailAccountData(account);
     setDetailAccountId(account.id);
+    setQuickConfigAccount(account);
   }, []);
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
     setDetailAccountData(null);
+    setQuickConfigAccount(null);
   }, []);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex > 0) {
       const target = sortedAccounts[detailNavIndex - 1] ?? null;
       setDetailAccountData(target);
       setDetailAccountId(target?.id ?? null);
+      if (target) setQuickConfigAccount(target);
       return;
     }
     if (currentPage > 1) {
@@ -2734,6 +2749,7 @@ export default function Accounts() {
       const target = sortedAccounts[detailNavIndex + 1] ?? null;
       setDetailAccountData(target);
       setDetailAccountId(target?.id ?? null);
+      if (target) setQuickConfigAccount(target);
       return;
     }
     if (currentPage < totalPages) {
@@ -5231,6 +5247,7 @@ export default function Accounts() {
     toggleSelect,
     openDetail: openAccountDetail,
     openSchedulerEditor,
+    openQuickConfig: (account) => setQuickConfigAccount(account),
     openQuickGroupEditor,
     openUsage: (account) => {
       setUsageInitialPage("overview");
@@ -5256,6 +5273,7 @@ export default function Accounts() {
       toggleSelect: (id) => rowActionsImplRef.current?.toggleSelect(id),
       openDetail: (a) => rowActionsImplRef.current?.openDetail(a),
       openSchedulerEditor: (a) => rowActionsImplRef.current?.openSchedulerEditor(a),
+      openQuickConfig: (a) => rowActionsImplRef.current?.openQuickConfig(a),
       openQuickGroupEditor: (a) => rowActionsImplRef.current?.openQuickGroupEditor(a),
       openUsage: (a) => rowActionsImplRef.current?.openUsage(a),
       openOfficialUsage: (a) => rowActionsImplRef.current?.openOfficialUsage(a),
@@ -7892,6 +7910,10 @@ export default function Accounts() {
             onClose={closeAccountDetail}
             onPrev={goDetailPrev}
             onNext={goDetailNext}
+            onQuickConfig={() => {
+              if (!detailAccount) return;
+              setQuickConfigAccount(detailAccount);
+            }}
             onEdit={() => {
               if (!detailAccount) return;
               openSchedulerEditor(detailAccount);
@@ -7944,6 +7966,14 @@ export default function Accounts() {
               if (!detailAccount) return;
               void handleDelete(detailAccount);
             }}
+          />
+
+          <AccountQuickConfigSheet
+            account={quickConfigAccount}
+            groups={allGroups}
+            show={Boolean(quickConfigAccount)}
+            onClose={() => setQuickConfigAccount(null)}
+            onSaved={() => void reloadSilently()}
           />
 
           <Modal

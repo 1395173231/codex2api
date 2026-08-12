@@ -68,7 +68,7 @@ func (h *Handler) buildAccountResponse(
 	}
 	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
 	codexFingerprintMode := ""
-	if !isOpenAIResponsesAccount && !isGrokAccount && includeDetails {
+	if !isOpenAIResponsesAccount && !isGrokAccount {
 		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
 	}
 	ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
@@ -319,7 +319,6 @@ func stripAccountDetailFields(resp *accountResponse) {
 	resp.GrokFreeQuota = nil
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
-	resp.CodexFingerprintMode = ""
 	resp.CustomHeaders = nil
 	resp.AllowedAPIKeyIDs = nil
 	resp.Usage5hDetail = nil

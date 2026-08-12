@@ -102,21 +102,21 @@ function InternalRequestBadge({ log }: { log: UsageLog }) {
 
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
-    return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
+    return 'border-emerald-500/20 bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
   }
   if (statusCode === 401) {
-    return 'border-transparent bg-red-500/14 text-red-600 dark:bg-red-500/20 dark:text-red-300'
+    return 'border-rose-500/20 bg-rose-500/12 text-rose-700 dark:text-rose-300'
   }
   if (statusCode === 429) {
-    return 'border-transparent bg-amber-500/14 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300'
+    return 'border-amber-500/20 bg-amber-500/12 text-amber-700 dark:text-amber-300'
   }
   if (statusCode >= 500) {
-    return 'border-transparent bg-red-500/14 text-red-600 dark:bg-red-500/20 dark:text-red-300'
+    return 'border-rose-500/20 bg-rose-500/12 text-rose-700 dark:text-rose-300'
   }
   if (statusCode >= 400) {
-    return 'border-transparent bg-amber-500/14 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300'
+    return 'border-amber-500/20 bg-amber-500/12 text-amber-700 dark:text-amber-300'
   }
-  return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
+  return 'border-slate-500/20 bg-slate-500/12 text-slate-700 dark:text-slate-300'
 }
 
 type UsagePresetRangeKey = 'today' | TimeRangeKey
@@ -903,12 +903,24 @@ function ImageUsageBadge({ log }: { log: UsageLog }) {
 
 function StatusCodeBadge({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
+  const dotColor = log.status_code === 200
+    ? 'bg-emerald-500'
+    : log.status_code === 429
+      ? 'bg-amber-500 animate-pulse'
+      : 'bg-rose-500 animate-pulse'
+
   const badge = (
     <Badge
       variant="outline"
-      className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)} ${log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''}`}
+      className={cn(
+        usageTableBadgeClass,
+        'gap-1.5',
+        getStatusBadgeClassName(log.status_code),
+        log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''
+      )}
     >
-      {log.status_code}
+      <span className={cn('size-1.5 rounded-full', dotColor)} />
+      <span>{log.status_code}</span>
     </Badge>
   )
 
@@ -926,10 +938,10 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
           {badge}
         </span>
       </TooltipTrigger>
-      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-3 text-xs text-slate-50 shadow-xl backdrop-blur-md">
         <div className="space-y-1.5">
           <div className="font-semibold text-slate-300">{title}</div>
-          <div className="font-geist-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
+          <div className="font-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
           <div className="whitespace-pre-wrap break-words leading-relaxed text-slate-50">{message}</div>
         </div>
       </TooltipContent>
@@ -2122,34 +2134,39 @@ export default function Usage() {
             <div className="mb-4 flex items-center justify-between gap-3 overflow-visible max-lg:flex-col max-lg:items-stretch max-lg:overflow-visible">
               <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <h3 className="shrink-0 whitespace-nowrap text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
-                <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border bg-muted/50 p-0.5">
-                  {USAGE_TIME_RANGE_OPTIONS.map((key) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        setTimeRange(key)
-                        setPage(1)
-                        setShowCustomPopover(false)
-                      }}
-                      className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
-                        timeRange === key
-                          ? 'bg-background text-foreground shadow-sm border border-border'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
-                    </button>
-                  ))}
+                <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border/70 bg-muted/40 p-1 shadow-2xs">
+                  {USAGE_TIME_RANGE_OPTIONS.map((key) => {
+                    const active = timeRange === key
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => {
+                          setTimeRange(key)
+                          setPage(1)
+                          setShowCustomPopover(false)
+                        }}
+                        className={cn(
+                          'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
+                          active
+                            ? 'bg-background text-foreground shadow-xs ring-1 ring-border/50 font-bold'
+                            : 'text-muted-foreground hover:bg-background/40 hover:text-foreground'
+                        )}
+                      >
+                        {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
+                      </button>
+                    )
+                  })}
                   <button
                     ref={customChipRef}
                     type="button"
                     onClick={() => setShowCustomPopover((v) => !v)}
-                    className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
+                    className={cn(
+                      'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
                       timeRange === 'custom'
-                        ? 'bg-background text-foreground shadow-sm border border-border'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
+                        ? 'bg-background text-foreground shadow-xs ring-1 ring-border/50 font-bold'
+                        : 'text-muted-foreground hover:bg-background/40 hover:text-foreground'
+                    )}
                   >
                     {timeRange === 'custom' && customRange
                       ? t('usage.customRangeChipApplied')

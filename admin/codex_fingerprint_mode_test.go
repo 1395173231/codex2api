@@ -111,7 +111,7 @@ func TestUpdateAccountSchedulerSyncsRuntimeCodexFingerprintMode(t *testing.T) {
 	}
 }
 
-func TestAccountResponseExposesCodexFingerprintModeOnlyWithDetails(t *testing.T) {
+func TestAccountResponseExposesCodexFingerprintMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)
 	accountID := insertTestAccount(t, db)
@@ -131,10 +131,10 @@ func TestAccountResponseExposesCodexFingerprintModeOnlyWithDetails(t *testing.T)
 		t.Fatalf("detailed mode = %q, want %q", detailed.CodexFingerprintMode, auth.CodexFingerprintModeFull)
 	}
 
-	// 列表档不加载详情字段，避免为每行多读一次凭据。
+	// 摘要响应也要带上指纹模式，供列表和快捷抽屉渲染。
 	summary := handler.buildAccountResponse(row, nil, nil, nil, nil, false)
-	if summary.CodexFingerprintMode != "" {
-		t.Fatalf("summary mode = %q, want empty", summary.CodexFingerprintMode)
+	if summary.CodexFingerprintMode != auth.CodexFingerprintModeFull {
+		t.Fatalf("summary mode = %q, want %q", summary.CodexFingerprintMode, auth.CodexFingerprintModeFull)
 	}
 }
 

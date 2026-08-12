@@ -18,6 +18,8 @@ import {
   Search,
   Users,
   Power,
+  ShieldCheck,
+  RotateCcw,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -53,12 +55,13 @@ import {
   readProxyBatchTestSSE,
 } from "../lib/proxyTestState";
 import { getErrorMessage } from "../utils/error";
+import { cn } from "@/lib/utils";
 
 const PROXY_SCHEMES = ["http:", "https:", "socks5:", "socks5h:"];
 
 type BindFilter = "all" | "unbound" | "this" | "other";
-// 账号池大类：Codex 池（含 AT / Agent / OpenAI Responses）与 Grok 池
 type BindKindFilter = "all" | "codex" | "grok";
+type StatusFilter = "all" | "enabled" | "disabled" | "error" | "untested";
 
 function accountDisplayName(account: AccountRow): string {
   if (account.openai_responses_api) {
@@ -91,17 +94,14 @@ function isAccountBoundToProxy(
 function validateProxyInput(url: string): boolean {
   const trimmed = url.trim();
   if (!trimmed) return false;
-  // 优先用 URL 严格解析（覆盖 IPv6 等）。
   try {
     const parsed = new URL(trimmed);
     if (Boolean(parsed.hostname) && PROXY_SCHEMES.includes(parsed.protocol)) {
       return true;
     }
   } catch {
-    /* 落到下方宽松校验 */
+    /* fallback */
   }
-  // 宽松结构校验：密码可能含 # / ? @ 等特殊字符，会让 new URL 抛错（issue #293）。
-  // 形如 scheme://[user[:pass]@]host[:port]，userinfo 贪婪匹配到最后一个 '@'。
   const m = /^([a-z0-9+.-]+):\/\/(?:.*@)?([^@\s:/?#]+)(?::(\d{1,5}))?\/?$/i.exec(
     trimmed,
   );
@@ -112,6 +112,18 @@ function validateProxyInput(url: string): boolean {
     if (port < 1 || port > 65535) return false;
   }
   return true;
+}
+
+function getProxyScheme(url: string): string {
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol.replace(":", "").toUpperCase();
+  } catch {
+    if (url.toLowerCase().startsWith("socks5")) return "SOCKS5";
+    if (url.toLowerCase().startsWith("https")) return "HTTPS";
+    if (url.toLowerCase().startsWith("http")) return "HTTP";
+    return "PROXY";
+  }
 }
 
 function latencyColor(ms: number): string {
@@ -140,11 +152,26 @@ function maskUrl(url: string): string {
   }
 }
 
-function ProxyStatusBadge({
-  proxy,
-}: {
-  proxy: ProxyRow;
-}) {
+function SchemeBadge({ scheme }: { scheme: string }) {
+  const isSocks = scheme.includes("SOCKS");
+  const isHttps = scheme === "HTTPS";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold font-mono tracking-wide uppercase border",
+        isSocks
+          ? "border-purple-500/25 bg-purple-500/10 text-purple-600 dark:text-purple-400"
+          : isHttps
+            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+            : "border-sky-500/25 bg-sky-500/10 text-sky-600 dark:text-sky-400"
+      )}
+    >
+      {scheme}
+    </span>
+  );
+}
+
+function ProxyStatusBadge({ proxy }: { proxy: ProxyRow }) {
   const { t } = useTranslation();
   const kind = getProxyStatusBadgeKind(proxy);
   const styles =
@@ -171,18 +198,15 @@ function ProxyStatusBadge({
         : kind === "enabled"
           ? t("proxies.enabled")
           : t("proxies.disabled");
-  const className = `inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-all ${styles}`;
 
   return (
-    <span className={className}>
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-all ${styles}`}>
       <span className={`size-1.5 rounded-full ${dot}`} />
       {label}
     </span>
   );
 }
 
-// BindAccountRow 是绑定弹窗里的单行账号。memo 化:勾选状态变化时只重渲染
-// 受影响的行,避免大列表整体重排(大号池卡死问题)。
 const BindAccountRow = memo(function BindAccountRow({
   account,
   checked,
@@ -283,7 +307,9 @@ export default function Proxies() {
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState("");
 
-  // 代理 → 账号池绑定
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [bindingProxy, setBindingProxy] = useState<ProxyRow | null>(null);
@@ -298,19 +324,14 @@ export default function Proxies() {
   const bindAbortRef = useRef<AbortController | null>(null);
   const [bindSubmitting, setBindSubmitting] = useState(false);
 
-  // 一键均衡绑定(把账号按最少绑定优先摊到可用代理上)
   const [showBalance, setShowBalance] = useState(false);
-  const [balanceChannel, setBalanceChannel] = useState<"" | "codex" | "grok">(
-    "grok",
-  );
+  const [balanceChannel, setBalanceChannel] = useState<"" | "codex" | "grok">("grok");
   const [balanceMode, setBalanceMode] = useState<"unbound" | "all">("unbound");
   const [balanceMaxPerProxy, setBalanceMaxPerProxy] = useState("");
   const [balanceSubmitting, setBalanceSubmitting] = useState(false);
 
   const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
 
-  // 账号列表只在绑定弹窗打开时按需加载 lite 视图(只含身份/绑定字段)。
-  // 页面本身的绑定计数用服务端聚合的 bound_count,大号池下不再拉全量账号。
   const reloadAccounts = useCallback(async () => {
     if (!bindingProxy) return;
     bindAbortRef.current?.abort();
@@ -384,9 +405,43 @@ export default function Proxies() {
     reload();
   }, [reload]);
 
-  const totalPages = Math.max(1, Math.ceil(proxies.length / pageSize));
+  const counts = useMemo(() => {
+    let enabled = 0;
+    let disabled = 0;
+    let error = 0;
+    let untested = 0;
+    for (const p of proxies) {
+      if (p.test_status === "error") error += 1;
+      else if (!p.test_status || p.test_status === "untested") untested += 1;
+
+      if (p.enabled) enabled += 1;
+      else disabled += 1;
+    }
+    return { total: proxies.length, enabled, disabled, error, untested };
+  }, [proxies]);
+
+  const filteredProxies = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return proxies.filter((p) => {
+      if (statusFilter === "enabled" && !p.enabled) return false;
+      if (statusFilter === "disabled" && p.enabled) return false;
+      if (statusFilter === "error" && p.test_status !== "error") return false;
+      if (statusFilter === "untested" && p.test_status && p.test_status !== "untested") return false;
+
+      if (q) {
+        const matchUrl = p.url.toLowerCase().includes(q);
+        const matchLabel = p.label?.toLowerCase().includes(q) ?? false;
+        const matchIp = p.test_ip?.toLowerCase().includes(q) ?? false;
+        const matchLoc = p.test_location?.toLowerCase().includes(q) ?? false;
+        if (!matchUrl && !matchLabel && !matchIp && !matchLoc) return false;
+      }
+      return true;
+    });
+  }, [proxies, query, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredProxies.length / pageSize));
   const currentPage = Math.min(page, totalPages);
-  const pagedProxies = proxies.slice(
+  const pagedProxies = filteredProxies.slice(
     (currentPage - 1) * pageSize,
     currentPage * pageSize,
   );
@@ -475,9 +530,7 @@ export default function Proxies() {
               fail: result.failed,
             }),
       );
-      // 同时刷新代理列表的服务端 bound_count。
       await Promise.all([reloadAccounts(), reload()]);
-      // 绑定成功后同步本地选中：绑定时保持选中，解绑后清空
       if (mode === "unbind") {
         setBindSelected(new Set());
       }
@@ -750,7 +803,7 @@ export default function Proxies() {
     }
   };
 
-  const errorCount = proxies.filter((p) => p.test_status === "error").length;
+  const errorCount = counts.error;
   const testsRunning = testAllLoading || testingIds.size > 0;
 
   const handleCleanErrors = async () => {
@@ -803,16 +856,20 @@ export default function Proxies() {
     }
   };
 
-  const enabledCount = proxies.filter((p) => p.enabled).length;
-  const untestedCount = proxies.filter(
-    (p) => !p.test_status || p.test_status === "untested",
-  ).length;
   const canEnable = proxies.some(
     (p) => p.enabled && p.test_status !== "error",
   );
 
+  const statusFilterItems: Array<{ id: StatusFilter; label: string; count: number }> = [
+    { id: "all", label: t("proxies.filterAll"), count: counts.total },
+    { id: "enabled", label: t("proxies.filterEnabled"), count: counts.enabled },
+    { id: "disabled", label: t("proxies.filterDisabled"), count: counts.disabled },
+    { id: "error", label: t("proxies.filterError"), count: counts.error },
+    { id: "untested", label: t("proxies.filterUntested"), count: counts.untested },
+  ];
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {confirmDialog}
       {/* Header */}
       <PageHeader
@@ -821,7 +878,6 @@ export default function Proxies() {
         className="mb-0 sm:mb-0"
         actions={
           <>
-            {/* Pool Toggle Switch */}
             <div
               className="flex h-9 shrink-0 items-center gap-2.5 rounded-lg border border-border/60 bg-muted/20 px-3"
               title={
@@ -906,21 +962,73 @@ export default function Proxies() {
         }
       />
 
+      {/* 批量测试进度条 */}
+      {testAllLoading && testAllTotal > 0 ? (
+        <div className="rounded-xl border border-primary/20 bg-primary/5 p-3.5 space-y-2">
+          <div className="flex items-center justify-between text-xs font-semibold">
+            <span className="flex items-center gap-1.5 text-primary">
+              <Loader2 className="size-3.5 animate-spin" />
+              {t("proxies.testingAllProgress", {
+                current: testAllDone,
+                total: testAllTotal,
+                failed: testAllFailed,
+              })}
+            </span>
+            <span className="tabular-nums text-muted-foreground">
+              {Math.round((testAllDone / testAllTotal) * 100)}%
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-primary/10">
+            <div
+              className="h-full bg-primary transition-all duration-300 rounded-full"
+              style={{ width: `${(testAllDone / testAllTotal) * 100}%` }}
+            />
+          </div>
+        </div>
+      ) : null}
+
       {/* Add Panel */}
       {showAdd && (
         <Card className="py-0">
-          <CardContent className="p-6 space-y-4">
-            <h4 className="text-base font-semibold text-foreground">
-              {t("proxies.addProxyTitle")}
-            </h4>
-            <p className="text-sm text-muted-foreground">
-              {t("proxies.addProxyDesc")}
-            </p>
+          <CardContent className="p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-base font-semibold text-foreground">
+                  {t("proxies.addProxyTitle")}
+                </h4>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {t("proxies.addProxyDesc")}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-xs text-muted-foreground"
+                  onClick={() => setAddInput("socks5://127.0.0.1:1080\nhttp://user:pass@1.2.3.4:8080")}
+                >
+                  <RotateCcw className="size-3 mr-1" />
+                  {t("proxies.insertTemplate")}
+                </Button>
+                {addInput ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 text-xs text-muted-foreground"
+                    onClick={() => setAddInput("")}
+                  >
+                    {t("proxies.clearAll")}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
             <textarea
               value={addInput}
               onChange={(e) => setAddInput(e.target.value)}
               placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
-              className="w-full h-32 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
+              className="w-full h-32 px-3.5 py-2.5 text-xs rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
             <div className="flex items-center gap-3">
               <Input
@@ -928,11 +1036,12 @@ export default function Proxies() {
                 value={addLabel}
                 onChange={(e) => setAddLabel(e.target.value)}
                 placeholder={t("proxies.labelPlaceholder")}
-                className="flex-1"
+                className="flex-1 rounded-xl h-10"
               />
               <Button
                 onClick={handleAdd}
                 disabled={addLoading || !addInput.trim()}
+                className="rounded-xl h-10 px-5"
               >
                 {addLoading ? t("proxies.adding") : t("proxies.confirmAdd")}
               </Button>
@@ -941,7 +1050,7 @@ export default function Proxies() {
         </Card>
       )}
 
-      {/* Stats */}
+      {/* Stats （点击快捷筛选） */}
       {loading ? (
         <div
           className="grid grid-cols-2 gap-3 min-[520px]:grid-cols-4 sm:gap-4"
@@ -958,14 +1067,18 @@ export default function Proxies() {
         <div className="grid grid-cols-2 gap-3 min-[520px]:grid-cols-4 sm:gap-4">
           <StatTile
             label={t("proxies.totalProxies")}
-            value={proxies.length}
+            value={counts.total}
             icon={<Globe className="size-4" />}
+            active={statusFilter === "all"}
+            onClick={() => setStatusFilter("all")}
           />
           <StatTile
             label={t("proxies.enabledCount")}
-            value={enabledCount}
+            value={counts.enabled}
             icon={<Power className="size-4" />}
             tone="success"
+            active={statusFilter === "enabled"}
+            onClick={() => setStatusFilter("enabled")}
           />
           <StatTile
             label={t("proxies.boundAccounts")}
@@ -975,12 +1088,69 @@ export default function Proxies() {
           />
           <StatTile
             label={t("proxies.untestedCount")}
-            value={untestedCount}
+            value={counts.untested}
             icon={<Zap className="size-4" />}
             tone="warning"
+            active={statusFilter === "untested"}
+            onClick={() => setStatusFilter("untested")}
           />
         </div>
       )}
+
+      {/* Sticky toolbar */}
+      <div className="sticky top-2 z-20 -mx-1 px-1">
+        <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-card/95 p-2.5 shadow-sm backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:p-2 sm:pl-3">
+          <div className="relative min-w-0 flex-1 sm:max-w-xs">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="h-9 border-transparent bg-muted/40 pl-9 text-sm shadow-none focus-visible:bg-background"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("proxies.searchPlaceholder")}
+            />
+          </div>
+
+          <div
+            className="flex max-w-full gap-0.5 overflow-x-auto rounded-xl bg-muted/50 p-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            role="tablist"
+          >
+            {statusFilterItems.map((item) => {
+              const active = statusFilter === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setStatusFilter(item.id)}
+                  className={cn(
+                    "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-all",
+                    active
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {item.label}
+                  <span
+                    className={cn(
+                      "tabular-nums rounded-md px-1 py-px text-[10px] font-bold",
+                      active
+                        ? item.id === "error" && item.count > 0
+                          ? "bg-destructive/20 text-destructive"
+                          : "bg-primary/10 text-primary"
+                        : item.id === "error" && item.count > 0
+                          ? "bg-destructive/10 text-destructive"
+                          : "bg-background/60 text-muted-foreground",
+                    )}
+                  >
+                    {item.count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
 
       {/* Table */}
       <Card className="py-0">
@@ -995,7 +1165,7 @@ export default function Proxies() {
                 />
               ))}
             </div>
-          ) : proxies.length === 0 ? (
+          ) : filteredProxies.length === 0 ? (
             <div className="text-center py-16 text-muted-foreground">
               <Globe className="size-12 mx-auto mb-3 opacity-30" />
               <p className="text-sm font-medium">{t("proxies.noProxies")}</p>
@@ -1007,6 +1177,7 @@ export default function Proxies() {
               <div className="grid gap-3 p-3 lg:hidden">
                 {pagedProxies.map((p) => {
                   const isTesting = testingIds.has(p.id);
+                  const scheme = getProxyScheme(p.url);
                   return (
                     <div
                       key={p.id}
@@ -1026,6 +1197,12 @@ export default function Proxies() {
                         />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-start gap-2">
+                            <SchemeBadge scheme={scheme} />
+                            {p.label ? (
+                              <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                                {p.label}
+                              </span>
+                            ) : null}
                             <Button
                               variant="ghost"
                               size="icon"
@@ -1037,7 +1214,7 @@ export default function Proxies() {
                                   return next;
                                 });
                               }}
-                              className="shrink-0 text-muted-foreground hover:text-foreground"
+                              className="shrink-0 text-muted-foreground hover:text-foreground ml-auto"
                               title={
                                 revealedIds.has(p.id)
                                   ? t("proxies.hideProxyUrl")
@@ -1050,9 +1227,10 @@ export default function Proxies() {
                                 <Eye className="size-3.5" />
                               )}
                             </Button>
-                            <span className="min-w-0 flex-1 break-all font-mono text-[12px] font-medium leading-relaxed text-foreground">
-                              {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
-                            </span>
+                          </div>
+
+                          <div className="mt-1.5 break-all font-mono text-[12px] font-medium leading-relaxed text-foreground">
+                            {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
                           </div>
 
                           <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -1173,6 +1351,7 @@ export default function Proxies() {
                   <TableBody>
                     {pagedProxies.map((p) => {
                       const isTesting = testingIds.has(p.id);
+                      const scheme = getProxyScheme(p.url);
                       return (
                         <TableRow key={p.id}>
                           <TableCell>
@@ -1190,6 +1369,12 @@ export default function Proxies() {
                           </TableCell>
                           <TableCell className="max-w-[380px] whitespace-normal">
                             <div className="flex items-center gap-2">
+                              <SchemeBadge scheme={scheme} />
+                              {p.label ? (
+                                <span className="inline-flex rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                                  {p.label}
+                                </span>
+                              ) : null}
                               <Button
                                 variant="ghost"
                                 size="icon-xs"
@@ -1352,7 +1537,7 @@ export default function Proxies() {
                   page={currentPage}
                   totalPages={totalPages}
                   onPageChange={setPage}
-                  totalItems={proxies.length}
+                  totalItems={filteredProxies.length}
                   pageSize={pageSize}
                   pageSizeOptions={pageSizeOptions}
                   onPageSizeChange={(nextPageSize) => {
@@ -1587,7 +1772,6 @@ export default function Proxies() {
       >
         {bindingProxy ? (
           <div className="flex flex-col">
-            {/* 目标代理摘要 */}
             <div className="border-b border-border bg-muted/20 px-5 py-3.5 sm:px-6">
               <div className="text-xs font-semibold text-muted-foreground">
                 {t("proxies.bindTargetProxy")}
@@ -1613,7 +1797,6 @@ export default function Proxies() {
               </p>
             </div>
 
-            {/* 搜索 + 筛选 */}
             <div className="space-y-3 border-b border-border px-5 py-3 sm:px-6">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -1699,7 +1882,6 @@ export default function Proxies() {
               </div>
             </div>
 
-            {/* 账号列表 */}
             <div className="max-h-[min(420px,50dvh)] overflow-y-auto">
               {accountsLoading ? (
                 <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
