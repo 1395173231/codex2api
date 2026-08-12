@@ -788,6 +788,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/model-pricing", h.ListModelPricing)
 	api.PUT("/model-pricing", h.UpdateModelPricing)
 	api.POST("/model-pricing/sync", h.SyncModelPricing)
+	api.PUT("/model-pricing/official-sync/config", h.UpdateOfficialPricingSyncConfig)
+	api.POST("/model-pricing/official-sync", h.SyncOfficialPricingNow)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
 	api.POST("/image-prompts", h.CreateImagePromptTemplate)
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
@@ -10519,9 +10521,17 @@ func (h *Handler) grokChannelModels() []string {
 	return models
 }
 
-// SyncModels 从官方 Codex 模型页同步模型注册表。
+// SyncModels 从官方 Codex 模型页同步模型注册表，并按管理员选择同步 Grok
+// 账号的真实上游白名单与官方价格。
 func (h *Handler) SyncModels(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	var req modelSyncRequest
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
 
 	proxyURL := ""
@@ -10533,7 +10543,18 @@ func (h *Handler) SyncModels(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, result)
+	response := adminModelSyncResponse{ModelSyncResult: result}
+	if req.SyncGrok {
+		response.Grok = h.syncGrokAccountModels(ctx)
+	}
+	if req.SyncOfficialPricing {
+		pricingResult, pricingErr := h.runOfficialPricingSync(ctx, true, true)
+		response.OfficialPricing = pricingResult
+		if pricingErr != nil {
+			response.PricingError = pricingErr.Error()
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // SyncCodexCLIVersion 从 openai/codex releases 拉取最新稳定版本，

@@ -990,6 +990,7 @@ function GrokAccounts({
   }>({ models: [], base_url: "", model_mapping: "", proxy_url: "" });
   const [editModelDraft, setEditModelDraft] = useState("");
   const [editSubmitting, setEditSubmitting] = useState(false);
+	const [editModelsLoading, setEditModelsLoading] = useState(false);
 
   const populateEdit = (account: AccountRow) => {
     setEditAccount(account);
@@ -1035,6 +1036,20 @@ function GrokAccounts({
       ...f,
       models: mergeModels(f.models, DEFAULT_GROK_TEST_MODELS),
     }));
+
+	const handleFetchEditModels = async () => {
+		if (!editAccount) return;
+		setEditModelsLoading(true);
+		try {
+			const res = await api.syncAccountModelsUpstream(editAccount.id);
+			setEditForm((form) => ({ ...form, models: res.models ?? [] }));
+			showToast(t("grok.modelsFetched", { count: (res.models ?? []).length }));
+		} catch (err) {
+			showToast(getErrorMessage(err), "error");
+		} finally {
+			setEditModelsLoading(false);
+		}
+	};
 
   const handleSaveEdit = async () => {
     if (!editAccount) return;
@@ -3170,12 +3185,12 @@ function GrokAccounts({
         onClose={() => setEditAccount(null)}
         footer={
           <>
-            <Button variant="outline" onClick={() => setEditAccount(null)}>
+            <Button variant="outline" onClick={() => setEditAccount(null)} disabled={editSubmitting || editModelsLoading}>
               {t("common.cancel")}
             </Button>
             <Button
               onClick={() => void handleSaveEdit()}
-              disabled={editSubmitting}
+              disabled={editSubmitting || editModelsLoading}
             >
               {editSubmitting ? (
                 <Loader2 className="size-3.5 animate-spin" />
@@ -3196,15 +3211,28 @@ function GrokAccounts({
                 <label className="text-sm font-medium text-muted-foreground">
                   {t("grok.models")}
                 </label>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={editFillCommonModels}
-                >
-                  <Plus className="size-3" />
-                  {t("grok.modelsQuickAdd")}
-                </Button>
+				<div className="flex flex-wrap gap-2">
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						onClick={() => void handleFetchEditModels()}
+						disabled={editModelsLoading || editSubmitting}
+					>
+						<RefreshCw className={cn("size-3", editModelsLoading && "animate-spin")} />
+						{t("grok.modelsFetch")}
+					</Button>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						onClick={editFillCommonModels}
+						disabled={editModelsLoading || editSubmitting}
+					>
+						<Plus className="size-3" />
+						{t("grok.modelsQuickAdd")}
+					</Button>
+				</div>
               </div>
               <div className="mb-2 flex gap-2">
                 <Input

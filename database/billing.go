@@ -158,8 +158,8 @@ var (
 			CacheReadPricePerMTokenPriority: 0.35,
 		}},
 		// ===== xAI Grok（USD / 1M token）=====
-		// 价目取自 models.dev 的 xai provider 条目；models.dev 未收录的老型号
-		// （grok-3-fast / grok-2）按 xAI 官方公开价填，缓存价未公开的留空
+		// 新型号以内置的 xAI 官方价格快照为准；官方页面未收录的老型号
+		// （grok-3-fast / grok-2）保留既有公开价，缓存价未公开的留空
 		// （留空 = 缓存 token 按输入价计）。任何一条都可在定价页覆盖。
 		// Grok 的长上下文分档线是 200K，与 OpenAI 的 272K 不同，逐条声明。
 		// grok-4.6 必须独立成条：否则会命中 grok-4 前缀被当成 $3/$15。
@@ -289,7 +289,7 @@ func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model s
 	if pricing.LongContextThresholdTokens > 0 {
 		threshold = pricing.LongContextThresholdTokens
 	}
-	isLong := inputTokens > threshold
+	isLong := inputTokens >= threshold
 	longContextApplied := false
 
 	inputPrice := pricing.InputPricePerMToken

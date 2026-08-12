@@ -1413,6 +1413,9 @@ export default function Settings() {
   const [modelsLastSyncedAt, setModelsLastSyncedAt] = useState<string | undefined>()
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
+	const [modelSyncOptionsOpen, setModelSyncOptionsOpen] = useState(false)
+	const [syncGrokModels, setSyncGrokModels] = useState(false)
+	const [syncOfficialPricing, setSyncOfficialPricing] = useState(false)
   const [syncingCliVersion, setSyncingCliVersion] = useState(false)
   const [syncedCliVersion, setSyncedCliVersion] = useState('')
   const logoFileInputRef = useRef<HTMLInputElement>(null)
@@ -1793,7 +1796,10 @@ export default function Settings() {
   const handleSyncModels = async () => {
     setSyncingModels(true)
     try {
-      const result = await api.syncModels()
+      const result = await api.syncModels({
+			sync_grok: syncGrokModels,
+			sync_official_pricing: syncOfficialPricing,
+		})
       setModelList(result.models ?? [])
       setModelItems(result.items ?? [])
       setModelsLastSyncedAt(result.last_synced_at)
@@ -1802,7 +1808,11 @@ export default function Settings() {
         added: result.added,
         updated: result.updated,
         skipped: result.skipped?.length ?? 0,
+			grokUpdated: result.grok?.updated ?? 0,
+			grokFailed: result.grok?.failed ?? 0,
       }))
+		if (result.pricing_error) showToast(`${t('settings.pricing.syncFailed')}: ${result.pricing_error}`, 'error')
+		setModelSyncOptionsOpen(false)
     } catch (error) {
       showToast(`${t('settings.modelsSyncFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
@@ -3739,12 +3749,44 @@ export default function Settings() {
                   <ExternalLink className="size-3.5" />
                   {t('settings.nav.openSource')}
                 </a>
-                <Button size="sm" variant="outline" onClick={() => void handleSyncModels()} disabled={syncingModels}>
+                <Button size="sm" variant="outline" onClick={() => setModelSyncOptionsOpen(true)} disabled={syncingModels}>
                   <RefreshCw className={cn('size-3.5', syncingModels && 'animate-spin')} />
                   {syncingModels ? t('settings.modelsSyncing') : t('settings.syncUpstreamModels')}
                 </Button>
               </div>
             </div>
+			<Sheet open={modelSyncOptionsOpen} onOpenChange={(open) => { if (!syncingModels) setModelSyncOptionsOpen(open) }}>
+				<SheetContent side="right">
+					<SheetHeader>
+						<SheetTitle>{t('settings.modelSyncOptionsTitle')}</SheetTitle>
+						<SheetDescription>{t('settings.modelSyncOptionsDesc')}</SheetDescription>
+					</SheetHeader>
+					<SheetBody className="space-y-4">
+						<div className="rounded-xl border border-border bg-muted/20 p-4">
+							<div className="text-sm font-semibold">{t('settings.syncCodexModels')}</div>
+							<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.syncCodexModelsDesc')}</p>
+						</div>
+						<label className="flex items-start justify-between gap-4 rounded-xl border border-border p-4">
+							<span>
+								<span className="block text-sm font-semibold">{t('settings.syncGrokModels')}</span>
+								<span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{t('settings.syncGrokModelsDesc')}</span>
+							</span>
+							<Switch checked={syncGrokModels} onCheckedChange={setSyncGrokModels} disabled={syncingModels} />
+						</label>
+						<label className="flex items-start justify-between gap-4 rounded-xl border border-border p-4">
+							<span>
+								<span className="block text-sm font-semibold">{t('settings.syncOfficialPricing')}</span>
+								<span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{t('settings.syncOfficialPricingDesc')}</span>
+							</span>
+							<Switch checked={syncOfficialPricing} onCheckedChange={setSyncOfficialPricing} disabled={syncingModels} />
+						</label>
+						<Button className="w-full" onClick={() => void handleSyncModels()} disabled={syncingModels}>
+							<RefreshCw className={cn('size-3.5', syncingModels && 'animate-spin')} />
+							{syncingModels ? t('settings.modelsSyncing') : t('settings.startModelSync')}
+						</Button>
+					</SheetBody>
+				</SheetContent>
+			</Sheet>
             <div className="grid gap-3 sm:grid-cols-2">
               <ModelSummaryCard
                 title={t('settings.modelRegistry')}

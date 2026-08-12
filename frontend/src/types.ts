@@ -2171,6 +2171,16 @@ export interface ModelSyncResponse {
   items: ModelInfo[]
   last_synced_at: string
   source_url: string
+	grok?: {
+		total: number
+		updated: number
+		unchanged: number
+		failed: number
+		models: string[]
+		errors?: Array<{ account_id: number; error: string }>
+	}
+	official_pricing?: OfficialPricingSyncResult
+	pricing_error?: string
 }
 
 export interface CPAExportEntry {
@@ -2452,6 +2462,31 @@ export interface ModelPricingOverride {
   input_long?: number
   cached_input_long?: number
   output_long?: number
+	input_long_priority?: number
+	cached_input_long_priority?: number
+	output_long_priority?: number
+	long_context_threshold_tokens?: number
+}
+
+export interface OfficialPricingSyncConfig {
+	enabled: boolean
+	interval_minutes: number
+	include_openai: boolean
+	include_grok: boolean
+	last_attempt_at?: string
+	last_success_at?: string
+	last_error?: string
+	last_warning?: string
+}
+
+export interface OfficialPricingSyncResult {
+	fetched: number
+	applied: number
+	skipped: number
+	missing?: string[]
+	sources: string[]
+	warnings?: string[]
+	synced_at: string
 }
 
 /**

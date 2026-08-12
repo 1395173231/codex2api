@@ -48,6 +48,9 @@ func TestRelayAccountSupportsModelHonoursAuthKind(t *testing.T) {
 	if !relayAccountSupportsModel(oauth, "grok-4.5") {
 		t.Fatalf("OAuth 账号应支持 grok-4.5")
 	}
+	if !relayAccountSupportsModel(oauth, "grok-4.6") {
+		t.Fatalf("OAuth 账号应支持 grok-4.6")
+	}
 	for _, model := range []string{"grok-3", "grok-2", "grok-3-fast"} {
 		if relayAccountSupportsModel(oauth, model) {
 			t.Errorf("OAuth 账号不应被放行到 %s（CLI 通道无此模型）", model)

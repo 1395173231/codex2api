@@ -318,6 +318,8 @@ func main() {
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
 	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
 	adminHandler.StartWhamDailyUsageProbe(backgroundCtx)
+	// 官方模型价目轮询默认关闭；启用后只在网络解析完成后做一次短数据库写入。
+	adminHandler.StartOfficialPricingSync(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，

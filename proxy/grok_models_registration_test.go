@@ -9,7 +9,7 @@ import (
 	"github.com/codex2api/database"
 )
 
-// 未声明 models 白名单的 Grok 账号应把默认 Grok 模型集(含 grok-4.5)注册进 /v1/models。
+// 未声明 models 白名单的 Grok 账号应把默认 Grok 模型集(含 grok-4.6)注册进 /v1/models。
 func TestSupportedModelIDsIncludesDefaultGrok(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
 	store.AddAccount(&auth.Account{DBID: 1, APIKey: "xai-1", UpstreamType: auth.UpstreamGrok})
@@ -21,6 +21,9 @@ func TestSupportedModelIDsIncludesDefaultGrok(t *testing.T) {
 	}
 	if !containsFold(ids, "grok-4.5") {
 		t.Fatalf("grok-4.5 应出现在 /v1/models，实际: %v", ids)
+	}
+	if !containsFold(ids, "grok-4.6") {
+		t.Fatalf("grok-4.6 应出现在 /v1/models，实际: %v", ids)
 	}
 }
 

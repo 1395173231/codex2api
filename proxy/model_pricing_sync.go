@@ -60,42 +60,26 @@ func SyncModelPricingFromURL(ctx context.Context, db *database.DB, syncURL, prox
 		return result, fmt.Errorf("定价源未解析到任何模型")
 	}
 
-	settings, err := db.GetSystemSettings(ctx)
-	if err != nil {
-		return result, err
-	}
-	if settings == nil {
-		settings = &database.SystemSettings{}
-	}
-	current, err := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides)
-	if err != nil {
-		current = map[string]database.ModelPricingOverride{}
-	}
-
-	for model, ov := range fetched {
-		key := strings.ToLower(strings.TrimSpace(model))
-		if key == "" || ov.IsEmpty() {
-			continue
+	_, err = db.MutateModelPricingSettings(ctx, &fieldURL, func(current map[string]database.ModelPricingOverride) error {
+		for model, ov := range fetched {
+			key := strings.ToLower(strings.TrimSpace(model))
+			if key == "" || ov.IsEmpty() {
+				continue
+			}
+			// 已有 custom 覆盖优先，跳过不动。
+			if existing, ok := current[key]; ok && existing.Source == database.ModelPricingSourceCustom {
+				result.Skipped++
+				continue
+			}
+			ov.Source = database.ModelPricingSourceSynced
+			current[key] = ov
+			result.Applied++
 		}
-		// 已有 custom 覆盖优先，跳过不动。
-		if existing, ok := current[key]; ok && existing.Source == database.ModelPricingSourceCustom {
-			result.Skipped++
-			continue
-		}
-		ov.Source = database.ModelPricingSourceSynced
-		current[key] = ov
-		result.Applied++
-	}
-
-	blob, err := database.MarshalModelPricingOverridesJSON(current)
+		return nil
+	})
 	if err != nil {
 		return result, err
 	}
-	// 字段为空则清空存储来源（下次回退默认）；非空则存为来源。
-	if err := db.UpdateModelPricingSettings(ctx, blob, fieldURL); err != nil {
-		return result, err
-	}
-	database.SetModelPricingOverrides(current)
 	return result, nil
 }
 

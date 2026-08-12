@@ -25,10 +25,11 @@ import StateShell from '../components/StateShell'
 import { StatTile } from '../components/StatTile'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
-import type { ModelPricingOverride } from '@/types'
+import type { ModelPricingOverride, OfficialPricingSyncConfig } from '@/types'
 
 type Row = { model: string; source: string; pricing: ModelPricingOverride }
 type SourceFilter = 'all' | 'custom' | 'synced' | 'default' | 'unsaved'
@@ -48,9 +49,14 @@ const PRIMARY_FIELDS: FieldDef[] = [
 
 const ADVANCED_FIELDS: FieldDef[] = [
   { key: 'input_priority', labelKey: 'settings.pricing.inputPriority', shortKey: 'settings.pricing.shortInputPriority', tone: 'accent' },
+	{ key: 'cached_input_priority', labelKey: 'settings.pricing.cachedInputPriority', shortKey: 'settings.pricing.shortCachedInputPriority', tone: 'accent' },
   { key: 'output_priority', labelKey: 'settings.pricing.outputPriority', shortKey: 'settings.pricing.shortOutputPriority', tone: 'accent' },
   { key: 'input_long', labelKey: 'settings.pricing.inputLong', shortKey: 'settings.pricing.shortInputLong', tone: 'accent' },
+	{ key: 'cached_input_long', labelKey: 'settings.pricing.cachedInputLong', shortKey: 'settings.pricing.shortCachedInputLong', tone: 'accent' },
   { key: 'output_long', labelKey: 'settings.pricing.outputLong', shortKey: 'settings.pricing.shortOutputLong', tone: 'accent' },
+	{ key: 'input_long_priority', labelKey: 'settings.pricing.inputLongPriority', shortKey: 'settings.pricing.shortInputLongPriority', tone: 'accent' },
+	{ key: 'cached_input_long_priority', labelKey: 'settings.pricing.cachedInputLongPriority', shortKey: 'settings.pricing.shortCachedInputLongPriority', tone: 'accent' },
+	{ key: 'output_long_priority', labelKey: 'settings.pricing.outputLongPriority', shortKey: 'settings.pricing.shortOutputLongPriority', tone: 'accent' },
 ]
 
 const ALL_FIELDS = [...PRIMARY_FIELDS, ...ADVANCED_FIELDS]
@@ -243,10 +249,20 @@ export default function ModelPricing() {
   const [syncUrl, setSyncUrl] = useState('')
   const [defaultUrl, setDefaultUrl] = useState('')
   const [modelsDevUrl, setModelsDevUrl] = useState('')
+  const [officialOpenAIUrl, setOfficialOpenAIUrl] = useState('')
+  const [officialXAIUrl, setOfficialXAIUrl] = useState('')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [bulkSaving, setBulkSaving] = useState(false)
+  const [officialSyncing, setOfficialSyncing] = useState(false)
+  const [officialSaving, setOfficialSaving] = useState(false)
+  const [officialConfig, setOfficialConfig] = useState<OfficialPricingSyncConfig>({
+    enabled: false,
+    interval_minutes: 1440,
+    include_openai: true,
+    include_grok: true,
+  })
   const [savingModel, setSavingModel] = useState('')
   const [query, setQuery] = useState('')
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
@@ -261,7 +277,10 @@ export default function ModelPricing() {
       setRows(res.models)
       setDefaultUrl(res.default_sync_url)
       setModelsDevUrl(res.models_dev_url)
+      setOfficialOpenAIUrl(res.official_openai_url)
+      setOfficialXAIUrl(res.official_xai_url)
       setSyncUrl(res.sync_url || '')
+      setOfficialConfig(res.official_sync_config)
       const d: Record<string, ModelPricingOverride> = {}
       for (const r of res.models) d[r.model] = { ...r.pricing }
       setDrafts(d)
@@ -362,6 +381,35 @@ export default function ModelPricing() {
     const nextState: Record<string, boolean> = {}
     for (const r of rows) nextState[r.model] = !allExpanded
     setExpandedAdvanced(nextState)
+  }
+
+  const saveOfficialConfig = async () => {
+    setOfficialSaving(true)
+    try {
+      const saved = await api.updateOfficialPricingSyncConfig(officialConfig)
+      setOfficialConfig(saved)
+      showToast(t('settings.pricing.officialConfigSaved'))
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setOfficialSaving(false)
+    }
+  }
+
+  const syncOfficial = async () => {
+    setOfficialSyncing(true)
+    try {
+      const result = await api.syncOfficialModelPricing({
+        include_openai: officialConfig.include_openai,
+        include_grok: officialConfig.include_grok,
+      })
+      showToast(t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }))
+      await load()
+    } catch (error) {
+      showToast(`${t('settings.pricing.syncFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setOfficialSyncing(false)
+    }
   }
 
   const activePreset = useMemo(() => {
@@ -516,6 +564,66 @@ export default function ModelPricing() {
                 </div>
 
                 <div className="mt-5 space-y-3">
+					<div className="rounded-xl border border-primary/20 bg-primary/[0.03] p-4">
+						<div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+							<div>
+								<div className="flex flex-wrap items-center gap-2">
+									<h4 className="text-sm font-semibold text-foreground">{t('settings.pricing.officialTitle')}</h4>
+									<span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">{t('settings.pricing.authoritative')}</span>
+								</div>
+								<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.pricing.officialDesc')}</p>
+								<div className="mt-2 flex flex-wrap gap-3 text-[11px] font-semibold">
+									<a href={officialOpenAIUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">OpenAI <ArrowUpRight className="size-3" /></a>
+									<a href={officialXAIUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">xAI <ArrowUpRight className="size-3" /></a>
+								</div>
+							</div>
+							<Button className="shrink-0" onClick={() => void syncOfficial()} disabled={officialSyncing || (!officialConfig.include_openai && !officialConfig.include_grok)}>
+								{officialSyncing ? <Loader2 className="size-3.5 animate-spin" /> : <CloudDownload className="size-3.5" />}
+								{officialSyncing ? t('settings.pricing.syncing') : t('settings.pricing.officialSyncNow')}
+							</Button>
+						</div>
+						<div className="mt-4 grid gap-3 sm:grid-cols-2">
+							<label className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background/80 px-3 py-2.5">
+								<span className="text-sm font-medium">OpenAI / Codex</span>
+								<Switch checked={officialConfig.include_openai} onCheckedChange={(checked) => setOfficialConfig((cfg) => ({ ...cfg, include_openai: checked }))} />
+							</label>
+							<label className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background/80 px-3 py-2.5">
+								<span className="text-sm font-medium">xAI / Grok</span>
+								<Switch checked={officialConfig.include_grok} onCheckedChange={(checked) => setOfficialConfig((cfg) => ({ ...cfg, include_grok: checked }))} />
+							</label>
+						</div>
+						<div className="mt-3 flex flex-col gap-3 rounded-lg border border-border bg-background/80 p-3 sm:flex-row sm:items-center">
+							<label className="flex flex-1 items-center justify-between gap-3">
+								<span>
+									<span className="block text-sm font-medium">{t('settings.pricing.autoOfficialSync')}</span>
+									<span className="block text-[11px] text-muted-foreground">{t('settings.pricing.autoOfficialSyncHint')}</span>
+								</span>
+								<Switch checked={officialConfig.enabled} onCheckedChange={(enabled) => setOfficialConfig((cfg) => ({ ...cfg, enabled }))} />
+							</label>
+							<label className="flex items-center gap-2 text-xs text-muted-foreground">
+								{t('settings.pricing.intervalMinutes')}
+								<Input
+									type="number"
+									min={60}
+									max={10080}
+									className="h-9 w-28"
+									value={officialConfig.interval_minutes}
+									onChange={(event) => setOfficialConfig((cfg) => ({ ...cfg, interval_minutes: Number(event.target.value) }))}
+								/>
+							</label>
+							<Button variant="outline" size="sm" onClick={() => void saveOfficialConfig()} disabled={officialSaving || (!officialConfig.include_openai && !officialConfig.include_grok)}>
+								{officialSaving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+								{t('common.save')}
+							</Button>
+						</div>
+						{officialConfig.last_success_at ? (
+							<p className="mt-2 text-[11px] text-muted-foreground">{t('settings.pricing.lastOfficialSuccess')}: {new Date(officialConfig.last_success_at).toLocaleString()}</p>
+						) : null}
+						{officialConfig.last_error ? <p className="mt-1 break-all text-[11px] text-destructive">{officialConfig.last_error}</p> : null}
+						{officialConfig.last_warning ? <p className="mt-1 break-all text-[11px] text-amber-700 dark:text-amber-300">{t('settings.pricing.lastWarning')}: {officialConfig.last_warning}</p> : null}
+					</div>
+
+					<div className="pt-1 text-xs font-semibold text-muted-foreground">{t('settings.pricing.referenceTitle')}</div>
                   <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center">
                     <div className="relative min-w-0 flex-1">
                       <Link2 className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />

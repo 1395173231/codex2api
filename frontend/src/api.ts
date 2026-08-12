@@ -54,6 +54,8 @@ import type {
   MessageResponse,
   ModelSyncResponse,
   ModelPricingOverride,
+	OfficialPricingSyncConfig,
+	OfficialPricingSyncResult,
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
@@ -1183,7 +1185,12 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
-  syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
+  syncModels: (options?: { sync_grok?: boolean; sync_official_pricing?: boolean }) =>
+		request<ModelSyncResponse>('/models/sync', {
+			method: 'POST',
+			body: JSON.stringify(options ?? {}),
+			timeoutMs: 95000,
+		}),
   syncCodexCLIVersion: () =>
     request<{
       fetched_version: string
@@ -1197,6 +1204,9 @@ export const api = {
       sync_url: string
       default_sync_url: string
       models_dev_url: string
+		official_openai_url: string
+		official_xai_url: string
+		official_sync_config: OfficialPricingSyncConfig
     }>('/model-pricing'),
   updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
     request<{ model: string; reset: boolean }>('/model-pricing', {
@@ -1208,6 +1218,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ url: url ?? '' }),
     }),
+	updateOfficialPricingSyncConfig: (config: Pick<OfficialPricingSyncConfig, 'enabled' | 'interval_minutes' | 'include_openai' | 'include_grok'>) =>
+		request<OfficialPricingSyncConfig>('/model-pricing/official-sync/config', {
+			method: 'PUT',
+			body: JSON.stringify(config),
+		}),
+	syncOfficialModelPricing: (sources: { include_openai: boolean; include_grok: boolean }) =>
+		request<OfficialPricingSyncResult>('/model-pricing/official-sync', {
+			method: 'POST',
+			body: JSON.stringify(sources),
+			timeoutMs: 95000,
+		}),
   batchTestAccounts: (target?: number[] | AccountOperationSelector) =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
       method: 'POST',
