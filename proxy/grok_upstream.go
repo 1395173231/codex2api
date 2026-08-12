@@ -324,11 +324,21 @@ func dropGrokToolChoiceWithoutTools(body []byte) []byte {
 	return body
 }
 
-// mapGrokReasoningEffort 把思考强度映射到 Grok build 支持的档位（只有 low/medium/high）：
-// Codex 侧更高的 xhigh/max → high、更低的 minimal → low；low/medium/high 原样；其它未知不动。
-func mapGrokReasoningEffort(effort string) (string, bool) {
+// mapGrokReasoningEffort 把思考强度映射到当前 Grok 模型支持的档位。
+// grok-4.6 起（含 grok-4.20-multi-agent）支持 xhigh；更旧的 build 只有 low/medium/high。
+// Codex 的 max 在支持 xhigh 的模型上落到 xhigh，否则落到 high；minimal 一律落到 low。
+// 无模型上下文时按旧 build 处理，避免 grok-4.5 / grok-3 收到不认的档位。
+func mapGrokReasoningEffort(effort, model string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "xhigh", "max":
+	case "xhigh":
+		if grokSupportsXHighReasoningEffort(model) {
+			return effort, false
+		}
+		return "high", true
+	case "max":
+		if grokSupportsXHighReasoningEffort(model) {
+			return "xhigh", true
+		}
 		return "high", true
 	case "minimal":
 		return "low", true
@@ -337,15 +347,46 @@ func mapGrokReasoningEffort(effort string) (string, bool) {
 	}
 }
 
+// grokSupportsXHighReasoningEffort 判断模型是否接受 reasoning.effort=xhigh。
+// xAI 文档：grok-4.6 支持；grok-4.5 等不支持的模型会把 xhigh 当成 high。
+// 版本线按 grok-4.6 起放行（grok-4.6-beta / grok-4.6-build / grok-4.20-multi-agent 同样识别）。
+func grokSupportsXHighReasoningEffort(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if !strings.HasPrefix(model, "grok-") {
+		return false
+	}
+	version := strings.TrimPrefix(model, "grok-")
+	if dash := strings.IndexByte(version, '-'); dash >= 0 {
+		version = version[:dash]
+	}
+	parts := strings.Split(version, ".")
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	if major > 4 {
+		return true
+	}
+	if major != 4 || len(parts) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return minor >= 6
+}
+
 // clampGrokReasoningEffort 规范化发给 Grok 上游的思考强度：同时覆盖 Responses
-// （reasoning.effort）与 Chat（reasoning_effort）两种形态，避免 Grok 不认的档位报错。
+// （reasoning.effort）与 Chat（reasoning_effort）两种形态，避免旧 Grok 不认的档位报错。
 func clampGrokReasoningEffort(body []byte) []byte {
+	model := gjson.GetBytes(body, "model").String()
 	for _, path := range []string{"reasoning.effort", "reasoning_effort"} {
 		v := gjson.GetBytes(body, path)
 		if !v.Exists() {
 			continue
 		}
-		mapped, changed := mapGrokReasoningEffort(v.String())
+		mapped, changed := mapGrokReasoningEffort(v.String(), model)
 		if !changed {
 			continue
 		}
@@ -463,17 +504,17 @@ func FetchGrokModelIDs(ctx context.Context, account *auth.Account, proxyURL stri
 //
 // 两条通道的目录并不相同，必须分开取：
 //   - OAuth 走 cli-chat-proxy，目录由 CLI 通道决定。实测 supergrok_heavy 与 free
-//     两种套餐的 GET /v1/models 都只返回 grok-4.5，不含 grok-3 / grok-2。
+//     两种套餐原先只返回 grok-4.5；grok-4.6 作为当前旗舰一并列入兜底，不含 grok-3 / grok-2。
 //   - API Key 走 xAI 公开 API，目录更宽。
 //
 // 默认集只是探测不到时的兜底：账号导入或连通性测试跑过 FetchGrokModelIDs 后，
 // 应以探到的真实目录为准。
 func grokOAuthDefaultModelIDs() []string {
-	return []string{"grok-4.5"}
+	return []string{"grok-4.6", "grok-4.5"}
 }
 
 func grokAPIKeyDefaultModelIDs() []string {
-	return []string{"grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
+	return []string{"grok-4.6", "grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
 }
 
 // DefaultGrokModelIDsForAccount 按账号的凭据类型返回默认可用文本模型集。

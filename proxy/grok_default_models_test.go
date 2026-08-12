@@ -7,12 +7,17 @@ import (
 )
 
 // TestDefaultGrokModelIDsForAccountByAuthKind 守护两条通道目录不同这一实测事实：
-// OAuth 走 cli-chat-proxy，实测 supergrok_heavy 与 free 两种套餐的 /v1/models
-// 都只返回 grok-4.5；API Key 走 xAI 公开 API，目录更宽。
+// OAuth 走 cli-chat-proxy，兜底当前旗舰 grok-4.6 / grok-4.5；API Key 走 xAI 公开 API，目录更宽。
 func TestDefaultGrokModelIDsForAccountByAuthKind(t *testing.T) {
 	oauth := &auth.Account{UpstreamType: auth.UpstreamGrok, RefreshToken: "rt"}
-	if got := DefaultGrokModelIDsForAccount(oauth); len(got) != 1 || got[0] != "grok-4.5" {
-		t.Fatalf("OAuth 默认集 = %v, want [grok-4.5]", got)
+	gotOAuth := DefaultGrokModelIDsForAccount(oauth)
+	if !modelIDInList("grok-4.6", gotOAuth) || !modelIDInList("grok-4.5", gotOAuth) {
+		t.Fatalf("OAuth 默认集 = %v, want grok-4.6 与 grok-4.5", gotOAuth)
+	}
+	for _, model := range []string{"grok-3", "grok-2", "grok-3-fast"} {
+		if modelIDInList(model, gotOAuth) {
+			t.Errorf("OAuth 默认集不应含 %s, got %v", model, gotOAuth)
+		}
 	}
 
 	apiKey := &auth.Account{UpstreamType: auth.UpstreamGrok, APIKey: "xai-key"}
@@ -20,15 +25,15 @@ func TestDefaultGrokModelIDsForAccountByAuthKind(t *testing.T) {
 		t.Fatalf("构造的账号应被识别为 API Key，实际 %q", apiKey.GrokAuthKind())
 	}
 	got := DefaultGrokModelIDsForAccount(apiKey)
-	if len(got) <= 1 {
-		t.Fatalf("API Key 默认集应比 OAuth 宽, got %v", got)
+	if len(got) <= len(gotOAuth) {
+		t.Fatalf("API Key 默认集应比 OAuth 宽, oauth=%v apiKey=%v", gotOAuth, got)
 	}
-	if !modelIDInList("grok-3", got) {
-		t.Fatalf("API Key 默认集应含 grok-3, got %v", got)
+	if !modelIDInList("grok-4.6", got) || !modelIDInList("grok-3", got) {
+		t.Fatalf("API Key 默认集应含 grok-4.6 与 grok-3, got %v", got)
 	}
 
 	// 空账号按 OAuth 处理：CLI 通道是更保守的一侧，宁可少放行也不要advertise 不存在的模型。
-	if nilGot := DefaultGrokModelIDsForAccount(nil); len(nilGot) != 1 {
+	if nilGot := DefaultGrokModelIDsForAccount(nil); len(nilGot) != len(gotOAuth) {
 		t.Fatalf("空账号应回落到最保守的 OAuth 默认集, got %v", nilGot)
 	}
 }
@@ -37,6 +42,9 @@ func TestDefaultGrokModelIDsForAccountByAuthKind(t *testing.T) {
 // 不存在的模型（grok-3 等），避免调度到必然失败的账号上。
 func TestRelayAccountSupportsModelHonoursAuthKind(t *testing.T) {
 	oauth := &auth.Account{UpstreamType: auth.UpstreamGrok, RefreshToken: "rt"}
+	if !relayAccountSupportsModel(oauth, "grok-4.6") {
+		t.Fatalf("OAuth 账号应支持 grok-4.6")
+	}
 	if !relayAccountSupportsModel(oauth, "grok-4.5") {
 		t.Fatalf("OAuth 账号应支持 grok-4.5")
 	}

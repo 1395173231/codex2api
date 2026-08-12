@@ -57,22 +57,27 @@ type Handler struct {
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
-	recordAccountEvent     func(int64, string, string)
-	proxyProbe             func(context.Context, string, string) proxyProbeResult
-	reloadProxyPoolFn      func() error
-	proxyBatchEventSender  func(*gin.Context, proxyBatchTestEvent) bool
-	proxyBatchTestMu       sync.Mutex
-	cpuSampler             *cpuSampler
-	memReader              memStatsReader
-	startedAt              time.Time
-	pgMaxConns             int
-	redisPoolSize          int
-	databaseDriver         string
-	databaseLabel          string
-	cacheDriver            string
-	cacheLabel             string
-	adminSecretEnv         string
-	imageProxy             *proxy.Handler
+	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
+	// last/in-flight 避免翻页或前端重试把同一号打爆上游。
+	whamDailyBackfillMu       sync.Mutex
+	whamDailyBackfillLast     map[int64]time.Time
+	whamDailyBackfillInFlight map[int64]struct{}
+	recordAccountEvent        func(int64, string, string)
+	proxyProbe                func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn         func() error
+	proxyBatchEventSender     func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu          sync.Mutex
+	cpuSampler                *cpuSampler
+	memReader                 memStatsReader
+	startedAt                 time.Time
+	pgMaxConns                int
+	redisPoolSize             int
+	databaseDriver            string
+	databaseLabel             string
+	cacheDriver               string
+	cacheLabel                string
+	adminSecretEnv            string
+	imageProxy                *proxy.Handler
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -553,6 +558,8 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
 	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.whamDailyBackfillLast = make(map[int64]time.Time)
+	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
 	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync

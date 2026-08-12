@@ -61,6 +61,7 @@ import {
 } from "../lib/operationResultsPreference";
 import {
   formatLongUsageWindowLabel,
+  needsOfficialCostReload,
   needsUsageReload,
 } from "../lib/usageFormat";
 import {
@@ -2505,6 +2506,33 @@ export default function Accounts() {
       });
     return () => controller.abort();
   }, [accountPageIDsKey, pageStatsReloadToken]);
+  const officialCostReloadAttemptsRef = useRef(0);
+  const missingOfficialCostKey = useMemo(
+    () =>
+      accounts
+        .filter(needsOfficialCostReload)
+        .map((account) => account.id)
+        .join(","),
+    [accounts],
+  );
+  useEffect(() => {
+    officialCostReloadAttemptsRef.current = 0;
+  }, [accountPageIDsKey]);
+  // 官方 7d 只存在于 page-stats 的快照字段。后台探针有启动延迟，列表打开时
+  // 经常还是空的；后端会给当前页做即时回补，这里按缺字段重拉，直到胶囊出现。
+  useEffect(() => {
+    if (providerView !== "codex") return undefined;
+    if (!missingOfficialCostKey) return undefined;
+    if (officialCostReloadAttemptsRef.current >= 6) return undefined;
+    const attempt = officialCostReloadAttemptsRef.current;
+    const delay = 1500 * 2 ** Math.min(attempt, 5);
+    const timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      officialCostReloadAttemptsRef.current += 1;
+      setPageStatsReloadToken((token) => token + 1);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [missingOfficialCostKey, pageStatsReloadToken, providerView]);
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
   // 测试连接后需要强制刷新用量的账号 id：即使其用量数据已存在（如已显示 100%），
   // 也要在后台探针跑完后重新拉取，确保进度条更新为最新值。
@@ -14073,10 +14101,20 @@ function BilledCell({
   const visibleH5 = has5hWindow ? h5 : null;
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
-  if (visibleH5 === null && d7 === null && official === null) {
+  const showOfficial = isCodexOfficialAccount(account);
+  if (visibleH5 === null && d7 === null && !showOfficial) {
     return <span className="text-[12px] text-muted-foreground">-</span>;
   }
   const longLabel = formatLongUsageWindowLabel(account);
+  const officialLabel =
+    official !== null ? formatOfficialUSD(official) : "—";
+  const officialPending = showOfficial && official === null;
+  const officialClassName = officialPending
+    ? "inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700/70 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400/70"
+    : "inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400";
+  const officialTitle = officialPending
+    ? t("accounts.billedOfficialPending")
+    : `${t("accounts.billedOfficialHint")}\n${t("accounts.billedOfficialOpen")}`;
   return (
     <div className="flex flex-col items-start gap-1">
       {(visibleH5 !== null || d7 !== null) && (
@@ -14090,7 +14128,7 @@ function BilledCell({
           {d7 !== null ? `${longLabel}: $${d7}` : null}
         </span>
       )}
-      {official !== null &&
+      {showOfficial &&
         (onOpenOfficial ? (
           <button
             type="button"
@@ -14099,19 +14137,24 @@ function BilledCell({
               event.stopPropagation();
               onOpenOfficial(account);
             }}
-            className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700 ring-1 ring-inset ring-amber-500/20 transition-colors hover:bg-amber-500/20 hover:ring-amber-500/40 dark:text-amber-400"
-            title={`${t("accounts.billedOfficialHint")}\n${t("accounts.billedOfficialOpen")}`}
+            className={`${officialClassName} cursor-pointer transition-colors hover:bg-amber-500/20 hover:ring-amber-500/40`}
+            title={officialTitle}
           >
-            <Banknote className="size-3 shrink-0" aria-hidden />
-            {t("accounts.billedOfficialLabel")}: {formatOfficialUSD(official)}
+            {officialPending ? (
+              <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+            ) : (
+              <Banknote className="size-3 shrink-0" aria-hidden />
+            )}
+            {t("accounts.billedOfficialLabel")}: {officialLabel}
           </button>
         ) : (
-          <span
-            className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400"
-            title={t("accounts.billedOfficialHint")}
-          >
-            <Banknote className="size-3 shrink-0" aria-hidden />
-            {t("accounts.billedOfficialLabel")}: {formatOfficialUSD(official)}
+          <span className={officialClassName} title={officialTitle}>
+            {officialPending ? (
+              <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+            ) : (
+              <Banknote className="size-3 shrink-0" aria-hidden />
+            )}
+            {t("accounts.billedOfficialLabel")}: {officialLabel}
           </span>
         ))}
     </div>

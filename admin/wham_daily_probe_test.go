@@ -70,6 +70,22 @@ func TestWhamDailyUsageDueTargetsRecoveredAccountResumesHourly(t *testing.T) {
 	}
 }
 
+func TestWhamDailyUsageBackfillEligibleSkipsRelayAndGrok(t *testing.T) {
+	if !whamDailyUsageBackfillEligible(&auth.Account{DBID: 1, AccessToken: "at"}) {
+		t.Fatal("codex oauth account should be eligible")
+	}
+	if whamDailyUsageBackfillEligible(&auth.Account{DBID: 2}) {
+		t.Fatal("missing access token should be skipped")
+	}
+	grok := &auth.Account{DBID: 3, AccessToken: "at", UpstreamType: auth.UpstreamGrok, APIKey: "gk"}
+	if !grok.IsGrokAPI() {
+		t.Fatal("test grok account is not classified as grok")
+	}
+	if whamDailyUsageBackfillEligible(grok) {
+		t.Fatal("grok account should be skipped")
+	}
+}
+
 func TestWhamDailyUsageDueTargetsPrunesRemovedAccounts(t *testing.T) {
 	now := time.Now()
 	kept := &auth.Account{DBID: 10, AccessToken: "token"}

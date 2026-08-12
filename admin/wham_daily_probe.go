@@ -44,6 +44,10 @@ const (
 	// whamDailyUsageProbeConcurrency 限制并发，避免大号池同时打上游。
 	whamDailyUsageProbeConcurrency = 4
 
+	// whamDailyUsageBackfillCooldown 是列表页即时回补的最短间隔。page-stats
+	// 会随翻页/前端重试反复打来，同一账号在冷却内只回补一次。
+	whamDailyUsageBackfillCooldown = 2 * time.Minute
+
 	// whamDailyUsageKeepDays 是本地快照保留期。上游只有 7 天，本地留一年足够看趋势。
 	whamDailyUsageKeepDays = 365
 )
@@ -176,6 +180,87 @@ func (h *Handler) runWhamDailyUsageProbe(ctx context.Context, lastAttempt map[in
 		cancel()
 	}
 	log.Printf("官方用量快照完成 成功=%d 失败=%d 耗时=%s", okCount, failCount, time.Since(started).Round(time.Millisecond))
+}
+
+// enqueueWhamDailyUsageBackfill 给当前页缺少官方结算快照的账号补一次上游拉取。
+// 后台小时级探针会覆盖全池，但列表打开时快照往往还是空的：page-stats 只读本地表，
+// 不在这里即时回补的话，「官方 7d」胶囊要等用户手动刷新或下一次探针才会出现。
+func (h *Handler) enqueueWhamDailyUsageBackfill(ids []int64) {
+	if h == nil || h.store == nil || len(ids) == 0 {
+		return
+	}
+	now := time.Now()
+	targets := make([]*auth.Account, 0, len(ids))
+	h.whamDailyBackfillMu.Lock()
+	if h.whamDailyBackfillLast == nil {
+		h.whamDailyBackfillLast = map[int64]time.Time{}
+	}
+	if h.whamDailyBackfillInFlight == nil {
+		h.whamDailyBackfillInFlight = map[int64]struct{}{}
+	}
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, flying := h.whamDailyBackfillInFlight[id]; flying {
+			continue
+		}
+		if last, ok := h.whamDailyBackfillLast[id]; ok && now.Sub(last) < whamDailyUsageBackfillCooldown {
+			continue
+		}
+		account := h.store.FindByID(id)
+		if !whamDailyUsageBackfillEligible(account) {
+			continue
+		}
+		h.whamDailyBackfillInFlight[id] = struct{}{}
+		h.whamDailyBackfillLast[id] = now
+		targets = append(targets, account)
+	}
+	h.whamDailyBackfillMu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	go h.runWhamDailyUsageBackfill(targets)
+}
+
+func whamDailyUsageBackfillEligible(account *auth.Account) bool {
+	if account == nil || account.DBID <= 0 {
+		return false
+	}
+	if account.IsOpenAIResponsesAPI() || account.IsGrokAPI() {
+		return false
+	}
+	return account.GetAccessToken() != ""
+}
+
+func (h *Handler) finishWhamDailyUsageBackfill(id int64) {
+	if h == nil {
+		return
+	}
+	h.whamDailyBackfillMu.Lock()
+	delete(h.whamDailyBackfillInFlight, id)
+	h.whamDailyBackfillMu.Unlock()
+}
+
+func (h *Handler) runWhamDailyUsageBackfill(accounts []*auth.Account) {
+	sem := make(chan struct{}, whamDailyUsageProbeConcurrency)
+	var wg sync.WaitGroup
+	for _, account := range accounts {
+		wg.Add(1)
+		go func(acc *auth.Account) {
+			defer wg.Done()
+			defer h.finishWhamDailyUsageBackfill(acc.DBID)
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := h.syncWhamDailyUsage(ctx, acc); err != nil {
+				log.Printf("官方用量即时回补失败 account=%d: %v", acc.DBID, err)
+			}
+		}(account)
+	}
+	wg.Wait()
 }
 
 // whamDailyUsageProbeTargets 挑出该拉统计的账号：只有 OAuth 登录的 Codex 账号

@@ -51,6 +51,10 @@ func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
 		return result
 	}
 
+	if model := root.Get("model"); model.Exists() {
+		result.Model = model.String()
+	}
+
 	aliases := make(map[string]grokNsIdentity)
 	register := func(namespace, name string) string {
 		alias := grokNamespaceAliasName(namespace, name)
@@ -120,14 +124,14 @@ func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
 				return true
 			}
 		case "reasoning":
-			if patched, ok := grokClampReasoningObjectRaw(value); ok {
+			if patched, ok := grokClampReasoningObjectRaw(value, result.Model); ok {
 				grokWriteObjectKey(&out, &first, key)
 				out.Write(patched)
 				changed = true
 				return true
 			}
 		case "reasoning_effort":
-			if mapped, ok := mapGrokReasoningEffort(value.String()); ok {
+			if mapped, ok := mapGrokReasoningEffort(value.String(), result.Model); ok {
 				if encoded, err := json.Marshal(mapped); err == nil {
 					grokWriteObjectKey(&out, &first, key)
 					out.Write(encoded)
@@ -516,7 +520,7 @@ func grokDecodedItemIsUserMessage(item map[string]any) bool {
 }
 
 // grokClampReasoningObjectRaw 钳制 reasoning.effort，返回 (新对象 JSON, 是否改写)。
-func grokClampReasoningObjectRaw(reasoning gjson.Result) ([]byte, bool) {
+func grokClampReasoningObjectRaw(reasoning gjson.Result, model string) ([]byte, bool) {
 	if !reasoning.IsObject() {
 		return nil, false
 	}
@@ -524,7 +528,7 @@ func grokClampReasoningObjectRaw(reasoning gjson.Result) ([]byte, bool) {
 	if !effort.Exists() {
 		return nil, false
 	}
-	mapped, ok := mapGrokReasoningEffort(effort.String())
+	mapped, ok := mapGrokReasoningEffort(effort.String(), model)
 	if !ok {
 		return nil, false
 	}

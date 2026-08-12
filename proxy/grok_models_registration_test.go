@@ -16,6 +16,9 @@ func TestSupportedModelIDsIncludesDefaultGrok(t *testing.T) {
 	h := NewHandler(store, nil, nil, nil)
 
 	ids := h.supportedModelIDs(context.Background())
+	if !containsFold(ids, "grok-4.6") {
+		t.Fatalf("grok-4.6 应出现在 /v1/models，实际: %v", ids)
+	}
 	if !containsFold(ids, "grok-4.5") {
 		t.Fatalf("grok-4.5 应出现在 /v1/models，实际: %v", ids)
 	}
@@ -58,7 +61,8 @@ func TestRelayAccountSupportsModel_GrokDefaultSet(t *testing.T) {
 		model   string
 		want    bool
 	}{
-		{"undeclared grok serves default-set model", undeclared, "grok-4.5", true},
+		{"undeclared grok serves default-set model", undeclared, "grok-4.6", true},
+		{"undeclared grok serves grok-4.5", undeclared, "grok-4.5", true},
 		{"undeclared grok serves grok-4", undeclared, "grok-4", true},
 		{"undeclared grok rejects non-grok model", undeclared, "gpt-5.5", false},
 		{"declared grok honors whitelist hit", declared, "grok-4", true},

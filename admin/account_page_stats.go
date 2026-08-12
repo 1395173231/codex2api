@@ -69,6 +69,7 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 	}
 
 	stats := make(map[int64]accountPageStatsItem, len(ids))
+	missingOfficial := make([]int64, 0)
 	for _, id := range ids {
 		item := accountPageStatsItem{}
 		if value := usage5h[id]; value != nil {
@@ -89,14 +90,17 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 		if value, ok := billed7d[id]; ok {
 			item.Billed7d = &value
 		}
-		// 没有快照的账号（新导入、中转号）不下发这个字段，前端据此隐藏胶囊，
-		// 而不是显示一个具有误导性的 $0。
+		// 没有快照的账号不下发这个字段，前端显示占位而不是 $0；
+		// 当前页缺快照时异步回补，不挡本次响应。
 		if total, ok := officialTotals[id]; ok {
 			usd := total.Credits / proxy.WhamCreditsPerUSD
 			item.OfficialUSD7d = &usd
+		} else {
+			missingOfficial = append(missingOfficial, id)
 		}
 		stats[id] = item
 	}
+	h.enqueueWhamDailyUsageBackfill(missingOfficial)
 	c.JSON(http.StatusOK, gin.H{"stats": stats})
 }
 

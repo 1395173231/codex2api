@@ -2,36 +2,35 @@ import type { ChangeEvent } from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  Activity,
-  Check,
   Fingerprint,
-  FolderOpen,
   Gauge,
   Globe,
-  KeyRound,
   Loader2,
   Save,
-  ShieldCheck,
-  Sliders,
-  SlidersHorizontal,
   Tag,
-  Users,
-  X,
-  Zap,
 } from "lucide-react";
 import type {
   AccountGroup,
   AccountRow,
   CodexFingerprintMode,
-  UpdateAccountSchedulerRequest,
 } from "../types";
 import { api } from "../api";
 import { useToast } from "../hooks/useToast";
 import { getErrorMessage } from "../utils/error";
+import {
+  accountHasQuickConfigDetails,
+  buildQuickConfigSavePayload,
+  canSaveQuickConfig,
+  formStateFromAccount,
+  isAbortError,
+  isQuickConfigFormCurrent,
+  type QuickConfigFormState,
+  type QuickConfigLoadStatus,
+  type QuickConfigReadySaveError,
+} from "../lib/accountQuickConfig";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
   Sheet,
@@ -44,6 +43,7 @@ import {
 } from "@/components/ui/sheet";
 import ChipInput from "./ChipInput";
 import AccountGroupMultiSelect from "./AccountGroupMultiSelect";
+import StateShell from "./StateShell";
 
 function formatSignedNumber(value: number): string {
   if (value > 0) return `+${value}`;
@@ -62,34 +62,12 @@ function getDefaultScoreBias(planType?: string | null): number {
   return 0;
 }
 
-function parseCustomHeadersText(value: string): {
-  ok: boolean;
-  value: Record<string, string> | null;
-} {
-  const trimmed = value.trim();
-  if (!trimmed) return { ok: true, value: null };
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { ok: false, value: null };
-    }
-    const result: Record<string, string> = {};
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v !== "string") return { ok: false, value: null };
-      result[k] = v;
-    }
-    return { ok: true, value: result };
-  } catch {
-    return { ok: false, value: null };
-  }
-}
-
-function formatCustomHeadersText(
-  headers?: Record<string, string> | null,
-): string {
-  if (!headers || Object.keys(headers).length === 0) return "";
-  return JSON.stringify(headers, null, 2);
-}
+const SAVE_ERROR_TOAST: Record<QuickConfigReadySaveError, string> = {
+  invalid_headers: "自定义请求头必须是 JSON 对象，且所有值必须是字符串",
+  invalid_score: "自定义加权分必须在 -200 到 200 之间",
+  invalid_concurrency: "基础并发覆盖必须大于等于 1",
+  invalid_priority: "调度优先级必须在 -100 到 100 之间",
+};
 
 interface AccountQuickConfigSheetProps {
   account: AccountRow | null;
@@ -110,125 +88,84 @@ export default function AccountQuickConfigSheet({
   const { showToast } = useToast();
 
   const [saving, setSaving] = useState(false);
-  const [fingerprintMode, setFingerprintMode] =
-    useState<CodexFingerprintMode>("off");
-  const [scoreMode, setScoreMode] = useState<"default" | "custom">("default");
-  const [scoreInput, setScoreInput] = useState("");
-  const [concurrencyMode, setConcurrencyMode] = useState<
-    "default" | "custom"
-  >("default");
-  const [concurrencyInput, setConcurrencyInput] = useState("");
-  const [schedulerPriorityInput, setSchedulerPriorityInput] = useState("");
-  const [skipWarmTier, setSkipWarmTier] = useState(false);
-  const [proxyUrl, setProxyUrl] = useState("");
-  const [customHeadersText, setCustomHeadersText] = useState("");
-  const [tags, setTags] = useState<string[]>([]);
-  const [groupIds, setGroupIds] = useState<number[]>([]);
+  const [loadStatus, setLoadStatus] = useState<QuickConfigLoadStatus>("loading");
+  const [loadError, setLoadError] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [form, setForm] = useState<QuickConfigFormState | null>(null);
+  const [syncedId, setSyncedId] = useState<number | null>(null);
+
+  const accountId = account?.id ?? null;
+  if (accountId !== syncedId) {
+    setSyncedId(accountId);
+    if (account && accountHasQuickConfigDetails(account)) {
+      setForm(formStateFromAccount(account));
+      setLoadStatus("ready");
+      setLoadError("");
+    } else {
+      setForm(null);
+      setLoadStatus("loading");
+      setLoadError("");
+    }
+  }
+
+  const formCurrent = isQuickConfigFormCurrent(form, accountId);
+  const detailsReady = loadStatus === "ready" && formCurrent;
+  const detailLoaded = Boolean(account?.detail_loaded);
+  const saveEnabled = canSaveQuickConfig({
+    status: loadStatus,
+    saving,
+    form,
+    accountId,
+  });
 
   useEffect(() => {
-    if (!account) return undefined;
+    if (!show || accountId == null || detailLoaded) {
+      return undefined;
+    }
 
-    let cancelled = false;
-
-    const populateForm = (acc: AccountRow) => {
-      const mode = (acc.codex_fingerprint_mode as string) || "off";
-      setFingerprintMode(
-        mode === "device" || mode === "session" || mode === "full" ? mode : "off",
-      );
-      if (acc.score_bias_override != null) {
-        setScoreMode("custom");
-        setScoreInput(String(acc.score_bias_override));
-      } else {
-        setScoreMode("default");
-        setScoreInput("");
-      }
-      if (acc.base_concurrency_override != null) {
-        setConcurrencyMode("custom");
-        setConcurrencyInput(String(acc.base_concurrency_override));
-      } else {
-        setConcurrencyMode("default");
-        setConcurrencyInput("");
-      }
-      setSchedulerPriorityInput(
-        acc.scheduler_priority != null ? String(acc.scheduler_priority) : "",
-      );
-      setSkipWarmTier(acc.skip_warm_tier ?? false);
-      setProxyUrl(acc.proxy_url ?? "");
-      setCustomHeadersText(formatCustomHeadersText(acc.custom_headers));
-      setTags(acc.tags ?? []);
-      setGroupIds(acc.group_ids ?? []);
-    };
-
-    populateForm(account);
-
-    void api.getAccount(account.id)
+    const controller = new AbortController();
+    setForm(null);
+    setLoadStatus("loading");
+    setLoadError("");
+    void api
+      .getAccount(accountId, controller.signal)
       .then((detailed) => {
-        if (!cancelled && detailed) {
-          populateForm(detailed);
-        }
+        setForm(formStateFromAccount(detailed));
+        setLoadStatus("ready");
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        const message = getErrorMessage(error);
+        setForm(null);
+        setLoadStatus("error");
+        setLoadError(message);
+        showToast(message, "error");
+      });
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [account]);
+  }, [show, accountId, detailLoaded, retryNonce, showToast]);
+
+  const patchForm = (patch: Partial<QuickConfigFormState>) => {
+    setForm((current) => (current ? { ...current, ...patch } : current));
+  };
 
   if (!account) return null;
 
   const handleSave = async () => {
-    const parsedHeaders = parseCustomHeadersText(customHeadersText);
-    if (!parsedHeaders.ok) {
-      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+    if (!saveEnabled) return;
+    const result = buildQuickConfigSavePayload(form, detailsReady);
+    if (!result.ok) {
+      if (result.error !== "not_ready") {
+        showToast(SAVE_ERROR_TOAST[result.error], "error");
+      }
       return;
-    }
-
-    let parsedScoreBias: number | null = null;
-    if (scoreMode === "custom") {
-      const v = parseInt(scoreInput.trim(), 10);
-      if (Number.isNaN(v) || v < -200 || v > 200) {
-        showToast("自定义加权分必须在 -200 到 200 之间", "error");
-        return;
-      }
-      parsedScoreBias = v;
-    }
-
-    let parsedBaseConcurrency: number | null = null;
-    if (concurrencyMode === "custom") {
-      const v = parseInt(concurrencyInput.trim(), 10);
-      if (Number.isNaN(v) || v < 1) {
-        showToast("基础并发覆盖必须大于等于 1", "error");
-        return;
-      }
-      parsedBaseConcurrency = v;
-    }
-
-    let parsedSchedulerPriority: number | null = null;
-    if (schedulerPriorityInput.trim()) {
-      const v = parseInt(schedulerPriorityInput.trim(), 10);
-      if (Number.isNaN(v) || v < -100 || v > 100) {
-        showToast("调度优先级必须在 -100 到 100 之间", "error");
-        return;
-      }
-      parsedSchedulerPriority = v;
     }
 
     setSaving(true);
     try {
-      const payload: UpdateAccountSchedulerRequest = {
-        score_bias_override: scoreMode === "custom" ? parsedScoreBias : null,
-        base_concurrency_override:
-          concurrencyMode === "custom" ? parsedBaseConcurrency : null,
-        scheduler_priority: parsedSchedulerPriority,
-        skip_warm_tier: skipWarmTier,
-        proxy_url: proxyUrl.trim() || null,
-        custom_headers: parsedHeaders.value,
-        codex_fingerprint_mode: fingerprintMode,
-        tags,
-        group_ids: groupIds,
-      };
-
-      await api.updateAccountScheduler(account.id, payload);
+      await api.updateAccountScheduler(account.id, result.payload);
       showToast("账号配置与设备指纹已保存");
       onSaved();
       onClose();
@@ -253,6 +190,10 @@ export default function AccountQuickConfigSheet({
     full: t("accounts.codexFingerprintModeFullDetail"),
   };
 
+  const fingerprintMode = form?.fingerprintMode ?? "off";
+  const scoreMode = form?.scoreMode ?? "default";
+  const concurrencyMode = form?.concurrencyMode ?? "default";
+
   return (
     <Sheet open={show} onOpenChange={(o) => { if (!o) onClose(); }}>
       <SheetContent
@@ -276,7 +217,6 @@ export default function AccountQuickConfigSheet({
         </SheetHeader>
 
         <SheetBody className="space-y-5">
-          {/* 账号概览 Header */}
           <div className="rounded-xl border border-border/70 bg-gradient-to-r from-primary/5 via-muted/30 to-background p-3.5 shadow-2xs">
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0 space-y-0.5">
@@ -293,7 +233,22 @@ export default function AccountQuickConfigSheet({
             </div>
           </div>
 
-          {/* 1. 设备指纹收敛 */}
+          <StateShell
+            variant="section"
+            loading={loadStatus === "loading" || (loadStatus === "ready" && !formCurrent)}
+            error={loadStatus === "error" ? loadError || t("common.loadFailed") : null}
+            onRetry={() => {
+              setForm(null);
+              setLoadStatus("loading");
+              setLoadError("");
+              setRetryNonce((value) => value + 1);
+            }}
+            loadingTitle={t("common.loading")}
+            loadingDescription={t("accounts.quickConfigLoadingDesc")}
+            errorTitle={t("common.loadFailed")}
+          >
+            {form ? (
+              <>
           <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3">
             <div className="flex items-center gap-2 border-b border-border/50 pb-2.5">
               <Fingerprint className="size-4 text-teal-500" />
@@ -309,7 +264,7 @@ export default function AccountQuickConfigSheet({
                 <button
                   key={opt.value}
                   type="button"
-                  onClick={() => setFingerprintMode(opt.value)}
+                  onClick={() => patchForm({ fingerprintMode: opt.value })}
                   className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-all duration-150 ${
                     fingerprintMode === opt.value
                       ? "bg-primary text-primary-foreground font-bold shadow-xs ring-1 ring-primary/30"
@@ -325,7 +280,6 @@ export default function AccountQuickConfigSheet({
             </div>
           </div>
 
-          {/* 2. 调度与并发 */}
           <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3.5">
             <div className="flex items-center gap-2 border-b border-border/50 pb-2.5">
               <Gauge className="size-4 text-amber-500" />
@@ -334,7 +288,6 @@ export default function AccountQuickConfigSheet({
               </span>
             </div>
 
-            {/* 加权分 */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs font-semibold">
                 <span className="text-foreground">{t("accounts.schedulerScoreLabel")}</span>
@@ -343,7 +296,7 @@ export default function AccountQuickConfigSheet({
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => setScoreMode("default")}
+                  onClick={() => patchForm({ scoreMode: "default" })}
                   className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
                     scoreMode === "default"
                       ? "bg-primary text-primary-foreground shadow-2xs"
@@ -354,7 +307,7 @@ export default function AccountQuickConfigSheet({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setScoreMode("custom")}
+                  onClick={() => patchForm({ scoreMode: "custom" })}
                   className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
                     scoreMode === "custom"
                       ? "bg-primary text-primary-foreground shadow-2xs"
@@ -374,14 +327,15 @@ export default function AccountQuickConfigSheet({
               ) : (
                 <Input
                   inputMode="numeric"
-                  value={scoreInput}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setScoreInput(e.target.value)}
+                  value={form.scoreInput}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                    patchForm({ scoreInput: e.target.value })
+                  }
                   placeholder={t("accounts.schedulerScorePlaceholder")}
                 />
               )}
             </div>
 
-            {/* 基础并发 */}
             <div className="space-y-2 pt-1 border-t border-border/40">
               <div className="flex items-center justify-between text-xs font-semibold">
                 <span className="text-foreground">{t("accounts.schedulerConcurrencyLabel")}</span>
@@ -390,7 +344,7 @@ export default function AccountQuickConfigSheet({
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => setConcurrencyMode("default")}
+                  onClick={() => patchForm({ concurrencyMode: "default" })}
                   className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
                     concurrencyMode === "default"
                       ? "bg-primary text-primary-foreground shadow-2xs"
@@ -401,7 +355,7 @@ export default function AccountQuickConfigSheet({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setConcurrencyMode("custom")}
+                  onClick={() => patchForm({ concurrencyMode: "custom" })}
                   className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
                     concurrencyMode === "custom"
                       ? "bg-primary text-primary-foreground shadow-2xs"
@@ -421,28 +375,30 @@ export default function AccountQuickConfigSheet({
               ) : (
                 <Input
                   inputMode="numeric"
-                  value={concurrencyInput}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setConcurrencyInput(e.target.value)}
+                  value={form.concurrencyInput}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                    patchForm({ concurrencyInput: e.target.value })
+                  }
                   placeholder={t("accounts.schedulerConcurrencyPlaceholder")}
                 />
               )}
             </div>
 
-            {/* 优先级 */}
             <div className="space-y-1.5 pt-1 border-t border-border/40">
               <label className="block text-xs font-semibold text-foreground">
                 {t("accounts.schedulerPriorityTitle")}
               </label>
               <Input
                 inputMode="numeric"
-                value={schedulerPriorityInput}
-                onChange={(e: ChangeEvent<HTMLInputElement>) => setSchedulerPriorityInput(e.target.value)}
+                value={form.schedulerPriorityInput}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  patchForm({ schedulerPriorityInput: e.target.value })
+                }
                 placeholder={t("accounts.schedulerPriorityPlaceholder")}
               />
             </div>
           </div>
 
-          {/* 3. 防护与网络 */}
           <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3.5">
             <div className="flex items-center gap-2 border-b border-border/50 pb-2.5">
               <Globe className="size-4 text-indigo-500" />
@@ -451,7 +407,6 @@ export default function AccountQuickConfigSheet({
               </span>
             </div>
 
-            {/* 跳过预热层级 */}
             <div className="flex items-center justify-between gap-3">
               <div>
                 <div className="text-xs font-semibold text-foreground">
@@ -462,39 +417,40 @@ export default function AccountQuickConfigSheet({
                 </div>
               </div>
               <Switch
-                checked={skipWarmTier}
-                onCheckedChange={setSkipWarmTier}
+                checked={form.skipWarmTier}
+                onCheckedChange={(checked) => patchForm({ skipWarmTier: checked })}
               />
             </div>
 
-            {/* 代理服务器 */}
             <div className="space-y-1.5 pt-1 border-t border-border/40">
               <label className="block text-xs font-semibold text-foreground">
                 代理服务器 (Proxy URL)
               </label>
               <Input
-                value={proxyUrl}
-                onChange={(e: ChangeEvent<HTMLInputElement>) => setProxyUrl(e.target.value)}
+                value={form.proxyUrl}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  patchForm({ proxyUrl: e.target.value })
+                }
                 placeholder="http://user:pass@host:port"
               />
             </div>
 
-            {/* 自定义请求头 */}
             <div className="space-y-1.5 pt-1 border-t border-border/40">
               <label className="block text-xs font-semibold text-foreground">
                 自定义请求头 JSON
               </label>
               <textarea
                 rows={3}
-                value={customHeadersText}
-                onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setCustomHeadersText(e.target.value)}
+                value={form.customHeadersText}
+                onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                  patchForm({ customHeadersText: e.target.value })
+                }
                 placeholder='{"Chatgpt-Account-Id": "workspace-id"}'
                 className="w-full rounded-lg border border-input bg-background px-3 py-2 font-mono text-xs shadow-2xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
             </div>
           </div>
 
-          {/* 4. 标签与分组 */}
           <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3.5">
             <div className="flex items-center gap-2 border-b border-border/50 pb-2.5">
               <Tag className="size-4 text-violet-500" />
@@ -508,8 +464,8 @@ export default function AccountQuickConfigSheet({
                 {t("accounts.tagsLabel")}
               </label>
               <ChipInput
-                value={tags}
-                onChange={setTags}
+                value={form.tags}
+                onChange={(tags) => patchForm({ tags })}
                 placeholder={t("accounts.tagsPlaceholder")}
                 maxVisible={3}
               />
@@ -521,11 +477,11 @@ export default function AccountQuickConfigSheet({
               </label>
               <AccountGroupMultiSelect
                 groups={groups}
-                value={groupIds}
-                onChange={setGroupIds}
+                value={form.groupIds}
+                onChange={(groupIds) => patchForm({ groupIds })}
                 allLabel={t("accounts.groupsUnbound")}
                 selectedLabel={t("accounts.groupsSelected", {
-                  count: groupIds.length,
+                  count: form.groupIds.length,
                 })}
                 placeholder={t("accounts.groupsPlaceholder")}
                 emptyLabel={t("accounts.groupsNone")}
@@ -533,13 +489,16 @@ export default function AccountQuickConfigSheet({
               />
             </div>
           </div>
+              </>
+            ) : null}
+          </StateShell>
         </SheetBody>
 
         <SheetFooter>
           <Button variant="outline" onClick={onClose} disabled={saving}>
             {t("common.cancel")}
           </Button>
-          <Button onClick={() => void handleSave()} disabled={saving}>
+          <Button onClick={() => void handleSave()} disabled={!saveEnabled}>
             {saving ? (
               <Loader2 className="size-4 animate-spin" />
             ) : (

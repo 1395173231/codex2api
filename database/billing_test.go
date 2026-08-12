@@ -395,6 +395,8 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 		wantOutput float64
 		wantCache  float64
 	}{
+		{model: "grok-4.6", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
+		{model: "grok-4.6-beta", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
 		{model: "grok-4.5", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.3},
 		{model: "grok-4.3", wantInput: 1.25, wantOutput: 2.5, wantCache: 0.2},
 		{model: "grok-4-fast", wantInput: 0.2, wantOutput: 0.5, wantCache: 0.05},
@@ -417,9 +419,12 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 	}
 }
 
-// grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
+// grok-4.6 / grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
 func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
+	assertPricing(t, GetModelPricing("grok-4.6"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.6").CacheReadPricePerMToken, 0.5)
 	assertPricing(t, GetModelPricing("grok-4.5"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.5").CacheReadPricePerMToken, 0.3)
 	assertPricing(t, GetModelPricing("grok-4"), 3.0, 15.0)
 	assertPricing(t, GetModelPricing("grok-3-fast"), 5.0, 25.0)
 	assertPricing(t, GetModelPricing("grok-3"), 3.0, 15.0)
@@ -443,6 +448,21 @@ func TestGrokLongContextThresholdIs200K(t *testing.T) {
 	}
 	if long.LongContextThreshold != 200000 {
 		t.Fatalf("LongContextThreshold = %d, want 200000", long.LongContextThreshold)
+	}
+
+	// grok-4.6 同分档线；缓存短档 $0.50、长档 $1.00（与 grok-4.5 的 $0.30 不同）。
+	std46 := CalculateCostBreakdown(200000, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, std46.InputPricePerMToken, 2.0)
+	assertFloatEqual(t, std46.CacheReadPricePerMToken, 0.5)
+	if std46.LongContext {
+		t.Fatal("LongContext = true at 200K for grok-4.6, want false")
+	}
+	long46 := CalculateCostBreakdown(200001, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, long46.InputPricePerMToken, 4.0)
+	assertFloatEqual(t, long46.OutputPricePerMToken, 12.0)
+	assertFloatEqual(t, long46.CacheReadPricePerMToken, 1.0)
+	if !long46.LongContext {
+		t.Fatal("LongContext = false above 200K for grok-4.6, want true")
 	}
 
 	// Codex 模型不受影响，仍是 272K。

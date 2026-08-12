@@ -92,6 +92,7 @@ import {
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4",
   "grok-3-fast",

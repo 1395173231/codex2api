@@ -46,3 +46,4 @@ grokcli2api-go/
 .gstack/
 .superpowers/
 CLAUDE.md
+.cursor
