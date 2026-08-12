@@ -229,9 +229,12 @@ func (h *Handler) attachPromptConversationLocks(ctx context.Context, profiles []
 		return
 	}
 	lockTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.ConversationLockTTLHours) * time.Hour
+	userCooldownTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.UserCyberCooldownMinutes) * time.Minute
 	if h.store != nil {
 		cfg := h.store.GetPromptFilterConfig()
-		lockTTL = time.Duration(promptfilter.NormalizeAdvancedConfig(cfg.Advanced).Enforcement.ConversationLockTTLHours) * time.Hour
+		normalized := promptfilter.NormalizeAdvancedConfig(cfg.Advanced)
+		lockTTL = time.Duration(normalized.Enforcement.ConversationLockTTLHours) * time.Hour
+		userCooldownTTL = time.Duration(normalized.Enforcement.UserCyberCooldownMinutes) * time.Minute
 	}
 	for _, profile := range profiles {
 		if profile == nil {
@@ -252,10 +255,10 @@ func (h *Handler) attachPromptConversationLocks(ctx context.Context, profiles []
 				continue
 			}
 			item, _, err := h.db.GetActivePromptConversationRestriction(
-				ctx, "", profile.Platform, profile.NewAPIUserID, lockTTL, database.PromptUserCyberCooldownTTL,
+				ctx, "", profile.Platform, profile.NewAPIUserID, lockTTL, userCooldownTTL,
 			)
 			if err == nil {
-				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeUserCooldown, database.PromptUserCyberCooldownTTL)
+				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeUserCooldown, userCooldownTTL)
 				profile.ConversationLock = item
 			}
 		}

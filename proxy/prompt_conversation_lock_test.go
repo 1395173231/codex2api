@@ -124,6 +124,9 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 
 func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
 	handler, _ := newPromptConversationLockTestHandler(t)
+	cfg := handler.store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.UserCyberCooldownMinutes = 7
+	handler.store.SetPromptFilterConfig(cfg)
 	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
 	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
 	first := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-first", identity, body, 101, "gateway-a", "gateway-a-secret", "0123456789abcdef0123456789abcdef")
@@ -139,7 +142,7 @@ func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
 	if metadata.ReasonCode != promptUserCyberCooldownReasonCode || metadata.StrikeEligible {
 		t.Fatalf("user cooldown metadata = %+v", metadata)
 	}
-	if message := newAPIPolicyDecisionAPIError(metadata).Message; !strings.Contains(message, "30 分钟安全冷却期") || !strings.Contains(message, "不会重复累计处罚") {
+	if message := newAPIPolicyDecisionAPIError(metadata).Message; !strings.Contains(message, "安全冷却期") || strings.Contains(message, "30 分钟") || !strings.Contains(message, "不会重复累计处罚") {
 		t.Fatalf("user cooldown message = %q", message)
 	}
 	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.code").String(); got != promptUserCyberCooldownReasonCode {
@@ -148,7 +151,11 @@ func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
 	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.details.restriction_scope").String(); got != database.PromptConversationRestrictionScopeUserCooldown {
 		t.Fatalf("user cooldown scope=%q body=%s", got, churnedRecorder.Body.String())
 	}
-	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 || got > int64(promptUserCyberCooldownTTL/time.Second) {
+	cooldownTTL := promptUserCyberCooldownTTL(handler.store.GetPromptFilterConfig())
+	if cooldownTTL != 7*time.Minute {
+		t.Fatalf("configured user cooldown TTL = %s, want 7m", cooldownTTL)
+	}
+	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 || got > int64(cooldownTTL/time.Second) {
 		t.Fatalf("user cooldown remaining=%d body=%s", got, churnedRecorder.Body.String())
 	}
 	if message := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.message").String(); !strings.Contains(message, "用户详情") || !strings.Contains(message, promptUserCyberCooldownReasonCode) {
@@ -187,6 +194,36 @@ func TestUpstreamCYBCoolsVerifiedUserWithoutSessionFingerprint(t *testing.T) {
 	setIngressRequestBodyIfAbsent(withSession, body)
 	if blocked := handler.inspectPromptFilterOpenAI(withSession, body, "/v1/responses", "gpt-5.5"); !blocked {
 		t.Fatal("verified user escaped sessionless CYB cooldown by later adding a session fingerprint")
+	}
+}
+
+func TestConfiguredUserCyberCooldownExpiresAcrossSessionChurn(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	cfg := handler.store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.UserCyberCooldownMinutes = 1
+	handler.store.SetPromptFilterConfig(cfg)
+
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-short-cooldown-first", identity, body, 101, "gateway-a", "gateway-a-secret", "")
+	requestCfg := handler.promptFilterConfigForRequest(first)
+	policyContext, verified := handler.verifyNewAPIPolicyContext(first, requestCfg.Advanced.NewAPI, body)
+	lockIdentity, ok := verifiedPromptUserCooldownIdentity(first, policyContext)
+	if !verified || !ok {
+		t.Fatal("signed user identity unavailable")
+	}
+	if _, _, err := db.LockPromptConversation(t.Context(), database.PromptConversationLockInput{
+		LockKey: lockIdentity.LockKey, Platform: lockIdentity.Platform, NewAPIUserID: lockIdentity.NewAPIUserID,
+		IncidentID: "incident-short-cooldown", DecisionID: "decision-short-cooldown", ReasonCode: newAPIUpstreamCyberPolicyReasonCode,
+		LockedAt: time.Now().UTC().Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("LockPromptConversation: %v", err)
+	}
+
+	repeat := signedBoundNewAPIPolicyContext(t, "cyb-short-cooldown-repeat", identity, body, 101, "gateway-a", "gateway-a-secret", "fedcba9876543210fedcba9876543210")
+	setIngressRequestBodyIfAbsent(repeat, body)
+	if blocked := handler.inspectPromptFilterOpenAI(repeat, body, "/v1/responses", "gpt-5.5"); blocked {
+		t.Fatal("expired configured user cooldown still blocked a new session")
 	}
 }
 

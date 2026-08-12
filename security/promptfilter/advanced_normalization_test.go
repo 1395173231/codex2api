@@ -179,10 +179,17 @@ func TestConversationLockTTLDefaultsAndClamps(t *testing.T) {
 	if cfg.Enforcement.ConversationLockTTLHours != 168 {
 		t.Fatalf("default conversation lock TTL = %d, want 168", cfg.Enforcement.ConversationLockTTLHours)
 	}
+	if cfg.Enforcement.UserCyberCooldownMinutes != DefaultUserCyberCooldownMinutes {
+		t.Fatalf("default user cyber cooldown = %d, want %d", cfg.Enforcement.UserCyberCooldownMinutes, DefaultUserCyberCooldownMinutes)
+	}
 	cfg.Enforcement.ConversationLockTTLHours = 9999
+	cfg.Enforcement.UserCyberCooldownMinutes = 9999
 	cfg = NormalizeAdvancedConfig(cfg)
 	if cfg.Enforcement.ConversationLockTTLHours != 720 {
 		t.Fatalf("clamped conversation lock TTL = %d, want 720", cfg.Enforcement.ConversationLockTTLHours)
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes != MaxUserCyberCooldownMinutes {
+		t.Fatalf("clamped user cyber cooldown = %d, want %d", cfg.Enforcement.UserCyberCooldownMinutes, MaxUserCyberCooldownMinutes)
 	}
 }
 

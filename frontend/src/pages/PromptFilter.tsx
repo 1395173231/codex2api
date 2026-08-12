@@ -207,7 +207,7 @@ type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; cyb_strike_enabled: boolean }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -298,7 +298,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, cyb_strike_enabled: false },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -400,6 +400,9 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       conversation_lock_ttl_hours: typeof enforcement.conversation_lock_ttl_hours === 'number' && enforcement.conversation_lock_ttl_hours > 0
         ? enforcement.conversation_lock_ttl_hours
         : defaultAdvancedProtection.enforcement.conversation_lock_ttl_hours,
+      user_cyber_cooldown_minutes: typeof enforcement.user_cyber_cooldown_minutes === 'number' && enforcement.user_cyber_cooldown_minutes > 0
+        ? enforcement.user_cyber_cooldown_minutes
+        : defaultAdvancedProtection.enforcement.user_cyber_cooldown_minutes,
       cyb_strike_enabled: typeof enforcement.cyb_strike_enabled === 'boolean'
         ? enforcement.cyb_strike_enabled
         : defaultAdvancedProtection.enforcement.cyb_strike_enabled,
@@ -1176,7 +1179,10 @@ function AdvancedProtectionEditor({
             <CompactField label={t('promptFilter.terminalBypassModels')} hint={t('promptFilter.help.terminalBypassModels')}><Input value={terminalBypassModelsText} placeholder="codex-auto-review" onChange={(e) => update('enforcement', { terminal_bypass_models: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalBypassModelsHint')}</p>
             <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />
-            {config.enforcement.conversation_lock_enabled ? <CompactField label={t('promptFilter.conversationLockTTL')} hint={t('promptFilter.help.conversationLockTTL')}><DraftNumberInput min={1} max={720} value={config.enforcement.conversation_lock_ttl_hours} onValueChange={(next) => update('enforcement', { conversation_lock_ttl_hours: next })} /></CompactField> : null}
+            {config.enforcement.conversation_lock_enabled ? <div className="grid gap-3 sm:grid-cols-2">
+              <CompactField label={t('promptFilter.conversationLockTTL')} hint={t('promptFilter.help.conversationLockTTL')}><DraftNumberInput min={1} max={720} value={config.enforcement.conversation_lock_ttl_hours} onValueChange={(next) => update('enforcement', { conversation_lock_ttl_hours: next })} /></CompactField>
+              <CompactField label={t('promptFilter.userCyberCooldownMinutes')} hint={t('promptFilter.help.userCyberCooldownMinutes')}><DraftNumberInput min={1} max={1440} value={config.enforcement.user_cyber_cooldown_minutes} onValueChange={(next) => update('enforcement', { user_cyber_cooldown_minutes: next })} /></CompactField>
+            </div> : null}
             <SwitchField label={t('promptFilter.cybStrikeEnabled')} hint={t('promptFilter.help.cybStrikeEnabled')} checked={config.enforcement.cyb_strike_enabled} onCheckedChange={(next) => update('enforcement', { cyb_strike_enabled: next })} />
           </div>
         </details>

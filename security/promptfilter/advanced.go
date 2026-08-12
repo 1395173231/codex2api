@@ -137,8 +137,15 @@ type EnforcementConfig struct {
 	TerminalBypassModels     []string `json:"terminal_bypass_models"`
 	ConversationLockEnabled  bool     `json:"conversation_lock_enabled"`
 	ConversationLockTTLHours int      `json:"conversation_lock_ttl_hours"`
+	UserCyberCooldownMinutes int      `json:"user_cyber_cooldown_minutes"`
 	CYBStrikeEnabled         bool     `json:"cyb_strike_enabled"`
 }
+
+const (
+	DefaultUserCyberCooldownMinutes = 30
+	MinUserCyberCooldownMinutes     = 1
+	MaxUserCyberCooldownMinutes     = 24 * 60
+)
 
 type NormalizationConfig struct {
 	Enabled           bool `json:"enabled"`
@@ -273,7 +280,7 @@ func DefaultAdvancedConfig() AdvancedConfig {
 		Output:          OutputConfig{BufferBytes: 4096, OverlapBytes: 512, StrictOnly: true},
 		Intelligence:    IntelligenceConfig{IntervalHours: 24, Queries: DefaultIntelligenceQueries(), MaxSearchResults: 20, Model: "gpt-5.4", MaxModelCalls: 1},
 		NewAPI:          NewAPIConfig{MaxClockSkewSeconds: 120},
-		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, ConversationLockTTLHours: 168, CYBStrikeEnabled: false},
+		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, ConversationLockTTLHours: 168, UserCyberCooldownMinutes: DefaultUserCyberCooldownMinutes, CYBStrikeEnabled: false},
 		Guard:           DefaultGuardConfig(),
 	}
 }
@@ -750,6 +757,12 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 	}
 	if cfg.Enforcement.ConversationLockTTLHours > 30*24 {
 		cfg.Enforcement.ConversationLockTTLHours = 30 * 24
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes < MinUserCyberCooldownMinutes {
+		cfg.Enforcement.UserCyberCooldownMinutes = d.Enforcement.UserCyberCooldownMinutes
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes > MaxUserCyberCooldownMinutes {
+		cfg.Enforcement.UserCyberCooldownMinutes = MaxUserCyberCooldownMinutes
 	}
 	if cfg.Normalization.MaxDecodeRuns <= 0 {
 		cfg.Normalization.MaxDecodeRuns = d.Normalization.MaxDecodeRuns

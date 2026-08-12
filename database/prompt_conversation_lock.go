@@ -16,7 +16,10 @@ const (
 	PromptConversationLockCacheNamespace           = "prompt-conversation-lock"
 	PromptConversationRestrictionScopeConversation = "conversation"
 	PromptConversationRestrictionScopeUserCooldown = "user_cooldown"
-	PromptUserCyberCooldownTTL                     = 30 * time.Minute
+	// PromptUserCyberCooldownTTL is retained for source compatibility with
+	// integrations that referenced the old default. Runtime enforcement reads
+	// the configurable prompt-filter setting instead.
+	PromptUserCyberCooldownTTL = 30 * time.Minute
 )
 
 type PromptConversationLock struct {

@@ -24,9 +24,8 @@ const (
 	promptConversationLockedReasonCode = "conversation_cyber_locked"
 	promptConversationLockedMessage    = "当前对话因上游 CYB 已被锁定。本次锁定拦截不会重复累计处罚；可等待自动到期，或由管理员在「Prompt 检查 → 风险画像 → 会话详情」手动解锁。解除后再次触发 CYB 可能会停用账号。"
 	promptUserCyberCooldownReasonCode  = "user_cyber_cooldown"
-	promptUserCyberCooldownMessage     = "该用户因上游 CYB 现处于 30 分钟安全冷却期。冷却期间的新请求不会继续转发，也不会重复累计处罚；可等待自动到期，或由管理员在「Prompt 检查 → 风险画像 → 用户详情」手动解除冷却。"
+	promptUserCyberCooldownMessage     = "该用户因上游 CYB 现处于安全冷却期。冷却期间的新请求不会继续转发，也不会重复累计处罚；可等待自动到期，或由管理员在「Prompt 检查 → 风险画像 → 用户详情」手动解除冷却。"
 	promptConversationLockCacheTTL     = 30 * time.Second
-	promptUserCyberCooldownTTL         = database.PromptUserCyberCooldownTTL
 )
 
 type promptCyberRestriction struct {
@@ -84,6 +83,11 @@ func promptConversationLockTTL(cfg promptfilter.Config) time.Duration {
 	return time.Duration(hours) * time.Hour
 }
 
+func promptUserCyberCooldownTTL(cfg promptfilter.Config) time.Duration {
+	minutes := promptfilter.NormalizeAdvancedConfig(cfg.Advanced).Enforcement.UserCyberCooldownMinutes
+	return time.Duration(minutes) * time.Minute
+}
+
 func promptConversationLockExpired(item *database.PromptConversationLock, ttl time.Duration) bool {
 	return item == nil || (ttl > 0 && !item.LockedAt.After(time.Now().UTC().Add(-ttl)))
 }
@@ -100,9 +104,8 @@ func promptCyberRestrictionDecision(item *database.PromptConversationLock, cfg p
 		result.IncidentID = strings.TrimSpace(item.IncidentID)
 		if item.ReasonCode == promptUserCyberCooldownReasonCode {
 			result.ReasonCode = promptUserCyberCooldownReasonCode
-			result.Message = promptUserCyberCooldownMessage
 			result.Scope = database.PromptConversationRestrictionScopeUserCooldown
-			ttl = promptUserCyberCooldownTTL
+			ttl = promptUserCyberCooldownTTL(cfg)
 		}
 	}
 	if !result.LockedAt.IsZero() && ttl > 0 {
@@ -228,6 +231,7 @@ func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.
 		lockKey = conversationIdentity.LockKey
 	}
 	lockTTL := promptConversationLockTTL(cfg)
+	userCooldownTTL := promptUserCyberCooldownTTL(cfg)
 	if hasConversationIdentity && h.cache != nil {
 		if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey); err == nil && found {
 			var item database.PromptConversationLock
@@ -241,7 +245,7 @@ func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.
 	defer cancel()
 	item, exactConversation, err := h.db.GetActivePromptConversationRestriction(
 		ctx, lockKey, userIdentity.Platform, userIdentity.NewAPIUserID,
-		lockTTL, promptUserCyberCooldownTTL,
+		lockTTL, userCooldownTTL,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false
