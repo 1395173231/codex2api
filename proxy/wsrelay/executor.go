@@ -337,6 +337,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 			headers.Set(name, value)
 		}
 	}
+	// 指纹收敛：在透传之后覆盖客户端原值，在账号自定义头之前保留运维覆盖优先级。
+	// 握手头是逐连接冻结的，复用连接沿用建连时的取值；收敛值按账号恒定，正好与
+	// 这一语义相容。off 档为空操作。
+	proxy.ApplyCodexFingerprintHeaders(headers, account, ginHeaders)
 
 	// Account ID
 	if accountID != "" {

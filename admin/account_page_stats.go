@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -14,6 +16,10 @@ type accountPageStatsItem struct {
 	Usage7dDetail *accountUsageWindow `json:"usage_7d_detail,omitempty"`
 	Billed5h      *float64            `json:"billed_5h,omitempty"`
 	Billed7d      *float64            `json:"billed_7d,omitempty"`
+	// OfficialUSD7d 是官方结算口径的近 7 天成本，与上面按本地日志算的
+	// Billed7d 是两套账：网关只看得到自己转发的请求，官方账单还含用户直接
+	// 用官方客户端的消耗。读的是快照表，不打上游。
+	OfficialUSD7d *float64 `json:"official_usd_7d,omitempty"`
 }
 
 // GetAccountPageStats loads log-derived usage and billing values after the
@@ -55,6 +61,13 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 		billed7d = map[int64]float64{}
 	}
 
+	// 官方结算快照缺失只是少一行展示，不能拖垮整页统计。
+	officialTotals, err := h.db.SumAccountDailyUsage(ctx, ids, proxy.WhamDailyUsageRetentionDays)
+	if err != nil {
+		log.Printf("获取当前页账号官方结算成本失败: %v", err)
+		officialTotals = map[int64]database.AccountDailyUsageTotal{}
+	}
+
 	stats := make(map[int64]accountPageStatsItem, len(ids))
 	for _, id := range ids {
 		item := accountPageStatsItem{}
@@ -75,6 +88,12 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 		}
 		if value, ok := billed7d[id]; ok {
 			item.Billed7d = &value
+		}
+		// 没有快照的账号（新导入、中转号）不下发这个字段，前端据此隐藏胶囊，
+		// 而不是显示一个具有误导性的 $0。
+		if total, ok := officialTotals[id]; ok {
+			usd := total.Credits / proxy.WhamCreditsPerUSD
+			item.OfficialUSD7d = &usd
 		}
 		stats[id] = item
 	}

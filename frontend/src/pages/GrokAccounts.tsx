@@ -563,11 +563,12 @@ function GrokAccounts({
     }
   }, [viewMode]);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (options?: { silent?: boolean }) => {
     requestAbortRef.current?.abort();
     const controller = new AbortController();
     requestAbortRef.current = controller;
-    setLoading(true);
+    // silent 供后台补拉使用:不把整页切回 loading,避免统计追平时闪烁。
+    if (!options?.silent) setLoading(true);
     try {
       const res = await api.getAccountsPage({
         channel: "grok",
@@ -640,6 +641,27 @@ function GrokAccounts({
   }, [reload]);
 
   useEffect(() => () => requestAbortRef.current?.abort(), []);
+
+  // stats_state 补拉:与 Codex 页同理——统计缓存两层 stale-while-revalidate,
+  // 从 stale 转 ready 需要连续几次轮询;非 ready 时用 3s 短间隔静默追平,
+  // 带次数上限防后端统计查询持续失败时退化成常驻轮询。
+  const statsStaleRetriesRef = useRef(0);
+  useEffect(() => {
+    if (loading) return undefined;
+    if (statsState === "ready") {
+      statsStaleRetriesRef.current = 0;
+      return undefined;
+    }
+    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      statsStaleRetriesRef.current += 1;
+      void reload({ silent: true });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+    // accounts 作为"每次响应都会变化"的信号:连续两次都返回 stale 时
+    // statsState 字符串不变,不依赖它定时器就不会被重新拉起。
+  }, [loading, statsState, reload, accounts]);
 
   // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
   // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
@@ -1805,7 +1827,11 @@ function GrokAccounts({
         {loading || statsState !== "ready" ? (
           <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
             {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-            {loading ? t("common.loading") : statsState}
+            {loading
+              ? t("common.loading")
+              : statsState === "warming"
+                ? t("accounts.statsWarming")
+                : t("accounts.statsStale")}
           </div>
         ) : null}
         <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">

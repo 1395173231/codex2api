@@ -1,0 +1,200 @@
+package admin
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
+)
+
+func patchAccountScheduler(t *testing.T, handler *Handler, accountID int64, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID),
+		strings.NewReader(body),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateAccountScheduler(ctx)
+	return recorder
+}
+
+func accountFingerprintCredential(t *testing.T, db *database.DB, accountID int64) string {
+	t.Helper()
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	return row.GetCredential(auth.CodexFingerprintModeCredentialKey)
+}
+
+func TestUpdateAccountSchedulerPersistsCodexFingerprintMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(db, nil, nil)
+	handler := &Handler{db: db, store: store}
+
+	// 未配置时默认 off，出站行为与升级前一致。
+	if got := accountFingerprintCredential(t, db, accountID); got != "" {
+		t.Fatalf("initial credential = %q, want empty", got)
+	}
+
+	recorder := patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":"session"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := accountFingerprintCredential(t, db, accountID); got != auth.CodexFingerprintModeSession {
+		t.Fatalf("credential = %q, want %q", got, auth.CodexFingerprintModeSession)
+	}
+
+	// null 表示重置为默认档 off。
+	recorder = patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":null}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := accountFingerprintCredential(t, db, accountID); got != auth.CodexFingerprintModeOff {
+		t.Fatalf("credential after reset = %q, want %q", got, auth.CodexFingerprintModeOff)
+	}
+}
+
+func TestUpdateAccountSchedulerRejectsInvalidCodexFingerprintMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+
+	recorder := patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":"converge"}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if got := accountFingerprintCredential(t, db, accountID); got != "" {
+		t.Fatalf("credential = %q, want the rejected update to leave it untouched", got)
+	}
+}
+
+// TestUpdateAccountSchedulerSyncsRuntimeCodexFingerprintMode 验证改动立即对运行时账号
+// 生效，不必等下一次全量重载。
+func TestUpdateAccountSchedulerSyncsRuntimeCodexFingerprintMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(db, nil, nil)
+	if err := store.LoadAccountByID(context.Background(), accountID); err != nil {
+		t.Fatalf("LoadAccountByID: %v", err)
+	}
+	handler := &Handler{db: db, store: store}
+
+	runtime := store.FindByID(accountID)
+	if runtime == nil {
+		t.Fatal("runtime account not loaded")
+	}
+	if got := runtime.EffectiveCodexFingerprintMode(); got != auth.CodexFingerprintModeOff {
+		t.Fatalf("runtime mode = %q, want %q before any update", got, auth.CodexFingerprintModeOff)
+	}
+
+	recorder := patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":"device"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := runtime.EffectiveCodexFingerprintMode(); got != auth.CodexFingerprintModeDevice {
+		t.Fatalf("runtime mode = %q, want %q", got, auth.CodexFingerprintModeDevice)
+	}
+}
+
+func TestAccountResponseExposesCodexFingerprintModeOnlyWithDetails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(db, nil, nil)
+	handler := &Handler{db: db, store: store}
+
+	if recorder := patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":"full"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+
+	detailed := handler.buildAccountResponse(row, nil, nil, nil, nil, true)
+	if detailed.CodexFingerprintMode != auth.CodexFingerprintModeFull {
+		t.Fatalf("detailed mode = %q, want %q", detailed.CodexFingerprintMode, auth.CodexFingerprintModeFull)
+	}
+
+	// 列表档不加载详情字段，避免为每行多读一次凭据。
+	summary := handler.buildAccountResponse(row, nil, nil, nil, nil, false)
+	if summary.CodexFingerprintMode != "" {
+		t.Fatalf("summary mode = %q, want empty", summary.CodexFingerprintMode)
+	}
+}
+
+// TestAccountResponseOmitsCodexFingerprintModeForRelayAccounts 验证中转账号不暴露该字段：
+// 它们不走 Codex 官方出站路径，收敛对其无意义。
+func TestAccountResponseOmitsCodexFingerprintModeForRelayAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccountWithCredentials(context.Background(), "relay", map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      "https://relay.example.com",
+		"api_key":       "relay-token",
+		auth.CodexFingerprintModeCredentialKey: auth.CodexFingerprintModeFull,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	handler := &Handler{db: db, store: store}
+
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	resp := handler.buildAccountResponse(row, nil, nil, nil, nil, true)
+	if resp.CodexFingerprintMode != "" {
+		t.Fatalf("relay account mode = %q, want empty", resp.CodexFingerprintMode)
+	}
+}
+
+func TestBatchUpdateAccountsAppliesCodexFingerprintMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	first := insertTestAccount(t, db)
+	second, err := db.InsertAccountWithCredentials(context.Background(), "second", map[string]interface{}{
+		"refresh_token": "rt-second",
+		"email":         "second@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		"/api/admin/accounts/batch",
+		strings.NewReader(fmt.Sprintf(`{"ids":[%d,%d],"codex_fingerprint_mode":"session"}`, first, second)),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.BatchUpdateAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	for _, id := range []int64{first, second} {
+		if got := accountFingerprintCredential(t, db, id); got != auth.CodexFingerprintModeSession {
+			t.Fatalf("account %d credential = %q, want %q", id, got, auth.CodexFingerprintModeSession)
+		}
+	}
+}

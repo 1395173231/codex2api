@@ -8,6 +8,8 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
+/** Codex 官方出站请求的设备指纹收敛档位，默认 off（不收敛）。 */
+export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
 export interface StatsChannelCounts {
@@ -110,6 +112,7 @@ export interface AccountRow {
   models?: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
+  codex_fingerprint_mode?: CodexFingerprintMode
   custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
@@ -182,6 +185,9 @@ export interface AccountRow {
   usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
+  // 官方结算口径的近 7 天成本(美元)。来自 account_daily_usage 快照,与
+  // billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  official_usd_7d?: number
   cooldown_until?: ISODateString
   cooldown_reason?: string
   model_cooldowns?: Array<{
@@ -260,6 +266,7 @@ export interface AccountPageStatsItem {
   usage_7d_detail?: AccountUsageWindow
   billed_5h?: number
   billed_7d?: number
+  official_usd_7d?: number
 }
 
 export interface AccountPageStatsResponse {
@@ -725,6 +732,7 @@ export interface UpdateAccountSchedulerRequest {
   dispatch_count_limit?: number | null
   scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
+  codex_fingerprint_mode?: CodexFingerprintMode | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -788,6 +796,53 @@ export interface AccountModelStat {
   cached_tokens: number
   account_billed: number
   user_billed: number
+}
+
+// 官方结算用量（wham daily-workspace-usage-counts 落库后的快照）。
+// 与本地 usage_logs 聚合是两套口径：这份是 OpenAI 侧的权威账单数据。
+export interface WhamDailyUsageSplit {
+  client_id?: string
+  model?: string
+  users: number
+  threads: number
+  turns: number
+  credits: number
+  uncached_text_input_tokens?: number
+  cached_text_input_tokens?: number
+  text_output_tokens?: number
+  text_total_tokens?: number
+}
+
+export interface WhamDailyUsageItem {
+  day: string
+  credits: number
+  usd: number
+  users: number
+  threads: number
+  turns: number
+  uncached_input_tokens: number
+  cached_input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  // 当天的记录在上游结算前不含 token 明细，settled=false 时 token 数还不可信。
+  settled: boolean
+  clients: WhamDailyUsageSplit[]
+  models: WhamDailyUsageSplit[]
+}
+
+export interface WhamDailyUsageResponse {
+  days: number
+  items: WhamDailyUsageItem[]
+  totals: {
+    credits: number
+    usd: number
+    total_tokens: number
+    turns: number
+  }
+  credits_per_usd: number
+  retention_days: number
+  last_synced_at?: string
+  refresh_error?: string
 }
 
 export interface AccountUsageDayStat {

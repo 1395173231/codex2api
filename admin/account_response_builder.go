@@ -66,6 +66,11 @@ func (h *Handler) buildAccountResponse(
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	}
+	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
+	codexFingerprintMode := ""
+	if !isOpenAIResponsesAccount && !isGrokAccount && includeDetails {
+		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
+	}
 	ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
 	ignoreUsageLimitStatusEffective := h.store.IgnoreUsageLimitStatus()
 	if ignoreUsageLimitStatusOverride != nil {
@@ -116,6 +121,7 @@ func (h *Handler) buildAccountResponse(
 		Models:                   row.GetCredentialStringSlice("models"),
 		ModelMapping:             modelMapping,
 		CodexClientMetadataMode:  codexClientMetadataMode,
+		CodexFingerprintMode:     codexFingerprintMode,
 		CustomHeaders:            customHeaders,
 		ProxyURL:                 row.ProxyURL,
 		Enabled:                  row.Enabled,
@@ -313,6 +319,7 @@ func stripAccountDetailFields(resp *accountResponse) {
 	resp.GrokFreeQuota = nil
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
+	resp.CodexFingerprintMode = ""
 	resp.CustomHeaders = nil
 	resp.AllowedAPIKeyIDs = nil
 	resp.Usage5hDetail = nil

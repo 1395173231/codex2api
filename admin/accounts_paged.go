@@ -19,7 +19,11 @@ const (
 	accountListSnapshotTTL = 5 * time.Second
 	accountListPageMax     = 500
 	accountListPageDefault = 20
-	requestCountCacheTTL   = 10 * time.Second
+	// requestCountCacheTTL 是请求数统计缓存的保鲜期。它只喂列表排序与统计卡,
+	// 不需要 10s 级新鲜度;前端静默刷新退避后轮询间隔最长 80s,TTL 太短会让
+	// 几乎每次轮询都撞上过期缓存、stats_state 长期停在 stale(表现为
+	// 「统计刷新中…」常驻)。
+	requestCountCacheTTL = 30 * time.Second
 )
 
 type accountListSnapshot struct {
@@ -484,7 +488,11 @@ func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string
 		groupNames[group.ID] = group.Name
 		groupSort[group.ID] = fmt.Sprintf("%020d\x00%s", group.SortOrder, strings.ToLower(group.Name))
 	}
-	requestCounts, statsState := h.getCachedRequestCountsNonBlocking()
+	channelIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		channelIDs = append(channelIDs, row.ID)
+	}
+	requestCounts, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
 	items := make([]*accountListSnapshotItem, 0, len(rows))
 	for _, row := range rows {
 		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, groupNames, groupSort))
@@ -614,42 +622,85 @@ func valueOrZero(value *int64) int64 {
 	return *value
 }
 
-func (h *Handler) getCachedRequestCountsNonBlocking() (map[int64]*database.AccountRequestCount, string) {
+// requestCountCacheEntry 是单个渠道的请求数统计缓存。
+type requestCountCacheEntry struct {
+	counts    map[int64]*database.AccountRequestCount
+	expiresAt time.Time
+}
+
+// getCachedRequestCountsNonBlocking 返回指定渠道的请求数统计。统计按渠道独立
+// 缓存与刷新:在 codex 页刷新只扫 codex 账号的日志行,不为 grok 账号买单,
+// 反之亦然。ids 是该渠道当前的账号列表,过期时交给后台刷新用。
+func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, string) {
 	now := time.Now()
 	h.reqCountMu.RLock()
-	cached := h.reqCountCache
-	fresh := cached != nil && now.Before(h.reqCountExpiresAt)
+	entry := h.reqCountCache[channel]
 	h.reqCountMu.RUnlock()
-	if fresh {
-		return cached, "ready"
+	if entry != nil && now.Before(entry.expiresAt) {
+		return entry.counts, "ready"
 	}
-	h.refreshRequestCountsAsync()
-	if cached != nil {
-		return cached, "stale"
+	h.refreshRequestCountsAsync(channel, ids)
+	if entry != nil {
+		return entry.counts, "stale"
 	}
 	return map[int64]*database.AccountRequestCount{}, "warming"
 }
 
-func (h *Handler) refreshRequestCountsAsync() {
-	if !h.reqCountRefreshMu.TryLock() {
+func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
+	h.reqCountRefreshMu.Lock()
+	if h.reqCountRefreshing == nil {
+		h.reqCountRefreshing = make(map[string]bool)
+	}
+	if h.reqCountRefreshing[channel] {
+		h.reqCountRefreshMu.Unlock()
 		return
 	}
+	h.reqCountRefreshing[channel] = true
+	h.reqCountRefreshMu.Unlock()
 	go func() {
-		defer h.reqCountRefreshMu.Unlock()
+		defer func() {
+			h.reqCountRefreshMu.Lock()
+			delete(h.reqCountRefreshing, channel)
+			h.reqCountRefreshMu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		counts, err := h.db.GetAccountRequestCounts(ctx)
+		counts, err := h.db.GetAccountRequestCountsByIDs(ctx, ids)
 		if err != nil {
 			// 静默失败会让请求数/用量排序与统计永久停在 warming 且无从排查
 			// (issue #493),失败必须留痕。
-			log.Printf("刷新账号请求统计失败(排序/统计将继续使用旧值): %v", err)
+			log.Printf("刷新账号请求统计失败 channel=%s(排序/统计将继续使用旧值): %v", channel, err)
 			return
 		}
-		h.reqCountMu.Lock()
-		h.reqCountCache = counts
-		h.reqCountExpiresAt = time.Now().Add(requestCountCacheTTL)
-		h.reqCountMu.Unlock()
+		h.storeRequestCountCache(channel, counts)
+		// stats_state 是烙在列表快照里的:快照重建时统计缓存还没刷完,烙出来
+		// 就是 stale,并一直随快照被返回。统计刷完后把本渠道快照标记为过期,
+		// 下一次轮询即触发重建、烙上 ready——否则要等快照自然过期再叠一轮轮询,
+		// 前端退避后「统计刷新中…」会挂几分钟。
+		h.expireAccountListSnapshot(channel)
 	}()
+}
+
+func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount) {
+	h.reqCountMu.Lock()
+	if h.reqCountCache == nil {
+		h.reqCountCache = make(map[string]*requestCountCacheEntry)
+	}
+	h.reqCountCache[channel] = &requestCountCacheEntry{
+		counts:    counts,
+		expiresAt: time.Now().Add(requestCountCacheTTL),
+	}
+	h.reqCountMu.Unlock()
+}
+
+// expireAccountListSnapshot 把指定渠道的列表快照标记为过期,但保留内容:
+// 读路径仍按 stale-while-revalidate 先返回旧值,只是下一次读取会立刻触发重建。
+func (h *Handler) expireAccountListSnapshot(channel string) {
+	h.accountListCacheMu.Lock()
+	if cached := h.accountListCache[channel]; cached != nil {
+		cached.ExpiresAt = time.Time{}
+	}
+	h.accountListCacheMu.Unlock()
 }
 
 func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuery, channel string) bool {

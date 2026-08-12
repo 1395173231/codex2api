@@ -86,6 +86,7 @@ import type {
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
+  WhamDailyUsageResponse,
   RuntimeStatusResponse,
   SiteBranding,
   StatsResponse,
@@ -713,6 +714,12 @@ export const api = {
     }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
   getResetCredits: (id: number) =>
     request<ResetCreditsDetailResponse>(`/accounts/${id}/reset-credits`),
+  // 官方结算用量历史。默认读本地快照；refresh 时先打上游回补保留窗口再返回。
+  getWhamDailyUsage: (id: number, days = 30, refresh = false) => {
+    const search = new URLSearchParams({ days: String(days) })
+    if (refresh) search.set('refresh', '1')
+    return request<WhamDailyUsageResponse>(`/accounts/${id}/wham-daily-usage?${search.toString()}`)
+  },
   getAccountHealthBars: (ids: number[] = []) => {
     const query = ids.length > 0 ? `?ids=${ids.join(',')}` : ''
     return request<AccountHealthBarsResponse>(`/accounts/health-bars${query}`)

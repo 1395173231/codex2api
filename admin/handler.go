@@ -56,6 +56,7 @@ type Handler struct {
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
 	recordAccountEvent     func(int64, string, string)
 	proxyProbe             func(context.Context, string, string) proxyProbeResult
 	reloadProxyPoolFn      func() error
@@ -77,11 +78,12 @@ type Handler struct {
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
 
-	// 账号请求统计缓存（分页路径 10 秒 stale-while-revalidate；旧全量路径复用同一份值）
-	reqCountMu        sync.RWMutex
-	reqCountCache     map[int64]*database.AccountRequestCount
-	reqCountExpiresAt time.Time
-	reqCountRefreshMu sync.Mutex
+	// 账号请求统计缓存,按渠道分键(codex/grok 各自刷新互不牵连;旧全量路径
+	// 用 "all" 键)。分页路径 stale-while-revalidate,TTL 见 requestCountCacheTTL。
+	reqCountMu         sync.RWMutex
+	reqCountCache      map[string]*requestCountCacheEntry
+	reqCountRefreshMu  sync.Mutex
+	reqCountRefreshing map[string]bool
 
 	// 管理后台账号分页使用的轻量快照。快照按渠道缓存，只保存筛选、排序和
 	// 当前页定位所需的信息；完整账号响应仍只为当前页构建。
@@ -550,6 +552,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
+	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
 	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync
@@ -655,6 +658,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id/model-cooldowns/:model", h.ClearAccountModelCooldown)
 	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
 	api.GET("/accounts/:id/reset-credits", h.GetResetCredits)
+	api.GET("/accounts/:id/wham-daily-usage", h.GetAccountWhamDailyUsage)
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/invite/eligibility", h.GetInviteEligibility)
 	api.GET("/accounts/:id/invite/tracking", h.GetInviteTracking)
@@ -1041,6 +1045,7 @@ type accountResponse struct {
 	Models                        []string                    `json:"models,omitempty"`
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
+	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1472,6 +1477,7 @@ type updateAccountSchedulerReq struct {
 	SchedulerPriority       json.RawMessage `json:"scheduler_priority"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
+	CodexFingerprintMode    json.RawMessage `json:"codex_fingerprint_mode"`
 }
 
 type accountSchedulerUpdate struct {
@@ -1490,6 +1496,7 @@ type accountSchedulerUpdate struct {
 	SchedulerPriority       database.OptionalNullInt64
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
+	CodexFingerprintMode    database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -1556,9 +1563,20 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	// null 视为重置为默认档 off。
+	codexFingerprintMode, err := parseOptionalStringField(req.CodexFingerprintMode, "codex_fingerprint_mode", validateCodexFingerprintMode)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if codexFingerprintMode.Set {
+		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
+	}
 	credentialUpdates := make(map[string]interface{})
 	if customHeaders.Set {
 		credentialUpdates["custom_headers"] = cloneCustomHeaders(customHeaders.Values)
+	}
+	if codexFingerprintMode.Set {
+		credentialUpdates[auth.CodexFingerprintModeCredentialKey] = codexFingerprintMode.Value
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -1613,8 +1631,17 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		SchedulerPriority:       schedulerPriority,
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
+		CodexFingerprintMode:    codexFingerprintMode,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
+}
+
+// validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
+func validateCodexFingerprintMode(value string) error {
+	if value == "" || auth.IsValidCodexFingerprintMode(value) {
+		return nil
+	}
+	return errors.New("必须是 off、device、session 或 full")
 }
 
 func (u accountSchedulerUpdate) hasChanges() bool {
@@ -1632,7 +1659,8 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.DispatchCountLimit.Set ||
 		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set ||
-		u.CustomHeaders.Set
+		u.CustomHeaders.Set ||
+		u.CodexFingerprintMode.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -1863,6 +1891,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	}
+	if update.CodexFingerprintMode.Set {
+		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
 	}
 }
 
@@ -2451,14 +2482,16 @@ func reflectInt64Field(value interface{}, field string) (int64, bool) {
 	}
 }
 
-// getCachedRequestCounts preserves the legacy full-list behavior while sharing
-// the paged list's ten-second cache.
+// getCachedRequestCounts preserves the legacy full-list behavior: a blocking
+// global aggregation cached under its own key, so it never contends with the
+// per-channel paged caches.
 func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCount {
+	const cacheKey = "all"
 	h.reqCountMu.RLock()
-	if h.reqCountCache != nil && time.Now().Before(h.reqCountExpiresAt) {
-		cached := h.reqCountCache
+	entry := h.reqCountCache[cacheKey]
+	if entry != nil && time.Now().Before(entry.expiresAt) {
 		h.reqCountMu.RUnlock()
-		return cached
+		return entry.counts
 	}
 	h.reqCountMu.RUnlock()
 
@@ -2469,12 +2502,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-
-	h.reqCountMu.Lock()
-	h.reqCountCache = counts
-	h.reqCountExpiresAt = time.Now().Add(requestCountCacheTTL)
-	h.reqCountMu.Unlock()
-
+	h.storeRequestCountCache(cacheKey, counts)
 	return counts
 }
 

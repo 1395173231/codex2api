@@ -245,16 +245,20 @@ func TestPagedAccountRuntimeStatusOverridesDatabaseRow(t *testing.T) {
 func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler, _, _ := newPagedAccountsHandler(t)
 	started := time.Now()
-	_, state := handler.getCachedRequestCountsNonBlocking()
+	_, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
 	if state != "warming" || time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("cold request stats state=%q elapsed=%s", state, time.Since(started))
 	}
-	// refreshAccountListSnapshotAsync acquires the lock before launching its
-	// goroutine, so taking it here waits until the background warmup is done.
-	handler.reqCountRefreshMu.Lock()
-	handler.reqCountRefreshMu.Unlock()
-	if _, state = handler.getCachedRequestCountsNonBlocking(); state != "ready" {
-		t.Fatalf("warmed request stats state=%q, want ready", state)
+	// 刷新在后台 goroutine 里完成,轮询等它把本渠道缓存转为 ready。
+	warmDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
+			break
+		}
+		if time.Now().After(warmDeadline) {
+			t.Fatalf("warmed request stats state=%q, want ready", state)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	snapshot, err := handler.getAccountListSnapshot(context.Background(), database.UpstreamChannelCodex)

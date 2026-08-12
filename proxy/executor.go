@@ -519,6 +519,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
 	}
+	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
+	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
+	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
 	// lite 信号收敛：签名在 payload 规则改写后采集（规则可注入/删除 WS 标记，改写
 	// 前采集会让注入失效、删除被回填），模型也已被入口映射/规则定稿——已知不支持
 	// lite 的模型带信号上游必 400，发出前剥离。
@@ -1108,6 +1111,9 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Originator", Originator)
 	}
 	applyCodexAllowedForwardHeaders(req, downstreamHeaders)
+	// 指纹收敛必须在白名单透传之后（覆盖客户端原值）、账号自定义头之前（运维显式
+	// 配置保持最终优先）。off 档为空操作。
+	ApplyCodexFingerprintHeaders(req.Header, account, downstreamHeaders)
 	if accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}
