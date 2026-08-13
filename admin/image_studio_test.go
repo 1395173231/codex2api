@@ -389,6 +389,40 @@ func TestUpscaleImageBytesHonoursRequestedSizeOnLocalBackend(t *testing.T) {
 	}
 }
 
+func TestSaveImageJobAssetsDefaultsExplicitSizeToStrictPad(t *testing.T) {
+	db := newTestAdminDB(t)
+	dir := t.TempDir()
+	t.Setenv("IMAGE_ASSET_DIR", dir)
+	t.Setenv("IMAGE_UPSCALER_ENDPOINT", "")
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
+	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{Prompt: "strict landscape"})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob: %v", err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"size": "4x4",
+		"data": []map[string]string{{"b64_json": base64.StdEncoding.EncodeToString(squarePNG(t, 4))}},
+	})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	assets, warnings, err := (&Handler{db: db}).saveImageJobAssets(context.Background(), jobID, imageGenerationJobPayload{
+		Model: "gpt-image-2", Size: "12x6", OutputFormat: "png",
+	}, raw)
+	if err != nil {
+		t.Fatalf("saveImageJobAssets returned error: %v", err)
+	}
+	if len(warnings) != 0 || len(assets) != 1 {
+		t.Fatalf("assets=%d warnings=%#v", len(assets), warnings)
+	}
+	if asset := assets[0]; asset.Width != 12 || asset.Height != 6 || asset.ActualSize != "12x6" || asset.RequestedSize != "12x6" {
+		t.Fatalf("asset = %#v", asset)
+	}
+}
+
 func TestSaveImageJobAssetsPreservesOriginalWhenUpscalerReturnsInvalidImage(t *testing.T) {
 	db := newTestAdminDB(t)
 	dir := t.TempDir()

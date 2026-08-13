@@ -2902,6 +2902,8 @@ export interface CreateImageJobPayload {
   background?: string
   style?: string
   upscale?: string
+  strict_size?: boolean
+  upscale_fit?: 'pad' | 'cover'
   api_key_id?: number
   template_id?: number
   input_images?: string[]

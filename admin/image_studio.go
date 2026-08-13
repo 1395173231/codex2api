@@ -64,6 +64,8 @@ type imageGenerationJobPayload struct {
 	Background   string   `json:"background"`
 	Style        string   `json:"style"`
 	Upscale      string   `json:"upscale"`
+	StrictSize   *bool    `json:"strict_size,omitempty"`
+	UpscaleFit   string   `json:"upscale_fit,omitempty"`
 	N            int      `json:"n"`
 	APIKeyID     int64    `json:"api_key_id"`
 	TemplateID   int64    `json:"template_id"`
@@ -1277,6 +1279,10 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 	}
 	responseModel := firstNonEmpty(gjson.GetBytes(responseJSON, "model").String(), req.Model)
 	responseSize := firstNonEmpty(gjson.GetBytes(responseJSON, "size").String(), req.Size)
+	requestedSize := strings.TrimSpace(req.Size)
+	if _, _, ok := imageupscale.ParseSize(requestedSize); !ok {
+		requestedSize = responseSize
+	}
 	responseQuality := firstNonEmpty(gjson.GetBytes(responseJSON, "quality").String(), req.Quality)
 	responseFormat := firstNonEmpty(gjson.GetBytes(responseJSON, "output_format").String(), req.OutputFormat, "png")
 
@@ -1287,8 +1293,12 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		if err != nil {
 			return saved, warnings, err
 		}
-		if req.Upscale != "" {
-			upscaledBytes, upscaledMime, upscaleErr := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale, req.Size)
+		strictSize := false
+		if _, _, ok := imageupscale.ParseSize(req.Size); ok {
+			strictSize = req.StrictSize == nil || *req.StrictSize
+		}
+		if req.Upscale != "" || strictSize {
+			upscaledBytes, upscaledMime, upscaleErr := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale, requestedSize, req.UpscaleFit, strictSize)
 			if upscaleErr != nil {
 				// Undecodable upscaler output is degraded the same way a
 				// transport failure is. The upstream image behind it has
@@ -1337,7 +1347,7 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 			Width:         width,
 			Height:        height,
 			Model:         responseModel,
-			RequestedSize: responseSize,
+			RequestedSize: requestedSize,
 			ActualSize:    actualSize,
 			Quality:       responseQuality,
 			OutputFormat:  format,
@@ -1369,13 +1379,14 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 	return saved, warnings, nil
 }
 
-func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIndex int, imageBytes []byte, scale, requestedSize string) ([]byte, string, error) {
+func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIndex int, imageBytes []byte, scale, requestedSize, fit string, strict bool) ([]byte, string, error) {
 	scale = imageproc.NormalizeUpscale(scale)
-	if scale == "" || len(imageBytes) == 0 {
+	if (scale == "" && !strict) || len(imageBytes) == 0 {
 		return nil, "", nil
 	}
+	fit = imageproc.NormalizeResizeFit(fit, strict)
 	cache := imageproc.GlobalUpscaleCache()
-	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale) + "-" + strings.ToLower(strings.TrimSpace(requestedSize))
+	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale) + "-" + strings.ToLower(strings.TrimSpace(requestedSize)) + "-" + fit + "-" + strconv.FormatBool(strict)
 	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
 		return data, contentType, nil
 	}
@@ -1399,7 +1410,7 @@ func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIn
 	}
 
 	beforeWidth, beforeHeight := imageDimensions(imageBytes)
-	upscaled, contentType, method, err := upscaleImageBytes(upscaleCtx, imageBytes, scale, requestedSize)
+	upscaled, contentType, method, err := imageupscale.BytesWithFit(upscaleCtx, imageBytes, scale, requestedSize, fit, strict)
 	if err != nil {
 		log.Printf("[image-studio] job=%d asset_index=%d upscale_failed scale=%s backend=%s error=%s",
 			jobID,
