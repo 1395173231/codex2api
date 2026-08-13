@@ -1004,8 +1004,8 @@ func buildAdminImageEditRequest(req imageGenerationJobPayload) ([]byte, error) {
 		images[i] = map[string]string{"image_url": img}
 	}
 	body["images"] = images
-	if req.Size != "" && req.Size != "auto" {
-		body["size"] = req.Size
+	if upstreamSize := upstreamImageJobSize(req); upstreamSize != "" && upstreamSize != "auto" {
+		body["size"] = upstreamSize
 	}
 	if req.Quality != "" && req.Quality != "auto" {
 		body["quality"] = req.Quality
@@ -1143,8 +1143,8 @@ func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, er
 		"prompt":          proxy.AppendImageStyleToPrompt(req.Prompt, req.Style),
 		"response_format": "b64_json",
 	}
-	if req.Size != "" && req.Size != "auto" {
-		body["size"] = req.Size
+	if upstreamSize := upstreamImageJobSize(req); upstreamSize != "" && upstreamSize != "auto" {
+		body["size"] = upstreamSize
 	}
 	if req.Quality != "" && req.Quality != "auto" {
 		body["quality"] = req.Quality
@@ -1156,6 +1156,30 @@ func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, er
 		body["background"] = req.Background
 	}
 	return json.Marshal(body)
+}
+
+// upstreamImageJobSize converts an exact output canvas into a size accepted by
+// GPT Image 2. The upstream image tool requires both dimensions to be multiples
+// of 16, while callers commonly request display sizes such as 1920x1080. The
+// original req.Size remains unchanged and is applied after generation, so this
+// compatibility adjustment never changes the promised final dimensions.
+func upstreamImageJobSize(req imageGenerationJobPayload) string {
+	size := strings.TrimSpace(req.Size)
+	width, height, ok := imageupscale.ParseSize(size)
+	if !ok || !strictImageJobSize(req) {
+		return size
+	}
+	const quantum = 16
+	width = ((width + quantum - 1) / quantum) * quantum
+	height = ((height + quantum - 1) / quantum) * quantum
+	return fmt.Sprintf("%dx%d", width, height)
+}
+
+func strictImageJobSize(req imageGenerationJobPayload) bool {
+	if _, _, ok := imageupscale.ParseSize(req.Size); !ok {
+		return false
+	}
+	return req.StrictSize == nil || *req.StrictSize
 }
 
 func runImageJobBatch(count int, execute func() ([]byte, int, error)) ([]byte, int, []string, error) {
@@ -1293,10 +1317,7 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		if err != nil {
 			return saved, warnings, err
 		}
-		strictSize := false
-		if _, _, ok := imageupscale.ParseSize(req.Size); ok {
-			strictSize = req.StrictSize == nil || *req.StrictSize
-		}
+		strictSize := strictImageJobSize(req)
 		if req.Upscale != "" || strictSize {
 			upscaledBytes, upscaledMime, upscaleErr := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale, requestedSize, req.UpscaleFit, strictSize)
 			if upscaleErr != nil {

@@ -30,6 +30,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
@@ -67,6 +68,46 @@ func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
 	}
 	if payload["quality"] != "high" || payload["output_format"] != "png" {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestBuildAdminImageRequestsUseCompatibleUpstreamSizeForStrictCanvas(t *testing.T) {
+	req := imageGenerationJobPayload{
+		Prompt:       "draw a landscape",
+		Model:        "gpt-image-2",
+		Size:         "1920x1080",
+		OutputFormat: "png",
+		InputImages:  []string{"data:image/png;base64,AA=="},
+	}
+	for name, build := range map[string]func(imageGenerationJobPayload) ([]byte, error){
+		"generation": buildAdminImageGenerationRequest,
+		"edit":       buildAdminImageEditRequest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := build(req)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			if got := gjson.GetBytes(body, "size").String(); got != "1920x1088" {
+				t.Fatalf("upstream size = %q, want 1920x1088", got)
+			}
+			if req.Size != "1920x1080" {
+				t.Fatalf("requested final size mutated to %q", req.Size)
+			}
+		})
+	}
+}
+
+func TestBuildAdminImageRequestLeavesSizeUnchangedWhenStrictDisabled(t *testing.T) {
+	strict := false
+	body, err := buildAdminImageGenerationRequest(imageGenerationJobPayload{
+		Prompt: "draw", Model: "gpt-image-2", Size: "1920x1080", StrictSize: &strict,
+	})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if got := gjson.GetBytes(body, "size").String(); got != "1920x1080" {
+		t.Fatalf("upstream size = %q, want explicit opt-out size unchanged", got)
 	}
 }
 
