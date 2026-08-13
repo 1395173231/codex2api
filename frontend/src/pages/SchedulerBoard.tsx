@@ -164,7 +164,7 @@ export default function SchedulerBoard() {
 
         {overview ? (
           <>
-            <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
+            <div className="mb-6 grid grid-cols-2 gap-2.5 sm:gap-4 xl:grid-cols-4">
               <StatTile label={t('scheduler.totalAccounts')} value={formatNumber(data.summary?.total ?? 0)} />
               <StatTile label={t('scheduler.availableAccounts')} value={`${overview.runtime.available_accounts} / ${overview.runtime.total_accounts}`} />
               <StatTile label="Healthy + Warm" value={formatNumber(schedulerCounts.healthy + schedulerCounts.warm)} />
@@ -207,9 +207,9 @@ export default function SchedulerBoard() {
                   />
                 </div>
 
-                <div className="mt-5 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/75 px-4 py-3">
+                <div className="mt-5 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/75 p-3 sm:px-4 sm:py-3">
                   <span className="text-[12px] font-semibold text-muted-foreground">{t('scheduler.filter')}</span>
-                  <div className="w-[180px]">
+                  <div className="w-full sm:w-[180px]">
                     <Select
                       value={tierFilter}
                       onValueChange={setTierFilter}
@@ -224,7 +224,7 @@ export default function SchedulerBoard() {
                     />
                   </div>
                   <span className="text-[12px] font-semibold text-muted-foreground">{t('scheduler.sort')}</span>
-                  <div className="w-[200px]">
+                  <div className="w-full sm:w-[200px]">
                     <Select
                       value={sortBy}
                       onValueChange={setSortBy}

@@ -883,7 +883,7 @@ export default function Proxies() {
               title={
                 !canEnable && !poolEnabled
                   ? t("proxies.addFirstProxy")
-                  : undefined
+                  : t("proxies.poolFailClosedHint")
               }
             >
               <span

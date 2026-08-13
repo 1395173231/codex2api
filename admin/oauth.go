@@ -333,7 +333,7 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string) (int64, bool, error) {
 	seed = normalizeTokenCredentialSeed(seed)
 	if seed.email == "" || effectiveWorkspaceIDFromSeed(seed) == "" {
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 		if err != nil {
 			return 0, false, err
 		}
@@ -373,7 +373,7 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 		return duplicateID, true, nil
 	}
 
-	id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
+	id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 	if err != nil {
 		return 0, false, err
 	}
@@ -399,7 +399,7 @@ func (h *Handler) loadInsertedTokenAccount(id int64, proxyURL string, seed token
 	if h == nil || h.store == nil {
 		return
 	}
-	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+	newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
 	h.triggerTokenAccountProbe(id, source)
 }

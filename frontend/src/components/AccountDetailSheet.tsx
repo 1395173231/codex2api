@@ -166,6 +166,7 @@ export interface AccountDetailSheetProps {
   healthBuckets?: AccountHealthBucket[];
   sequence?: number;
   usageSlot?: ReactNode;
+  providerSlot?: ReactNode;
   canGoPrev?: boolean;
   canGoNext?: boolean;
   refreshing?: boolean;
@@ -199,6 +200,7 @@ export default function AccountDetailSheet({
   healthBuckets,
   sequence,
   usageSlot,
+  providerSlot,
   canGoPrev = false,
   canGoNext = false,
   refreshing = false,
@@ -490,6 +492,8 @@ export default function AccountDetailSheet({
                 ) : null}
               </div>
             </Section>
+
+            {providerSlot}
 
             {!isGrok ? <Section
               title={t("accounts.modelCooldownPolicy")}

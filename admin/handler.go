@@ -58,10 +58,14 @@ type Handler struct {
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
 	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
-	// last/in-flight 避免翻页或前端重试把同一号打爆上游。
+	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
+	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
+	// （官方统计有滞后），让 page-stats 下发显式空态而不是无限触发回补。
 	whamDailyBackfillMu       sync.Mutex
 	whamDailyBackfillLast     map[int64]time.Time
 	whamDailyBackfillInFlight map[int64]struct{}
+	whamDailyBackfillFailedAt map[int64]time.Time
+	whamDailySyncedOnce       map[int64]struct{}
 	recordAccountEvent        func(int64, string, string)
 	proxyProbe                func(context.Context, string, string) proxyProbeResult
 	reloadProxyPoolFn         func() error
@@ -560,6 +564,8 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
 	handler.whamDailyBackfillLast = make(map[int64]time.Time)
 	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
+	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
+	handler.whamDailySyncedOnce = make(map[int64]struct{})
 	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync
@@ -620,6 +626,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.GET("/accounts/analysis", h.GetAccountAnalysis)
 	api.GET("/accounts/page-stats", h.GetAccountPageStats)
+	api.GET("/accounts/live", h.GetAccountLiveState)
 	api.GET("/accounts/:id", h.GetAccount)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
@@ -639,6 +646,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
 	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
+	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
+	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
+	api.POST("/accounts/:id/grok/capabilities/probe", h.ProbeGrokAccountCapabilities)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -2722,7 +2732,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			continue
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -2734,7 +2744,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		h.db.InsertAccountEventAsync(id, "added", "manual")
 
 		// 热加载：直接加入内存池
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		if newAcc.GetAccessToken() != "" {
@@ -2812,7 +2822,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			continue
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -2827,7 +2837,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		createdIDs.add(id)
 		h.db.InsertAccountEventAsync(id, "added", "manual")
 
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		if newAcc.GetAccessToken() != "" {
@@ -3006,7 +3016,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			seenATRoutes[routeKey] = true
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -3019,7 +3029,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
 		// 身份信息后续由 wham 用量查询补齐。
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		// 触发 wham 用量探针：codex_at 的身份此刻未知，探针补齐身份后会回查
@@ -3130,7 +3140,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 			seenATRoutes[routeKey] = true
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -3141,7 +3151,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		successCount++
 		createdIDs.add(id)
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 		// 与非流式路径一致：探针补齐 codex_at 身份后回查合并同身份的已有账号。
 		h.triggerImportedAccountUsageProbe(id, "manual_at")
@@ -3602,15 +3612,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		return
 	}
 	if account.IsGrokAPI() {
-		// Grok 账号：用自身凭据拉取 Grok 上游模型目录
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		// Grok 账号同步完整富目录并持久化；响应保留 legacy models 字段。
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 110*time.Second)
 		defer cancel()
-		models, err := proxy.FetchGrokModelIDs(ctx, account, h.store.ResolveProxyForAccount(account))
+		result, err := h.syncGrokAccountState(ctx, id)
 		if err != nil {
 			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Grok 上游模型目录失败: %s", err.Error()))
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"models": models})
+		if result.capabilityGeneration > 0 {
+			h.triggerGrokCapabilityProbeForGeneration(id, result.capabilityGeneration)
+		}
+		c.JSON(http.StatusOK, gin.H{"models": result.Models, "state": result.State, "errors": result.Errors})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -4701,7 +4714,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
 				insertCancel()
 
 				if err != nil {
@@ -4716,7 +4729,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
 				h.store.AddAccount(newAcc)
 				h.applyImportedAccountUsageState(newAcc, "import_at")
 				if newAcc.GetAccessToken() != "" {
@@ -4729,7 +4742,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
 				insertCancel()
 
 				if err != nil {
@@ -4744,7 +4757,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
 				h.store.AddAccount(newAcc)
 				h.applyImportedAccountUsageState(newAcc, "import")
 
@@ -7474,6 +7487,12 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
 	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	// Grok live /user.subscriptionTier values. These labels are authorization
+	// inputs only when auth.Store has a fresh live fact; JWT/archive labels never
+	// satisfy plan_allow. "api" is the explicit xAI API-key channel plan.
+	"api": {}, "supergrok": {}, "x_basic": {}, "x_premium": {},
+	"x_premium_plus": {}, "supergrok_heavy": {}, "supergrok_lite": {},
+	"supergrok_plus": {},
 }
 
 // cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
@@ -7675,6 +7694,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	OverflowAutoCompactEnabled          bool   `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          bool   `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled bool   `json:"codex_preflight_sse_passthrough_enabled"`
 	FirstTokenExcludesWsAcquire         bool   `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled        bool   `json:"codex_continue_thinking_enabled"`
@@ -7699,6 +7719,7 @@ type settingsResponse struct {
 	MaxRateLimitRetries                int                              `json:"max_rate_limit_retries"`
 	RetryIntervalMS                    int                              `json:"retry_interval_ms"`
 	TransportRetryPolicy               string                           `json:"transport_retry_policy"`
+	CodexFingerprintDefaultMode        string                           `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration               bool                             `json:"allow_remote_migration"`
 	DatabaseDriver                     string                           `json:"database_driver"`
 	DatabaseLabel                      string                           `json:"database_label"`
@@ -7819,6 +7840,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool    `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int     `json:"codex_ws_busy_patience_sec"`
 	OverflowAutoCompactEnabled          *bool    `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          *bool    `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled *bool    `json:"codex_preflight_sse_passthrough_enabled"`
 	FirstTokenExcludesWsAcquire         *bool    `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled        *bool    `json:"codex_continue_thinking_enabled"`
@@ -7838,6 +7860,7 @@ type updateSettingsReq struct {
 	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
 	RetryIntervalMS                     *int     `json:"retry_interval_ms"`
 	TransportRetryPolicy                *string  `json:"transport_retry_policy"`
+	CodexFingerprintDefaultMode         *string  `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration                *bool    `json:"allow_remote_migration"`
 	ModelMapping                        *string  `json:"model_mapping"`
 	CodexModelMapping                   *string  `json:"codex_model_mapping"`
@@ -8540,6 +8563,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -8562,6 +8586,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
 		DatabaseLabel:                       h.databaseLabel,
@@ -9236,6 +9261,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
 	}
 
+	if req.CompactViaResponsesEnabled != nil {
+		h.store.SetCompactViaResponsesEnabled(*req.CompactViaResponsesEnabled)
+		runtimeCfg.CompactViaResponses = *req.CompactViaResponsesEnabled
+		log.Printf("设置已更新: compact_via_responses_enabled = %t", *req.CompactViaResponsesEnabled)
+	}
+
 	if req.CodexPreflightSSEPassthroughEnabled != nil {
 		h.store.SetCodexPreflightSSEPassthroughEnabled(*req.CodexPreflightSSEPassthroughEnabled)
 		runtimeCfg.CodexPreflightSSEPassthrough = *req.CodexPreflightSSEPassthroughEnabled
@@ -9376,6 +9407,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
 		h.store.SetTransportRetryPolicy(v)
 		log.Printf("设置已更新: transport_retry_policy = %s", v)
+	}
+
+	if req.CodexFingerprintDefaultMode != nil {
+		if err := validateCodexFingerprintMode(*req.CodexFingerprintDefaultMode); err != nil {
+			writeError(c, http.StatusBadRequest, "codex_fingerprint_default_mode "+err.Error())
+			return
+		}
+		v := auth.NormalizeCodexFingerprintMode(*req.CodexFingerprintDefaultMode)
+		h.store.SetCodexFingerprintDefaultMode(v)
+		log.Printf("设置已更新: codex_fingerprint_default_mode = %s", v)
 	}
 
 	if req.AllowRemoteMigration != nil {
@@ -9785,6 +9826,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -9800,6 +9842,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                        h.store.GetModelMapping(),
 		CodexModelMapping:                   h.store.GetCodexModelMapping(),
@@ -10021,6 +10064,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -10040,6 +10084,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
 		DatabaseLabel:                       h.databaseLabel,
@@ -10521,17 +10566,9 @@ func (h *Handler) grokChannelModels() []string {
 	return models
 }
 
-// SyncModels 从官方 Codex 模型页同步模型注册表，并按管理员选择同步 Grok
-// 账号的真实上游白名单与官方价格。
+// SyncModels 从官方 Codex 模型页同步模型注册表。
 func (h *Handler) SyncModels(c *gin.Context) {
-	var req modelSyncRequest
-	if c.Request.ContentLength != 0 {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			writeError(c, http.StatusBadRequest, "invalid request body")
-			return
-		}
-	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	proxyURL := ""
@@ -10543,18 +10580,7 @@ func (h *Handler) SyncModels(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
 	}
-	response := adminModelSyncResponse{ModelSyncResult: result}
-	if req.SyncGrok {
-		response.Grok = h.syncGrokAccountModels(ctx)
-	}
-	if req.SyncOfficialPricing {
-		pricingResult, pricingErr := h.runOfficialPricingSync(ctx, true, true)
-		response.OfficialPricing = pricingResult
-		if pricingErr != nil {
-			response.PricingError = pricingErr.Error()
-		}
-	}
-	c.JSON(http.StatusOK, response)
+	c.JSON(http.StatusOK, result)
 }
 
 // SyncCodexCLIVersion 从 openai/codex releases 拉取最新稳定版本，
@@ -10762,7 +10788,7 @@ func (h *Handler) AddProxies(c *gin.Context) {
 	})
 }
 
-// DeleteProxy 删除单个代理
+// DeleteProxy 删除单个代理，并立即解绑仍引用该 URL 的账号。
 func (h *Handler) DeleteProxy(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -10773,22 +10799,33 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.DeleteProxy(ctx, id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(c, http.StatusNotFound, "代理不存在")
-			return
-		}
+	result, err := h.db.RetireProxiesByIDs(ctx, []int64{id})
+	if err != nil {
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
 	}
-
-	if err := h.store.ReloadProxyPool(); err != nil {
-		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+	if result.Deleted == 0 {
+		writeError(c, http.StatusNotFound, "代理不存在")
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "代理已删除"})
+
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "代理已删除",
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
 }
 
-// UpdateProxy 更新代理（启用/禁用/改标签）
+// UpdateProxy 更新代理（启用/禁用/改标签/改 URL）
 func (h *Handler) UpdateProxy(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -10817,6 +10854,17 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	existing, err := h.db.GetProxy(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+		return
+	}
+	oldURL := strings.TrimSpace(existing.URL)
+
 	if err := h.db.UpdateProxy(ctx, id, req.URL, req.Label, req.Enabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "代理不存在")
@@ -10826,8 +10874,31 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.ReloadProxyPool(); err != nil {
+	newURL := oldURL
+	if req.URL != nil {
+		newURL = strings.TrimSpace(*req.URL)
+	}
+	if newURL != "" && newURL != oldURL {
+		reboundIDs, rebindErr := h.db.RebindAccountProxyURLs(ctx, oldURL, newURL)
+		if rebindErr != nil {
+			writeError(c, http.StatusInternalServerError, "更新代理绑定失败")
+			return
+		}
+		if h.store != nil {
+			for _, accountID := range reboundIDs {
+				h.store.ApplyAccountProxyURL(accountID, newURL)
+			}
+		}
+		h.removeProxyURLsFromRuntime([]string{oldURL})
+	}
+	if req.Enabled != nil && !*req.Enabled {
+		h.removeProxyURLsFromRuntime([]string{newURL})
+	}
+
+	if err := h.reloadProxyPool(); err != nil {
 		log.Printf("代理已更新，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "代理已更新，但代理池刷新失败"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
 }
@@ -10845,14 +10916,26 @@ func (h *Handler) BatchDeleteProxies(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	deleted, err := h.db.DeleteProxies(ctx, req.IDs)
+	result, err := h.db.RetireProxiesByIDs(ctx, req.IDs)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "批量删除失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已删除 %d 个代理", deleted), "deleted": deleted})
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已批量删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个代理", result.Deleted),
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
 }
 
 // CleanErrorProxies 一键清理测试错误的代理，并解绑引用这些代理的账号。
@@ -10868,12 +10951,16 @@ func (h *Handler) CleanErrorProxies(c *gin.Context) {
 	}
 
 	if h.store != nil {
-		for _, accountID := range result.UnboundAccountIDs {
-			h.store.ClearAccountProxyURLIfMatches(accountID, result.DeletedProxyURLs)
+		if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+			log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "错误代理已清理，但代理池刷新失败",
+				"cleaned": result.Deleted,
+				"unbound": result.Unbound,
+			})
+			return
 		}
-		h.removeProxyURLsFromRuntime(result.DeletedProxyURLs)
-	}
-	if err := h.reloadProxyPool(); err != nil {
+	} else if err := h.reloadProxyPool(); err != nil {
 		log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "错误代理已清理，但代理池刷新失败",

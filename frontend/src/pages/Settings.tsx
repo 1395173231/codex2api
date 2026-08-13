@@ -1207,6 +1207,12 @@ export default function Settings() {
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
   ]
+  const codexFingerprintDefaultModeOptions = [
+    { label: t('accounts.codexFingerprintModeOff'), value: 'off' },
+    { label: t('accounts.codexFingerprintModeDevice'), value: 'device' },
+    { label: t('accounts.codexFingerprintModeSession'), value: 'session' },
+    { label: t('accounts.codexFingerprintModeFull'), value: 'full' },
+  ]
   const modelCooldownModeOptions = [
     { label: t('settings.modelCooldownModeOff'), value: 'off' },
     { label: t('settings.modelCooldownModeFixed'), value: 'fixed' },
@@ -1309,6 +1315,7 @@ export default function Settings() {
     codex_ws_busy_patience_sec: 2,
     codex_continue_thinking_enabled: false,
     overflow_auto_compact_enabled: false,
+    compact_via_responses_enabled: false,
     codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
     utls_shutdown_timeout_minutes: 30,
@@ -1324,6 +1331,7 @@ export default function Settings() {
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
     transport_retry_policy: 'rotate',
+    codex_fingerprint_default_mode: 'off',
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -1413,9 +1421,6 @@ export default function Settings() {
   const [modelsLastSyncedAt, setModelsLastSyncedAt] = useState<string | undefined>()
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
-	const [modelSyncOptionsOpen, setModelSyncOptionsOpen] = useState(false)
-	const [syncGrokModels, setSyncGrokModels] = useState(false)
-	const [syncOfficialPricing, setSyncOfficialPricing] = useState(false)
   const [syncingCliVersion, setSyncingCliVersion] = useState(false)
   const [syncedCliVersion, setSyncedCliVersion] = useState('')
   const logoFileInputRef = useRef<HTMLInputElement>(null)
@@ -1796,10 +1801,7 @@ export default function Settings() {
   const handleSyncModels = async () => {
     setSyncingModels(true)
     try {
-      const result = await api.syncModels({
-			sync_grok: syncGrokModels,
-			sync_official_pricing: syncOfficialPricing,
-		})
+      const result = await api.syncModels()
       setModelList(result.models ?? [])
       setModelItems(result.items ?? [])
       setModelsLastSyncedAt(result.last_synced_at)
@@ -1808,11 +1810,7 @@ export default function Settings() {
         added: result.added,
         updated: result.updated,
         skipped: result.skipped?.length ?? 0,
-			grokUpdated: result.grok?.updated ?? 0,
-			grokFailed: result.grok?.failed ?? 0,
       }))
-		if (result.pricing_error) showToast(`${t('settings.pricing.syncFailed')}: ${result.pricing_error}`, 'error')
-		setModelSyncOptionsOpen(false)
     } catch (error) {
       showToast(`${t('settings.modelsSyncFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
@@ -2015,8 +2013,8 @@ export default function Settings() {
         {/* 顶部分段导航 + 自动保存状态：视口顶部居中固定 */}
         <div
           className={cn(
-            'fixed left-1/2 top-[max(0.625rem,env(safe-area-inset-top,0px))] z-50 flex -translate-x-1/2 items-center gap-2',
-            'max-w-[min(72rem,calc(100vw-1.25rem))]',
+            'fixed left-1/2 top-[max(0.625rem,env(safe-area-inset-top,0px))] z-50 flex w-full -translate-x-1/2 items-center gap-2',
+            'max-w-[min(72rem,calc(100vw-1.25rem))] px-1',
           )}
         >
           <nav
@@ -2975,6 +2973,17 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
+          <SettingsCard title={t('settings.compactViaResponses')} description={t('settings.compactViaResponsesDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.compactViaResponsesEnabled')} description={t('settings.compactViaResponsesEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.compact_via_responses_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('compact_via_responses_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
             <div className={SETTINGS_SWITCH_GRID}>
               <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
@@ -3083,6 +3092,13 @@ export default function Settings() {
                       {t('settings.unit.min')}
                     </span>
                   </div>
+                </SettingField>
+                <SettingField label={t('settings.codexFingerprintDefaultMode')} description={t('settings.codexFingerprintDefaultModeDesc')}>
+                  <Select
+                    value={settingsForm.codex_fingerprint_default_mode || 'off'}
+                    onValueChange={(value) => autoSaveStringField('codex_fingerprint_default_mode', value)}
+                    options={codexFingerprintDefaultModeOptions}
+                  />
                 </SettingField>
                 <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
                   <Input
@@ -3749,44 +3765,12 @@ export default function Settings() {
                   <ExternalLink className="size-3.5" />
                   {t('settings.nav.openSource')}
                 </a>
-                <Button size="sm" variant="outline" onClick={() => setModelSyncOptionsOpen(true)} disabled={syncingModels}>
+                <Button size="sm" variant="outline" onClick={() => void handleSyncModels()} disabled={syncingModels}>
                   <RefreshCw className={cn('size-3.5', syncingModels && 'animate-spin')} />
                   {syncingModels ? t('settings.modelsSyncing') : t('settings.syncUpstreamModels')}
                 </Button>
               </div>
             </div>
-			<Sheet open={modelSyncOptionsOpen} onOpenChange={(open) => { if (!syncingModels) setModelSyncOptionsOpen(open) }}>
-				<SheetContent side="right">
-					<SheetHeader>
-						<SheetTitle>{t('settings.modelSyncOptionsTitle')}</SheetTitle>
-						<SheetDescription>{t('settings.modelSyncOptionsDesc')}</SheetDescription>
-					</SheetHeader>
-					<SheetBody className="space-y-4">
-						<div className="rounded-xl border border-border bg-muted/20 p-4">
-							<div className="text-sm font-semibold">{t('settings.syncCodexModels')}</div>
-							<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.syncCodexModelsDesc')}</p>
-						</div>
-						<label className="flex items-start justify-between gap-4 rounded-xl border border-border p-4">
-							<span>
-								<span className="block text-sm font-semibold">{t('settings.syncGrokModels')}</span>
-								<span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{t('settings.syncGrokModelsDesc')}</span>
-							</span>
-							<Switch checked={syncGrokModels} onCheckedChange={setSyncGrokModels} disabled={syncingModels} />
-						</label>
-						<label className="flex items-start justify-between gap-4 rounded-xl border border-border p-4">
-							<span>
-								<span className="block text-sm font-semibold">{t('settings.syncOfficialPricing')}</span>
-								<span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{t('settings.syncOfficialPricingDesc')}</span>
-							</span>
-							<Switch checked={syncOfficialPricing} onCheckedChange={setSyncOfficialPricing} disabled={syncingModels} />
-						</label>
-						<Button className="w-full" onClick={() => void handleSyncModels()} disabled={syncingModels}>
-							<RefreshCw className={cn('size-3.5', syncingModels && 'animate-spin')} />
-							{syncingModels ? t('settings.modelsSyncing') : t('settings.startModelSync')}
-						</Button>
-					</SheetBody>
-				</SheetContent>
-			</Sheet>
             <div className="grid gap-3 sm:grid-cols-2">
               <ModelSummaryCard
                 title={t('settings.modelRegistry')}

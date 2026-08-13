@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 )
@@ -153,7 +154,7 @@ func (db *DB) MutateModelPricingSettings(ctx context.Context, syncURL *string, m
 	}
 	overrides, err := ParseModelPricingOverridesJSON(settings.ModelPricingOverrides)
 	if err != nil {
-		overrides = map[string]ModelPricingOverride{}
+		return nil, fmt.Errorf("解析模型定价覆盖失败，已中止写入以免清空现有价格: %w", err)
 	}
 	if mutate != nil {
 		if err := mutate(overrides); err != nil {

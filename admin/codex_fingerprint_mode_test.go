@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -162,6 +165,99 @@ func TestAccountResponseOmitsCodexFingerprintModeForRelayAccounts(t *testing.T) 
 	resp := handler.buildAccountResponse(row, nil, nil, nil, nil, true)
 	if resp.CodexFingerprintMode != "" {
 		t.Fatalf("relay account mode = %q, want empty", resp.CodexFingerprintMode)
+	}
+}
+
+// TestUpdateSettingsPersistsCodexFingerprintDefaultMode 验证系统设置里的
+// 「新账号默认指纹收敛档位」经 PUT /settings 保存后：响应回显、落库、运行时 Store 三处一致。
+func TestUpdateSettingsPersistsCodexFingerprintDefaultMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"codex_fingerprint_default_mode":"session"}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.CodexFingerprintDefaultMode != auth.CodexFingerprintModeSession {
+		t.Fatalf("response mode = %q, want %q", response.CodexFingerprintDefaultMode, auth.CodexFingerprintModeSession)
+	}
+	if got := store.GetCodexFingerprintDefaultMode(); got != auth.CodexFingerprintModeSession {
+		t.Fatalf("store mode = %q, want %q", got, auth.CodexFingerprintModeSession)
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted.CodexFingerprintDefaultMode != auth.CodexFingerprintModeSession {
+		t.Fatalf("persisted mode = %q, want %q", persisted.CodexFingerprintDefaultMode, auth.CodexFingerprintModeSession)
+	}
+
+	// 非法档位必须整体拒绝，不落任何变更。
+	recorder = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"codex_fingerprint_default_mode":"converge"}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid mode status = %d, want %d body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if got := store.GetCodexFingerprintDefaultMode(); got != auth.CodexFingerprintModeSession {
+		t.Fatalf("store mode after rejected update = %q, want %q", got, auth.CodexFingerprintModeSession)
+	}
+}
+
+// TestNewCodexAccountCredentialsStampsDefaultFingerprintMode 验证新建账号的
+// credentials 与内存态都盖上系统默认档位；tokenCredentialMap（更新已有账号的路径）
+// 永远不带该键，避免重新导入覆盖用户手动调整过的档位。
+func TestNewCodexAccountCredentialsStampsDefaultFingerprintMode(t *testing.T) {
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, nil)
+	handler := &Handler{db: db, store: store}
+	seed := tokenCredentialSeed{refreshToken: "rt-stamp"}
+
+	// 默认 off：不写入键，与升级前行为完全一致。
+	if _, ok := handler.newCodexAccountCredentials(seed)[auth.CodexFingerprintModeCredentialKey]; ok {
+		t.Fatal("默认 off 时不应写入 codex_fingerprint_mode 键")
+	}
+
+	store.SetCodexFingerprintDefaultMode(auth.CodexFingerprintModeSession)
+	credentials := handler.newCodexAccountCredentials(seed)
+	if got := credentials[auth.CodexFingerprintModeCredentialKey]; got != auth.CodexFingerprintModeSession {
+		t.Fatalf("credential = %v, want %q", got, auth.CodexFingerprintModeSession)
+	}
+	account := handler.newCodexAccountFromSeed(7, "", seed)
+	if got := account.EffectiveCodexFingerprintMode(); got != auth.CodexFingerprintModeSession {
+		t.Fatalf("runtime mode = %q, want %q", got, auth.CodexFingerprintModeSession)
+	}
+
+	if _, ok := tokenCredentialMap(seed)[auth.CodexFingerprintModeCredentialKey]; ok {
+		t.Fatal("tokenCredentialMap 不应携带 codex_fingerprint_mode，更新路径会覆盖已有账号档位")
 	}
 }
 

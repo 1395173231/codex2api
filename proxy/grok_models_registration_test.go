@@ -56,6 +56,7 @@ func containsFold(list []string, target string) bool {
 func TestRelayAccountSupportsModel_GrokDefaultSet(t *testing.T) {
 	undeclared := &auth.Account{DBID: 1, APIKey: "xai-1", UpstreamType: auth.UpstreamGrok}
 	declared := &auth.Account{DBID: 2, APIKey: "xai-2", UpstreamType: auth.UpstreamGrok, Models: []string{"grok-4"}}
+	declared.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-4", APIBackend: auth.GrokProtocolResponses}}})
 	relay := &auth.Account{DBID: 3, APIKey: "sk-relay", BaseURL: "https://relay.example.com", UpstreamType: auth.UpstreamOpenAIResponses}
 
 	cases := []struct {

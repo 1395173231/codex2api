@@ -11,6 +11,7 @@ import ModelLogo from "../components/ModelLogo";
 import OperationResultsModal from "../components/OperationResultsModal";
 import { cn } from "@/lib/utils";
 import GrokAccounts from "./GrokAccounts";
+import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import PageHeader from "../components/PageHeader";
 import { CompactStat } from "../components/CompactStat";
 import Pagination from "../components/Pagination";
@@ -45,6 +46,7 @@ import type {
   AccountEmailDomainFacet,
   AccountOperationSelector,
   AccountPageStatsItem,
+  AccountLiveStateResponse,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -181,6 +183,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "priority",
   "plan",
   "status",
+  "today",
   "requests",
   "usage",
   "billed",
@@ -1164,7 +1167,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                     <AccountStatusCountdown account={account} />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
-                                        className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
+                                        className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
                                         title={t("accounts.activeRequestsTooltip", {
                                           count: account.active_requests ?? 0,
                                         })}
@@ -1181,6 +1184,11 @@ const AccountTableRow = memo(function AccountTableRow({
                                     buckets={healthBuckets}
                                   />
                                 </div>
+                              </TableCell>
+                            )}
+                            {visibleColumns.today && (
+                              <TableCell>
+                                <TodayStatsCell account={account} />
                               </TableCell>
                             )}
                             {visibleColumns.requests && (
@@ -1347,6 +1355,7 @@ const AccountCardItem = memo(function AccountCardItem({
   refreshing,
   authJsonExporting,
   variant,
+  visibleColumns,
   t,
   actions,
 }: {
@@ -1361,6 +1370,7 @@ const AccountCardItem = memo(function AccountCardItem({
   refreshing: boolean;
   authJsonExporting: boolean;
   variant: "mobile" | "personal";
+  visibleColumns?: Record<AccountTableColumn, boolean>;
   t: ReturnType<typeof useTranslation>["t"];
   actions: AccountRowActions;
 }) {
@@ -1377,6 +1387,7 @@ const AccountCardItem = memo(function AccountCardItem({
       refreshing={refreshing}
       authJsonExporting={authJsonExporting}
       variant={variant}
+      visibleColumns={visibleColumns}
       t={t}
       onToggleSelect={() => actions.toggleSelect(account.id)}
       onOpenDetail={() => actions.openDetail(account)}
@@ -2424,6 +2435,17 @@ export default function Accounts() {
     }));
     return account;
   }, [setData]);
+  const visibleAccountIDs = useMemo(
+    () => data.accounts.map((account) => account.id),
+    [data.accounts],
+  );
+  const applyAccountLiveState = useCallback((response: AccountLiveStateResponse) => {
+    setData((current) => {
+      const accounts = mergeAccountLiveState(current.accounts, response);
+      return accounts === current.accounts ? current : { ...current, accounts };
+    });
+  }, [setData]);
+  useAccountLiveState(visibleAccountIDs, applyAccountLiveState, providerView === "codex");
   const loadAccountDetail = useCallback(
     (account: AccountRow) =>
       account.detail_loaded ? Promise.resolve(account) : api.getAccount(account.id),
@@ -2453,8 +2475,10 @@ export default function Accounts() {
         if (merged.billed_5h == null && stats.billed_5h != null) merged.billed_5h = stats.billed_5h;
         if (merged.billed_7d == null && stats.billed_7d != null) merged.billed_7d = stats.billed_7d;
         if (merged.official_usd_7d == null && stats.official_usd_7d != null) merged.official_usd_7d = stats.official_usd_7d;
+        if (merged.official_usage_synced == null && stats.official_usage_synced != null) merged.official_usage_synced = stats.official_usage_synced;
         if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
         if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
+        if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
         return merged;
       }),
     [data.accounts, accountPageStats],
@@ -5833,7 +5857,7 @@ export default function Accounts() {
           ) : null}
 
           <div className="toolbar-surface mb-3 flex flex-col gap-2.5">
-            <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
@@ -5903,7 +5927,7 @@ export default function Accounts() {
             </div>
 
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-              <div className="relative w-full shrink-0 sm:w-64">
+              <div className="relative w-full min-w-0 shrink-0 sm:w-64">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <AccountSearchInput
                   className="h-9 rounded-lg pl-9 text-[13px] sm:h-8"
@@ -5987,7 +6011,7 @@ export default function Accounts() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="min-w-0"
+                  className="w-full min-w-0 px-2 sm:w-auto"
                   aria-pressed={sortKey === "group"}
                   title={t("accounts.groupSortHint")}
                   onClick={() => {
@@ -6002,12 +6026,12 @@ export default function Accounts() {
                     setPage(1);
                   }}
                 >
-                  <Layers className="size-3.5" />
+                  <Layers className="size-3.5 shrink-0" />
                   <span className="truncate">
                     {t("accounts.groupSort")}
                   </span>
                   {sortKey === "group" ? (
-                    <span aria-hidden="true">
+                    <span aria-hidden="true" className="shrink-0">
                       {sortDir === "desc" ? "↓" : "↑"}
                     </span>
                   ) : null}
@@ -6016,7 +6040,7 @@ export default function Accounts() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="min-w-0"
+                  className="w-full min-w-0 px-2 sm:w-auto"
                   aria-pressed={sortKey === "schedulerPriority"}
                   title={t("accounts.schedulerPrioritySortHint")}
                   onClick={() => {
@@ -6031,12 +6055,12 @@ export default function Accounts() {
                     setPage(1);
                   }}
                 >
-                  <SlidersHorizontal className="size-3.5" />
+                  <SlidersHorizontal className="size-3.5 shrink-0" />
                   <span className="truncate">
                     {t("accounts.schedulerPrioritySort")}
                   </span>
                   {sortKey === "schedulerPriority" ? (
-                    <span aria-hidden="true">
+                    <span aria-hidden="true" className="shrink-0">
                       {sortDir === "desc" ? "↓" : "↑"}
                     </span>
                   ) : null}
@@ -6044,9 +6068,9 @@ export default function Accounts() {
                 {/* 卡片布局(自用模式/网格/移动端)没有可排序表头,这里补一个
                     紧凑排序入口,避免升级后"排序功能消失"(issue #493)。 */}
                 {!shouldRenderDesktopTable && (
-                  <>
+                  <div className="col-span-2 flex items-center gap-1.5 sm:col-span-1 sm:w-auto">
                     <Select
-                      className="w-32"
+                      className="w-full min-w-0 sm:w-32"
                       compact
                       value={
                         sortKey === "requests" || sortKey === "usage" || sortKey === "importTime"
@@ -6074,7 +6098,7 @@ export default function Accounts() {
                         type="button"
                         variant="outline"
                         size="sm"
-                        className="min-w-0"
+                        className="shrink-0 px-2.5"
                         aria-label={t("accounts.cardSortDirection")}
                         onClick={() => {
                           setSortDir((current) => (current === "desc" ? "asc" : "desc"));
@@ -6084,20 +6108,20 @@ export default function Accounts() {
                         <span aria-hidden="true">{sortDir === "desc" ? "↓" : "↑"}</span>
                       </Button>
                     )}
-                  </>
+                  </div>
                 )}
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="min-w-0"
+                  className="w-full min-w-0 px-2 sm:w-auto"
                   aria-pressed={showEmailDomainTags}
                   onClick={() => setShowEmailDomainTags((visible) => !visible)}
                 >
                   {showEmailDomainTags ? (
-                    <EyeOff className="size-3.5" />
+                    <EyeOff className="size-3.5 shrink-0" />
                   ) : (
-                    <Eye className="size-3.5" />
+                    <Eye className="size-3.5 shrink-0" />
                   )}
                   <span className="truncate">
                     {showEmailDomainTags
@@ -6109,10 +6133,10 @@ export default function Accounts() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="min-w-0"
+                  className="w-full min-w-0 px-2 sm:w-auto"
                   onClick={() => setShowGroupManager(true)}
                 >
-                  <FolderOpen className="size-3.5" />
+                  <FolderOpen className="size-3.5 shrink-0" />
                   <span className="truncate">{t("accounts.groupManage")}</span>
                 </Button>
               </div>
@@ -6171,6 +6195,7 @@ export default function Accounts() {
                       groups: t("accounts.groupsLabel"),
                       priority: t("accounts.schedulerPriorityColumn"),
                       status: t("accounts.status"),
+                      today: t("accounts.todayStats"),
                       requests: t("accounts.requests"),
                       usage: t("accounts.usage"),
                       billed: t("accounts.billed"),
@@ -6456,6 +6481,7 @@ export default function Accounts() {
                         refreshing={refreshingIds.has(account.id)}
                         authJsonExporting={authJsonExportingIds.has(account.id)}
                         variant={isPersonalMode ? "personal" : "mobile"}
+                        visibleColumns={visibleColumns}
                         t={t}
                         actions={rowActions}
                       />
@@ -6550,6 +6576,14 @@ export default function Accounts() {
                         {visibleColumns.status && (
                           <TableHead className="text-[13px] font-semibold">
                             {t("accounts.status")}
+                          </TableHead>
+                        )}
+                        {visibleColumns.today && (
+                          <TableHead
+                            className="text-[13px] font-semibold"
+                            title={t("accounts.todayStatsHint")}
+                          >
+                            {t("accounts.todayStats")}
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
@@ -12530,7 +12564,7 @@ function ColumnSettingsMenu({
         {title}
       </Button>
       {open ? (
-        <div className="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-48 overflow-hidden rounded-lg border border-border bg-popover p-1.5 shadow-lg">
+        <div className="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-48 max-w-[calc(100vw-2.5rem)] overflow-hidden rounded-lg border border-border bg-popover p-1.5 shadow-lg">
           <button
             type="button"
             className="mb-1 flex w-full items-center justify-center rounded-md px-2.5 py-1.5 text-xs font-semibold text-primary transition-colors hover:bg-accent/70"
@@ -12573,6 +12607,7 @@ function AccountMobileCard({
   refreshing,
   authJsonExporting,
   variant = "mobile",
+  visibleColumns,
   t,
   onToggleSelect,
   onOpenDetail,
@@ -12602,6 +12637,7 @@ function AccountMobileCard({
   refreshing: boolean;
   authJsonExporting: boolean;
   variant?: "mobile" | "personal";
+  visibleColumns?: Record<AccountTableColumn, boolean>;
   t: ReturnType<typeof useTranslation>["t"];
   onToggleSelect: () => void;
   onOpenDetail: () => void;
@@ -12747,11 +12783,27 @@ function AccountMobileCard({
                 </div>
               </div>
               <div className="shrink-0">
-                <StatusBadge
-                  status={account.status}
-                  detail={getAccountRateLimitWindow(account) ?? undefined}
-                  errorMessage={account.error_message}
-                />
+                <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  <StatusBadge
+                    status={account.status}
+                    detail={getAccountRateLimitWindow(account) ?? undefined}
+                    errorMessage={account.error_message}
+                  />
+                  {(account.active_requests ?? 0) > 0 && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                      title={t("accounts.activeRequestsTooltip", {
+                        count: account.active_requests ?? 0,
+                      })}
+                    >
+                      <span
+                        className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                        aria-hidden
+                      />
+                      {account.active_requests}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -12989,11 +13041,17 @@ function AccountMobileCard({
           <div className="flex min-w-0 items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
-                    #{sequence}
-                  </span>
-                  <PlanBadge planType={account.plan_type} />
-                  <SchedulerPriorityBadge account={account} />
+                  {(!visibleColumns || visibleColumns.sequence) && (
+                    <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
+                      #{sequence}
+                    </span>
+                  )}
+                  {(!visibleColumns || visibleColumns.plan) && (
+                    <PlanBadge planType={account.plan_type} />
+                  )}
+                  {(!visibleColumns || visibleColumns.priority) && (
+                    <SchedulerPriorityBadge account={account} />
+                  )}
                   <ExpiryBadge
                     expiresAt={account.subscription_expires_at}
                     planType={account.plan_type}
@@ -13022,17 +13080,19 @@ function AccountMobileCard({
                   </div>
                 )}
               </div>
-              <div className="flex min-w-[112px] shrink-0 flex-col items-end">
-                <StatusBadge
-                  status={account.status}
-                  detail={getAccountRateLimitWindow(account) ?? undefined}
-                  errorMessage={account.error_message}
-                />
-                <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
-                  <UsingCreditsBadge account={account} />
-                  <AccountStatusCountdown account={account} />
+              {(!visibleColumns || visibleColumns.status) && (
+                <div className="flex min-w-[112px] shrink-0 flex-col items-end">
+                  <StatusBadge
+                    status={account.status}
+                    detail={getAccountRateLimitWindow(account) ?? undefined}
+                    errorMessage={account.error_message}
+                  />
+                  <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
+                    <UsingCreditsBadge account={account} />
+                    <AccountStatusCountdown account={account} />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
@@ -13083,91 +13143,123 @@ function AccountMobileCard({
                 : ""}
             </div>
           )}
-          <div
-            className="mt-1.5"
-            title={t("accounts.healthSummary", {
-              health: formatHealthTier(account.health_tier, t),
-              score: Math.round(getDispatchScore(account)),
-              concurrency: account.dynamic_concurrency_limit ?? "-",
-            })}
-          >
-            <AccountHealthBar buckets={healthBuckets} />
-          </div>
+          {(!visibleColumns || visibleColumns.usage) && (
+            <div
+              className="mt-1.5"
+              title={t("accounts.healthSummary", {
+                health: formatHealthTier(account.health_tier, t),
+                score: Math.round(getDispatchScore(account)),
+                concurrency: account.dynamic_concurrency_limit ?? "-",
+              })}
+            >
+              <AccountHealthBar buckets={healthBuckets} />
+            </div>
+          )}
+          {(account.active_requests ?? 0) > 0 && (
+            <div className="mt-1">
+              <span
+                className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                title={t("accounts.activeRequestsTooltip", {
+                  count: account.active_requests ?? 0,
+                })}
+              >
+                <span
+                  className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                  aria-hidden
+                />
+                {account.active_requests}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
       <div
         className="mt-3 grid min-w-0 grid-cols-2 gap-2 max-[380px]:grid-cols-1"
       >
-        <AccountMobileMetric label={t("accounts.requests")} className="min-h-[84px]">
-          <div className="flex items-center gap-2 text-[13px]">
-            <span className="font-medium text-emerald-600">
-              {account.success_requests ?? 0}
-            </span>
-            <span className="text-muted-foreground">/</span>
-            <span className="font-medium text-red-500">
-              {account.error_requests ?? 0}
-            </span>
-          </div>
-          {((account.retry_error_requests ?? 0) > 0 ||
-            (account.rate_limit_attempts ?? 0) > 0) && (
-            <div className="mt-0.5 text-[11px] text-muted-foreground">
-              retry {account.retry_error_requests ?? 0} · 429{" "}
-              {account.rate_limit_attempts ?? 0}
+        {(!visibleColumns || visibleColumns.requests) && (
+          <AccountMobileMetric label={t("accounts.requests")} className="min-h-[84px]">
+            <div className="flex items-center gap-2 text-[13px]">
+              <span className="font-medium text-emerald-600">
+                {account.success_requests ?? 0}
+              </span>
+              <span className="text-muted-foreground">/</span>
+              <span className="font-medium text-red-500">
+                {account.error_requests ?? 0}
+              </span>
             </div>
-          )}
-        </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.billed")} className="min-h-[84px]">
-          <BilledCell
-                  account={account}
-                  onOpenOfficial={onOpenOfficialUsage ? () => onOpenOfficialUsage() : undefined}
-                />
-        </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.updatedAt")} className="min-h-[84px]">
-          {lazyMode ? (
-            <div className="space-y-0.5">
-              <div>
-                <span className="mr-1 text-muted-foreground/70">
-                  {t("accounts.recordUpdatedAtShort")}
-                </span>
-                {formatRelativeTime(account.updated_at)}
+            {((account.retry_error_requests ?? 0) > 0 ||
+              (account.rate_limit_attempts ?? 0) > 0) && (
+              <div className="mt-0.5 text-[11px] text-muted-foreground">
+                retry {account.retry_error_requests ?? 0} · 429{" "}
+                {account.rate_limit_attempts ?? 0}
               </div>
-              <div>
-                <span className="mr-1 text-muted-foreground/70">
-                  {t("accounts.usageUpdatedAtShort")}
-                </span>
-                {account.codex_usage_updated_at
-                  ? formatRelativeTime(account.codex_usage_updated_at)
-                  : t("accounts.noUsageUpdatedAt")}
+            )}
+          </AccountMobileMetric>
+        )}
+        {(!visibleColumns || visibleColumns.billed) && (
+          <AccountMobileMetric label={t("accounts.billed")} className="min-h-[84px]">
+            <BilledCell
+              account={account}
+              onOpenOfficial={onOpenOfficialUsage ? () => onOpenOfficialUsage() : undefined}
+            />
+          </AccountMobileMetric>
+        )}
+        {(!visibleColumns || visibleColumns.updatedAt) && (
+          <AccountMobileMetric label={t("accounts.updatedAt")} className="min-h-[84px]">
+            {lazyMode ? (
+              <div className="space-y-0.5">
+                <div>
+                  <span className="mr-1 text-muted-foreground/70">
+                    {t("accounts.recordUpdatedAtShort")}
+                  </span>
+                  {formatRelativeTime(account.updated_at)}
+                </div>
+                <div>
+                  <span className="mr-1 text-muted-foreground/70">
+                    {t("accounts.usageUpdatedAtShort")}
+                  </span>
+                  {account.codex_usage_updated_at
+                    ? formatRelativeTime(account.codex_usage_updated_at)
+                    : t("accounts.noUsageUpdatedAt")}
+                </div>
               </div>
-            </div>
-          ) : (
-            formatRelativeTime(account.updated_at)
-          )}
-        </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.importTime")} className="min-h-[84px]">
-          {formatBeijingTime(account.created_at)}
-        </AccountMobileMetric>
-        <AccountMobileMetric
-          label={t("accounts.usage")}
-          className="col-span-2 min-h-[116px] max-[380px]:col-span-1"
-        >
-          <UsageCell account={account} onRefreshed={onUsageRefreshed} />
-        </AccountMobileMetric>
+            ) : (
+              formatRelativeTime(account.updated_at)
+            )}
+          </AccountMobileMetric>
+        )}
+        {(!visibleColumns || visibleColumns.importTime) && (
+          <AccountMobileMetric label={t("accounts.importTime")} className="min-h-[84px]">
+            {formatBeijingTime(account.created_at)}
+          </AccountMobileMetric>
+        )}
+        {(!visibleColumns || visibleColumns.usage) && (
+          <AccountMobileMetric
+            label={t("accounts.usage")}
+            className="col-span-2 min-h-[116px] max-[380px]:col-span-1"
+          >
+            <UsageCell account={account} onRefreshed={onUsageRefreshed} />
+          </AccountMobileMetric>
+        )}
       </div>
 
       <div className="mt-3 space-y-1.5 border-t border-border pt-2">
-        <ChipList items={account.tags ?? []} tone="purple" />
+        {(!visibleColumns || visibleColumns.tags) && (
+          <ChipList items={account.tags ?? []} tone="purple" />
+        )}
         {!isPersonal && showEmailDomainTags && getAccountEmailDomain(account) && (
           <div className="mt-1.5 flex flex-wrap gap-1">
             <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
           </div>
         )}
-        <GroupChipList
-          groups={groups}
-          onClick={onEditGroups}
-          emptyLabel={t("accounts.groupQuickEdit")}
-        />
+        {(!visibleColumns || visibleColumns.groups) && (
+          <GroupChipList
+            groups={groups}
+            onClick={onEditGroups}
+            emptyLabel={t("accounts.groupQuickEdit")}
+          />
+        )}
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
@@ -13962,6 +14054,109 @@ function UsageWindowStat({
   );
 }
 
+// 今日统计列:网关侧口径,服务器时区当天 0 点起(参考 sub2api 的今日统计列)。
+// page-stats 对本页每个账号必回该字段,零值是真实的"今天没跑";
+// 字段缺失说明 stats 还没到(加载中/失败),显示占位而不是 0。
+function TodayStatsCell({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  const detail = account.usage_today_detail;
+  if (!detail) {
+    return <span className="text-[12px] font-mono text-muted-foreground/40">-</span>;
+  }
+  const requests = detail.requests ?? 0;
+  const tokens = detail.tokens ?? 0;
+  const accountBilled =
+    typeof detail.account_billed === "number" ? detail.account_billed : 0;
+  const userBilled =
+    typeof detail.user_billed === "number" ? detail.user_billed : 0;
+
+  const tooltip = [
+    `${t("accounts.todayStats")}:`,
+    `Requests: ${requests.toLocaleString()} req`,
+    `Tokens: ${tokens.toLocaleString()} tok`,
+    `${t("accounts.accountBilledLabel")}: $${accountBilled.toFixed(4)}`,
+    userBilled > 0 ? `${t("accounts.userBilledLabel")}: $${userBilled.toFixed(4)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    <div
+      className="flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums cursor-default"
+      title={tooltip}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1",
+            requests > 0
+              ? "font-semibold text-foreground"
+              : "font-normal text-muted-foreground/50",
+          )}
+        >
+          <Activity
+            className={cn(
+              "size-3 shrink-0",
+              requests > 0 ? "text-sky-500" : "text-muted-foreground/40",
+            )}
+            aria-hidden
+          />
+          <span>{requests > 0 ? requests.toLocaleString() : 0}</span>
+          <span className="text-[11px] font-normal text-muted-foreground/60">req</span>
+        </span>
+
+        <span
+          className={cn(
+            "inline-flex items-center gap-1",
+            tokens > 0
+              ? "font-semibold text-foreground"
+              : "font-normal text-muted-foreground/50",
+          )}
+        >
+          <Sparkles
+            className={cn(
+              "size-3 shrink-0",
+              tokens > 0 ? "text-purple-500 dark:text-purple-400" : "text-muted-foreground/40",
+            )}
+            aria-hidden
+          />
+          <span>{formatCompactUsageNumber(tokens)}</span>
+          <span className="text-[11px] font-normal text-muted-foreground/60">tok</span>
+        </span>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-[11px]">
+        {accountBilled > 0 ? (
+          <span
+            className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[11px] font-medium tabular-nums text-emerald-700 ring-1 ring-inset ring-emerald-500/20 dark:text-emerald-400"
+            title={t("accounts.accountBilledLabel")}
+          >
+            <Coins className="size-3 shrink-0 text-emerald-500" aria-hidden />
+            ${accountBilled < 0.01 ? "<0.01" : accountBilled.toFixed(2)}
+          </span>
+        ) : (
+          <span
+            className="inline-flex items-center gap-1 rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400 ring-1 ring-inset ring-slate-500/20"
+            title={t("accounts.accountBilledLabel")}
+          >
+            <Coins className="size-3 shrink-0 opacity-50" aria-hidden />
+            $0.00
+          </span>
+        )}
+
+        {userBilled > 0 && Math.abs(userBilled - accountBilled) > 0.0001 && (
+          <span
+            className="inline-flex items-center gap-1 rounded-md bg-sky-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-sky-700 ring-1 ring-inset ring-sky-500/20 dark:text-sky-400"
+            title={`${t("accounts.userBilledLabel")}: $${userBilled.toFixed(4)}`}
+          >
+            U: ${userBilled < 0.01 ? "<0.01" : userBilled.toFixed(2)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // 用量列组件
 //
 // 显示策略不再单独依赖 plan_type:
@@ -14080,6 +14275,11 @@ function UsageCell({
   return <span className="text-[13px] text-muted-foreground">-</span>;
 }
 
+// 官方胶囊转圈的兜底超时:页面级重拉最多 6 次退避(累计约 95 秒)就会停,
+// 超过这个时间还没有数据说明上游拉不到(鉴权失败/官方统计滞后),
+// 再转下去只会让用户以为一直在加载。
+const OFFICIAL_PENDING_SPIN_TIMEOUT_MS = 100_000;
+
 // 成本列并排两套账,颜色区分口径:
 // 上行(石板色)是网关自己的日志算出来的,只含经由本网关转发的请求;
 // 下行(琥珀色)是 OpenAI 官方结算数,还包含用户直接用官方客户端的消耗。
@@ -14093,27 +14293,44 @@ function BilledCell({
   onOpenOfficial?: (account: AccountRow) => void;
 }) {
   const { t } = useTranslation();
+  const official =
+    typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
+  const showOfficial = isCodexOfficialAccount(account);
+  // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
+  // 这是确定的"暂无数据",不是"还在加载",不该转圈。
+  const officialSynced = account.official_usage_synced === true;
+  const officialPending = showOfficial && official === null && !officialSynced;
+  const [officialSpinTimedOut, setOfficialSpinTimedOut] = useState(false);
+  useEffect(() => {
+    if (!officialPending) return undefined;
+    const timer = window.setTimeout(
+      () => setOfficialSpinTimedOut(true),
+      OFFICIAL_PENDING_SPIN_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [officialPending]);
+  const officialSpinning = officialPending && !officialSpinTimedOut;
+
   const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
   const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
   const has5hWindow =
     (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
     !!account.reset_5h_at;
   const visibleH5 = has5hWindow ? h5 : null;
-  const official =
-    typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
-  const showOfficial = isCodexOfficialAccount(account);
   if (visibleH5 === null && d7 === null && !showOfficial) {
     return <span className="text-[12px] text-muted-foreground">-</span>;
   }
   const longLabel = formatLongUsageWindowLabel(account);
   const officialLabel =
     official !== null ? formatOfficialUSD(official) : "—";
-  const officialPending = showOfficial && official === null;
-  const officialClassName = officialPending
+  const officialEmpty = showOfficial && official === null;
+  const officialClassName = officialEmpty
     ? "inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700/70 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400/70"
     : "inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400";
-  const officialTitle = officialPending
-    ? t("accounts.billedOfficialPending")
+  const officialTitle = officialEmpty
+    ? officialSpinning
+      ? t("accounts.billedOfficialPending")
+      : `${t("accounts.billedOfficialNoData")}\n${t("accounts.billedOfficialOpen")}`
     : `${t("accounts.billedOfficialHint")}\n${t("accounts.billedOfficialOpen")}`;
   return (
     <div className="flex flex-col items-start gap-1">
@@ -14140,7 +14357,7 @@ function BilledCell({
             className={`${officialClassName} cursor-pointer transition-colors hover:bg-amber-500/20 hover:ring-amber-500/40`}
             title={officialTitle}
           >
-            {officialPending ? (
+            {officialSpinning ? (
               <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
             ) : (
               <Banknote className="size-3 shrink-0" aria-hidden />
@@ -14149,7 +14366,7 @@ function BilledCell({
           </button>
         ) : (
           <span className={officialClassName} title={officialTitle}>
-            {officialPending ? (
+            {officialSpinning ? (
               <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
             ) : (
               <Banknote className="size-3 shrink-0" aria-hidden />

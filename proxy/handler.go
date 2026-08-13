@@ -33,6 +33,9 @@ import (
 const consoleUpstreamErrorLogMaxBytes = 4 * 1024
 
 func upstreamErrorConsoleBody(body []byte) string {
+	if len(bytes.TrimSpace(body)) > 0 && !gjson.ValidBytes(body) {
+		return fmt.Sprintf("[non-JSON upstream body omitted; %d bytes]", len(body))
+	}
 	truncated := false
 	if len(body) > consoleUpstreamErrorLogMaxBytes {
 		body = body[:consoleUpstreamErrorLogMaxBytes]
@@ -123,13 +126,13 @@ func (h *Handler) shouldUseWebsocketForHTTP() bool {
 }
 
 func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
-	if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" {
-		return proxyURL
+	if h != nil && h.store != nil {
+		if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" && !h.store.ManagedProxyUnavailable(proxyURL) {
+			return proxyURL
+		}
+		return h.store.ResolveProxyForAccount(account)
 	}
-	if h == nil || h.store == nil {
-		return ""
-	}
-	return h.store.ResolveProxyForAccount(account)
+	return strings.TrimSpace(stickyProxyURL)
 }
 
 type usageLimitDetails struct {
@@ -343,7 +346,7 @@ func grokChannelAccountFilter(model string) auth.AccountFilter {
 		if routedModel != "" && account.IsModelRateLimited(routedModel) {
 			return false
 		}
-		return account.GrokChannelSupportsModel(routedModel)
+		return grokAccountSupportsVisibleModel(account, routedModel)
 	}
 }
 
@@ -405,13 +408,30 @@ func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	if account == nil {
 		return false
 	}
+	if account.IsGrokAPI() {
+		return grokAccountSupportsVisibleModel(account, model)
+	}
 	if account.SupportsOpenAIResponsesModel(model) {
 		return true
 	}
-	if !account.IsGrokAPI() || len(account.GrokModels()) > 0 {
+	return false
+}
+
+// grokAccountSupportsVisibleModel keeps request admission aligned with the
+// account-scoped catalog exposed by /v1/models. An explicit Models setting is
+// a narrowing whitelist, never authority to invent or unhide a model absent
+// from the account catalog (or conservative no-catalog defaults).
+func grokAccountSupportsVisibleModel(account *auth.Account, model string) bool {
+	if account == nil || !account.IsGrokAPI() || !account.GrokChannelSupportsModel(model) {
 		return false
 	}
-	return modelIDInList(model, DefaultGrokModelIDsForAccount(account))
+	if !account.GrokDispatchHardAllowed(time.Now()) {
+		return false
+	}
+	if !modelIDInList(model, GrokVisibleModelIDsForAccount(account)) {
+		return false
+	}
+	return GrokModelRoutable(account, model, GrokProtocolResponses, time.Now())
 }
 
 func modelIDInList(model string, models []string) bool {
@@ -539,11 +559,10 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 	}
 
 	if message == "" {
-		raw := strings.TrimSpace(string(body))
-		if raw == "" {
-			return fmt.Sprintf("HTTP %d", statusCode)
-		}
-		message = raw
+		// HTML and plain-text provider pages routinely contain request IDs,
+		// internal routing details or echoed credentials. They are not an API
+		// contract, so persist only the transport status instead of the body.
+		return fmt.Sprintf("HTTP %d", statusCode)
 	}
 
 	parts := make([]string, 0, 3)
@@ -555,6 +574,342 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 	}
 	parts = append(parts, message)
 	return security.SafeTruncate(security.SanitizeLog(strings.Join(parts, " · ")), 600)
+}
+
+var grokDownstreamResponseHeaders = map[string]struct{}{
+	"cache-control": {}, "content-language": {}, "content-type": {},
+	"retry-after": {}, "x-ratelimit-limit-requests": {},
+	"x-ratelimit-limit-tokens": {}, "x-ratelimit-remaining-requests": {},
+	"x-ratelimit-remaining-tokens": {}, "x-ratelimit-reset-requests": {},
+	"x-ratelimit-reset-tokens": {}, "x-request-id": {},
+}
+
+// copyGrokNativeResponseHeaders copies only end-to-end, non-sensitive provider
+// metadata. Authorization, Set-Cookie, model extra headers and process-local
+// route markers can therefore never leak to downstream clients.
+func copyGrokNativeResponseHeaders(c *gin.Context, header http.Header) {
+	if c == nil {
+		return
+	}
+	for name, values := range header {
+		if _, ok := grokDownstreamResponseHeaders[strings.ToLower(strings.TrimSpace(name))]; !ok {
+			continue
+		}
+		for _, value := range values {
+			if !strings.ContainsAny(value, "\r\n") {
+				c.Writer.Header().Add(name, value)
+			}
+		}
+	}
+}
+
+func grokNativeUsage(protocol GrokProtocol, payload []byte) *UsageInfo {
+	root := gjson.ParseBytes(payload)
+	if !root.Exists() {
+		return nil
+	}
+	switch auth.NormalizeGrokProtocol(string(protocol)) {
+	case GrokProtocolChatCompletions:
+		input := int(root.Get("usage.prompt_tokens").Int())
+		output := int(root.Get("usage.completion_tokens").Int())
+		reasoning := int(root.Get("usage.completion_tokens_details.reasoning_tokens").Int())
+		cached := int(root.Get("usage.prompt_tokens_details.cached_tokens").Int())
+		if !root.Get("usage").Exists() {
+			return nil
+		}
+		return newUsageInfo(input, output, reasoning, cached)
+	case GrokProtocolMessages:
+		// 非流式 body 与 message_delta 事件的 usage 在顶层；流式 message_start
+		// 事件的 input_tokens 在 message.usage 下。两处都认，交给 max 合并。
+		usage := root.Get("usage")
+		if !usage.Exists() {
+			usage = root.Get("message.usage")
+		}
+		if !usage.Exists() {
+			return nil
+		}
+		input := int(usage.Get("input_tokens").Int())
+		output := int(usage.Get("output_tokens").Int())
+		cached := int(usage.Get("cache_read_input_tokens").Int())
+		return newUsageInfo(input, output, 0, cached)
+	default:
+		// Responses 协议：非流式 body 的 usage 在顶层；流式 response.completed /
+		// response.incomplete 事件的 usage 在 response.usage 下。
+		usage := root.Get("usage")
+		if !usage.Exists() {
+			usage = root.Get("response.usage")
+		}
+		return extractUsageFromResult(usage)
+	}
+}
+
+func grokNativeTerminalEvent(protocol GrokProtocol, payload []byte) (terminal bool, failed bool) {
+	root := gjson.ParseBytes(payload)
+	switch auth.NormalizeGrokProtocol(string(protocol)) {
+	case GrokProtocolChatCompletions:
+		if root.Get("error").Exists() || root.Get("type").String() == "error" {
+			return true, true
+		}
+		// A finish_reason chunk is not the wire terminal: include_usage streams
+		// commonly send a separate usage-only chunk before the [DONE] sentinel.
+		// [DONE] is handled by the raw SSE frame reader.
+		return false, false
+	case GrokProtocolMessages:
+		switch root.Get("type").String() {
+		case "error":
+			return true, true
+		case "message_stop":
+			return true, false
+		}
+		return false, false
+	default:
+		switch root.Get("type").String() {
+		case "response.completed":
+			return true, false
+		case "response.failed", "error":
+			return true, true
+		}
+		return false, false
+	}
+}
+
+func grokNativeStreamFailure(protocol GrokProtocol, payload []byte) streamOutcome {
+	outcome := classifyResponseFailedOutcome(payload)
+	if outcome.failureMessage == "" || outcome.failureMessage == fmt.Sprintf("HTTP %d", outcome.logStatusCode) {
+		outcome.failureMessage = "Grok upstream stream failed"
+	}
+	return outcome
+}
+
+func writeGrokNativeStreamBreak(c *gin.Context, protocol GrokProtocol) error {
+	switch auth.NormalizeGrokProtocol(string(protocol)) {
+	case GrokProtocolChatCompletions:
+		payload := []byte(`{"error":{"message":"` + upstreamStreamBreakMessage +
+			`","type":"` + ErrorTypeUpstreamError + `","code":"` + ErrorCodeUpstreamStreamBreak + `"}}`)
+		_, err := fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
+		return err
+	case GrokProtocolMessages:
+		payload := []byte(`{"type":"error","error":{"type":"overloaded_error","message":"` +
+			upstreamStreamBreakMessage + ` (upstream_stream_break)"}}`)
+		_, err := fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
+		return err
+	default:
+		payload := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"` +
+			ErrorCodeUpstreamStreamBreak + `","message":"` + upstreamStreamBreakMessage + `"}}}`)
+		_, err := fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
+		return err
+	}
+}
+
+func safeGrokNativeHTTPStatus(status int) int {
+	if status < 400 || status > 599 || status == logStatusUpstreamStreamBreak || status == logStatusClientClosed {
+		return http.StatusBadGateway
+	}
+	return status
+}
+
+func (h *Handler) sendGrokNativeHTTPError(c *gin.Context, protocol GrokProtocol, outcome streamOutcome) {
+	if c == nil {
+		return
+	}
+	status := safeGrokNativeHTTPStatus(outcome.logStatusCode)
+	message := strings.TrimSpace(outcome.failureMessage)
+	if message == "" {
+		message = fmt.Sprintf("Upstream returned status %d", status)
+	}
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	if auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolMessages {
+		sendAnthropicError(c, status, mapHTTPStatusToAnthropicError(status), message)
+		return
+	}
+	code := fmt.Sprintf("upstream_%d", status)
+	if outcome.logStatusCode == logStatusUpstreamStreamBreak {
+		code = ErrorCodeUpstreamStreamBreak
+	}
+	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": ErrorTypeUpstreamError, "code": code}})
+}
+
+func mergeGrokNativeUsage(current, next *UsageInfo) *UsageInfo {
+	if next == nil {
+		return current
+	}
+	if current == nil {
+		copy := *next
+		return &copy
+	}
+	current.PromptTokens = max(current.PromptTokens, next.PromptTokens)
+	current.CompletionTokens = max(current.CompletionTokens, next.CompletionTokens)
+	current.InputTokens = max(current.InputTokens, next.InputTokens)
+	current.OutputTokens = max(current.OutputTokens, next.OutputTokens)
+	current.ReasoningTokens = max(current.ReasoningTokens, next.ReasoningTokens)
+	current.CachedTokens = max(current.CachedTokens, next.CachedTokens)
+	current.TotalTokens = max(current.TotalTokens, next.TotalTokens)
+	current.TotalTokens = max(current.TotalTokens, current.InputTokens+current.OutputTokens)
+	if current.CachedTokens > 0 {
+		details := &TokenDetails{CachedTokens: current.CachedTokens}
+		current.PromptTokensDetails = details
+		current.InputTokensDetails = details
+	}
+	return current
+}
+
+func grokNativeNonStreamFailure(protocol GrokProtocol, payload []byte) (streamOutcome, bool) {
+	if len(bytes.TrimSpace(payload)) == 0 || !gjson.ValidBytes(payload) {
+		return streamOutcome{
+			logStatusCode: logStatusUpstreamStreamBreak, failureKind: "transport",
+			failureMessage: "Grok upstream returned an invalid JSON response", penalize: true,
+		}, true
+	}
+	root := gjson.ParseBytes(payload)
+	failed := false
+	switch auth.NormalizeGrokProtocol(string(protocol)) {
+	case GrokProtocolChatCompletions, GrokProtocolMessages:
+		failed = root.Get("type").String() == "error" || (root.Get("error").Exists() && root.Get("error").Raw != "null")
+	default:
+		failed = root.Get("type").String() == "response.failed" || root.Get("status").String() == "failed" ||
+			(root.Get("error").Exists() && root.Get("error").Raw != "null")
+	}
+	if !failed {
+		return streamOutcome{}, false
+	}
+	return grokNativeStreamFailure(protocol, payload), true
+}
+
+// forwardGrokNativeResponse preserves a proven same-protocol upstream wire
+// response. Native SSE frames are forwarded byte-for-byte (including event,
+// id, retry, comments, multiline data, line endings, and [DONE]); their data
+// projection is inspected only for terminal state, usage, and the pre-output
+// retry boundary. firstTokenMs is measured from startedAt.
+func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func()) (*UsageInfo, streamOutcome, bool, int) {
+	copyGrokNativeResponseHeaders(c, resp.Header)
+	resp.Header.Del(grokNativeRouteHeader)
+	if !streaming {
+		body, err := readAllLimited(resp.Body, grokMaxDecodedBody)
+		if err != nil {
+			return nil, classifyStreamOutcome(nil, err, nil, false), false, 0
+		}
+		if failure, failed := grokNativeNonStreamFailure(protocol, body); failed {
+			return grokNativeUsage(protocol, body), failure, false, 0
+		}
+		usage := grokNativeUsage(protocol, body)
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		c.Data(resp.StatusCode, contentType, body)
+		return usage, streamOutcome{logStatusCode: http.StatusOK}, len(body) > 0, 0
+	}
+
+	if c.Writer.Header().Get("Content-Type") == "" {
+		c.Header("Content-Type", "text/event-stream")
+	}
+	if c.Writer.Header().Get("Cache-Control") == "" {
+		c.Header("Cache-Control", "no-cache")
+	}
+	c.Header("X-Accel-Buffering", "no")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return nil, streamOutcome{logStatusCode: http.StatusInternalServerError, failureKind: "server", failureMessage: "streaming not supported"}, false, 0
+	}
+	var usage *UsageInfo
+	var terminal, failed, wrote, visible bool
+	firstTokenMs := 0
+	var failure streamOutcome
+	var pending bytes.Buffer
+	writeErr := error(nil)
+	frameErr := error(nil)
+	readErr := readRawGrokSSEFrames(resp.Body, func(frame rawGrokSSEFrame) bool {
+		if frame.HasData && !frame.Done {
+			usage = mergeGrokNativeUsage(usage, grokNativeUsage(protocol, frame.Data))
+		}
+		isTerminal, isFailed := false, false
+		if frame.Done && auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolChatCompletions {
+			isTerminal = true
+		} else if frame.HasData && !frame.Done {
+			isTerminal, isFailed = grokNativeTerminalEvent(protocol, frame.Data)
+		}
+		if isTerminal {
+			terminal, failed = true, isFailed
+			if isFailed {
+				failure = grokNativeStreamFailure(protocol, frame.Data)
+			}
+		}
+		isVisible := frame.HasData && !frame.Done && grokNativeVisibleEvent(protocol, frame.Data)
+		// Preserve the pre-output retry window. Lifecycle/role-only frames are
+		// buffered until the first visible delta; a failure before then produces
+		// no downstream bytes and the handler may safely select another account.
+		if !visible && !isTerminal && !isVisible {
+			if pending.Len()+len(frame.Raw) > grokMaxNativeSSEPendingBytes {
+				frameErr = fmt.Errorf("Grok pre-output SSE exceeds %d bytes", grokMaxNativeSSEPendingBytes)
+				return false
+			}
+			pending.Write(frame.Raw)
+			return true
+		}
+		if isVisible && !visible {
+			visible = true
+			if firstVisible != nil {
+				firstVisible()
+			}
+			if !startedAt.IsZero() {
+				firstTokenMs = max(int(time.Since(startedAt).Milliseconds()), 1)
+			}
+		}
+		if isFailed && !visible && !wrote {
+			pending.Reset()
+			return false
+		}
+		if pending.Len() > 0 {
+			if _, err := c.Writer.Write(pending.Bytes()); err != nil {
+				writeErr = err
+				return false
+			}
+			wrote = true
+			pending.Reset()
+		}
+		if len(frame.Raw) > 0 {
+			if _, err := c.Writer.Write(frame.Raw); err != nil {
+				writeErr = err
+				return false
+			}
+			wrote = true
+		}
+		flusher.Flush()
+		return !isTerminal
+	})
+	if frameErr != nil {
+		readErr = frameErr
+	}
+	if failed {
+		return usage, failure, wrote, firstTokenMs
+	}
+	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, terminal)
+	if !terminal && wrote && c.Request.Context().Err() == nil && writeErr == nil {
+		_ = writeGrokNativeStreamBreak(c, protocol)
+		flusher.Flush()
+	}
+	return usage, outcome, wrote, firstTokenMs
+}
+
+func grokNativeVisibleEvent(protocol GrokProtocol, payload []byte) bool {
+	root := gjson.ParseBytes(payload)
+	switch auth.NormalizeGrokProtocol(string(protocol)) {
+	case GrokProtocolChatCompletions:
+		return root.Get("choices.0.delta.content").String() != "" ||
+			root.Get("choices.0.delta.reasoning_content").String() != "" ||
+			root.Get("choices.0.delta.tool_calls").IsArray()
+	case GrokProtocolMessages:
+		switch root.Get("type").String() {
+		case "content_block_delta":
+			return root.Get("delta.text").String() != "" || root.Get("delta.thinking").String() != "" ||
+				root.Get("delta.partial_json").String() != "" || root.Get("delta.signature").String() != ""
+		case "content_block_start":
+			return root.Get("content_block.type").String() == "tool_use"
+		}
+		return false
+	default:
+		return isFirstTokenResult(root)
+	}
 }
 
 func noAvailableAnthropicAccountMessage(model string) string {
@@ -744,6 +1099,12 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
+	// Grok usage belongs to the credential generation that actually dispatched
+	// this attempt. Resolve it from AccountID at the common sink so success,
+	// failure and transport-retry paths cannot accidentally omit it. A retry
+	// that switches accounts naturally resolves the replacement account here.
+	// Non-Grok and unresolved accounts deliberately remain legacy/unscoped (0).
+	h.populateUsageCredentialGeneration(input)
 	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
 	h.recordAPIKeyScopeUsage(input)
 	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
@@ -763,6 +1124,20 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 		input.SettlementAssignmentSource = owner.AssignmentSource
 	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
+}
+
+func (h *Handler) populateUsageCredentialGeneration(input *database.UsageLogInput) {
+	if input == nil || input.CredentialGeneration != 0 {
+		return
+	}
+	if h == nil || h.store == nil || input.AccountID <= 0 {
+		return
+	}
+	account := h.store.FindByID(input.AccountID)
+	if account == nil || !account.IsGrokAPI() {
+		return
+	}
+	input.CredentialGeneration = account.GetCredentialGeneration()
 }
 
 func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput) {
@@ -2176,7 +2551,8 @@ func isRetryableStatus(code int) bool {
 	return code == http.StatusServiceUnavailable ||
 		code == http.StatusUnauthorized ||
 		code == http.StatusInternalServerError ||
-		code == http.StatusForbidden
+		code == http.StatusForbidden ||
+		code == http.StatusUpgradeRequired
 }
 
 func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
@@ -2275,9 +2651,8 @@ func upstreamAccountErrorMessage(statusCode int, body []byte) string {
 	if message == "" {
 		message = strings.TrimSpace(gjson.GetBytes(body, "detail.message").String())
 	}
-	if message == "" {
-		message = strings.TrimSpace(string(body))
-	}
+	// Do not persist arbitrary HTML/plain-text bodies. Structured JSON fields
+	// above are bounded and sanitised; an unstructured body becomes status text.
 	if len(message) > 300 {
 		message = message[:300]
 	}
@@ -2302,14 +2677,24 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 		return "rate_limited"
 	case http.StatusUnauthorized:
 		return "unauthorized"
-	case http.StatusPaymentRequired, http.StatusForbidden:
+	case http.StatusPaymentRequired:
+		if IsDeactivatedWorkspaceError(body) {
+			return "deactivated_workspace"
+		}
+		if decision.Reason != "" {
+			return decision.Reason
+		}
+		return "payment_required_unknown"
+	case http.StatusForbidden:
 		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
 			return "agent_runtime_deleted"
 		}
 		if IsDeactivatedWorkspaceError(body) {
 			return "deactivated_workspace"
 		}
-		return "payment_required"
+		return "forbidden"
+	case http.StatusUpgradeRequired:
+		return "version_required"
 	case http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
 		return "server"
 	default:
@@ -2635,7 +3020,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftTimedOut := func() bool {
 				return ttftGuard != nil && ttftGuard.TimedOut()
 			}
-			upstreamEndpoint := relayUpstreamEndpointForAccount(account)
+			upstreamEndpoint := relayUpstreamEndpointForProtocol(account, GrokProtocolResponses, attemptEffectiveModel)
 			upstreamBody := getOpenAIResponsesBody()
 			var mappedBody []byte
 			var mappedModel string
@@ -2650,7 +3035,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -2786,6 +3171,48 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				return
+			}
+			if isGrokNativeRouteResponse(resp) {
+				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard)
+				totalDuration := int(time.Since(start).Milliseconds())
+				stopTTFTGuard()
+				resp.Body.Close()
+				if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+					h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					retryExclusions.MarkHard(account.ID())
+					continue
+				}
+				if !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil {
+					h.sendGrokNativeHTTPError(c, GrokProtocolResponses, outcome)
+				}
+				logInput := &database.UsageLogInput{
+					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
+					EffectiveModel: attemptLogEffectiveModel, StatusCode: outcome.logStatusCode,
+					DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+					InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint,
+					Stream: isStream, ViaWebsocket: false, AttemptIndex: attempt + 1,
+				}
+				if usage != nil {
+					logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
+					logInput.InputTokens, logInput.OutputTokens = usage.InputTokens, usage.OutputTokens
+					logInput.ReasoningTokens, logInput.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+				}
+				if outcome.logStatusCode != http.StatusOK {
+					logInput.UpstreamErrorKind = outcome.failureKind
+					logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				}
+				h.logUsageForRequest(c, logInput)
+				if outcome.penalize {
+					h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				} else if outcome.logStatusCode == http.StatusOK {
+					h.store.ClearModelCooldown(account, attemptEffectiveModel)
+					h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+				}
+				h.store.Release(account)
 				return
 			}
 
@@ -3263,7 +3690,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		SyncCodexUsageState(h.store, account, resp)
-
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
@@ -4083,7 +4509,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				log.Printf("OpenAI Responses compact 上游响应读取失败 (attempt %d): %v", attempt+1, readErr)
 				if shouldRetry {
 					lastStatusCode = http.StatusBadGateway
-					lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
+					lastBody = []byte(`{"error":{"message":"Failed to read upstream response","type":"upstream_error","code":"upstream_read_error"}}`)
 					continue
 				}
 				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
@@ -4143,7 +4569,19 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		// compact（会话压缩续写）刻意保留确定性 IsolateCodexSessionID、不走 resolveUpstreamSessionID
 		// 的默认隔离：压缩本身是对同一会话的延续，需要稳定的 prompt_cache_key 维持缓存连续性。
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionIdentity.upstreamSeed)
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		// compact_via_responses_enabled：上游已下线 /responses/compact 专用端点（404），
+		// 开启后官方账号改走 /responses + compaction_trigger 的 body-signal 形态
+		// （强制 HTTP SSE），成功后聚合回 compact 的一次性 JSON。
+		compactViaResponses := CurrentRuntimeSettings().CompactViaResponses
+		upstreamEndpointLabel := "/v1/responses/compact"
+		var resp *http.Response
+		var reqErr error
+		if compactViaResponses {
+			upstreamEndpointLabel = "/v1/responses"
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, appendCompactionTriggerToResponsesBody(codexBody), upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
+		} else {
+			resp, reqErr = ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -4214,7 +4652,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				DurationMs:             durationMs,
 				ReasoningEffort:        reasoningEffort,
 				InboundEndpoint:        "/v1/responses/compact",
-				UpstreamEndpoint:       "/v1/responses/compact",
+				UpstreamEndpoint:       upstreamEndpointLabel,
 				ServiceTier:            usageTiers.ServiceTier,
 				RequestedServiceTier:   usageTiers.RequestedServiceTier,
 				ActualServiceTier:      usageTiers.ActualServiceTier,
@@ -4239,8 +4677,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			return
 		}
 
-		// 成功：直接透传响应体
-		respBody, readErr := io.ReadAll(resp.Body)
+		// 成功：直接透传响应体（body-signal 兼容模式先把 SSE 聚合成一次性 JSON）
+		var respBody []byte
+		var readErr error
+		var compactFailedPayload []byte
+		if compactViaResponses {
+			respBody, compactFailedPayload, readErr = collectCompactResponsesSSE(resp.Body)
+		} else {
+			respBody, readErr = io.ReadAll(resp.Body)
+		}
 		resp.Body.Close()
 		if readErr != nil {
 			totalDuration := int(time.Since(start).Milliseconds())
@@ -4265,7 +4710,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				DurationMs:           totalDuration,
 				ReasoningEffort:      reasoningEffort,
 				InboundEndpoint:      "/v1/responses/compact",
-				UpstreamEndpoint:     "/v1/responses/compact",
+				UpstreamEndpoint:     upstreamEndpointLabel,
 				ServiceTier:          usageTiers.ServiceTier,
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
@@ -4278,10 +4723,87 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			log.Printf("compact 上游响应读取失败 (attempt %d): %v", attempt+1, readErr)
 			if shouldRetry {
 				lastStatusCode = http.StatusBadGateway
-				lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
+				lastBody = []byte(`{"error":{"message":"Failed to read upstream response","type":"upstream_error","code":"upstream_read_error"}}`)
 				continue
 			}
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+			return
+		}
+
+		// body-signal 兼容模式：SSE 内的 response.failed 终态按上游错误处理，
+		// 语义对齐传统 compact 链路的 HTTP 非 200 分支（含 encrypted_content 剥离重试）。
+		if compactViaResponses && len(compactFailedPayload) > 0 {
+			failStatus := responseFailedStatusCode(compactFailedPayload)
+			if isExplicitUpstreamCyberPolicy(compactFailedPayload) {
+				failStatus = http.StatusBadRequest
+			}
+			errBody := responseFailedErrorBody(compactFailedPayload)
+
+			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(failStatus, errBody) {
+				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+				if rawChanged || codexChanged {
+					invalidEncryptedContentRetried = true
+					if rawChanged {
+						rawBody = strippedRawBody
+						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+					}
+					if codexChanged {
+						codexBody = strippedCodexBody
+					}
+					log.Printf("compact(body-signal) 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
+			if kind := classifyHTTPFailure(failStatus); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			SyncCodexUsageState(h.store, account, resp)
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			excludeAccounts[account.ID()] = true
+
+			logUpstreamError("/v1/responses/compact", failStatus, logModel, account.ID(), errBody)
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: "http", StatusCode: failStatus, AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
+			decision := h.applyResponseFailedCooldown(account, compactFailedPayload, resp, effectiveModel)
+			shouldRetry := shouldRetryHTTPStatus(failStatus, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:              account.ID(),
+				Endpoint:               "/v1/responses/compact",
+				Model:                  logModel,
+				EffectiveModel:         logEffectiveModel,
+				StatusCode:             failStatus,
+				DurationMs:             durationMs,
+				ReasoningEffort:        reasoningEffort,
+				InboundEndpoint:        "/v1/responses/compact",
+				UpstreamEndpoint:       upstreamEndpointLabel,
+				ServiceTier:            usageTiers.ServiceTier,
+				RequestedServiceTier:   usageTiers.RequestedServiceTier,
+				ActualServiceTier:      usageTiers.ActualServiceTier,
+				BillingServiceTier:     usageTiers.BillingServiceTier,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKind(failStatus, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(failStatus, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
+			})
+
+			if shouldRetry {
+				lastStatusCode = failStatus
+				lastBody = errBody
+				if !h.waitBeforeRetry(c.Request.Context()) {
+					return
+				}
+				continue
+			}
+
+			h.sendFinalUpstreamError(c, failStatus, errBody)
 			return
 		}
 
@@ -4315,7 +4837,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			CachedTokens:         cachedTokens,
 			ReasoningEffort:      reasoningEffort,
 			InboundEndpoint:      "/v1/responses/compact",
-			UpstreamEndpoint:     "/v1/responses/compact",
+			UpstreamEndpoint:     upstreamEndpointLabel,
 			ServiceTier:          usageTiers.ServiceTier,
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
@@ -4498,7 +5020,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
+			upstreamEndpoint = relayUpstreamEndpointForProtocol(account, GrokProtocolChatCompletions, attemptEffectiveModel)
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -4546,7 +5068,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolChatCompletions, rawBody, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -4679,6 +5201,48 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		SyncCodexUsageState(h.store, account, resp)
+		if isGrokNativeRouteResponse(resp) {
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolChatCompletions, isStream, start, ttftGuard.Stop)
+			totalDuration := int(time.Since(start).Milliseconds())
+			ttftGuard.Stop()
+			resp.Body.Close()
+			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				continue
+			}
+			if !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil {
+				h.sendGrokNativeHTTPError(c, GrokProtocolChatCompletions, outcome)
+			}
+			logInput := &database.UsageLogInput{
+				AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel,
+				EffectiveModel: attemptLogEffectiveModel, StatusCode: outcome.logStatusCode,
+				DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+				InboundEndpoint: "/v1/chat/completions", UpstreamEndpoint: upstreamEndpoint,
+				Stream: isStream, ViaWebsocket: false, AttemptIndex: attempt + 1,
+			}
+			if usage != nil {
+				logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
+				logInput.InputTokens, logInput.OutputTokens = usage.InputTokens, usage.OutputTokens
+				logInput.ReasoningTokens, logInput.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+			}
+			if outcome.logStatusCode != http.StatusOK {
+				logInput.UpstreamErrorKind = outcome.failureKind
+				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+			}
+			h.logUsageForRequest(c, logInput)
+			if outcome.penalize {
+				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			} else if outcome.logStatusCode == http.StatusOK {
+				h.store.ClearModelCooldown(account, attemptEffectiveModel)
+				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			}
+			h.store.Release(account)
+			return
+		}
 
 		// 成功！翻译响应 + TTFT 跟踪
 		account.Mu().RLock()
@@ -4747,7 +5311,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						parsed = gjson.ParseBytes(data)
 					}
 				}
-				chunk, done := streamTranslator.TranslateParsed(parsed)
+				translation := streamTranslator.TranslateParsedResult(parsed)
+				chunk, done := translation.Chunk, translation.Terminal
 
 				ttftGuard.MarkProgress(eventType)
 				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
@@ -4798,6 +5363,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 				}
 				if !clientGone && done {
+					// response.failed is already represented by the translated stream
+					// error chunk above. [DONE] is a successful Chat Completions
+					// sentinel; appending it here would disguise a failed generation as
+					// a clean terminal response to downstream gateways.
+					if translation.Failed {
+						writeErr = streamWriter.Flush()
+						if writeErr != nil {
+							clientGone = true
+						} else {
+							wroteAnyBody = true
+						}
+						return false
+					}
 					if pendingFirstTokenChunks.Len() > 0 {
 						pendingFirstTokenChunks.WriteString("data: [DONE]\n\n")
 						writeErr = streamWriter.WriteBytes(pendingFirstTokenChunks.Bytes())
@@ -5059,15 +5637,17 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 
 	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
-		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
-		if chunk != nil {
-			if err := streamWriter.WriteSSEData(chunk); err != nil {
+		translation := TranslateStreamChunkResult(data, model, chunkID, created)
+		if translation.Chunk != nil {
+			if err := streamWriter.WriteSSEData(translation.Chunk); err != nil {
 				return false
 			}
 		}
-		if done {
-			if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
-				return false
+		if translation.Terminal {
+			if !translation.Failed {
+				if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
+					return false
+				}
 			}
 			_ = streamWriter.Flush()
 			return false
@@ -5836,9 +6416,13 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 		})
 		return
 	}
+	message := usageLogErrorMessage(statusCode, body)
+	if message == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
+		message = fmt.Sprintf("Upstream returned status %d", statusCode)
+	}
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
-			"message": fmt.Sprintf("上游返回错误 (status %d): %s", statusCode, string(body)),
+			"message": message,
 			"type":    "upstream_error",
 			"code":    fmt.Sprintf("upstream_%d", statusCode),
 		},
@@ -5935,14 +6519,21 @@ func (h *Handler) ListModels(c *gin.Context) {
 	if c != nil && c.Request != nil {
 		ctx = c.Request.Context()
 	}
+	// Authenticated routes always carry the complete APIKeyRow. Keep the
+	// historical global list only for direct/internal calls that bypass the
+	// middleware (including older embedders); a real key always gets an
+	// isolated, read-only account snapshot.
+	if row := apiKeyRowFromContext(c); row != nil {
+		api.SendList(c, "list", h.scopedModels(ctx, row))
+		return
+	}
 	modelIDs := h.supportedModelIDs(ctx)
 	models := make([]api.Model, 0, len(modelIDs))
-	now := time.Now().Unix()
 	for _, id := range modelIDs {
 		models = append(models, api.Model{
 			ID:      id,
 			Object:  "model",
-			Created: now,
+			Created: modelCompatibilityCreatedUnix,
 			OwnedBy: "openai",
 		})
 	}

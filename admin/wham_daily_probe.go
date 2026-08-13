@@ -48,6 +48,11 @@ const (
 	// 会随翻页/前端重试反复打来，同一账号在冷却内只回补一次。
 	whamDailyUsageBackfillCooldown = 2 * time.Minute
 
+	// whamDailyUsageBackfillFailureCooldown 是回补失败后的冷却。上游拉不到
+	//（401/网络/滞后）短时间内重试也不会好，按普通冷却每 2 分钟打一次只是
+	// 白白消耗上游配额；失败账号交给小时级探针兜底即可。
+	whamDailyUsageBackfillFailureCooldown = 15 * time.Minute
+
 	// whamDailyUsageKeepDays 是本地快照保留期。上游只有 7 天，本地留一年足够看趋势。
 	whamDailyUsageKeepDays = 365
 )
@@ -208,6 +213,9 @@ func (h *Handler) enqueueWhamDailyUsageBackfill(ids []int64) {
 		if last, ok := h.whamDailyBackfillLast[id]; ok && now.Sub(last) < whamDailyUsageBackfillCooldown {
 			continue
 		}
+		if failedAt, ok := h.whamDailyBackfillFailedAt[id]; ok && now.Sub(failedAt) < whamDailyUsageBackfillFailureCooldown {
+			continue
+		}
 		account := h.store.FindByID(id)
 		if !whamDailyUsageBackfillEligible(account) {
 			continue
@@ -242,6 +250,45 @@ func (h *Handler) finishWhamDailyUsageBackfill(id int64) {
 	h.whamDailyBackfillMu.Unlock()
 }
 
+// markWhamDailySynced 记录该账号至少成功同步过一次官方用量——即使上游返回
+// 空数据（官方统计有滞后，或账号确实没有官方客户端消耗）。page-stats 据此
+// 下发显式空态，前端停止转圈与重拉，也不再触发回补。进程内存即可：重启后
+// 最多多回补一次就重新标记。
+func (h *Handler) markWhamDailySynced(id int64) {
+	if h == nil || id <= 0 {
+		return
+	}
+	h.whamDailyBackfillMu.Lock()
+	if h.whamDailySyncedOnce == nil {
+		h.whamDailySyncedOnce = map[int64]struct{}{}
+	}
+	h.whamDailySyncedOnce[id] = struct{}{}
+	delete(h.whamDailyBackfillFailedAt, id)
+	h.whamDailyBackfillMu.Unlock()
+}
+
+func (h *Handler) whamDailySyncedOnceFor(id int64) bool {
+	if h == nil {
+		return false
+	}
+	h.whamDailyBackfillMu.Lock()
+	_, ok := h.whamDailySyncedOnce[id]
+	h.whamDailyBackfillMu.Unlock()
+	return ok
+}
+
+func (h *Handler) markWhamDailyBackfillFailed(id int64) {
+	if h == nil || id <= 0 {
+		return
+	}
+	h.whamDailyBackfillMu.Lock()
+	if h.whamDailyBackfillFailedAt == nil {
+		h.whamDailyBackfillFailedAt = map[int64]time.Time{}
+	}
+	h.whamDailyBackfillFailedAt[id] = time.Now()
+	h.whamDailyBackfillMu.Unlock()
+}
+
 func (h *Handler) runWhamDailyUsageBackfill(accounts []*auth.Account) {
 	sem := make(chan struct{}, whamDailyUsageProbeConcurrency)
 	var wg sync.WaitGroup
@@ -256,6 +303,7 @@ func (h *Handler) runWhamDailyUsageBackfill(accounts []*auth.Account) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if _, err := h.syncWhamDailyUsage(ctx, acc); err != nil {
+				h.markWhamDailyBackfillFailed(acc.DBID)
 				log.Printf("官方用量即时回补失败 account=%d: %v", acc.DBID, err)
 			}
 		}(account)

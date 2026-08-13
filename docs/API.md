@@ -1285,6 +1285,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -1321,6 +1322,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 500,
   "transport_retry_policy": "sticky",
+  "codex_fingerprint_default_mode": "session",
   "response_cache_local_max_bytes": 134217728,
   "response_cache_local_max_entry_bytes": 8388608,
   "response_cache_reconstruct_max_bytes": 134217728
@@ -1328,6 +1330,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 ```
 
 **响应:** 更新后的完整设置对象
+
+`codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
 Responses 上下文缓存字段使用原始字节数：
 
@@ -1390,11 +1394,11 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### DELETE /api/admin/proxies/:id
 
-删除代理。
+删除代理，并清空仍引用该 URL 的账号绑定。提交后立即从当前进程的运行时代理池剔除；若数据库快照重载失败，接口返回 HTTP `500` 和已完成的 `deleted` / `unbound` 数量，但不会把已删除代理重新投入调度。
 
 #### PATCH /api/admin/proxies/:id
 
-更新代理。
+更新代理。禁用会立刻从运行时代理池剔除该 URL，但保留账号上的 `proxy_url` 绑定——这些账号在重新启用前不会改走其它代理，也不会直连。修改 URL 时，仍指向旧 URL 的账号绑定会改写为新 URL。
 
 **请求:**
 
@@ -1407,7 +1411,7 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### POST /api/admin/proxies/batch-delete
 
-批量删除代理。
+批量删除代理，并解绑仍引用这些 URL 的账号。重载失败时的语义与单条删除相同。
 
 **请求:**
 

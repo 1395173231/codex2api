@@ -1901,6 +1901,21 @@ func TestUsageLogErrorMessageExtractsStructuredError(t *testing.T) {
 	}
 }
 
+func TestUsageLogAndClientErrorsOmitUnstructuredUpstreamBodies(t *testing.T) {
+	body := []byte(`<html><body>secret request-id and internal route</body></html>`)
+	if got := usageLogErrorMessage(http.StatusBadGateway, body); got != "HTTP 502" {
+		t.Fatalf("usageLogErrorMessage() = %q", got)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	(&Handler{}).sendUpstreamError(ctx, http.StatusBadGateway, body)
+	if strings.Contains(recorder.Body.String(), "secret request-id") || strings.Contains(recorder.Body.String(), "internal route") {
+		t.Fatalf("unstructured upstream body leaked to client: %s", recorder.Body.String())
+	}
+}
+
 func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -3082,6 +3097,19 @@ func TestAccountFilterForModelRespectsAccountModelWhitelist(t *testing.T) {
 	}
 	if !accountFilterForModel("")(restricted) {
 		t.Fatal("无模型信息的请求不应被白名单拦截")
+	}
+}
+
+func TestCodexOnlyTransportsExcludeGrokAccounts(t *testing.T) {
+	grok := &auth.Account{
+		DBID: 99, UpstreamType: auth.UpstreamGrok, AccessToken: "grok-at",
+		Models: []string{"gpt-5.6-sol", "grok-4.5"},
+	}
+	if accountFilterForModel("gpt-5.6-sol")(grok) {
+		t.Fatal("Responses WebSocket/Realtime Codex filter admitted a Grok account")
+	}
+	if accountFilterForCompactResponsesModelWithOriginal("grok-4.5", "grok-4.5", false)(grok) {
+		t.Fatal("Responses Compact filter admitted a Grok account")
 	}
 }
 

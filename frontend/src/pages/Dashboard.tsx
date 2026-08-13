@@ -380,7 +380,7 @@ export default function Dashboard() {
         </div>
 
         {/* Account status */}
-        <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-5 sm:gap-4">
+        <div className="mb-6 grid grid-cols-2 gap-2.5 sm:gap-4 md:grid-cols-3 xl:grid-cols-5">
           <StatCard icon={icons.total} iconClass="blue" label={t('dashboard.totalAccounts')} value={total} />
           <StatCard
             icon={icons.available}
@@ -395,7 +395,7 @@ export default function Dashboard() {
             value={rateLimited}
           />
           <StatCard icon={icons.error} iconClass="red" label={t('dashboard.error')} value={errorCount} />
-          <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
+          <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} className="col-span-2 min-[420px]:col-span-1 md:col-span-1" />
         </div>
 
         {/* Pool runway（可开关）+ system health */}

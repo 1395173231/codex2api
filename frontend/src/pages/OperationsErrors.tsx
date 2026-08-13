@@ -246,7 +246,7 @@ export default function OperationsErrors() {
         />
         <OpsTabs />
 
-        <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 sm:gap-4 lg:grid-cols-3 xl:grid-cols-6">
+        <div className="mb-6 grid grid-cols-2 gap-2.5 sm:gap-4 lg:grid-cols-3 xl:grid-cols-6">
           <StatTile
             label={t('opsErrors.totalErrors')}
             value={formatNumber(data.summary?.total_errors ?? 0)}
@@ -422,7 +422,56 @@ export default function OperationsErrors() {
               emptyTitle={t('opsErrors.emptyTitle')}
               emptyDescription={hasActiveFilters ? t('opsErrors.emptyFilteredDesc') : t('opsErrors.emptyDesc')}
             >
-              <div className="data-table-shell">
+              <div className="grid gap-3 lg:hidden">
+                {data.logs.map((log) => (
+                  <Card key={log.id} className="p-3.5 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                        <Badge variant="outline" className={`text-[12px] ${getStatusBadgeClassName(log.status_code)}`}>
+                          {log.status_code}
+                        </Badge>
+                        <Badge variant="outline" className="border-transparent bg-slate-500/10 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300 text-[12px]">
+                          {log.upstream_error_kind || classifyStatus(log.status_code)}
+                        </Badge>
+                        <Badge variant="outline" className="text-[12px] truncate max-w-[140px]">{log.model || '-'}</Badge>
+                      </div>
+                      <span className="shrink-0 font-geist-mono text-[11px] text-muted-foreground">
+                        {formatDuration(log.duration_ms)}
+                      </span>
+                    </div>
+
+                    <div className="text-xs space-y-1">
+                      <div className="font-geist-mono text-muted-foreground truncate" title={formatEndpoint(log)}>
+                        {formatEndpoint(log)}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+                        <span title={formatAccountTitle(log)}>{formatAccountLabel(log)}</span>
+                        {formatAPIKeyLabel(log) ? (
+                          <>
+                            <span>·</span>
+                            <span title={formatAPIKeyLabel(log)}>{formatAPIKeyLabel(log)}</span>
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    {log.error_message ? (
+                      <div className="rounded-lg bg-destructive/5 border border-destructive/20 p-2 text-xs text-destructive line-clamp-3 leading-relaxed">
+                        {log.error_message}
+                      </div>
+                    ) : null}
+
+                    <div className="flex items-center justify-between pt-1 border-t border-border/50 text-[11px] text-muted-foreground">
+                      <span>{formatBeijingTime(log.created_at)}</span>
+                      <Button variant="outline" size="xs" onClick={() => setSelectedLog(log)}>
+                        {t('opsErrors.details')}
+                      </Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+
+              <div className="data-table-shell hidden lg:block">
                 <Table>
                   <TableHeader>
                     <TableRow>

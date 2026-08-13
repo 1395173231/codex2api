@@ -821,27 +821,30 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
   return (
     <div className="mb-5 flex justify-center">
       <div
-        className="relative grid w-full max-w-[900px] rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg"
+        className="relative flex max-w-[900px] w-full items-center gap-1 overflow-x-auto rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:grid"
         style={{ gridTemplateColumns: `repeat(${tabCount}, minmax(0, 1fr))` }}
         role="tablist"
       >
         <div
-          className="pointer-events-none absolute left-1 top-1 h-[calc(100%-0.5rem)] rounded-xl border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out"
+          className="pointer-events-none absolute left-1 top-1 hidden h-[calc(100%-0.5rem)] rounded-xl border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out sm:block"
           style={{ width: `calc((100% - 0.5rem) / ${tabCount})`, transform: `translateX(${activeIndex * 100}%)` }}
         />
-        {tabs.map((tab) => (
-          <NavLink
-            key={tab.view}
-            to={tab.to}
-            role="tab"
-            aria-selected={activeView === tab.view}
-            className={`relative z-10 flex h-9 items-center justify-center rounded-xl px-2 text-sm font-semibold transition-colors sm:px-3 ${
-              activeView === tab.view ? 'text-primary' : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            {tab.label}
-          </NavLink>
-        ))}
+        {tabs.map((tab) => {
+          const active = activeView === tab.view
+          return (
+            <NavLink
+              key={tab.view}
+              to={tab.to}
+              role="tab"
+              aria-selected={active}
+              className={`relative z-10 flex h-9 shrink-0 items-center justify-center rounded-xl px-3 text-sm font-semibold transition-colors whitespace-nowrap ${
+                active ? 'text-primary max-sm:bg-primary/10 max-sm:border max-sm:border-primary/20' : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {tab.label}
+            </NavLink>
+          )
+        })}
       </div>
     </div>
   )
@@ -1803,7 +1806,8 @@ function IntelligenceView() {
             </div>
           </div>
           <div className="mb-3 text-xs text-muted-foreground">{t('promptFilter.intelligence.reviewCount', { count: candidateTotal })}</div>
-          <Table>
+          <div className="overflow-x-auto rounded-lg border border-border bg-card">
+            <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>{t('promptFilter.intelligence.ruleOrEvidence')}</TableHead>
@@ -1880,6 +1884,7 @@ function IntelligenceView() {
               {!candidateLoading && !candidates.length ? <TableRow><TableCell colSpan={6} className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noReviewCandidates')}</TableCell></TableRow> : null}
             </TableBody>
           </Table>
+          </div>
           <Pagination
             page={candidatePage}
             totalPages={Math.max(1, Math.ceil(candidateTotal / candidatePageSize))}
@@ -4545,7 +4550,7 @@ function RulesView({
             </div>
           </div>
 
-          <div className="rounded-lg border border-border">
+          <div className="overflow-x-auto rounded-lg border border-border">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -4613,7 +4618,7 @@ function RulesView({
             </Button>
           </div>
 
-          <div className="rounded-lg border border-border">
+          <div className="overflow-x-auto rounded-lg border border-border">
             <Table>
               <TableHeader>
                 <TableRow>

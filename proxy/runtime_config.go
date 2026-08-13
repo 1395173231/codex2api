@@ -80,6 +80,10 @@ type RuntimeSettings struct {
 	// OverflowAutoCompact 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）。
 	// 全局开关与 per-key limits.auto_compact_overflow 为「或」关系。
 	OverflowAutoCompact bool
+	// CompactViaResponses 把 /v1/responses/compact 对官方 Codex OAuth 账号的透传
+	// 改写为 /responses + compaction_trigger 的 body-signal 形态并聚合为一次性 JSON
+	// （上游已下线专用 compact 端点，默认 false）。中转账号不受影响。
+	CompactViaResponses bool
 	// CodexPreflightSSEPassthrough 将前置元数据事件（codex.rate_limits /
 	// codex.response.metadata / response.metadata）立即透传下游而不缓冲到首个内容
 	// 事件（旧版兼容，默认 false，issue #425）。开启后首内容前会提前提交 200，
@@ -301,6 +305,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
 		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
 		next.OverflowAutoCompact = settings.OverflowAutoCompactEnabled
+		next.CompactViaResponses = settings.CompactViaResponsesEnabled
 		next.CodexPreflightSSEPassthrough = settings.CodexPreflightSSEPassthroughEnabled
 		next.FirstTokenExcludesWsAcquire = settings.FirstTokenExcludesWsAcquire
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled

@@ -63,18 +63,33 @@ func TestRelayAccountSupportsModelHonoursAuthKind(t *testing.T) {
 	}
 }
 
-// TestRelayAccountSupportsModelRespectsDeclaredWhitelist 账号显式声明 models 后
-// 以白名单为准，默认集不再介入。
+// TestRelayAccountSupportsModelRespectsDeclaredWhitelist 账号显式声明 models 只
+// 能收窄真实目录，不能凭配置把 OAuth 默认目录之外的模型发明出来。
 func TestRelayAccountSupportsModelRespectsDeclaredWhitelist(t *testing.T) {
 	declared := &auth.Account{
 		UpstreamType: auth.UpstreamGrok,
 		RefreshToken: "rt",
 		Models:       []string{"grok-3"},
 	}
-	if !relayAccountSupportsModel(declared, "grok-3") {
-		t.Fatalf("声明了 grok-3 应被放行")
+	if relayAccountSupportsModel(declared, "grok-3") {
+		t.Fatalf("OAuth 无目录时不能仅凭声明放行 grok-3")
 	}
 	if relayAccountSupportsModel(declared, "grok-4.5") {
 		t.Fatalf("声明白名单后不应再补默认集放行 grok-4.5")
+	}
+	declared.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-3", APIBackend: auth.GrokProtocolResponses}}})
+	if !relayAccountSupportsModel(declared, "grok-3") {
+		t.Fatalf("目录与声明同时命中时应放行 grok-3")
+	}
+}
+
+func TestGrokChannelSupportsModelUsesCatalogBeforeDefaults(t *testing.T) {
+	account := &auth.Account{UpstreamType: auth.UpstreamGrok, RefreshToken: "rt"}
+	account.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-catalog-only", APIBackend: auth.GrokProtocolResponses}}})
+	if !account.GrokChannelSupportsModel("grok-catalog-only") {
+		t.Fatal("catalog model should be routable")
+	}
+	if account.GrokChannelSupportsModel("grok-4.5") {
+		t.Fatal("non-empty catalog must replace conservative default set")
 	}
 }

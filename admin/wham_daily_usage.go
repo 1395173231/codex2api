@@ -213,5 +213,8 @@ func (h *Handler) syncWhamDailyUsage(ctx context.Context, account *auth.Account)
 		}
 		written++
 	}
+	// 空数据也算同步成功：上游窗口内确实没有记录（官方统计滞后或无官方
+	// 消耗），必须记住这次成功，否则该账号会被 page-stats 永远当作缺失。
+	h.markWhamDailySynced(account.DBID)
 	return written, nil
 }

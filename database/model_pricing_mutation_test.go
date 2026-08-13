@@ -62,3 +62,34 @@ func TestMutateModelPricingSettingsSerializesReadMergeWrite(t *testing.T) {
 		t.Fatalf("serialized mutations lost data: %+v", overrides)
 	}
 }
+
+func TestMutateModelPricingSettingsFailsClosedOnCorruptJSON(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "pricing-corrupt.db"))
+	if err != nil {
+		t.Fatalf("New sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	if err := db.UpdateModelPricingSettings(ctx, `{"gpt-keep":{"source":"custom","input":9}}`, ""); err != nil {
+		t.Fatalf("seed pricing JSON: %v", err)
+	}
+	const corrupt = `{"gpt-keep":{"source":"custom","input":9}`
+	if _, err := db.conn.ExecContext(ctx, `UPDATE system_settings SET model_pricing_overrides = $1 WHERE id = 1`, corrupt); err != nil {
+		t.Fatalf("inject corrupt JSON: %v", err)
+	}
+	_, err = db.MutateModelPricingSettings(ctx, nil, func(current map[string]ModelPricingOverride) error {
+		current["gpt-new"] = ModelPricingOverride{Source: ModelPricingSourceSynced, Input: 1}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected corrupt pricing JSON to fail closed")
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if settings == nil || settings.ModelPricingOverrides != corrupt {
+		t.Fatalf("corrupt blob was rewritten: %q", settings.ModelPricingOverrides)
+	}
+}

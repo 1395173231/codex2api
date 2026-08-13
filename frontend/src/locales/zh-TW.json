@@ -16,6 +16,10 @@
     }
   },
   "accounts": {
+    "todayStats": "今日統計",
+    "todayStatsHint": "今日(0 點起)經由本閘道的請求數、Token 與成本",
+    "todayNoUsage": "無使用",
+    "todayReqUnit": "次",
     "modelCooldownPolicy": "模型冷卻策略",
     "clearAllModelCooldowns": "清除全部",
     "modelCooldownEffective": "目前生效：{{mode}} · {{seconds}} 秒 · 退避{{backoff}}",

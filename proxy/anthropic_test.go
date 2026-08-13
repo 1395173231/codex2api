@@ -45,6 +45,95 @@ func TestSendAnthropicStreamErrorEscapesJSON(t *testing.T) {
 	}
 }
 
+func TestTranslateAnthropicRejectsOrphanToolResult(t *testing.T) {
+	raw := []byte(`{"model":"grok-4.5","max_tokens":1,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_missing","content":"result"}]}]}`)
+	_, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"grok-4.5"})
+	if err == nil || !strings.Contains(err.Error(), "orphan tool_result") {
+		t.Fatalf("orphan tool_result error = %v", err)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokPreservesControls(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.5",
+		"max_tokens":321,
+		"messages":[{"role":"user","content":"hello"}],
+		"temperature":0.4,
+		"top_p":0.75,
+		"stop_sequences":["END","DONE"],
+		"tools":[{"name":"lookup","input_schema":{"type":"object","uniqueItems":true}}],
+		"tool_choice":{"type":"tool","name":"lookup"},
+		"output_config":{
+			"effort":"high",
+			"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"}},"uniqueItems":true}}
+		}
+	}`)
+	got, originalModel, err := TranslateAnthropicToResponsesForGrok(raw, "", []string{"grok-4.5"})
+	if err != nil {
+		t.Fatalf("TranslateAnthropicToResponsesForGrok: %v", err)
+	}
+	if originalModel != "grok-4.5" {
+		t.Fatalf("original model = %q", originalModel)
+	}
+	checks := map[string]string{
+		"model":             "grok-4.5",
+		"max_output_tokens": "321",
+		"temperature":       "0.4",
+		"top_p":             "0.75",
+		"stop.0":            "END",
+		"stop.1":            "DONE",
+		"tool_choice.type":  "function",
+		"tool_choice.name":  "lookup",
+		"text.format.type":  "json_schema",
+		"text.format.name":  "structured_output",
+		"reasoning.effort":  "high",
+	}
+	for path, want := range checks {
+		if value := gjson.GetBytes(got, path); value.String() != want {
+			t.Fatalf("%s = %q, want %q; body=%s", path, value.String(), want, got)
+		}
+	}
+	if !gjson.GetBytes(got, "text.format.schema.uniqueItems").Bool() {
+		t.Fatalf("Messages output_config schema was not preserved; body=%s", got)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokAcceptsNestedJSONSchemaFormat(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.5",
+		"messages":[{"role":"user","content":"hello"}],
+		"output_config":{"format":{"type":"json_schema","json_schema":{"name":"answer","strict":false,"schema":{"type":"object"}}}}
+	}`)
+	got, _, err := TranslateAnthropicToResponsesForGrok(raw, "", []string{"grok-4.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "text.format.name").String() != "answer" || gjson.GetBytes(got, "text.format.strict").Bool() {
+		t.Fatalf("nested JSON schema metadata not preserved; body=%s", got)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokRejectsTopK(t *testing.T) {
+	raw := []byte(`{"model":"grok-4.5","max_tokens":1,"top_k":40,"messages":[{"role":"user","content":"hello"}]}`)
+	_, _, err := TranslateAnthropicToResponsesForGrok(raw, "", []string{"grok-4.5"})
+	if err == nil || !strings.Contains(err.Error(), "top_k cannot be represented by Responses") {
+		t.Fatalf("top_k error = %v", err)
+	}
+}
+
+func TestTranslateAnthropicToCodexRemainsCodexSafeWhenControlsPresent(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","max_tokens":11,"temperature":0.4,"top_p":0.75,"stop_sequences":["END"],"messages":[{"role":"user","content":"hello"}]}`)
+	got, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "stop"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("Codex converter unexpectedly retained %s; body=%s", field, got)
+		}
+	}
+}
+
 func TestAnthropicStreamErrorCarriesPolicyDetails(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -452,6 +541,9 @@ func TestTranslateAnthropicToCodexBridgesToolResultImage(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-sonnet-4-5",
 		"messages":[{
+			"role":"assistant",
+			"content":[{"type":"tool_use","id":"toolu_img","name":"capture_screenshot","input":{}}]
+		},{
 			"role":"user",
 			"content":[{
 				"type":"tool_result",
@@ -493,6 +585,9 @@ func TestTranslateAnthropicToCodexImageOnlyToolResultUsesMarker(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-sonnet-4-5",
 		"messages":[{
+			"role":"assistant",
+			"content":[{"type":"tool_use","id":"toolu_img","name":"capture_screenshot","input":{}}]
+		},{
 			"role":"user",
 			"content":[{
 				"type":"tool_result",
@@ -516,6 +611,9 @@ func TestTranslateAnthropicToCodexTextOnlyToolResultNoSyntheticMessage(t *testin
 	raw := []byte(`{
 		"model":"claude-sonnet-4-5",
 		"messages":[{
+			"role":"assistant",
+			"content":[{"type":"tool_use","id":"toolu_txt","name":"read_output","input":{}}]
+		},{
 			"role":"user",
 			"content":[{
 				"type":"tool_result",

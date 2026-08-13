@@ -1617,7 +1617,7 @@ function PayloadRulesDocsView() {
             </div>
             <div className="mt-1 text-sm font-semibold text-foreground">{t('payloadRules.docs.tocHint')}</div>
           </div>
-          <nav className="max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
+          <nav className="max-h-[180px] xl:max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
             {groups.map((group) => (
               <div key={group.id}>
                 <div className="mb-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">

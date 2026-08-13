@@ -493,7 +493,7 @@ export default function ModelPricing() {
       >
         <div className="space-y-5 sm:space-y-6">
           {/* Source metrics */}
-          <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
+          <div className="grid grid-cols-2 gap-2.5 sm:gap-4 xl:grid-cols-4">
             <StatTile
               label={t('settings.pricing.statTotal')}
               value={counts.total}

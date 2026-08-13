@@ -130,6 +130,153 @@ func TestGetAccountPageStatsBackfillsMissingOfficialUsage(t *testing.T) {
 	}
 }
 
+// 上游同步成功但窗口内没有数据(官方统计滞后/账号没有官方消耗)时,
+// page-stats 必须下发显式空态并停止回补,而不是让前端永远当"还在加载"。
+func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
+		"refresh_token": "rt",
+		"access_token":  "at",
+		"email":         "codex@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+
+	var mu sync.Mutex
+	calls := 0
+	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return &proxy.WhamDailyUsageResponse{}, nil, nil
+	}
+
+	key := strconv.FormatInt(id, 10)
+	first := invokeAccountPageStats(t, handler, []int64{id})
+	if first[key].OfficialUSD7d != nil || first[key].OfficialUsageSynced {
+		t.Fatalf("first page-stats = %+v, want plain missing before sync", first[key])
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !handler.whamDailySyncedOnceFor(id) {
+		if time.Now().After(deadline) {
+			t.Fatal("empty upstream sync did not mark the account as synced")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	second := invokeAccountPageStats(t, handler, []int64{id})
+	item := second[key]
+	if item.OfficialUSD7d != nil {
+		t.Fatalf("official_usd_7d = %v, want omitted for empty upstream data", *item.OfficialUSD7d)
+	}
+	if !item.OfficialUsageSynced {
+		t.Fatal("official_usage_synced missing: frontend would keep spinning and re-polling")
+	}
+
+	// 再打一次不允许触发新的回补:已同步的账号不进 missing 列表。
+	invokeAccountPageStats(t, handler, []int64{id})
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want exactly 1", calls)
+	}
+}
+
+// 回补失败后要按失败冷却退避,而不是每过 2 分钟的普通冷却就再打一次上游。
+func TestWhamDailyBackfillFailureCooldownSkipsRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
+		"refresh_token": "rt",
+		"access_token":  "at",
+		"email":         "codex@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+
+	var mu sync.Mutex
+	calls := 0
+	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return nil, nil, errWhamDailyUsageUnavailable
+	}
+
+	invokeAccountPageStats(t, handler, []int64{id})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		handler.whamDailyBackfillMu.Lock()
+		_, failed := handler.whamDailyBackfillFailedAt[id]
+		handler.whamDailyBackfillMu.Unlock()
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backfill failure was not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 越过普通 2 分钟冷却,只留失败冷却:不允许再打上游。
+	handler.whamDailyBackfillMu.Lock()
+	delete(handler.whamDailyBackfillLast, id)
+	handler.whamDailyBackfillMu.Unlock()
+	invokeAccountPageStats(t, handler, []int64{id})
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	if calls != 1 {
+		mu.Unlock()
+		t.Fatalf("upstream calls = %d, want 1 while failure cooldown active", calls)
+	}
+	mu.Unlock()
+
+	// 失败冷却过期后允许重试。
+	handler.whamDailyBackfillMu.Lock()
+	handler.whamDailyBackfillFailedAt[id] = time.Now().Add(-whamDailyUsageBackfillFailureCooldown - time.Minute)
+	delete(handler.whamDailyBackfillLast, id)
+	handler.whamDailyBackfillMu.Unlock()
+	invokeAccountPageStats(t, handler, []int64{id})
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		done := calls >= 2
+		mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired failure cooldown did not allow a retry")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestGetAccountPageStatsSkipsOfficialBackfillWhenSnapshotExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)

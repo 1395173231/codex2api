@@ -1166,7 +1166,7 @@ export default function APIKeys() {
           {activeTab === "keys" && (
             <>
               <div className="toolbar-surface flex flex-col gap-2.5">
-                <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                   <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
                     {t("apiKeys.filter")}
                   </span>
@@ -1218,8 +1218,8 @@ export default function APIKeys() {
                     </button>
                   ))}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="relative min-w-0 flex-1 sm:max-w-sm">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
+                  <div className="relative w-full min-w-0 flex-1 sm:max-w-sm">
                     <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       value={searchQuery}
@@ -1230,9 +1230,10 @@ export default function APIKeys() {
                       className="h-8 pl-8 text-[13px]"
                     />
                   </div>
-                  <div className="flex min-w-[10.5rem] items-center gap-1.5">
+                  <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:min-w-[10.5rem]">
                     <ArrowUpDown className="size-3.5 shrink-0 text-muted-foreground" />
                     <Select
+                      className="w-full min-w-0"
                       value={sortMode}
                       onValueChange={(value) =>
                         setSortMode(value as SortMode)
@@ -3469,6 +3470,14 @@ const PLAN_FILTER_OPTIONS = [
   "team",
   "k12",
   "go",
+  "api",
+  "supergrok",
+  "x_basic",
+  "x_premium",
+  "x_premium_plus",
+  "supergrok_heavy",
+  "supergrok_lite",
+  "supergrok_plus",
 ] as const;
 
 // PlanMultiSelect 让 API Key 选择只调度哪些账号套餐。空表示不限套餐。

@@ -177,6 +177,8 @@ export interface AccountRow {
   dispatch_count_limited?: boolean
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
+  // 今日(服务器时区当天 0 点起)网关侧聚合,由 page-stats 补齐。
+  usage_today_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
@@ -188,6 +190,9 @@ export interface AccountRow {
   // 官方结算口径的近 7 天成本(美元)。来自 account_daily_usage 快照,与
   // billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
   official_usd_7d?: number
+  // 官方快照已成功同步过但上游窗口内没有数据(官方统计有滞后)。
+  // 有这个标记时不再重拉 page-stats,胶囊显示静态"暂无数据"而非转圈。
+  official_usage_synced?: boolean
   cooldown_until?: ISODateString
   cooldown_reason?: string
   model_cooldowns?: Array<{
@@ -264,13 +269,19 @@ export interface AccountsPageResponse extends AccountsResponse {
 export interface AccountPageStatsItem {
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
+  usage_today_detail?: AccountUsageWindow
   billed_5h?: number
   billed_7d?: number
   official_usd_7d?: number
+  official_usage_synced?: boolean
 }
 
 export interface AccountPageStatsResponse {
   stats: Record<string, AccountPageStatsItem>
+}
+
+export interface AccountLiveStateResponse {
+  accounts: Record<string, { active_requests: number }>
 }
 
 export interface AccountsPageParams {
@@ -636,6 +647,120 @@ export type UpdateGrokAccountRequest = AddGrokAccountRequest
 
 export interface FetchGrokModelsResponse {
   models: string[]
+}
+
+export type GrokFactKind = 'user' | 'settings' | 'billing' | 'auto_topup'
+export type GrokProtocol = 'responses' | 'chat_completions' | 'messages'
+
+/** A sanitized control-plane observation. Token material is never included. */
+export interface GrokAccountFact {
+  account_id: number
+  kind: GrokFactKind | string
+  status: string
+  http_status?: number
+  payload?: Record<string, unknown> | null
+  field_presence?: Record<string, string>
+  credential_generation: number
+  source?: string
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokAccountIdentitySummary {
+  credential_family_id: string
+  archive_plan?: string
+  archive_plan_source?: string
+  jwt_tier?: string
+  jwt_tier_trust?: string
+}
+
+export interface GrokModelCatalogSnapshot {
+  account_id: number
+  origin: string
+  credential_generation: number
+  auth_kind?: string
+  status: string
+  http_etag?: string
+  etag_hint?: string
+  etag_hint_observed_at?: ISODateString
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokModelCatalogItem {
+  account_id: number
+  origin: string
+  model_id: string
+  display_name?: string
+  description?: string
+  base_url?: string
+  api_base_url?: string
+  api_backend?: GrokProtocol | string
+  context_window?: number
+  max_output_tokens?: number
+  reasoning?: boolean | null
+  backend_search?: boolean | null
+  stream_tool_calls?: boolean | null
+  supported_in_api?: boolean | null
+  hidden?: boolean | null
+  first_seen_at?: ISODateString
+  observed_at?: ISODateString
+}
+
+export interface GrokModelCatalog {
+  snapshot: GrokModelCatalogSnapshot
+  items: GrokModelCatalogItem[]
+}
+
+export interface GrokModelCapability {
+  account_id: number
+  model_id: string
+  origin: string
+  protocol: GrokProtocol | string
+  credential_generation: number
+  status: string
+  http_status?: number
+  provider_code?: string
+  source?: string
+  retry_after_seconds?: number | null
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokAccountState {
+  account_id: number
+  credential_generation: number
+  identity?: GrokAccountIdentitySummary | null
+  facts: Record<string, GrokAccountFact>
+  catalogs: GrokModelCatalog[]
+  capabilities: GrokModelCapability[]
+}
+
+export interface GrokStateSyncResponse {
+  message: string
+  state: GrokAccountState
+  models: string[]
+  synced_facts?: string[]
+  errors?: Record<string, string>
+}
+
+export interface GrokCapabilityProbeResult {
+  model_id: string
+  protocol: GrokProtocol | string
+  status: string
+  http_status?: number
+  provider_code?: string
+  retry_after_seconds?: number | null
+  observed_at?: ISODateString
+}
+
+export interface GrokCapabilityProbeResponse {
+  message: string
+  state: GrokAccountState
+  results: GrokCapabilityProbeResult[]
 }
 
 // Grok Device Code OAuth（与 CLIProxyAPI / Grok CLI 一致）。
@@ -1210,6 +1335,7 @@ export interface SystemSettings {
   codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
+  compact_via_responses_enabled: boolean
   codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
   utls_shutdown_timeout_minutes: number
@@ -1229,6 +1355,8 @@ export interface SystemSettings {
   max_rate_limit_retries: number
   retry_interval_ms: number
   transport_retry_policy: string
+  /** 新导入/新建 Codex 账号默认盖上的设备指纹收敛档位（off/device/session/full）。 */
+  codex_fingerprint_default_mode: string
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -2171,16 +2299,6 @@ export interface ModelSyncResponse {
   items: ModelInfo[]
   last_synced_at: string
   source_url: string
-	grok?: {
-		total: number
-		updated: number
-		unchanged: number
-		failed: number
-		models: string[]
-		errors?: Array<{ account_id: number; error: string }>
-	}
-	official_pricing?: OfficialPricingSyncResult
-	pricing_error?: string
 }
 
 export interface CPAExportEntry {

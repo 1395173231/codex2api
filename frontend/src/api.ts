@@ -22,6 +22,9 @@ import type {
   GrokSSOImportResponse,
   GrokBatchImportRequest,
   GrokBatchImportResponse,
+  GrokAccountState,
+  GrokStateSyncResponse,
+  GrokCapabilityProbeResponse,
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
@@ -33,6 +36,7 @@ import type {
   AccountsPageParams,
   AccountsPageResponse,
   AccountPageStatsResponse,
+  AccountLiveStateResponse,
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
@@ -577,6 +581,10 @@ export const api = {
     const query = new URLSearchParams({ ids: ids.join(',') })
     return request<AccountPageStatsResponse>(`/accounts/page-stats?${query}`, { signal })
   },
+  getAccountLiveState: (ids: number[], signal?: AbortSignal) => {
+    const query = new URLSearchParams({ ids: ids.join(',') })
+    return request<AccountLiveStateResponse>(`/accounts/live?${query}`, { signal })
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
@@ -622,6 +630,18 @@ export const api = {
     }),
   updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getGrokAccountState: (id: number, signal?: AbortSignal) =>
+    request<GrokAccountState>(`/accounts/${id}/grok/state`, { signal }),
+  syncGrokAccountState: (id: number) =>
+    request<GrokStateSyncResponse>(`/accounts/${id}/grok/sync`, {
+      method: 'POST',
+      timeoutMs: 120_000,
+    }),
+  probeGrokAccountCapabilities: (id: number) =>
+    request<GrokCapabilityProbeResponse>(`/accounts/${id}/grok/capabilities/probe`, {
+      method: 'POST',
+      timeoutMs: 180_000,
+    }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   updateAccountNote: (id: number, note: string) =>
@@ -1185,12 +1205,7 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
-  syncModels: (options?: { sync_grok?: boolean; sync_official_pricing?: boolean }) =>
-		request<ModelSyncResponse>('/models/sync', {
-			method: 'POST',
-			body: JSON.stringify(options ?? {}),
-			timeoutMs: 95000,
-		}),
+  syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
   syncCodexCLIVersion: () =>
     request<{
       fetched_version: string

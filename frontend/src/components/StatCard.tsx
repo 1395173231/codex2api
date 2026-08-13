@@ -27,24 +27,24 @@ export default function StatCard({ icon, iconClass, label, value, sub, className
         className,
       )}
     >
-      <CardContent className="relative flex flex-col justify-between gap-2 p-4 sm:p-5">
-        <div className="flex items-center justify-between gap-3">
+      <CardContent className="relative flex flex-col justify-between gap-1.5 p-3.5 sm:p-5">
+        <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <label className="block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/90">
+            <label className="block truncate text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/90 sm:text-[11px]">
               {label}
             </label>
-            <div className="mt-2 text-[26px] font-extrabold leading-none tabular-nums tracking-tight text-foreground sm:text-[28px]">
+            <div className="mt-1 text-[22px] font-extrabold leading-none tabular-nums tracking-tight text-foreground sm:mt-2 sm:text-[28px]">
               {value}
             </div>
           </div>
           <div
             className={cn(
-              'flex size-10.5 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset transition-transform duration-200 group-hover:scale-105 sm:size-11.5',
+              'flex size-9 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset transition-transform duration-200 group-hover:scale-105 sm:size-11.5',
               iconColors[iconClass] || iconColors.purple,
             )}
             aria-hidden="true"
           >
-            <span className="[&_svg]:size-[20px]">{icon}</span>
+            <span className="[&_svg]:size-[18px] sm:[&_svg]:size-[20px]">{icon}</span>
           </div>
         </div>
         {sub ? (

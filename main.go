@@ -33,6 +33,11 @@ import (
 //go:embed frontend/dist/*
 var frontendFS embed.FS
 
+func migrateOnlyEnabled() bool {
+	value := strings.TrimSpace(os.Getenv("CODEX_MIGRATE_ONLY"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -50,6 +55,10 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if migrateOnlyEnabled() {
+		log.Println("数据库迁移完成，CODEX_MIGRATE_ONLY 已启用，进程退出")
+		return
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)

@@ -1005,13 +1005,21 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
       ? t('usage.userAgentOverridden')
       : t('usage.userAgentPreserved')
 
+  if (!hasAudit) {
+    return (
+      <div className="font-mono text-[11px] text-muted-foreground" title={t('usage.userAgentNotRecorded')}>
+        UA: -
+      </div>
+    )
+  }
+
   const content = (
     <div className={`${mobile ? 'w-full' : 'w-[260px] max-w-[28vw]'} space-y-1 font-mono text-[11px] leading-relaxed`}>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5" title={t('usage.clientUserAgent')}>
         <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">C</span>
         <span className="min-w-0 truncate text-foreground/80">{clientUserAgent || '-'}</span>
       </div>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5" title={t('usage.upstreamUserAgent')}>
         <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">U</span>
         <span className="min-w-0 truncate text-foreground/80">{upstreamLabel}</span>
         {hasAudit ? (
@@ -1655,7 +1663,7 @@ function ColumnSettingsDropdown({
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 z-20 mt-2 w-56 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-lg"
+          className="absolute right-0 z-20 mt-2 w-56 max-w-[calc(100vw-2.5rem)] rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-lg"
         >
           <div className="mb-1 px-2 py-1 text-[11px] font-semibold uppercase text-muted-foreground">
             {t('accounts.columnSettings', { defaultValue: 'Columns' })}
@@ -2011,7 +2019,7 @@ export default function Usage() {
 
         <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
-        <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid grid-cols-2 gap-2.5 sm:gap-3 md:grid-cols-3 xl:grid-cols-6">
           <Card className="min-w-0 py-0">
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
@@ -2116,7 +2124,7 @@ export default function Usage() {
 
         {showAnalysis && (
           <>
-            <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
               <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
@@ -2314,7 +2322,7 @@ export default function Usage() {
                 </div>
 
                 <Select
-                  className="w-40 shrink-0"
+                  className="w-full min-w-0 sm:w-40 shrink-0"
                   compact
                   value={filterModel}
                   onValueChange={(value) => { setFilterModel(value); setPage(1) }}
@@ -2327,7 +2335,7 @@ export default function Usage() {
 
                 {showAPIKeyFilter ? (
                   <Select
-                    className="w-52 shrink-0"
+                    className="w-full min-w-0 sm:w-52 shrink-0"
                     compact
                     value={filterApiKeyId}
                     onValueChange={(value) => { setFilterApiKeyId(value); setPage(1) }}
@@ -2341,7 +2349,7 @@ export default function Usage() {
                   onClick={() => setShowAdvancedFilters((current) => !current)}
                   aria-expanded={showAdvancedFilters}
                   className={cn(
-                    'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors',
+                    'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors max-sm:w-full',
                     showAdvancedFilters || advancedFilterCount > 0
                       ? 'border-primary/30 bg-primary/8 text-primary'
                       : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground',
@@ -2489,6 +2497,8 @@ export default function Usage() {
               <TooltipProvider>
               <div className="grid gap-3 lg:hidden">
                 {logs.map((log: UsageLog) => {
+                  const hasDetails = visibleColumns.account || visibleColumns.apiKey || visibleColumns.clientIp || visibleColumns.endpoint || visibleColumns.userAgent
+                  const hasMetrics = visibleColumns.token || visibleColumns.timing || visibleColumns.tokensPerSec || visibleColumns.cost
                   return (
                     <div
                       key={log.id}
@@ -2496,16 +2506,18 @@ export default function Usage() {
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
-                            className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            title={t('usage.filterByStatus', { status: log.status_code })}
-                          >
-                            <StatusCodeBadge log={log} />
-                          </button>
+                          {visibleColumns.status && (
+                            <button
+                              type="button"
+                              onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
+                              className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              title={t('usage.filterByStatus', { status: log.status_code })}
+                            >
+                              <StatusCodeBadge log={log} />
+                            </button>
+                          )}
                           {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
-                          {log.via_websocket ? (
+                          {visibleColumns.type && log.via_websocket ? (
                             <Badge
                               variant="outline"
                               className="border-transparent bg-cyan-500/12 text-[11px] font-semibold uppercase text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-400"
@@ -2513,13 +2525,15 @@ export default function Usage() {
                               ws
                             </Badge>
                           ) : null}
-                          <Badge variant="outline" className={usageTableBadgeClass}>
-                            {log.model || '-'}
-                          </Badge>
+                          {visibleColumns.model && (
+                            <Badge variant="outline" className={usageTableBadgeClass}>
+                              {log.model || '-'}
+                            </Badge>
+                          )}
                           {log.reasoning_effort ? (
                             <ReasoningEffortBadge effort={log.reasoning_effort} />
                           ) : null}
-                          {isFastTier(log.billing_service_tier || log.service_tier) ? (
+                          {visibleColumns.type && isFastTier(log.billing_service_tier || log.service_tier) ? (
                             <Badge
                               variant="outline"
                               className="gap-0.5 border-transparent bg-blue-500/12 text-[11px] font-semibold text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
@@ -2528,78 +2542,110 @@ export default function Usage() {
                               Fast
                             </Badge>
                           ) : null}
-                          <StreamBadge stream={log.stream} />
+                          {visibleColumns.type && <StreamBadge stream={log.stream} />}
                           <CompactionBadges
                             compact={log.compact}
                             hasCompactionHistory={log.has_compaction_history}
                           />
                           <InternalRequestBadge log={log} />
                         </div>
-                        <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
-                          {formatBeijingTime(log.created_at)}
-                        </div>
+                        {visibleColumns.time && (
+                          <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
+                            {formatBeijingTime(log.created_at)}
+                          </div>
+                        )}
                       </div>
 
-                      <UsageErrorSummaryCell log={log} mobile />
+                      {visibleColumns.error && <UsageErrorSummaryCell log={log} mobile />}
 
-                      <div className="mt-2.5 space-y-1 text-xs text-muted-foreground">
-                        <div className="truncate" title={formatUsageAccountTitle(log)}>
-                          <span className="font-semibold text-foreground/80">{t('usage.tableAccount')}: </span>
-                          {formatUsageAccountLabel(log)}
+                      {hasDetails && (
+                        <div className="mt-2.5 space-y-1 text-xs text-muted-foreground">
+                          {visibleColumns.account && (
+                            <div className="truncate" title={formatUsageAccountTitle(log)}>
+                              <span className="font-semibold text-foreground/80">{t('usage.tableAccount')}: </span>
+                              {formatUsageAccountLabel(log)}
+                            </div>
+                          )}
+                          {visibleColumns.apiKey && (
+                            <div className="truncate font-mono" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableApiKey')}: </span>
+                              {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
+                            </div>
+                          )}
+                          {visibleColumns.clientIp && (
+                            <div className="truncate font-mono" title={log.client_ip || '-'}>
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableClientIP')}: </span>
+                              {log.client_ip || '-'}
+                            </div>
+                          )}
+                          {visibleColumns.endpoint && (
+                            <div className="truncate font-mono">
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
+                              {log.inbound_endpoint || log.endpoint || '-'}
+                            </div>
+                          )}
+                          {visibleColumns.userAgent && (
+                            <div className="border-t border-border/60 pt-2">
+                              <UserAgentCell log={log} mobile />
+                            </div>
+                          )}
                         </div>
-                        <div className="truncate font-mono">
-                          <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
-                          {log.inbound_endpoint || log.endpoint || '-'}
-                        </div>
-                        <div className="border-t border-border/60 pt-2">
-                          <UserAgentCell log={log} mobile />
-                        </div>
-                      </div>
+                      )}
 
-                      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableToken')}</div>
-                          <div className="mt-1 font-mono tabular-nums">
-                            {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
-                              <>
-                                <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
-                                <span className="mx-0.5 text-border">/</span>
-                                <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
-                              </>
-                            ) : (
-                              <span className="text-muted-foreground">-</span>
-                            )}
-                          </div>
+                      {hasMetrics && (
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                          {visibleColumns.token && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableToken')}</div>
+                              <div className="mt-1 font-mono tabular-nums">
+                                {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
+                                  <>
+                                    <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
+                                    <span className="mx-0.5 text-border">/</span>
+                                    <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
+                                  </>
+                                ) : (
+                                  <span className="text-muted-foreground">-</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.timing && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div
+                                className="text-[11px] font-semibold text-muted-foreground"
+                                title={t('usage.tableTimingHint')}
+                              >
+                                {t('usage.tableTiming')}
+                              </div>
+                              <div className="mt-1.5">
+                                <TimingCell log={log} />
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.tokensPerSec && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div
+                                className="text-[11px] font-semibold text-muted-foreground"
+                                title={t('usage.tableTokensPerSecHint')}
+                              >
+                                {t('usage.tableTokensPerSec')}
+                              </div>
+                              <div className="mt-1">
+                                <TokensPerSecCell log={log} />
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.cost && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
+                              <div className="mt-1">
+                                <UsageCostCell log={log} />
+                              </div>
+                            </div>
+                          )}
                         </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div
-                            className="text-[11px] font-semibold text-muted-foreground"
-                            title={t('usage.tableTimingHint')}
-                          >
-                            {t('usage.tableTiming')}
-                          </div>
-                          <div className="mt-1.5">
-                            <TimingCell log={log} />
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div
-                            className="text-[11px] font-semibold text-muted-foreground"
-                            title={t('usage.tableTokensPerSecHint')}
-                          >
-                            {t('usage.tableTokensPerSec')}
-                          </div>
-                          <div className="mt-1">
-                            <TokensPerSecCell log={log} />
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
-                          <div className="mt-1">
-                            <UsageCostCell log={log} />
-                          </div>
-                        </div>
-                      </div>
+                      )}
                     </div>
                   )
                 })}

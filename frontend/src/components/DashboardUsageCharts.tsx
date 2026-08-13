@@ -301,12 +301,12 @@ export default function DashboardUsageCharts({
 function ChartCard({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return (
     <Card className="py-0 border-border/70 bg-card shadow-2xs transition-all duration-200 hover:border-border">
-      <CardContent className="p-5">
-        <div className="mb-4">
+      <CardContent className="p-3.5 sm:p-5">
+        <div className="mb-3 sm:mb-4">
           <h4 className="text-sm font-bold tracking-tight text-foreground">{title}</h4>
           <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground/90">{description}</p>
         </div>
-        <div className="h-[280px]">{children}</div>
+        <div className="h-[220px] sm:h-[280px]">{children}</div>
       </CardContent>
     </Card>
   )

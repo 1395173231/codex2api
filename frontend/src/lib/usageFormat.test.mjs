@@ -26,3 +26,12 @@ test("official cost reload only retries Codex accounts missing the snapshot", ()
   assert.equal(needsOfficialCostReload({ openai_responses_api: true }), false);
   assert.equal(needsOfficialCostReload({ grok_api: true }), false);
 });
+
+test("official cost reload stops once the backend reports a completed sync", () => {
+  // 同步成功但上游没有数据(官方统计滞后):继续重拉不会有结果,必须停。
+  assert.equal(needsOfficialCostReload({ official_usage_synced: true }), false);
+  assert.equal(
+    needsOfficialCostReload({ official_usage_synced: false }),
+    true,
+  );
+});

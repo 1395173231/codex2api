@@ -25,7 +25,7 @@ export function SegmentedTabs({
   const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.value === value))
   const itemClass = (active: boolean) =>
     cn(
-      'relative z-10 flex min-w-0 items-center justify-center gap-1.5 rounded-lg font-semibold transition-colors',
+      'relative z-10 flex shrink-0 items-center justify-center gap-1.5 rounded-lg font-semibold transition-colors whitespace-nowrap',
       size === 'sm' ? 'h-8 px-2.5 text-[13px]' : 'h-9 px-3 text-sm',
       active ? 'text-primary' : 'text-muted-foreground hover:text-foreground',
       'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
@@ -34,25 +34,34 @@ export function SegmentedTabs({
   return (
     <div
       role="tablist"
-      className={cn('relative grid rounded-xl border border-border bg-background/80 p-1 shadow-sm', className)}
-      style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}
+      className={cn(
+        'relative flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-border bg-background/80 p-1 shadow-sm [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:grid',
+        className,
+      )}
+      style={{
+        gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))`,
+      }}
     >
       <div
         aria-hidden
-        className="pointer-events-none absolute left-1 top-1 h-[calc(100%-0.5rem)] rounded-lg border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out"
+        className="pointer-events-none absolute left-1 top-1 hidden h-[calc(100%-0.5rem)] rounded-lg border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out sm:block"
         style={{
           width: `calc((100% - 0.5rem) / ${tabs.length})`,
           transform: `translateX(${activeIndex * 100}%)`,
         }}
       />
-      {tabs.map((tab) =>
-        tab.to ? (
+      {tabs.map((tab) => {
+        const active = tab.value === value
+        return tab.to ? (
           <NavLink
             key={tab.value}
             to={tab.to}
             role="tab"
-            aria-selected={tab.value === value}
-            className={itemClass(tab.value === value)}
+            aria-selected={active}
+            className={cn(
+              itemClass(active),
+              active && 'max-sm:bg-primary/10 max-sm:border max-sm:border-primary/20',
+            )}
           >
             {tab.label}
           </NavLink>
@@ -61,14 +70,17 @@ export function SegmentedTabs({
             key={tab.value}
             type="button"
             role="tab"
-            aria-selected={tab.value === value}
+            aria-selected={active}
             onClick={() => onValueChange?.(tab.value)}
-            className={itemClass(tab.value === value)}
+            className={cn(
+              itemClass(active),
+              active && 'max-sm:bg-primary/10 max-sm:border max-sm:border-primary/20',
+            )}
           >
             {tab.label}
           </button>
-        ),
-      )}
+        )
+      })}
     </div>
   )
 }

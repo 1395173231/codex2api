@@ -189,7 +189,7 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `ProxyURL` | string | "" | 全局代理 URL |
-| `ProxyPoolEnabled` | bool | false | 启用代理池 |
+| `ProxyPoolEnabled` | bool | false | 启用代理池。开启后未绑定账号从启用代理中粘性分配；绑定到已禁用/测挂托管代理的账号不会直连；池空且无全局代理时拒绝调度 |
 
 ### 账号级设置（单账号）
 
