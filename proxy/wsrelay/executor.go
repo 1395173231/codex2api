@@ -610,7 +610,7 @@ func (r *WsResponse) Close() error {
 	//     * 下游写入失败 / ctx 取消 / 上游正常关闭 / 握手失败后未读流 → 流没消费到边界，
 	//       上游可能仍在推送残留帧，复用会串会话(issue #308)。
 	if r.conn != nil {
-		if !r.connBroken && r.streamCompleted {
+		if !r.connBroken && r.streamCompleted && !r.shouldDiscardOneShotConn() {
 			r.manager.ReleaseConnection(r.conn)
 		} else {
 			r.manager.DiscardConnection(r.conn)
@@ -618,6 +618,21 @@ func (r *WsResponse) Close() error {
 	}
 
 	return nil
+}
+
+// shouldDiscardOneShotConn 一次性池键连接在响应正常收尾后是否直接销毁。
+// 这类连接的池键每请求唯一，归还池后不可能再被按键复用，只会占用账号连接名额
+// 直到空闲超时；唯一的保留价值是 response_id 续链亲和（上游无服务端存储时，
+// previous_response_id 的上下文只存活在产出响应的那条连接里），因此有存活绑定时
+// 仍归还池。CODEX_WS_STATELESS_ONESHOT 模式显式承诺用完即毁，无条件销毁。
+func (r *WsResponse) shouldDiscardOneShotConn() bool {
+	if r.conn == nil || r.conn.session == nil || !proxy.IsStatelessWebsocketSessionID(r.conn.session.ID) {
+		return false
+	}
+	if statelessOneShotEnabled() {
+		return true
+	}
+	return r.manager == nil || !r.manager.hasLiveResponseBinding(r.conn)
 }
 
 // HTTPResponse 返回 HTTP 握手响应

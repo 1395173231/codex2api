@@ -233,11 +233,6 @@ type DB struct {
 	scopeQuotaMu        sync.Mutex
 	scopeQuotaKeys      map[int64]struct{}
 	scopeQuotaExpiresAt time.Time
-
-	// profitAttribution is an immutable request-time lookup snapshot. Readers on
-	// the proxy hot path only perform an atomic load; configuration writers swap
-	// the pointer after their database transaction commits.
-	profitAttribution atomic.Pointer[profitAttributionSnapshot]
 }
 
 const (
@@ -254,7 +249,7 @@ const (
 	maxUsageLogFlushIntervalSeconds     = 300
 
 	postgresMaxBindParams       = 65535
-	usageLogInsertColumnCount   = 59
+	usageLogInsertColumnCount   = 50
 	maxUsageLogInsertRowsPerSQL = 1000
 
 	// usageLogBufferHardLimit 内存缓冲的硬上限。PG 长时间不可用时（维护、主从切换、
@@ -300,66 +295,57 @@ func NormalizeUsageLogFlushIntervalSeconds(n int) int {
 
 // usageLogEntry 日志缓冲条目
 type usageLogEntry struct {
-	StoreUsageLog               bool
-	AccountID                   int64
-	CredentialGeneration        int64
-	Channel                     string
-	ClientIP                    string
-	ClientUserAgent             string
-	UpstreamUserAgent           string
-	UserAgentOverridden         bool
-	InternalReason              string
-	ParentRequestID             string
-	Endpoint                    string
-	Model                       string
-	EffectiveModel              string
-	PromptTokens                int
-	CompletionTokens            int
-	TotalTokens                 int
-	StatusCode                  int
-	DurationMs                  int
-	InputTokens                 int
-	OutputTokens                int
-	ReasoningTokens             int
-	FirstTokenMs                int
-	WsAcquireMs                 int
-	ReasoningEffort             string
-	InboundEndpoint             string
-	UpstreamEndpoint            string
-	Stream                      bool
-	Compact                     bool
-	HasCompactionHistory        bool
-	ViaWebsocket                bool
-	CachedTokens                int
-	ServiceTier                 string
-	RequestedServiceTier        string
-	ActualServiceTier           string
-	BillingServiceTier          string
-	APIKeyID                    int64
-	APIKeyName                  string
-	APIKeyMasked                string
-	ImageCount                  int
-	ImageWidth                  int
-	ImageHeight                 int
-	ImageBytes                  int
-	ImageFormat                 string
-	ImageSize                   string
-	AccountBilled               float64
-	UserBilled                  float64
-	IsRetryAttempt              bool
-	AttemptIndex                int
-	UpstreamErrorKind           string
-	ErrorMessage                string
-	PromptPolicyIncidentID      string
-	SettlementGroupIDSnapshot   int64
-	SettlementGroupNameSnapshot string
-	SettlementAssignmentSource  string
-	ConsumerSourceType          string
-	ConsumerSourceID            string
-	ConsumerAssignmentVersionID int64
-	ConsumerGroupIDSnapshot     int64
-	ConsumerGroupNameSnapshot   string
-	NonSettleableReason         string
+	StoreUsageLog          bool
+	AccountID              int64
+	CredentialGeneration   int64
+	Channel                string
+	ClientIP               string
+	ClientUserAgent        string
+	UpstreamUserAgent      string
+	UserAgentOverridden    bool
+	InternalReason         string
+	ParentRequestID        string
+	Endpoint               string
+	Model                  string
+	EffectiveModel         string
+	PromptTokens           int
+	CompletionTokens       int
+	TotalTokens            int
+	StatusCode             int
+	DurationMs             int
+	InputTokens            int
+	OutputTokens           int
+	ReasoningTokens        int
+	FirstTokenMs           int
+	WsAcquireMs            int
+	ReasoningEffort        string
+	InboundEndpoint        string
+	UpstreamEndpoint       string
+	Stream                 bool
+	Compact                bool
+	HasCompactionHistory   bool
+	ViaWebsocket           bool
+	CachedTokens           int
+	ServiceTier            string
+	RequestedServiceTier   string
+	ActualServiceTier      string
+	BillingServiceTier     string
+	APIKeyID               int64
+	APIKeyName             string
+	APIKeyMasked           string
+	ImageCount             int
+	ImageWidth             int
+	ImageHeight            int
+	ImageBytes             int
+	ImageFormat            string
+	ImageSize              string
+	AccountBilled          float64
+	UserBilled             float64
+	IsRetryAttempt         bool
+	AttemptIndex           int
+	UpstreamErrorKind      string
+	ErrorMessage           string
+	PromptPolicyIncidentID string
 }
 
 // New 创建数据库连接并自动建表。
@@ -912,20 +898,12 @@ func (db *DB) SetUsageLogConfig(mode string, batchSize int, flushIntervalSeconds
 	if db == nil {
 		return
 	}
-	previousMode := db.GetUsageLogMode()
 	mode = NormalizeUsageLogMode(mode)
 	batchSize = NormalizeUsageLogBatchSize(batchSize)
 	flushIntervalSeconds = NormalizeUsageLogFlushIntervalSeconds(flushIntervalSeconds)
 	db.usageLogMode.Store(mode)
 	atomic.StoreInt64(&db.usageLogBatchSize, int64(batchSize))
 	atomic.StoreInt64(&db.usageLogFlushInterval, int64(time.Duration(flushIntervalSeconds)*time.Second))
-	if previousMode != mode {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := db.recordProfitIngestionEvent(ctx, "mode", mode, 0, "usage log mode changed from "+previousMode); err != nil {
-			log.Printf("记录利润结算日志模式变更失败（不阻塞主流程）: %v", err)
-		}
-	}
 }
 
 func (db *DB) GetUsageLogMode() string {
@@ -1567,9 +1545,6 @@ func (db *DB) migrate(ctx context.Context) error {
 	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer migrateCancel()
 	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
-		return err
-	}
-	if err := db.migrateProfitSettlement(migrateCtx); err != nil {
 		return err
 	}
 	return db.runDataMigrationsWithTimeout()
@@ -3715,66 +3690,57 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
-		StoreUsageLog:               storeUsageLog,
-		AccountID:                   log.AccountID,
-		CredentialGeneration:        log.CredentialGeneration,
-		Channel:                     clampUsageLogText(log.Channel, usageLogChannelMaxLen),
-		ClientIP:                    clampUsageLogText(log.ClientIP, usageLogShortTextMaxLen),
-		ClientUserAgent:             log.ClientUserAgent,
-		UpstreamUserAgent:           log.UpstreamUserAgent,
-		UserAgentOverridden:         log.UserAgentOverridden,
-		InternalReason:              clampUsageLogText(log.InternalReason, usageLogShortTextMaxLen),
-		ParentRequestID:             clampUsageLogText(log.ParentRequestID, usageLogRequestIDMaxLen),
-		Endpoint:                    clampUsageLogText(log.Endpoint, usageLogTextMaxLen),
-		Model:                       clampUsageLogText(log.Model, usageLogTextMaxLen),
-		EffectiveModel:              clampUsageLogText(log.EffectiveModel, usageLogTextMaxLen),
-		PromptTokens:                log.PromptTokens,
-		CompletionTokens:            log.CompletionTokens,
-		TotalTokens:                 log.TotalTokens,
-		StatusCode:                  log.StatusCode,
-		DurationMs:                  log.DurationMs,
-		InputTokens:                 log.InputTokens,
-		OutputTokens:                log.OutputTokens,
-		ReasoningTokens:             log.ReasoningTokens,
-		FirstTokenMs:                log.FirstTokenMs,
-		WsAcquireMs:                 log.WsAcquireMs,
-		ReasoningEffort:             clampUsageLogText(log.ReasoningEffort, usageLogTextMaxLen),
-		InboundEndpoint:             clampUsageLogText(log.InboundEndpoint, usageLogTextMaxLen),
-		UpstreamEndpoint:            clampUsageLogText(log.UpstreamEndpoint, usageLogTextMaxLen),
-		Stream:                      log.Stream,
-		Compact:                     log.Compact,
-		HasCompactionHistory:        log.HasCompactionHistory,
-		ViaWebsocket:                log.ViaWebsocket,
-		CachedTokens:                log.CachedTokens,
-		ServiceTier:                 clampUsageLogText(serviceTier, usageLogTextMaxLen),
-		RequestedServiceTier:        clampUsageLogText(log.RequestedServiceTier, usageLogTextMaxLen),
-		ActualServiceTier:           clampUsageLogText(log.ActualServiceTier, usageLogTextMaxLen),
-		BillingServiceTier:          clampUsageLogText(billingServiceTier, usageLogTextMaxLen),
-		APIKeyID:                    log.APIKeyID,
-		APIKeyName:                  clampUsageLogText(log.APIKeyName, usageLogAPIKeyNameMaxLen),
-		APIKeyMasked:                clampUsageLogText(log.APIKeyMasked, usageLogShortTextMaxLen),
-		ImageCount:                  log.ImageCount,
-		ImageWidth:                  log.ImageWidth,
-		ImageHeight:                 log.ImageHeight,
-		ImageBytes:                  log.ImageBytes,
-		ImageFormat:                 clampUsageLogText(log.ImageFormat, usageLogTextMaxLen),
-		ImageSize:                   clampUsageLogText(log.ImageSize, usageLogImageSizeMaxLen),
-		AccountBilled:               accountBilled,
-		UserBilled:                  userBilled,
-		IsRetryAttempt:              log.IsRetryAttempt,
-		AttemptIndex:                log.AttemptIndex,
-		UpstreamErrorKind:           clampUsageLogText(log.UpstreamErrorKind, usageLogShortTextMaxLen),
-		ErrorMessage:                log.ErrorMessage,
-		PromptPolicyIncidentID:      clampUsageLogText(log.PromptPolicyIncidentID, usageLogShortTextMaxLen),
-		SettlementGroupIDSnapshot:   log.SettlementGroupIDSnapshot,
-		SettlementGroupNameSnapshot: clampUsageLogText(log.SettlementGroupNameSnapshot, usageLogAPIKeyNameMaxLen),
-		SettlementAssignmentSource:  clampUsageLogText(log.SettlementAssignmentSource, usageLogShortTextMaxLen),
-		ConsumerSourceType:          clampUsageLogText(log.ConsumerSourceType, usageLogShortTextMaxLen),
-		ConsumerSourceID:            clampUsageLogText(log.ConsumerSourceID, usageLogRequestIDMaxLen),
-		ConsumerAssignmentVersionID: log.ConsumerAssignmentVersionID,
-		ConsumerGroupIDSnapshot:     log.ConsumerGroupIDSnapshot,
-		ConsumerGroupNameSnapshot:   clampUsageLogText(log.ConsumerGroupNameSnapshot, usageLogAPIKeyNameMaxLen),
-		NonSettleableReason:         clampUsageLogText(log.NonSettleableReason, usageLogShortTextMaxLen),
+		StoreUsageLog:          storeUsageLog,
+		AccountID:              log.AccountID,
+		CredentialGeneration:   log.CredentialGeneration,
+		Channel:                clampUsageLogText(log.Channel, usageLogChannelMaxLen),
+		ClientIP:               clampUsageLogText(log.ClientIP, usageLogShortTextMaxLen),
+		ClientUserAgent:        log.ClientUserAgent,
+		UpstreamUserAgent:      log.UpstreamUserAgent,
+		UserAgentOverridden:    log.UserAgentOverridden,
+		InternalReason:         clampUsageLogText(log.InternalReason, usageLogShortTextMaxLen),
+		ParentRequestID:        clampUsageLogText(log.ParentRequestID, usageLogRequestIDMaxLen),
+		Endpoint:               clampUsageLogText(log.Endpoint, usageLogTextMaxLen),
+		Model:                  clampUsageLogText(log.Model, usageLogTextMaxLen),
+		EffectiveModel:         clampUsageLogText(log.EffectiveModel, usageLogTextMaxLen),
+		PromptTokens:           log.PromptTokens,
+		CompletionTokens:       log.CompletionTokens,
+		TotalTokens:            log.TotalTokens,
+		StatusCode:             log.StatusCode,
+		DurationMs:             log.DurationMs,
+		InputTokens:            log.InputTokens,
+		OutputTokens:           log.OutputTokens,
+		ReasoningTokens:        log.ReasoningTokens,
+		FirstTokenMs:           log.FirstTokenMs,
+		WsAcquireMs:            log.WsAcquireMs,
+		ReasoningEffort:        clampUsageLogText(log.ReasoningEffort, usageLogTextMaxLen),
+		InboundEndpoint:        clampUsageLogText(log.InboundEndpoint, usageLogTextMaxLen),
+		UpstreamEndpoint:       clampUsageLogText(log.UpstreamEndpoint, usageLogTextMaxLen),
+		Stream:                 log.Stream,
+		Compact:                log.Compact,
+		HasCompactionHistory:   log.HasCompactionHistory,
+		ViaWebsocket:           log.ViaWebsocket,
+		CachedTokens:           log.CachedTokens,
+		ServiceTier:            clampUsageLogText(serviceTier, usageLogTextMaxLen),
+		RequestedServiceTier:   clampUsageLogText(log.RequestedServiceTier, usageLogTextMaxLen),
+		ActualServiceTier:      clampUsageLogText(log.ActualServiceTier, usageLogTextMaxLen),
+		BillingServiceTier:     clampUsageLogText(billingServiceTier, usageLogTextMaxLen),
+		APIKeyID:               log.APIKeyID,
+		APIKeyName:             clampUsageLogText(log.APIKeyName, usageLogAPIKeyNameMaxLen),
+		APIKeyMasked:           clampUsageLogText(log.APIKeyMasked, usageLogShortTextMaxLen),
+		ImageCount:             log.ImageCount,
+		ImageWidth:             log.ImageWidth,
+		ImageHeight:            log.ImageHeight,
+		ImageBytes:             log.ImageBytes,
+		ImageFormat:            clampUsageLogText(log.ImageFormat, usageLogTextMaxLen),
+		ImageSize:              clampUsageLogText(log.ImageSize, usageLogImageSizeMaxLen),
+		AccountBilled:          accountBilled,
+		UserBilled:             userBilled,
+		IsRetryAttempt:         log.IsRetryAttempt,
+		AttemptIndex:           log.AttemptIndex,
+		UpstreamErrorKind:      clampUsageLogText(log.UpstreamErrorKind, usageLogShortTextMaxLen),
+		ErrorMessage:           log.ErrorMessage,
+		PromptPolicyIncidentID: clampUsageLogText(log.PromptPolicyIncidentID, usageLogShortTextMaxLen),
 	})
 	db.trimUsageLogBufferLocked()
 	bufLen := len(db.logBuf)
@@ -3794,61 +3760,52 @@ type UsageLogInput struct {
 	// credential snapshot that issued it. Zero is legacy/unscoped traffic.
 	CredentialGeneration int64
 	// Channel 是处理该请求的上游渠道（codex/grok），写入时固化，空值表示未知。
-	Channel                     string
-	ClientIP                    string
-	ClientUserAgent             string
-	UpstreamUserAgent           string
-	UserAgentOverridden         bool
-	InternalReason              string
-	ParentRequestID             string
-	Endpoint                    string
-	Model                       string
-	EffectiveModel              string
-	PromptTokens                int
-	CompletionTokens            int
-	TotalTokens                 int
-	StatusCode                  int
-	DurationMs                  int
-	InputTokens                 int
-	OutputTokens                int
-	ReasoningTokens             int
-	FirstTokenMs                int
-	WsAcquireMs                 int
-	ReasoningEffort             string
-	InboundEndpoint             string
-	UpstreamEndpoint            string
-	Stream                      bool
-	Compact                     bool
-	HasCompactionHistory        bool
-	ViaWebsocket                bool
-	CachedTokens                int
-	ServiceTier                 string
-	RequestedServiceTier        string
-	ActualServiceTier           string
-	BillingServiceTier          string
-	APIKeyID                    int64
-	APIKeyName                  string
-	APIKeyMasked                string
-	ImageCount                  int
-	ImageWidth                  int
-	ImageHeight                 int
-	ImageBytes                  int
-	ImageFormat                 string
-	ImageSize                   string
-	IsRetryAttempt              bool
-	AttemptIndex                int
-	UpstreamErrorKind           string
-	ErrorMessage                string
-	PromptPolicyIncidentID      string
-	SettlementGroupIDSnapshot   int64
-	SettlementGroupNameSnapshot string
-	SettlementAssignmentSource  string
-	ConsumerSourceType          string
-	ConsumerSourceID            string
-	ConsumerAssignmentVersionID int64
-	ConsumerGroupIDSnapshot     int64
-	ConsumerGroupNameSnapshot   string
-	NonSettleableReason         string
+	Channel                string
+	ClientIP               string
+	ClientUserAgent        string
+	UpstreamUserAgent      string
+	UserAgentOverridden    bool
+	InternalReason         string
+	ParentRequestID        string
+	Endpoint               string
+	Model                  string
+	EffectiveModel         string
+	PromptTokens           int
+	CompletionTokens       int
+	TotalTokens            int
+	StatusCode             int
+	DurationMs             int
+	InputTokens            int
+	OutputTokens           int
+	ReasoningTokens        int
+	FirstTokenMs           int
+	WsAcquireMs            int
+	ReasoningEffort        string
+	InboundEndpoint        string
+	UpstreamEndpoint       string
+	Stream                 bool
+	Compact                bool
+	HasCompactionHistory   bool
+	ViaWebsocket           bool
+	CachedTokens           int
+	ServiceTier            string
+	RequestedServiceTier   string
+	ActualServiceTier      string
+	BillingServiceTier     string
+	APIKeyID               int64
+	APIKeyName             string
+	APIKeyMasked           string
+	ImageCount             int
+	ImageWidth             int
+	ImageHeight            int
+	ImageBytes             int
+	ImageFormat            string
+	ImageSize              string
+	IsRetryAttempt         bool
+	AttemptIndex           int
+	UpstreamErrorKind      string
+	ErrorMessage           string
+	PromptPolicyIncidentID string
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -3971,7 +3928,9 @@ func (db *DB) flushLogBatch(drain bool) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
-	if err := db.insertUsageLogBatch(ctx, batch); err != nil {
+	if err := db.withSQLiteWriteLock(ctx, func() error {
+		return db.insertUsageLogBatch(ctx, batch)
+	}); err != nil {
 		// 瞬时故障（连接断开、超时、死锁）原样放回缓冲区重试，一条都不能丢。
 		if !isUsageLogDataError(err) {
 			log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
@@ -3984,11 +3943,6 @@ func (db *DB) flushLogBatch(drain bool) bool {
 			total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
 			log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
 				dropped, total, err)
-			auditCtx, cancelAudit := context.WithTimeout(context.Background(), time.Second)
-			if auditErr := db.recordProfitIngestionEvent(auditCtx, "drop", db.GetUsageLogMode(), int64(dropped), err.Error()); auditErr != nil {
-				log.Printf("记录利润结算日志丢弃事件失败（不阻塞日志队列）: %v", auditErr)
-			}
-			cancelAudit()
 		}
 		if len(pending) > 0 {
 			log.Printf("批量写入日志部分失败，%d 条已放回缓冲区等待重试", len(pending))
@@ -4015,9 +3969,7 @@ func (db *DB) insertUsageLogBatch(ctx context.Context, batch []usageLogEntry) er
 	if db.driver == "postgres" {
 		return db.batchInsertLogs(ctx, batch)
 	}
-	return db.withSQLiteWriteLock(ctx, func() error {
-		return db.insertSQLiteUsageLogBatch(ctx, batch)
-	})
+	return db.insertSQLiteUsageLogBatch(ctx, batch)
 }
 
 // isUsageLogDataError 判断失败是不是「这批数据本身写不进去」。PostgreSQL 的 SQLSTATE
@@ -4142,10 +4094,6 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	}
 	defer tx.Rollback()
 
-	batch, err = db.populateProfitSettlementSnapshots(ctx, tx, batch)
-	if err != nil {
-		return fmt.Errorf("固化利润结算归属: %w", err)
-	}
 	// usage_log_mode 只过滤审计行；额度仍按完整 batch 在同一事务内更新。
 	logsToStore := storedUsageLogs(batch)
 	if len(logsToStore) > 0 {
@@ -4155,11 +4103,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				  requested_service_tier, actual_service_tier, billing_service_tier,
 				  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 				  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id,
-				  settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source,
-				  consumer_source_type, consumer_source_id, consumer_assignment_version_id, consumer_group_id_snapshot,
-				  consumer_group_name_snapshot, non_settleable_reason)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59)`)
+				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)`)
 		if err != nil {
 			return fmt.Errorf("准备语句: %w", err)
 		}
@@ -4171,10 +4116,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 				e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 				e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID),
-				e.SettlementGroupIDSnapshot, e.SettlementGroupNameSnapshot, e.SettlementAssignmentSource,
-				e.ConsumerSourceType, e.ConsumerSourceID, e.ConsumerAssignmentVersionID, e.ConsumerGroupIDSnapshot,
-				e.ConsumerGroupNameSnapshot, e.NonSettleableReason); err != nil {
+				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID)); err != nil {
 				return fmt.Errorf("执行插入: %w", err)
 			}
 		}
@@ -4196,7 +4138,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化。
-// PostgreSQL 单条语句最多 65535 个 bind 参数；安全行数按当前列数动态计算。
+// PostgreSQL 单条语句最多 65535 个 bind 参数；usage_logs 当前每行 47 个参数，
+// 因此单条 INSERT 的行数必须稳定低于 floor(65535/47)=1394。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -4208,10 +4151,6 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
-	batch, err = db.populateProfitSettlementSnapshots(ctx, tx, batch)
-	if err != nil {
-		return fmt.Errorf("固化利润结算归属: %w", err)
-	}
 	logsToStore := storedUsageLogs(batch)
 	maxRowsPerBatch := maxUsageLogInsertRowsPerSQL
 	if paramSafeRows := postgresMaxBindParams / usageLogInsertColumnCount; paramSafeRows > 0 && maxRowsPerBatch > paramSafeRows {
@@ -4267,10 +4206,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID),
-			e.SettlementGroupIDSnapshot, e.SettlementGroupNameSnapshot, e.SettlementAssignmentSource,
-			e.ConsumerSourceType, e.ConsumerSourceID, e.ConsumerAssignmentVersionID, e.ConsumerGroupIDSnapshot,
-			e.ConsumerGroupNameSnapshot, e.NonSettleableReason)
+			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID))
 		argIdx += usageLogInsertColumnCount
 	}
 
@@ -4279,10 +4215,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-		client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id,
-		settlement_group_id_snapshot, settlement_group_name_snapshot, settlement_assignment_source,
-		consumer_source_type, consumer_source_id, consumer_assignment_version_id, consumer_group_id_snapshot,
-		consumer_group_name_snapshot, non_settleable_reason)
+		client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := execer.ExecContext(ctx, query, valueArgs...)
@@ -5672,50 +5605,50 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	if _, err := db.loadUsageStatsRollup(ctx, ""); err != nil {
 		return fmt.Errorf("读取清理前完整累计失败: %w", err)
 	}
-	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
-		if !db.isSQLite() {
-			// 先锁明细表，等待正在写入的批次完整提交；之后的新写入在清理事务结束前不会插入。
-			if _, err := tx.ExecContext(ctx, `LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
-				return err
-			}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if !db.isSQLite() {
+		// 先锁明细表，等待正在写入的批次完整提交；之后的新写入在清理事务结束前不会插入。
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
+			return err
 		}
-		var rollup usageStatsRollup
-		if err := tx.QueryRowContext(ctx, `SELECT total_requests, total_tokens, prompt_tokens, completion_tokens,
+	}
+	var rollup usageStatsRollup
+	if err := tx.QueryRowContext(ctx, `SELECT total_requests, total_tokens, prompt_tokens, completion_tokens,
 		cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		FROM usage_stats_rollup WHERE channel=''`).Scan(&rollup.TotalRequests, &rollup.TotalTokens,
-			&rollup.PromptTokens, &rollup.CompletionTokens, &rollup.CachedTokens, &rollup.CacheHitRequests,
-			&rollup.FirstTokenMsSum, &rollup.FirstTokenSamples, &rollup.TotalAccountBilled, &rollup.TotalUserBilled); err != nil {
-			return fmt.Errorf("锁定后读取完整累计失败: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE usage_stats_baseline SET
+		&rollup.PromptTokens, &rollup.CompletionTokens, &rollup.CachedTokens, &rollup.CacheHitRequests,
+		&rollup.FirstTokenMsSum, &rollup.FirstTokenSamples, &rollup.TotalAccountBilled, &rollup.TotalUserBilled); err != nil {
+		return fmt.Errorf("锁定后读取完整累计失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE usage_stats_baseline SET
 		total_requests=$1, total_tokens=$2, prompt_tokens=$3, completion_tokens=$4,
 		cached_tokens=$5, cache_hit_requests=$6, first_token_ms_sum=$7, first_token_samples=$8,
 		account_billed=$9, user_billed=$10 WHERE id=1`, rollup.TotalRequests, rollup.TotalTokens,
-			rollup.PromptTokens, rollup.CompletionTokens, rollup.CachedTokens, rollup.CacheHitRequests,
-			rollup.FirstTokenMsSum, rollup.FirstTokenSamples, rollup.TotalAccountBilled, rollup.TotalUserBilled); err != nil {
-			return fmt.Errorf("快照统计基线失败: %w", err)
-		}
-		if db.isSQLite() {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM usage_logs`); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`); err != nil {
-				return err
-			}
-		} else if _, err := tx.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`); err != nil {
+		rollup.PromptTokens, rollup.CompletionTokens, rollup.CachedTokens, rollup.CacheHitRequests,
+		rollup.FirstTokenMsSum, rollup.FirstTokenSamples, rollup.TotalAccountBilled, rollup.TotalUserBilled); err != nil {
+		return fmt.Errorf("快照统计基线失败: %w", err)
+	}
+	if db.isSQLite() {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_logs`); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM usage_stats_rollup WHERE channel <> ''`); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE usage_stats_rollup_state SET initialized=1, last_log_id=0, updated_at=CURRENT_TIMESTAMP WHERE id=1`); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO profit_ingestion_events
-			(event_type,mode,dropped_count,details,event_at) VALUES ('clear',$1,0,'usage logs cleared',$2)`,
-			db.GetUsageLogMode(), db.timeArg(time.Now().UTC()))
+	} else if _, err = tx.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`); err != nil {
 		return err
-	})
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM usage_stats_rollup WHERE channel <> ''`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE usage_stats_rollup_state SET initialized=1, last_log_id=0, updated_at=CURRENT_TIMESTAMP WHERE id=1`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Ping 检查 PostgreSQL 连通性
@@ -7179,89 +7112,89 @@ func (db *DB) ListDeleted(ctx context.Context) ([]*AccountRow, error) {
 
 // RestoreAccount 将回收站中的账号恢复为 active 状态。
 func (db *DB) RestoreAccount(ctx context.Context, id int64) error {
-	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
-		query := `
-			UPDATE accounts
-			SET status = 'active',
-				error_message = '',
-				cooldown_reason = '',
-				cooldown_until = NULL,
-				deleted_at = NULL,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')
-		`
-		res, err := tx.ExecContext(ctx, query, id)
-		if err != nil {
-			return err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if affected == 0 {
-			return sql.ErrNoRows
-		}
-		return nil
-	})
+	query := `
+		UPDATE accounts
+		SET status = 'active',
+			error_message = '',
+			cooldown_reason = '',
+			cooldown_until = NULL,
+			deleted_at = NULL,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')
+	`
+	res, err := db.conn.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // PurgeAccount 从回收站彻底删除账号（物理删除，不可恢复）。
 func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
-	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
-		if err := ensureProfitAccountCanBePurgedQuery(ctx, tx, id); err != nil {
-			return err
-		}
-		// Grok observations intentionally do not rely on foreign-key cascades.
-		if err := db.deleteGrokAccountStateTx(ctx, tx, "= $1", id); err != nil {
-			return err
-		}
-		query := `DELETE FROM accounts WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
-		res, err := tx.ExecContext(ctx, query, id)
-		if err != nil {
-			return err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if affected == 0 {
-			return sql.ErrNoRows
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM account_group_members WHERE account_id = $1`, id); err != nil {
-			return err
-		}
-		return nil
-	})
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Grok observations intentionally do not rely on foreign-key cascades; keep
+	// purge behavior consistent across SQLite and PostgreSQL.
+	if err := db.deleteGrokAccountStateTx(ctx, tx, "= $1", id); err != nil {
+		return err
+	}
+	query := `DELETE FROM accounts WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
+	res, err := tx.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM account_group_members WHERE account_id = $1`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // PurgeDeletedAccounts 清空回收站，返回被彻底删除的账号数量。
 func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
-	var count int64
-	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
-		eligible := `status='deleted' OR COALESCE(error_message,'')='deleted'`
-		unreferenced := `NOT EXISTS (SELECT 1 FROM profit_daily_ledger l WHERE l.account_id=accounts.id)
-			AND NOT EXISTS (SELECT 1 FROM profit_settlement_items i WHERE i.account_id=accounts.id)
-			AND NOT EXISTS (SELECT 1 FROM profit_settlement_account_roi_items r WHERE r.account_id=accounts.id)
-			AND NOT EXISTS (SELECT 1 FROM profit_account_cost_allocations c WHERE c.account_id=accounts.id)
-			AND NOT EXISTS (SELECT 1 FROM profit_account_economic_versions e WHERE e.account_id=accounts.id)`
-		deletedPredicate := `IN (SELECT id FROM accounts WHERE (` + eligible + `) AND ` + unreferenced + `)`
-		if err := db.deleteGrokAccountStateTx(ctx, tx, deletedPredicate); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	deletedPredicate := `IN (SELECT id FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
+	if err := db.deleteGrokAccountStateTx(ctx, tx, deletedPredicate); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM account_group_members
-		WHERE account_id IN (SELECT id FROM accounts WHERE (`+eligible+`) AND `+unreferenced+`)
-		`); err != nil {
-			return err
-		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE (`+eligible+`) AND `+unreferenced)
-		if err != nil {
-			return err
-		}
-		count, err = res.RowsAffected()
-		return err
-	})
-	return count, err
+		WHERE account_id IN (SELECT id FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted')
+	`); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted'`)
+	if err != nil {
+		return 0, err
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // BatchSoftDeleteAccounts 批量软删除账号，分批执行避免 SQL 参数过多。

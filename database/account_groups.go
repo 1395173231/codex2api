@@ -238,7 +238,7 @@ func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) e
 	if err != nil {
 		return err
 	}
-	return db.reloadProfitAttributionSnapshot(ctx)
+	return nil
 }
 
 func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite bool, groupID int64) error {
@@ -386,7 +386,7 @@ func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []
 	if err != nil {
 		return err
 	}
-	return db.reloadProfitAttributionSnapshot(ctx)
+	return nil
 }
 
 // BatchSetAccountGroups 在单个事务里把一批账号的分组归属整体替换成 groupIDs。
@@ -405,7 +405,7 @@ func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, gro
 	if err != nil {
 		return err
 	}
-	return db.reloadProfitAttributionSnapshot(ctx)
+	return nil
 }
 
 func (db *DB) GetAccountGroupIDs(ctx context.Context, accountID int64) ([]int64, error) {

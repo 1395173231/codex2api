@@ -1,20 +1,5 @@
 {
   "common": {"success":"成功","failed":"失敗","enabled":"開啟","disabled":"關閉"},
-  "nav": {"profitCenter":"利潤結算中心"},
-  "profit": {
-    "settings": {
-      "nav": "利潤結算",
-      "title": "利潤結算中心",
-      "description": "預設關閉。啟用後顯示利潤結算選單，並依官方美元成本、人民幣結算比例及分組倍率建立可稽核帳本。",
-      "ratio": "預設人民幣結算比例",
-      "ratioHelp": "內部結算比例，不是市場匯率。1.00 表示官方成本 1 USD 按 1 CNY 計入結算成本。",
-      "defaultMultiplier": "預設分組利潤倍率",
-      "multiplierHelp": "分組未單獨設定時使用。1.20 表示按結算成本的 120% 計算收入。",
-      "invalidNumber": "結算比例與利潤倍率必須大於 0",
-      "saved": "利潤結算設定已儲存",
-      "save": "儲存利潤設定"
-    }
-  },
   "accounts": {
     "todayStats": "今日統計",
     "todayStatsHint": "今日(0 點起)經由本閘道的請求數、Token 與成本",

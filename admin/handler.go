@@ -730,29 +730,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
-	api.GET("/profit/settings", h.GetProfitSettings)
-	api.PUT("/profit/settings", h.UpdateProfitSettings)
-	api.GET("/profit/groups", h.ListProfitGroups)
-	api.PUT("/profit/groups/:id", h.UpdateProfitGroup)
-	api.GET("/profit/api-key-assignments", h.ListProfitAPIKeyAssignments)
-	api.PUT("/profit/api-key-assignments/:id", h.AssignProfitAPIKeyConsumerGroup)
-	api.GET("/profit/pair-rates", h.ListProfitPairRates)
-	api.PUT("/profit/pair-rates", h.UpdateProfitPairRate)
-	api.GET("/profit/account-economics", h.ListProfitAccountEconomics)
-	api.PUT("/profit/account-economics/:id", h.UpdateProfitAccountEconomic)
-	api.GET("/profit/pending-accounts", h.ListProfitPendingAccounts)
-	api.PUT("/profit/accounts/:id/settlement-group", h.AssignProfitSettlementGroup)
-	api.POST("/profit/accounts/:id/ignore", h.IgnoreProfitPendingAccount)
-	api.POST("/profit/ledger/refresh", h.RefreshProfitLedger)
-	api.GET("/profit/dashboard", h.GetProfitDashboard)
-	api.GET("/profit/dimensions/:dimension", h.GetProfitDashboardDimension)
-	api.GET("/profit/settlements", h.ListProfitSettlements)
-	api.POST("/profit/settlements", h.CreateProfitSettlement)
-	api.GET("/profit/settlements/:id", h.GetProfitSettlement)
-	api.PATCH("/profit/settlements/:id", h.UpdateProfitSettlement)
-	api.POST("/profit/settlements/:id/confirm", h.ConfirmProfitSettlement)
-	api.POST("/profit/settlements/:id/revise", h.ReviseProfitSettlement)
-	api.GET("/profit/settlements/:id/export", h.ExportProfitSettlement)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
@@ -906,6 +883,8 @@ func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
 
 // GetStats 获取仪表盘统计
 func (h *Handler) GetStats(c *gin.Context) {
+	// Large installations may need more than five seconds to aggregate the
+	// dashboard inputs. Keep the request bounded without failing normal loads.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 

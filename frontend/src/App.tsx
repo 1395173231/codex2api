@@ -27,7 +27,6 @@ const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
 const ModelPricing = lazy(() => import('./pages/ModelPricing'))
 const PayloadRules = lazy(() => import('./pages/PayloadRules'))
-const ProfitCenter = lazy(() => import('./pages/ProfitCenter'))
 
 export default function App() {
   return (
@@ -75,7 +74,6 @@ function AdminApp() {
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/model-pricing" element={<ModelPricing />} />
-          <Route path="/profit" element={<ProfitCenter />} />
           <Route path="/payload-rules" element={<Navigate to="/payload-rules/editor" replace />} />
           <Route path="/payload-rules/:view" element={<PayloadRules />} />
           <Route path="/theme" element={<ThemeSettings />} />

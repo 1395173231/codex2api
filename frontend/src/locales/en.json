@@ -14,22 +14,7 @@
     "images": "Images",
     "promptFilter": "Prompt Filter",
     "modelPricing": "Model Pricing",
-    "payloadRules": "Payload Rules",
-    "profitCenter": "Profit Center"
-  },
-  "profit": {
-    "settings": {
-      "nav": "Profit settlement",
-      "title": "Profit Settlement Center",
-      "description": "Disabled by default. When enabled, shows the profit menu and builds an auditable ledger from official USD cost, the internal CNY settlement ratio, and group multipliers.",
-      "ratio": "Default CNY settlement ratio",
-      "ratioHelp": "An internal settlement ratio, not a market FX rate. 1.00 means USD 1 of official cost is treated as CNY 1 of settlement cost.",
-      "defaultMultiplier": "Default group profit multiplier",
-      "multiplierHelp": "Used when a group has no override. 1.20 calculates revenue at 120% of settlement cost.",
-      "invalidNumber": "Settlement ratio and multiplier must be greater than zero",
-      "saved": "Profit settlement settings saved",
-      "save": "Save profit settings"
-    }
+    "payloadRules": "Payload Rules"
   },
   "grok": {
     "pageTitle": "Grok Accounts",

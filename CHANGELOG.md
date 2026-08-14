@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.7.8 - 2026-08-14
+
+### Features
+
+- **Custom image sizes land on the exact requested canvas, including sizes upstream rejects as not a multiple of 16 (PR #519 by @ifThink404).** A requested `1920x1080` used to miss the promised pixels: GPT Image 2 requires both sides to be multiples of 16, so the job either failed or came back at a nearby size. Strict sizing now treats the requested canvas as authoritative — the upstream request is rounded up to a legal size (for example `1920x1088`) and the result is locally resized back to the exact canvas, padding by default or covering when opted in. `strict_size=false` restores the previous upscale-tier behaviour. Cache keys include fit/strict so mixed sizes no longer collide. Verified live: `2048x1152` returned `2048x1152`; `1920x1080` generated upstream at `1920x1088` and cropped locally to `1920x1080`.
+- **Official settlement pills stop spinning when upstream has nothing to show.** Accounts whose official 7-day snapshot synced successfully but came back empty — official stats lag, or the account has no official-client usage — used to look like they were still loading, and the page kept retrying the backfill. The API now reports `official_usage_synced`; the capsule shows a static "no data yet" placeholder and the page stops polling. Failed backfills cool down for 15 minutes instead of retrying every two, leaving recovery to the hourly probe.
+- **The admin console layout holds together on smaller viewports.** Usage, accounts, operations and the shared chrome (pagination, segmented tabs, stat cards, time-range selector, layout shell) get denser grids, wrapping filters, overflow-safe dropdowns and mobile cards that honour the column visibility settings instead of overflowing or leaving empty chrome.
+
+### Fixes
+
+- **WebSocket fallback connections no longer crowd out the reusable slot pool (#520, reported by @huyachigege).** When all eight stateless slots were busy, the overflow connection was pooled under a per-request unique key that no later request can ever hit. Pure LRU then kept these just-used zombies while evicting older but reusable slot connections, so reuse dropped and later requests paid a 10–20s handshake. Capacity eviction now drops one-shot connections first; on clean stream completion an unbound one-shot is discarded instead of released (bindings with a live `previous_response_id` stay pooled so chain affinity still works); `CODEX_WS_STATELESS_ONESHOT` now actually destroys the connection on release.
+
 ## v2.7.7 - 2026-08-13
 
 ### Features

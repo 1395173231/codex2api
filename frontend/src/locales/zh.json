@@ -14,22 +14,7 @@
     "images": "生图工作台",
     "promptFilter": "Prompt 检查",
     "modelPricing": "模型定价",
-    "payloadRules": "请求体重写",
-    "profitCenter": "利润结算中心"
-  },
-  "profit": {
-    "settings": {
-      "nav": "利润结算",
-      "title": "利润结算中心",
-      "description": "默认关闭。启用后显示利润结算菜单，并按官方美元成本、人民币结算比例和分组倍率生成可审核账本。",
-      "ratio": "默认人民币结算比例",
-      "ratioHelp": "内部结算比例，不是市场汇率。1.00 表示官方成本 1 USD 按 1 CNY 计入结算成本。",
-      "defaultMultiplier": "默认分组利润倍率",
-      "multiplierHelp": "分组未单独设置时使用。1.20 表示按结算成本的 120% 计算收入。",
-      "invalidNumber": "结算比例和利润倍率必须大于 0",
-      "saved": "利润结算设置已保存",
-      "save": "保存利润设置"
-    }
+    "payloadRules": "请求体重写"
   },
   "grok": {
     "pageTitle": "Grok 账号",
