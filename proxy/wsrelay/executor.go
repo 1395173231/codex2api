@@ -322,6 +322,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		headers.Set("X-Codex-Beta-Features", betaFeatures)
 	} else if deviceCfg != nil && strings.TrimSpace(deviceCfg.BetaFeatures) != "" {
 		headers.Set("X-Codex-Beta-Features", strings.TrimSpace(deviceCfg.BetaFeatures))
+	} else {
+		// 会话级默认:真实 Codex 的每个握手都带该头,默认值即 remote_compaction_v2。
+		headers.Set("X-Codex-Beta-Features", "remote_compaction_v2")
 	}
 
 	// Originator

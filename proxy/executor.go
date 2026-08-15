@@ -358,6 +358,12 @@ const (
 	codexResponsesLiteWSMetadataPath = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
+const (
+	codexBetaFeaturesHeader = "X-Codex-Beta-Features"
+	// defaultCodexBetaFeatures 是默认安装的真实 Codex 发出的会话级特性协商值。
+	defaultCodexBetaFeatures = "remote_compaction_v2"
+)
+
 var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
@@ -1111,6 +1117,18 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Originator", Originator)
 	}
 	applyCodexAllowedForwardHeaders(req, downstreamHeaders)
+	// 会话级 beta-features:真实 Codex 每个 /responses 请求、WS 握手与 compact 都带
+	// x-codex-beta-features,默认恰为 remote_compaction_v2(codex-rs
+	// build_model_client_beta_features_header,无实验特性默认开启)。下游声明的原样
+	// 保留——非空但无 v2 表示用户显式关闭,不改写;未声明时补默认,避免"只有部分
+	// 请求带头"这种真实客户端不会产生的模式。
+	if strings.TrimSpace(req.Header.Get(codexBetaFeaturesHeader)) == "" {
+		value := defaultCodexBetaFeatures
+		if deviceCfg != nil && strings.TrimSpace(deviceCfg.BetaFeatures) != "" {
+			value = strings.TrimSpace(deviceCfg.BetaFeatures)
+		}
+		req.Header.Set(codexBetaFeaturesHeader, value)
+	}
 	// 指纹收敛必须在白名单透传之后（覆盖客户端原值）、账号自定义头之前（运维显式
 	// 配置保持最终优先）。off 档为空操作。
 	ApplyCodexFingerprintHeaders(req.Header, account, downstreamHeaders)

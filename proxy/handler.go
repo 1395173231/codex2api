@@ -232,15 +232,6 @@ func codexWSTurnContinuationToken(body []byte) string {
 	return codexTurnContinuationToken(nil, body)
 }
 
-func copyCodexTurnStateResponseHeader(c *gin.Context, headers http.Header) {
-	if c == nil || headers == nil {
-		return
-	}
-	if token := strings.TrimSpace(headers.Get(codexTurnStateHeader)); token != "" {
-		c.Header(codexTurnStateHeader, token)
-	}
-}
-
 // applyAffinityGroupRouting keeps fingerprinted requests on the API key's original groups
 // and routes requests without either a Codex engine fingerprint or the dedicated local
 // affinity header to the configured split groups.
@@ -3196,7 +3187,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
-			copyCodexTurnStateResponseHeader(c, resp.Header)
+			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
 			if isGrokNativeRouteResponse(resp) {
 				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard)
 				totalDuration := int(time.Since(start).Milliseconds())
@@ -3548,6 +3539,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
+		// 换号后剥离旧账号铸造的 turn-state 回带,防止跨账号矛盾信号打到上游。
+		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -3713,7 +3706,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
-		copyCodexTurnStateResponseHeader(c, resp.Header)
+		relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
 		SyncCodexUsageState(h.store, account, resp)
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
