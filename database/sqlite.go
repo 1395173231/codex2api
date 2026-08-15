@@ -586,8 +586,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_disabled_patterns", "TEXT DEFAULT '[]'"},
 		{"system_settings", "prompt_filter_review_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_review_api_key", "TEXT DEFAULT ''"},
-		{"system_settings", "prompt_filter_review_base_url", "TEXT DEFAULT 'https://api.openai.com'"},
-		{"system_settings", "prompt_filter_review_model", "TEXT DEFAULT 'omni-moderation-latest'"},
+		{"system_settings", "prompt_filter_review_base_url", "TEXT DEFAULT 'https://api.deepseek.com'"},
+		{"system_settings", "prompt_filter_review_model", "TEXT DEFAULT 'deepseek-v4-flash'"},
 		{"system_settings", "prompt_filter_review_timeout_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "prompt_filter_review_fail_closed", "INTEGER DEFAULT 1"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
@@ -661,6 +661,20 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		SET test_status = 'success'
 		WHERE COALESCE(test_status, 'untested') = 'untested'
 		  AND (COALESCE(test_ip, '') <> '' OR COALESCE(test_location, '') <> '' OR COALESCE(test_latency_ms, 0) > 0)
+	`); err != nil {
+		return err
+	}
+
+	// 审查服务从未配置过(无 key、未启用)且仍是旧出厂默认时,迁移到新的
+	// DeepSeek 默认供应商;真在用 OpenAI 审核的部署不受影响。
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE system_settings
+		SET prompt_filter_review_base_url = 'https://api.deepseek.com',
+			prompt_filter_review_model = 'deepseek-v4-flash'
+		WHERE COALESCE(prompt_filter_review_api_key, '') = ''
+		  AND COALESCE(prompt_filter_review_enabled, 0) = 0
+		  AND COALESCE(prompt_filter_review_base_url, '') = 'https://api.openai.com'
+		  AND COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest'
 	`); err != nil {
 		return err
 	}

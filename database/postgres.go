@@ -1281,10 +1281,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_api_key TEXT DEFAULT '';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.openai.com';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'omni-moderation-latest';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.deepseek.com';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'deepseek-v4-flash';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
+	-- 审查服务从未配置过(无 key、未启用)且仍是旧出厂默认时,迁移到新的
+	-- DeepSeek 默认供应商;真在用 OpenAI 审核的部署不受影响。
+	UPDATE system_settings
+	SET prompt_filter_review_base_url = 'https://api.deepseek.com',
+		prompt_filter_review_model = 'deepseek-v4-flash'
+	WHERE COALESCE(prompt_filter_review_api_key, '') = ''
+	  AND COALESCE(prompt_filter_review_enabled, FALSE) = FALSE
+	  AND COALESCE(prompt_filter_review_base_url, '') = 'https://api.openai.com'
+	  AND COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1';
 	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.144.1';
@@ -2304,8 +2313,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_disabled_patterns, '[]'),
 		       COALESCE(prompt_filter_review_enabled, false),
 		       COALESCE(prompt_filter_review_api_key, ''),
-		       COALESCE(prompt_filter_review_base_url, 'https://api.openai.com'),
-		       COALESCE(prompt_filter_review_model, 'omni-moderation-latest'),
+		       COALESCE(prompt_filter_review_base_url, 'https://api.deepseek.com'),
+		       COALESCE(prompt_filter_review_model, 'deepseek-v4-flash'),
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
@@ -5769,6 +5778,9 @@ type AccountRequestCount struct {
 	// HTTP status. It matches ErrorCount so the list tooltip can show each
 	// code's share of the red capsule.
 	ErrorStatusCounts map[int]int64
+	// SuccessModelCounts is the matching 7-day non-retry 2xx/3xx breakdown
+	// keyed by effective model (falling back to inbound model).
+	SuccessModelCounts map[string]int64
 }
 
 // AccountTimeRangeUsage 每个账号在指定时间窗口内的真实请求/token 统计。
@@ -5844,6 +5856,9 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 		return nil, err
 	}
 	if err := db.attachErrorStatusCounts(ctx, result, nil); err != nil {
+		return nil, err
+	}
+	if err := db.attachSuccessModelCounts(ctx, result, nil); err != nil {
 		return nil, err
 	}
 	return result, nil

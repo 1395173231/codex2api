@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   buildErrorStatusBreakdown,
+  buildModelCountBreakdown,
   formatErrorStatusPercent,
 } from "./requestErrorStatus.ts";
 
@@ -21,6 +22,22 @@ describe("buildErrorStatusBreakdown", () => {
     const rows = buildErrorStatusBreakdown({ 502: 1, 429: 3 });
     assert.equal(rows[0].percent, 75);
     assert.equal(rows[1].percent, 25);
+  });
+});
+
+describe("buildModelCountBreakdown", () => {
+  it("sorts successful models by count then name", () => {
+    const rows = buildModelCountBreakdown(
+      { "gpt-5.2": 2, "gpt-5.4": 8, unknown: 0 },
+      10,
+    );
+    assert.deepEqual(
+      rows.map((row) => [row.key, row.count, row.percent]),
+      [
+        ["gpt-5.4", 8, 80],
+        ["gpt-5.2", 2, 20],
+      ],
+    );
   });
 });
 

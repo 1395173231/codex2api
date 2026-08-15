@@ -55,6 +55,9 @@ func (db *DB) GetAccountRequestCountsByIDs(ctx context.Context, ids []int64) (ma
 	if err := db.attachErrorStatusCounts(ctx, result, ids); err != nil {
 		return nil, err
 	}
+	if err := db.attachSuccessModelCounts(ctx, result, ids); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -100,6 +103,55 @@ func (db *DB) attachErrorStatusCounts(ctx context.Context, result map[int64]*Acc
 			rc.ErrorStatusCounts = make(map[int]int64)
 		}
 		rc.ErrorStatusCounts[statusCode] = count
+	}
+	return rows.Err()
+}
+
+func (db *DB) attachSuccessModelCounts(ctx context.Context, result map[int64]*AccountRequestCount, ids []int64) error {
+	if len(result) == 0 {
+		return nil
+	}
+	args := []interface{}{db.timeArg(time.Now().AddDate(0, 0, -7))}
+	idFilter := ""
+	if ids != nil {
+		ids = positiveUniqueIDs(ids)
+		if len(ids) == 0 {
+			return nil
+		}
+		placeholders := make([]string, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		idFilter = fmt.Sprintf(" AND account_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	query := fmt.Sprintf(`
+		SELECT account_id,
+			COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown'),
+			COUNT(*)
+		FROM usage_logs
+		WHERE created_at >= $1 AND status_code < 400 AND %s AND %s%s
+		GROUP BY account_id, COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown')`,
+		db.nonRetryUsageLogPredicate(), db.endUserUsageLogPredicate(), idFilter)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID, count int64
+		var model string
+		if err := rows.Scan(&accountID, &model, &count); err != nil {
+			return err
+		}
+		rc := result[accountID]
+		if rc == nil {
+			continue
+		}
+		if rc.SuccessModelCounts == nil {
+			rc.SuccessModelCounts = make(map[string]int64)
+		}
+		rc.SuccessModelCounts[model] = count
 	}
 	return rows.Err()
 }

@@ -295,6 +295,12 @@ func (h *Handler) buildAccountResponse(
 				resp.ErrorStatusCounts[strconv.Itoa(code)] = count
 			}
 		}
+		if len(requestCount.SuccessModelCounts) > 0 {
+			resp.SuccessModelCounts = make(map[string]int64, len(requestCount.SuccessModelCounts))
+			for model, count := range requestCount.SuccessModelCounts {
+				resp.SuccessModelCounts[model] = count
+			}
+		}
 	}
 	if usage5h != nil {
 		resp.Usage5hDetail = &accountUsageWindow{

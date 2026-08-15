@@ -1117,6 +1117,8 @@ export const api = {
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptReview: (data: PromptReviewTestRequest) =>
     request<PromptReviewTestResponse>('/prompt-filter/review/test', { method: 'POST', body: JSON.stringify(data) }),
+  listPromptReviewModels: (data: { base_url?: string; api_key?: string; timeout_seconds?: number }) =>
+    request<{ endpoint: string; models: string[] }>('/prompt-filter/review/models', { method: 'POST', body: JSON.stringify(data) }),
   getPromptReviewAPIKeys: () =>
     request<PromptReviewAPIKeysResponse>('/prompt-filter/review/keys'),
   deletePromptReviewAPIKey: (keyID: string) =>

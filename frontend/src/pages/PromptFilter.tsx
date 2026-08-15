@@ -448,8 +448,8 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_review_api_key: '',
   prompt_filter_review_api_key_configured: false,
   prompt_filter_review_api_key_count: 0,
-  prompt_filter_review_base_url: 'https://api.openai.com',
-  prompt_filter_review_model: 'omni-moderation-latest',
+  prompt_filter_review_base_url: 'https://api.deepseek.com',
+  prompt_filter_review_model: 'deepseek-v4-flash',
   prompt_filter_review_timeout_seconds: 10,
   prompt_filter_review_fail_closed: true,
 }
@@ -533,8 +533,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_review_api_key: '',
   prompt_filter_review_api_key_configured: Boolean(settings?.prompt_filter_review_api_key_configured),
   prompt_filter_review_api_key_count: settings?.prompt_filter_review_api_key_count || 0,
-  prompt_filter_review_base_url: settings?.prompt_filter_review_base_url || 'https://api.openai.com',
-  prompt_filter_review_model: settings?.prompt_filter_review_model || 'omni-moderation-latest',
+  prompt_filter_review_base_url: settings?.prompt_filter_review_base_url || 'https://api.deepseek.com',
+  prompt_filter_review_model: settings?.prompt_filter_review_model || 'deepseek-v4-flash',
   prompt_filter_review_timeout_seconds: settings?.prompt_filter_review_timeout_seconds || 10,
   prompt_filter_review_fail_closed: settings?.prompt_filter_review_fail_closed ?? true,
 })
@@ -2794,6 +2794,8 @@ function OverviewView({
   )
   const [reviewTestText, setReviewTestText] = useState('请帮我整理今天的会议纪要。')
   const [reviewTesting, setReviewTesting] = useState(false)
+  const [reviewModelsLoading, setReviewModelsLoading] = useState(false)
+  const [reviewModelOptions, setReviewModelOptions] = useState<string[]>([])
   const [reviewTestResult, setReviewTestResult] = useState<PromptReviewTestResponse | null>(null)
   const [configuredReviewKeys, setConfiguredReviewKeys] = useState<PromptReviewAPIKeyDescriptor[]>([])
   const [reviewKeysLoading, setReviewKeysLoading] = useState(false)
@@ -2881,6 +2883,24 @@ function OverviewView({
       return
     }
     setForm((current) => ({ ...current, prompt_filter_advanced_config: patched.serialized }))
+  }
+  const fetchReviewModels = async () => {
+    setReviewModelsLoading(true)
+    try {
+      const result = await api.listPromptReviewModels({
+        base_url: form.prompt_filter_review_base_url?.trim() || undefined,
+        api_key: form.prompt_filter_review_api_key?.trim() || undefined,
+        timeout_seconds: form.prompt_filter_review_timeout_seconds || undefined,
+      })
+      setReviewModelOptions(result.models)
+      if (!result.models.length) {
+        showToast(t('promptFilter.reviewModelsEmpty'), 'error')
+      }
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewModelsFetchFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewModelsLoading(false)
+    }
   }
   const runReviewConnectionTest = async () => {
     const text = reviewTestText.trim()
@@ -3124,9 +3144,9 @@ function OverviewView({
       </div>
 
       <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
-        <DialogContent className="max-h-[92vh] w-[calc(100vw-2rem)] max-w-none overflow-y-auto sm:max-w-6xl">
-          <DialogHeader><DialogTitle>{t('promptFilter.advancedTitle')}</DialogTitle><DialogDescription>{t('promptFilter.advancedDescription')}</DialogDescription></DialogHeader>
-          <div className="space-y-4">
+        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-6xl sm:p-0">
+          <DialogHeader className="border-b px-5 pb-4 pt-5 pr-12 sm:px-6 sm:pt-6 sm:pr-12"><DialogTitle>{t('promptFilter.advancedTitle')}</DialogTitle><DialogDescription>{t('promptFilter.advancedDescription')}</DialogDescription></DialogHeader>
+          <div className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4 sm:px-6">
             <div className="rounded-xl border bg-muted/20 p-4">
               <div className="mb-4">
                 <h3 className="text-sm font-semibold">{t('promptFilter.dailyPolicyTitle')}</h3>
@@ -3182,10 +3202,31 @@ function OverviewView({
                   </div>
                   <div className="grid gap-4 sm:grid-cols-3">
                     <Field label={t('promptFilter.reviewBaseUrl')}>
-                      <Input value={form.prompt_filter_review_base_url} placeholder="https://api.example.com/v1" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
+                      <Input value={form.prompt_filter_review_base_url} placeholder="https://api.deepseek.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
                     </Field>
                     <Field label={t('promptFilter.reviewModel')}>
-                      <Input value={form.prompt_filter_review_model} placeholder="review-model" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                      <div className="flex gap-2">
+                        <Input className="min-w-0 flex-1" value={form.prompt_filter_review_model} placeholder="deepseek-v4-flash" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="shrink-0"
+                          disabled={reviewModelsLoading}
+                          title={t('promptFilter.reviewModelsFetchHint')}
+                          onClick={() => void fetchReviewModels()}
+                        >
+                          {reviewModelsLoading ? <RefreshCw className="size-4 animate-spin" /> : t('promptFilter.reviewModelsFetch')}
+                        </Button>
+                      </div>
+                      {reviewModelOptions.length > 0 ? (
+                        <Select
+                          className="mt-2"
+                          value={reviewModelOptions.includes(form.prompt_filter_review_model) ? form.prompt_filter_review_model : ''}
+                          placeholder={t('promptFilter.reviewModelsPick', { count: reviewModelOptions.length })}
+                          options={reviewModelOptions.map((model) => ({ value: model, label: model }))}
+                          onValueChange={(model) => setForm((current) => ({ ...current, prompt_filter_review_model: model }))}
+                        />
+                      ) : null}
                     </Field>
                     <Field label={t('promptFilter.reviewTimeout')}>
                       <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
@@ -3409,7 +3450,7 @@ function OverviewView({
               ) : null}
             </div>
           </div>
-          <DialogFooter className="flex-wrap sm:justify-between">
+          <DialogFooter className="flex-wrap border-t px-5 py-4 sm:justify-between sm:px-6">
             <div className="flex flex-wrap items-end gap-2">
               <div className="min-w-[210px] space-y-1.5">
                 <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.recommendedStrengthTitle')}</div>
@@ -5407,6 +5448,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const { t } = useTranslation()
   const matches = parseLogMatches(log.matched_patterns)
   const [expanded, setExpanded] = useState(false)
+  const [detailOpen, setDetailOpen] = useState(false)
   const fullText = (log.full_text || '').trim()
   const hasFull = fullText.length > 0
   const matchContext = (log.match_context || '').trim()
@@ -5428,6 +5470,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const auditScore = typeof log.audit_score === 'number' ? log.audit_score : undefined
   const apiKeyLabel = log.api_key_name || log.api_key_masked || '-'
   const decisionSource = promptFilterDecisionSource(log)
+  const hasPreviewDetail = Boolean(matchContext || userPrompt || hasFull)
   return (
     <>
     <TableRow>
@@ -5531,7 +5574,18 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         {!compact && log.newapi_request_id ? <div className="truncate font-mono text-[11px] text-muted-foreground" title={log.newapi_request_id}>{t('promptFilter.newapiRequest')} {log.newapi_request_id}</div> : null}
       </TableCell>
       <TableCell className="min-w-0">
-        <div className="space-y-1.5">
+        <div
+          className={cn('space-y-1.5', hasPreviewDetail && 'cursor-pointer rounded-md transition-colors hover:bg-muted/40')}
+          role={hasPreviewDetail ? 'button' : undefined}
+          tabIndex={hasPreviewDetail ? 0 : undefined}
+          onClick={hasPreviewDetail ? () => setDetailOpen(true) : undefined}
+          onKeyDown={hasPreviewDetail ? (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              setDetailOpen(true)
+            }
+          } : undefined}
+        >
           {matchContext ? (
             <div className="min-w-0 rounded-md border border-[hsl(var(--warning))]/20 bg-[hsl(var(--warning-bg))] px-2 py-1.5">
               <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px] font-semibold text-[hsl(var(--warning))]">
@@ -5576,6 +5630,50 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
           </button>
         ) : null}
         {!compact && log.review_model ? <div className="mt-1 truncate text-xs text-muted-foreground">{log.review_model}</div> : null}
+        {hasPreviewDetail ? (
+          <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+            <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+              <DialogHeader>
+                <DialogTitle>{t('promptFilter.previewDetailTitle')}</DialogTitle>
+                <DialogDescription className="break-all font-mono text-xs">
+                  {formatBeijingTime(log.created_at)} · {log.endpoint || '-'} · {log.model || '-'}
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 text-sm">
+                {matchContext ? (
+                  <div>
+                    <div className="mb-2 flex flex-wrap items-baseline gap-1.5">
+                      <span className="font-semibold">{t('promptFilter.matchContextLabel')}</span>
+                      <span className="text-xs text-muted-foreground">{t('promptFilter.triggerOrigin')}: {primaryOriginLabel}</span>
+                    </div>
+                    <pre className="max-h-[30vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-[hsl(var(--warning))]/30 bg-[hsl(var(--warning-bg))] p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptPreview text={matchContext} /></pre>
+                  </div>
+                ) : null}
+                {userPrompt ? (
+                  <div>
+                    <div className="mb-2 font-semibold">{userPromptLabel}</div>
+                    <pre className="max-h-[30vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptPreview text={userPrompt} /></pre>
+                  </div>
+                ) : null}
+                {hasFull ? (
+                  <div>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="font-semibold">{t('promptFilter.fullTextTitle')}</span>
+                      <button
+                        type="button"
+                        onClick={() => void navigator.clipboard?.writeText(fullText)}
+                        className="text-xs font-medium text-primary hover:underline"
+                      >
+                        {t('common.copy')}
+                      </button>
+                    </div>
+                    <pre className="max-h-[40vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptText text={fullText} terms={hitTerms} /></pre>
+                  </div>
+                ) : null}
+              </div>
+            </DialogContent>
+          </Dialog>
+        ) : null}
       </TableCell>
     </TableRow>
     {expanded && hasFull ? (

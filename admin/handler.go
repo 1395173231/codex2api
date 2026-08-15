@@ -751,6 +751,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/review/keys", h.ListPromptReviewAPIKeys)
 	api.DELETE("/prompt-filter/review/keys/:key_id", h.DeletePromptReviewAPIKey)
 	api.POST("/prompt-filter/review/test", h.TestPromptReviewConnection)
+	api.POST("/prompt-filter/review/models", h.ListPromptReviewModels)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/prompt-filter/newapi-bindings", h.ListPromptFilterNewAPIBindings)
@@ -1066,6 +1067,7 @@ type accountResponse struct {
 	RetryErrorRequests            int64                       `json:"retry_error_requests"`
 	RateLimitAttempts             int64                       `json:"rate_limit_attempts"`
 	ErrorStatusCounts             map[string]int64            `json:"error_status_counts,omitempty"`
+	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`

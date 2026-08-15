@@ -157,6 +157,7 @@ export interface AccountRow {
   retry_error_requests?: number
   rate_limit_attempts?: number
   error_status_counts?: Record<string, number>
+  success_model_counts?: Record<string, number>
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
