@@ -21,12 +21,14 @@ func TestWhamDailyUsageDueTargetsUsesPerStatusIntervals(t *testing.T) {
 	now := time.Now()
 	active := &auth.Account{DBID: 1, AccessToken: "token"}
 	limited := rateLimitedProbeAccount(2, now)
-	all := []*auth.Account{active, limited}
+	authoritative := &auth.Account{DBID: 3, AccessToken: "token"}
+	authoritative.SetCooldownUntil(now.Add(12*time.Hour), auth.ResponsesRateLimitedCooldownReason)
+	all := []*auth.Account{active, limited, authoritative}
 
 	// 首轮：没有计时记录，两个账号都要刷。
 	lastAttempt := map[int64]time.Time{}
-	if targets := whamDailyUsageDueTargets(all, lastAttempt, now); len(targets) != 2 {
-		t.Fatalf("first round targets = %d, want 2", len(targets))
+	if targets := whamDailyUsageDueTargets(all, lastAttempt, now); len(targets) != 3 {
+		t.Fatalf("first round targets = %d, want 3", len(targets))
 	}
 
 	// 半小时后：正常账号未到 1h，限流账号未到 6h，都不刷。
@@ -51,6 +53,9 @@ func TestWhamDailyUsageDueTargetsUsesPerStatusIntervals(t *testing.T) {
 	}
 	if !found[2] {
 		t.Fatalf("6h targets = %+v, want rate-limited account 2 due", targets)
+	}
+	if !found[3] {
+		t.Fatalf("6h targets = %+v, want Responses-limited account 3 due", targets)
 	}
 }
 

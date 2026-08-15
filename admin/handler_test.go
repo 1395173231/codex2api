@@ -101,6 +101,8 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		{ID: 5, Status: "active", Enabled: true},  // normal
 		{ID: 6, Status: "error", Enabled: true},   // DB error without runtime override
 		{ID: 7, Status: "cooldown", Enabled: true, CooldownReason: "rate_limited"},
+		{ID: 8, Status: "active", Enabled: true}, // runtime authoritative Responses limit
+		{ID: 9, Status: "cooldown", Enabled: true, CooldownReason: auth.ResponsesRateLimitedCooldownReason},
 	}
 
 	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
@@ -110,6 +112,8 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
 	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+	responsesLimited := &auth.Account{DBID: 8, Status: auth.StatusReady, AccessToken: "at-8"}
+	responsesLimited.SetCooldownWithReason(time.Hour, auth.ResponsesRateLimitedCooldownReason)
 
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
@@ -117,10 +121,11 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		disabled,
 		rateLimited,
 		normal,
+		responsesLimited,
 	})
 
-	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
-		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	if got.total != 9 || got.normal != 3 || got.rateLimited != 4 || got.abnormal != 2 || got.disabled != 1 {
+		t.Fatalf("counts = %+v, want total=9 normal=3 rateLimited=4 abnormal=2 disabled=1", got)
 	}
 }
 

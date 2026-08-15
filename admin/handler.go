@@ -996,11 +996,11 @@ func isDashboardAbnormalAccount(status string) bool {
 
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false

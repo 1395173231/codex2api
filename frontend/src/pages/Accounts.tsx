@@ -11872,11 +11872,13 @@ function getAccountRateLimitWindow(
   const reason = (account.cooldown_reason || "").toLowerCase();
   const explicitlyRateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "usage_exhausted" ||
     status === "quota_paused" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d" ||
     reason === "rate_limited" ||
+    reason === "responses_rate_limited" ||
     reason === "rate_limited_5h" ||
     reason === "rate_limited_7d";
   const usageWindowsAreInformational =
@@ -14735,6 +14737,7 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   const rateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d";
   if (

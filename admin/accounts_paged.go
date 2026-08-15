@@ -855,7 +855,10 @@ func accountListRateLimited(item *accountListSnapshotItem) bool {
 	}
 	limited := map[string]bool{
 		"usage_limited": true, "usage_exhausted": true, "rate_limited": true,
-		"rate_limited_5h": true, "rate_limited_7d": true, "quota_paused": true,
+		auth.ResponsesRateLimitedCooldownReason: true,
+		"rate_limited_5h":                       true,
+		"rate_limited_7d":                       true,
+		"quota_paused":                          true,
 	}
 	return limited[strings.ToLower(item.Status)] || limited[strings.ToLower(item.CooldownReason)]
 }

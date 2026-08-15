@@ -106,7 +106,7 @@ func TestReconcileDispatchStateReloadsChangedResponsesIdentity(t *testing.T) {
 	store.Release(selected)
 }
 
-func TestApplyOpenAIResponsesConfigClearsPersistedAPIKey(t *testing.T) {
+func TestApplyOpenAIResponsesConfigUsesPersistedAPIKeySemantics(t *testing.T) {
 	ctx := context.Background()
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "responses-empty-key.db"))
 	if err != nil {
@@ -127,6 +127,23 @@ func TestApplyOpenAIResponsesConfigClearsPersistedAPIKey(t *testing.T) {
 	if err := store.Init(ctx); err != nil {
 		t.Fatalf("Store.Init: %v", err)
 	}
+	if err := db.UpdateOpenAIResponsesAccount(ctx, accountID, "relay", map[string]interface{}{
+		"models": []string{"gpt-5.6", "gpt-5.6-mini"},
+	}, ""); err != nil {
+		t.Fatalf("config-only UpdateOpenAIResponsesAccount: %v", err)
+	}
+	if !store.ApplyOpenAIResponsesConfig(accountID, "https://relay.example", "", []string{"gpt-5.6", "gpt-5.6-mini"}, "", "auto", "") {
+		t.Fatal("config-only ApplyOpenAIResponsesConfig returned false")
+	}
+	acc := store.FindByID(accountID)
+	if acc == nil {
+		t.Fatal("runtime account missing")
+	}
+	_, apiKey := acc.OpenAIResponsesCredentials()
+	if apiKey != "sk-old" {
+		t.Fatalf("runtime API key after omitted-key update = %q, want sk-old", apiKey)
+	}
+
 	if err := db.UpdateOpenAIResponsesAccount(ctx, accountID, "relay", map[string]interface{}{"api_key": ""}, ""); err != nil {
 		t.Fatalf("UpdateOpenAIResponsesAccount: %v", err)
 	}
@@ -134,11 +151,7 @@ func TestApplyOpenAIResponsesConfigClearsPersistedAPIKey(t *testing.T) {
 		t.Fatal("ApplyOpenAIResponsesConfig returned false")
 	}
 
-	acc := store.FindByID(accountID)
-	if acc == nil {
-		t.Fatal("runtime account missing")
-	}
-	_, apiKey := acc.OpenAIResponsesCredentials()
+	_, apiKey = acc.OpenAIResponsesCredentials()
 	if apiKey != "" {
 		t.Fatalf("runtime API key = %q, want empty persisted value", apiKey)
 	}

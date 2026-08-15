@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -281,7 +282,7 @@ func TestResponsesWebSocketFreshTurnReportsUsageLimitAs429(t *testing.T) {
 	var upstreamCalls atomic.Int64
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		upstreamCalls.Add(1)
-		return nil, nil
+		return nil, fmt.Errorf("unexpected upstream call for account %d", account.ID())
 	}
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
@@ -392,5 +393,116 @@ func TestResponsesWebSocketTurnStateDoesNotRerouteAfterAuthoritativeLimit(t *tes
 	}
 	if upstreamCalls.Load() != 0 {
 		t.Fatalf("active WebSocket turn was rerouted after authoritative limit: upstream calls=%d", upstreamCalls.Load())
+	}
+}
+
+func TestResponsesWebSocketUpgradeTurnStateDoesNotAuthorizeFreshFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	served := make(chan int64, 1)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		served <- account.ID()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`data: {"type":"response.completed","response":{"id":"resp_fresh","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n",
+			)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		IgnoreUsageLimitStatus: true,
+	})
+	limited := &auth.Account{
+		DBID:                1,
+		AccessToken:         "limited-token",
+		AccountID:           "limited-account",
+		PlanType:            "plus",
+		UsagePercent5h:      100,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(time.Hour),
+	}
+	healthy := &auth.Account{DBID: 2, AccessToken: "healthy-token", AccountID: "healthy-account", PlanType: "plus"}
+	store.AddAccount(limited)
+	store.AddAccount(healthy)
+	store.BindSessionAffinity("ws-upgrade-turn", limited, "")
+
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	upgradeHeaders := make(http.Header)
+	upgradeHeaders.Set(codexTurnStateHeader, "connection-scoped-token")
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", upgradeHeaders)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, response.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-upgrade-turn","input":"fresh turn"}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write websocket request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, event, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read websocket response: %v", err)
+	} else if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+		t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
+	}
+	if accountID := <-served; accountID != healthy.ID() {
+		t.Fatalf("fresh frame used account %d, want healthy account %d", accountID, healthy.ID())
+	}
+}
+
+func TestResponsesWebSocketPinnedTurnForwardsPreviousResponseFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		body := "" +
+			`data: {"type":"error","error":{"code":"previous_response_not_found","message":"missing response"}}` + "\n\n" +
+			`data: {"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, IgnoreUsageLimitStatus: true})
+	account := &auth.Account{DBID: 1, AccessToken: "token", AccountID: "account", PlanType: "plus"}
+	store.AddAccount(account)
+	store.BindSessionAffinity("ws-pinned-failure", account, "")
+
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, response.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-pinned-failure","previous_response_id":"resp_missing","input":"continue","client_metadata":{"x-codex-turn-state":"turn-state"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write websocket request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, event, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read pinned-turn failure: %v", err)
+	}
+	if eventType := gjson.GetBytes(event, "type").String(); eventType != "error" {
+		t.Fatalf("event type = %q, want error; body=%s", eventType, event)
 	}
 }

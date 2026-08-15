@@ -290,7 +290,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	hasPreviousResponse := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
-	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
+	turnContinuation := codexWSTurnContinuationToken(rawBody) != ""
 	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	ruleIdentity := h.payloadRuleIdentity(c)
@@ -370,6 +370,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}
 	preserveContinuationBinding := func() bool {
 		return continuationPinned || (hasPreviousResponse && !continuationDegraded)
+	}
+	canDegradeContinuation := func() bool {
+		return !continuationPinned && hasPreviousResponse && !continuationDegraded
 	}
 	var wsHTTPFallback websocketHTTPFallbackState
 	var lastUpstreamCancel context.CancelFunc
@@ -632,7 +635,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			fallbackLog = &wsHTTPFallback
 		}
 		preserveAffinity := preserveContinuationBinding()
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, preserveAffinity, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
+		allowContinuationDegrade := canDegradeContinuation()
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
 			var continuationErr *responsesWSContinuationNotFoundError
 			if !continuationPinned && errors.As(err, &continuationErr) {
 				// 账号已在流内释放，未记失败也未解绑：剥离续链 id 后原地再试一次。
@@ -686,6 +690,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	proxyURL string,
 	affinityKey string,
 	preserveAffinity bool,
+	allowContinuationDegrade bool,
 	model string,
 	effectiveModel string,
 	logEffectiveModel string,
@@ -805,7 +810,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			// 就进不了下面的续链降级分支。
 			shouldDefer := !ttftRecorded && !gotTerminal &&
 				(isPreContentLifecycleEvent(eventType) || isRetryableUpstreamErrorFrame(eventType, data) ||
-					(preserveAffinity && eventType == "error" && isPreviousResponseNotFoundBody(data)))
+					(allowContinuationDegrade && eventType == "error" && isPreviousResponseNotFoundBody(data)))
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
 				pendingFirstTokenBytes += len(clientData)
@@ -827,7 +832,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				}
 				// 续链 id 上游认不出：换号重试没用（换了还是找不到），但剥离续链 id
 				// 后同一账号就能继续。丢弃缓冲交回外层降级重试，别把 400 甩给客户端。
-				if preserveAffinity && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody &&
+				if allowContinuationDegrade && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody &&
 					isPreviousResponseNotFoundBody(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0

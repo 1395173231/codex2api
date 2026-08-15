@@ -5003,7 +5003,9 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 		activeIDs[row.ID] = struct{}{}
 		if acc := s.FindByID(row.ID); acc != nil {
 			if openAIResponsesRuntimeConfigDiffers(acc, row) {
-				s.ApplyOpenAIResponsesConfig(
+				s.applyOpenAIResponsesConfig(
+					ctx,
+					row,
 					row.ID,
 					row.GetCredential("base_url"),
 					row.GetCredential("api_key"),
@@ -5249,7 +5251,11 @@ func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus stri
 	cleaned := 0
 
 	for _, acc := range accounts {
-		if acc == nil || acc.RuntimeStatus() != targetStatus {
+		if acc == nil {
+			continue
+		}
+		status := acc.RuntimeStatus()
+		if status != targetStatus && !(targetStatus == "rate_limited" && status == ResponsesRateLimitedCooldownReason) {
 			continue
 		}
 		// 正在用积分顶替限流的账号显示为限流，但实际仍在正常调度——清理会误删好账号。
@@ -5289,7 +5295,7 @@ func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus stri
 
 // CleanRateLimitedManual 清理所有"限流"含义下的账号（用于手动一键清理）。
 // 与 CleanByRuntimeStatus("rate_limited") 的区别：
-//   - 涵盖 RuntimeStatus 的全部限流相关值：rate_limited / usage_exhausted
+//   - 涵盖 RuntimeStatus 的全部限流相关值，包括 Responses 权威 429
 //   - 不跳过 premium 5h 限流：手动触发即代表用户明确意图删除
 //   - 锁定账号依然跳过（与所有清理流程一致）
 func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
@@ -5301,7 +5307,7 @@ func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
 			continue
 		}
 		status := acc.RuntimeStatus()
-		if status != "rate_limited" && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
+		if status != "rate_limited" && status != ResponsesRateLimitedCooldownReason && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
 			continue
 		}
 		// 同上：积分顶着的账号只是显示为限流，仍可正常调度，不该被"清理限流账号"删掉。
@@ -6211,8 +6217,12 @@ func (s *Store) HasUsageLimitedCandidateWithFilter(apiKeyID int64, exclude map[i
 		if filter != nil && !filter(acc) {
 			continue
 		}
-		_ = s.accountHasCachedCooldown(acc)
-		if acc.FreshDispatchUsageLimited() {
+		cachedCooldown := s.accountHasCachedCooldown(acc)
+		usageLimited := acc.FreshDispatchUsageLimited()
+		if cachedCooldown && !usageLimited {
+			continue
+		}
+		if usageLimited {
 			return true
 		}
 	}
@@ -7756,6 +7766,18 @@ func (s *Store) accountAllowedForAPIKey(acc *Account, apiKeyID int64) bool {
 }
 
 func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
+	if s != nil && s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if row, err := s.db.GetAccountByID(ctx, dbID); err == nil &&
+			strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamOpenAIResponses) {
+			return s.applyOpenAIResponsesConfig(ctx, row, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, proxyURL)
+		}
+	}
+	return s.applyOpenAIResponsesConfig(context.Background(), nil, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, proxyURL)
+}
+
+func (s *Store) applyOpenAIResponsesConfig(ctx context.Context, row *database.AccountRow, dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -7764,21 +7786,16 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	normalizedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	effectiveAPIKey := strings.TrimSpace(apiKey)
 	credentialGeneration := int64(0)
-	loadedPersistedConfig := false
-	if s.db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if row, err := s.db.GetAccountByID(ctx, dbID); err == nil &&
-			strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamOpenAIResponses) {
-			loadedPersistedConfig = true
-			normalizedBaseURL = strings.TrimRight(strings.TrimSpace(row.GetCredential("base_url")), "/")
-			effectiveAPIKey = strings.TrimSpace(row.GetCredential("api_key"))
-			models = row.GetCredentialStringSlice("models")
-			modelMapping = row.GetCredential("model_mapping")
-			codexClientMetadataMode = row.GetCredential("codex_client_metadata_mode")
-			proxyURL = row.ProxyURL
-			credentialGeneration = row.CredentialGeneration
-		}
-		cancel()
+	loadedPersistedConfig := row != nil &&
+		strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamOpenAIResponses)
+	if loadedPersistedConfig {
+		normalizedBaseURL = strings.TrimRight(strings.TrimSpace(row.GetCredential("base_url")), "/")
+		effectiveAPIKey = strings.TrimSpace(row.GetCredential("api_key"))
+		models = row.GetCredentialStringSlice("models")
+		modelMapping = row.GetCredential("model_mapping")
+		codexClientMetadataMode = row.GetCredential("codex_client_metadata_mode")
+		proxyURL = row.ProxyURL
+		credentialGeneration = row.CredentialGeneration
 	}
 
 	acc.mu.Lock()
@@ -7830,8 +7847,8 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 		s.deleteCachedAccountCooldown(acc.DBID)
 		s.ClearAllModelCooldowns(acc)
 		if s.db != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+			clearCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if err := s.db.ClearError(clearCtx, acc.DBID); err != nil {
 				log.Printf("[账号 %d] Responses API 身份变更后清理账号状态失败: %v", acc.DBID, err)
 			}
 			cancel()

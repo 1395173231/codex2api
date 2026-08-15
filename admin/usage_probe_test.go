@@ -223,6 +223,7 @@ func TestProbeUsageSnapshotResponsesSuccessRecoversIgnoredUsageCooldown(t *testi
 	store.SetUsageProbeResponsesFallbackEnabled(true)
 	account := &auth.Account{DBID: 4, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
 	store.AddAccount(account)
+	store.BindSessionAffinity("working-turn", account, "")
 	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
 
 	h := &Handler{store: store, executeUsageProbe: executeRequest}
@@ -238,7 +239,6 @@ func TestProbeUsageSnapshotResponsesSuccessRecoversIgnoredUsageCooldown(t *testi
 	if account.IsAvailable() {
 		t.Fatal("WHAM 100% account became available to fresh sessions")
 	}
-	store.BindSessionAffinity("working-turn", account, "")
 	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
 	if continued != account {
 		t.Fatal("authoritative Responses 200 did not preserve active-turn continuation")

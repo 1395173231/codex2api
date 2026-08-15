@@ -225,6 +225,13 @@ func codexTurnContinuationToken(headers http.Header, body []byte) string {
 	return strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-turn-state").String())
 }
 
+// codexWSTurnContinuationToken reads per-frame metadata only. Upgrade headers
+// are connection-scoped and cannot prove that every response.create belongs to
+// the same active turn.
+func codexWSTurnContinuationToken(body []byte) string {
+	return codexTurnContinuationToken(nil, body)
+}
+
 func copyCodexTurnStateResponseHeader(c *gin.Context, headers http.Header) {
 	if c == nil || headers == nil {
 		return
