@@ -47,6 +47,7 @@ const (
 
 	grokImagineAliasModel        = "grok-imagine"
 	grokImagineImageQualityModel = "grok-imagine-image-quality"
+	grokImagineVideoModel        = "grok-imagine-video"
 	grokImagineVideo15Model      = "grok-imagine-video-1.5"
 	grokImagineVideo15Preview    = "grok-imagine-video-1.5-preview"
 	grokDefaultVideoModel        = grokImagineVideo15Model
@@ -158,9 +159,32 @@ func sendGrokMediaChannelBlockedError(c *gin.Context) {
 	}})
 }
 
+// grokMediaPreferredAccountFilter 在媒体过滤器上再收一层:优先付费凭据。
+// free 计划的 OAuth 号打媒体端点必 403,先挑付费号能避免把重试额度和 6h 模型
+// 冷却烧在注定失败的账号上;API Key 账号按量计费视同付费。
+func grokMediaPreferredAccountFilter(model string) auth.AccountFilter {
+	base := grokMediaAccountFilter(model)
+	return func(account *auth.Account) bool {
+		if !base(account) {
+			return false
+		}
+		if account.GrokAuthKind() == auth.GrokAuthKindAPIKey {
+			return true
+		}
+		plan := strings.ToLower(strings.TrimSpace(account.GetPlanType()))
+		return plan != "" && plan != "free"
+	}
+}
+
+// nextGrokMediaAccount 两层选号:先付费凭据,挑不到再放开到全部候选
+// (与生图路径的 plus 优先层级同构)。两层都过 scope 预算闸门。
 func (h *Handler) nextGrokMediaAccount(c *gin.Context, apiKeyID int64, exclude map[int64]bool, model string, identity requestSessionIdentity) (*auth.Account, string) {
-	filter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, grokMediaAccountFilter(model)))
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, filter))
+	preferred := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, grokMediaPreferredAccountFilter(model)))
+	if account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, preferred)); account != nil {
+		return account, stickyProxyURL
+	}
+	fallback := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, grokMediaAccountFilter(model)))
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, fallback))
 }
 
 // ==================== 上游 profile 与请求投递 ====================
@@ -250,6 +274,12 @@ func doGrokMediaRequest(ctx context.Context, account *auth.Account, profile grok
 	if model != "" {
 		req.Header.Set("x-grok-model-override", model)
 	}
+	// CLI 身份头只发给 CLI 网关。xAI 公开 API 识别到 x-grok-client-* 会按 CLI
+	// 客户端的 Zero Data Retention 政策处理(实测报 "Zero Data Retention teams
+	// must provide output.upload_url"),媒体请求直接 400。
+	if profile.Kind == grokMediaProfileXAI {
+		stripGrokCLIIdentityHeaders(req.Header)
+	}
 	for key, values := range extra {
 		if len(values) > 0 {
 			req.Header.Set(key, values[0])
@@ -264,6 +294,19 @@ func doGrokMediaRequest(ctx context.Context, account *auth.Account, profile grok
 	}
 	decodeGrokResponseEncoding(resp)
 	return resp, nil
+}
+
+// stripGrokCLIIdentityHeaders 移除 Grok CLI 专属的身份/会话头,保留 Authorization、
+// Content-Type、Accept 等通用头。
+func stripGrokCLIIdentityHeaders(header http.Header) {
+	for _, key := range []string{
+		"x-grok-client-version", "x-grok-client-identifier", "x-grok-client-mode",
+		"x-xai-token-auth", "x-authenticateresponse", "x-compaction-at",
+		"x-grok-agent-id", "x-grok-session-id", "x-grok-conv-id", "x-grok-req-id",
+		"x-grok-turn-idx", "x-grok-model-override", "x-userid", "x-grok-user-id",
+	} {
+		header.Del(key)
+	}
 }
 
 type grokMediaSendResult struct {
@@ -408,6 +451,33 @@ func buildGrokImagesBody(model, prompt, responseFormat string, params grokImages
 	return body
 }
 
+// grokImagesUsageLogInfo 从 OpenAI Images 形状的响应(data[].url|b64_json)提取
+// 用量维度:计数必有;b64 形态可解出尺寸/字节数,url 形态只有计数与格式。
+func grokImagesUsageLogInfo(responseJSON []byte) imageUsageLogInfo {
+	var info imageUsageLogInfo
+	data := gjson.GetBytes(responseJSON, "data")
+	if !data.IsArray() {
+		return info
+	}
+	for _, item := range data.Array() {
+		b64 := strings.TrimSpace(item.Get("b64_json").String())
+		if b64 == "" && strings.TrimSpace(item.Get("url").String()) == "" {
+			continue
+		}
+		entry := imageUsageLogInfo{Count: 1, Format: imageFormatFromContentType(item.Get("mime_type").String())}
+		if b64 != "" {
+			if stats, ok := imageStatsFromBase64(b64); ok {
+				entry.Bytes = stats.ByteSize
+				entry.Width = stats.Width
+				entry.Height = stats.Height
+				entry.Size = imageActualSize(stats.Width, stats.Height)
+			}
+		}
+		info = mergeImageUsageLogInfo(info, entry)
+	}
+	return info
+}
+
 // forwardGrokImagesRequest 把 /v1/images/* 请求直投 Grok 媒体上游,成功响应按
 // OpenAI Images 形状原样透传(data[].url / b64_json 由上游按 response_format 决定)。
 func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imageModel, logModel, logEffectiveModel, prompt, responseFormat string, params grokImagesParams, images []string, stream bool) {
@@ -548,7 +618,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		logInput.CompletionTokens = imageCount
 		logInput.OutputTokens = imageCount
 		logInput.TotalTokens = imageCount
-		applyImageUsageLogInfo(logInput, imageUsageLogInfoFromResponseJSON(out))
+		applyImageUsageLogInfo(logInput, grokImagesUsageLogInfo(out))
 		h.logUsageForRequest(c, logInput)
 		h.store.ClearModelCooldown(account, routedModel)
 		h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
@@ -667,7 +737,13 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 
 	model := normalizeGrokMediaModel(gjson.GetBytes(rawBody, "model").String())
 	if model == "" {
-		model = grokDefaultVideoModel
+		// 上游实测:edits/extensions 只有 grok-imagine-video 支持,1.5 系列会
+		// 400 "not supported for this model",默认模型按操作分开。
+		if operation == "generations" {
+			model = grokDefaultVideoModel
+		} else {
+			model = grokImagineVideoModel
+		}
 	}
 	requestModel := model
 	if mapped, ok := h.resolveConfiguredRequestModel(model, h.supportedModelIDs(c.Request.Context())); ok {
@@ -936,7 +1012,9 @@ func (h *Handler) VideosStatus(c *gin.Context) {
 	defer resp.Body.Close()
 	recordGrokUpstreamObservations(account, resp.Header)
 	out, _ := io.ReadAll(io.LimitReader(resp.Body, grokVideoStatusBodyLimit))
-	if resp.StatusCode != http.StatusOK {
+	// 任务进行中上游以 202 携带 {"status":"pending","progress":N} 返回,
+	// 与 200 一样是合法状态体;统一以 200 透传,轮询客户端只看 body.status。
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		h.sendFinalUpstreamError(c, resp.StatusCode, out)
 		return
 	}

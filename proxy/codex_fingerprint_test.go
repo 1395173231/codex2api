@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -423,5 +427,60 @@ func TestApplyCodexFingerprintSkipsRelayAccounts(t *testing.T) {
 	body := []byte(`{"client_metadata":{"x-codex-installation-id":"client-install"}}`)
 	if got := ApplyCodexFingerprintToBody(body, grok, downstream); string(got) != string(body) {
 		t.Fatalf("grok body = %s, want %s unchanged", got, body)
+	}
+}
+
+// compact 路径此前只收敛请求头、请求体 client_metadata 原样发出，上游会看到
+// 「头说设备 A、体说设备 B」这种真实客户端不会有的矛盾（也让收敛形同虚设）。
+func TestExecuteCompactRequestConvergesBodyAndHeaders(t *testing.T) {
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	account.AccessToken = "token-compact"
+	// 带 turn metadata 才算真 Codex 客户端，身份头补发才会生效（见
+	// ApplyCodexFingerprintHeaders 的 EvaluateEngineFingerprint 门）。
+	downstream := codexClientHeaders(`{"installation_id":"client-install","session_id":"client-session"}`, "client-session")
+	ids := resolveCodexFingerprintIDs(account, downstream)
+	if ids == nil {
+		t.Fatal("expected convergence ids for session mode")
+	}
+
+	var capturedBody []byte
+	var capturedHeader http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		capturedHeader = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	// 经 Resin 反代把出站请求引到本地服务器，从而断言真实发出的字节。
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+	SetResinConfig(&ResinConfig{BaseURL: server.URL, PlatformName: "test"})
+	clientPool.Delete(fmt.Sprintf("resin|%d", account.ID()))
+
+	body := []byte(`{"model":"gpt-5.6-codex","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","thread_id":"client-thread","x-codex-window-id":"client-window:0"}}`)
+	resp, err := ExecuteCompactRequest(context.Background(), account, body, "", "", "api-key-1", nil, downstream)
+	if err != nil {
+		t.Fatalf("ExecuteCompactRequest: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	for _, tc := range []struct{ path, want string }{
+		{"client_metadata.x-codex-installation-id", ids.installationID},
+		{"client_metadata.session_id", ids.sessionID},
+		{"client_metadata.thread_id", ids.threadID},
+		{"client_metadata.x-codex-window-id", ids.windowID},
+	} {
+		if got := gjson.GetBytes(capturedBody, tc.path).String(); got != tc.want {
+			t.Fatalf("outbound %s = %q, want converged %q", tc.path, got, tc.want)
+		}
+	}
+	// 头与体必须来自同一份推导，否则矛盾本身就是特征。
+	if got := capturedHeader.Get(codexInstallationIDHeader); got != ids.installationID {
+		t.Fatalf("outbound %s = %q, want %q", codexInstallationIDHeader, got, ids.installationID)
+	}
+	if got := gjson.GetBytes(capturedBody, "client_metadata.x-codex-installation-id").String(); got != capturedHeader.Get(codexInstallationIDHeader) {
+		t.Fatalf("header/body installation id disagree: body=%q header=%q", got, capturedHeader.Get(codexInstallationIDHeader))
 	}
 }

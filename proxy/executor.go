@@ -901,6 +901,12 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
+	// 指纹收敛：与 ExecuteRequest 同样在请求体定稿后、构造出站请求前改写
+	// client_metadata。漏掉这一步会让 compact 路径只收敛请求头、请求体仍带客户端
+	// 真实标识，上游看到「头说设备 A、体说设备 B」这种真实客户端不会有的矛盾。
+	// 必须用 prepareCodexResponsesLiteTransport 之后的 headers（它可能返回克隆），
+	// 与下方 applyCodexRequestHeaders 取同一份下游头，两处推导结果才一致。
+	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
 
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey

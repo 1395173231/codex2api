@@ -452,3 +452,135 @@ func TestGrokVideoBindingRoundTrip(t *testing.T) {
 		t.Errorf("binding json = %s", raw)
 	}
 }
+
+// 媒体调度优先付费凭据:free OAuth 号打媒体端点必 403,不该在首选层出现;
+// API Key 账号按量计费视同付费。
+func TestGrokMediaPreferredAccountFilter(t *testing.T) {
+	filter := grokMediaPreferredAccountFilter("grok-imagine-image")
+	free := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, AccessToken: "at", PlanType: "free"}
+	heavy := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamGrok, AccessToken: "at", PlanType: "supergrok_heavy"}
+	unknown := &auth.Account{DBID: 3, UpstreamType: auth.UpstreamGrok, AccessToken: "at"}
+	apiKey := &auth.Account{DBID: 4, UpstreamType: auth.UpstreamGrok, APIKey: "xai-key", PlanType: "free"}
+	if filter(free) {
+		t.Error("free plan must not be preferred")
+	}
+	if !filter(heavy) {
+		t.Error("paid plan must be preferred")
+	}
+	if filter(unknown) {
+		t.Error("unknown plan oauth must fall to the fallback tier")
+	}
+	if !filter(apiKey) {
+		t.Error("api-key credential must be preferred regardless of plan")
+	}
+	// 首选层是基础媒体过滤器的子集:非 Grok 账号仍被拒
+	if filter(&auth.Account{DBID: 5, AccessToken: "codex", PlanType: "pro"}) {
+		t.Error("non-grok account must be rejected")
+	}
+}
+
+func TestGrokImagesUsageLogInfo(t *testing.T) {
+	urlResp := []byte(`{"data":[{"url":"https://imgen.x.ai/a.jpeg","mime_type":"image/jpeg"},{"url":"https://imgen.x.ai/b.jpeg","mime_type":"image/jpeg"}]}`)
+	info := grokImagesUsageLogInfo(urlResp)
+	if info.Count != 2 || info.Format != "jpeg" {
+		t.Fatalf("url form info = %+v, want count 2 format jpeg", info)
+	}
+	// 1x1 PNG,可解出尺寸与字节数
+	const tinyPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	b64Resp := []byte(`{"data":[{"b64_json":"` + tinyPNG + `"}]}`)
+	info = grokImagesUsageLogInfo(b64Resp)
+	if info.Count != 1 || info.Width != 1 || info.Height != 1 || info.Bytes <= 0 {
+		t.Fatalf("b64 form info = %+v, want 1x1 with bytes", info)
+	}
+	if info = grokImagesUsageLogInfo([]byte(`{"data":[]}`)); info.Count != 0 {
+		t.Fatalf("empty data info = %+v", info)
+	}
+}
+
+// pending 期上游以 202 携带状态体返回;网关须按 200 透传而不是包装成错误。
+// edits/extensions 缺省模型是 grok-imagine-video(1.5 系列不支持这两个操作)。
+func TestGrokVideoPendingStatusAndPerOperationDefaultModel(t *testing.T) {
+	var editModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/videos/edits":
+			body, _ := io.ReadAll(r.Body)
+			editModel = gjson.GetBytes(body, "model").String()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"request_id":"video_pending1"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/videos/video_pending1":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"pending","progress":42}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	account := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, APIKey: "xai-test", BaseURL: upstream.URL}
+	handler := newGrokMediaTestHandler(t, account)
+
+	ctx, rec := newGrokMediaTestContext(t, http.MethodPost, "/v1/videos/edits", []byte(`{"prompt":"snow","video":{"url":"https://vidgen.x.ai/a.mp4"}}`))
+	handler.VideosEdits(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edits create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if editModel != grokImagineVideoModel {
+		t.Fatalf("edits default model = %q, want %q", editModel, grokImagineVideoModel)
+	}
+
+	ctx, rec = newGrokMediaTestContext(t, http.MethodGet, "/v1/videos/video_pending1", nil)
+	ctx.Params = gin.Params{{Key: "request_id", Value: "video_pending1"}}
+	handler.VideosStatus(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending poll status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "status").String(); got != "pending" {
+		t.Fatalf("pending body = %s", rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "progress").Int(); got != 42 {
+		t.Fatalf("progress = %d, want 42", got)
+	}
+}
+
+// CLI 身份头只发 CLI 网关:xAI 公开 API 收到 x-grok-client-* 会按 CLI 的
+// Zero Data Retention 政策强制 output.upload_url,媒体请求 400。
+func TestGrokMediaXAIProfileStripsCLIIdentityHeaders(t *testing.T) {
+	var seen http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://imgen.x.ai/a.jpeg"}]}`))
+	}))
+	defer upstream.Close()
+
+	// API Key 账号 → xai profile
+	apiKey := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, APIKey: "xai-test", BaseURL: upstream.URL}
+	handler := newGrokMediaTestHandler(t, apiKey)
+	ctx, rec := newGrokMediaTestContext(t, http.MethodPost, "/v1/images/generations", []byte(`{"model":"grok-imagine-image","prompt":"x"}`))
+	handler.ImagesGenerations(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	for _, key := range []string{"x-grok-client-version", "x-grok-client-identifier", "x-grok-client-mode", "x-grok-model-override", "x-compaction-at"} {
+		if seen.Get(key) != "" {
+			t.Errorf("xai profile leaked CLI header %s=%q", key, seen.Get(key))
+		}
+	}
+	if seen.Get("Authorization") != "Bearer xai-test" {
+		t.Errorf("Authorization = %q", seen.Get("Authorization"))
+	}
+
+	// OAuth 账号 → cli profile 保留 CLI 头
+	oauth := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamGrok, AccessToken: "at", BaseURL: upstream.URL, PlanType: "supergrok_heavy"}
+	handler = newGrokMediaTestHandler(t, oauth)
+	ctx, rec = newGrokMediaTestContext(t, http.MethodPost, "/v1/images/generations", []byte(`{"model":"grok-imagine-image","prompt":"x"}`))
+	handler.ImagesGenerations(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("oauth status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if seen.Get("x-grok-client-version") == "" || seen.Get("x-xai-token-auth") == "" {
+		t.Error("cli profile must keep CLI identity headers")
+	}
+}
