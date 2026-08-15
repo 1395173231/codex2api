@@ -104,7 +104,6 @@ export default function AccountQuotaDistributionChart({
       buckets,
       total: source.total,
       sampled: source.sampled,
-      unsampled: source.unsampled,
       highUsage: source.high_usage,
       exhausted: source.exhausted,
       averageUsed: source.average_used,
@@ -243,10 +242,9 @@ export default function AccountQuotaDistributionChart({
             )}
           </div>
 
-          <div className={compact ? 'grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6' : 'grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2'}>
+          <div className={compact ? 'grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-5' : 'grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2'}>
             <QuotaMetric label={t('accounts.quotaDistributionEligible')} value={distribution.total} compact={compact} />
             <QuotaMetric label={t('accounts.quotaDistributionSampled')} value={distribution.sampled} compact={compact} />
-            <QuotaMetric label={t('accounts.quotaDistributionUnsampled')} value={distribution.unsampled} tone={distribution.unsampled > 0 ? 'warning' : 'neutral'} compact={compact} />
             <QuotaMetric label={t('accounts.quotaDistributionHighUsage')} value={distribution.highUsage} tone={distribution.highUsage > 0 ? 'danger' : 'neutral'} compact={compact} />
             <QuotaMetric label={t('accounts.quotaDistributionExhausted')} value={distribution.exhausted} tone={distribution.exhausted > 0 ? 'danger' : 'neutral'} compact={compact} />
             <QuotaMetric

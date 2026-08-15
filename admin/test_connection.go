@@ -117,9 +117,14 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+			case http.StatusPaymentRequired:
+				// 测连 402 是账号侧计费/工作区拒绝，标成错误，避免继续显示成「未采样」。
+				h.store.MarkError(account, errMsg)
 			case http.StatusForbidden:
 				if proxy.IsAgentRuntimeDeletedError(errBody) {
 					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errMsg)
+				} else if proxy.IsDeactivatedWorkspaceError(errBody) {
+					h.store.MarkError(account, errMsg)
 				}
 			case http.StatusTooManyRequests:
 				// Grok 虽是 relay 风格，但有自己的免费额度语义（free-usage-exhausted → 24h），
@@ -1379,7 +1384,7 @@ func batchTestContextFailure(ctx context.Context, err error) (string, bool) {
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
 	msg := strings.ToLower(string(body))
-	if statusCode == http.StatusPaymentRequired && proxy.IsDeactivatedWorkspaceError(body) {
+	if statusCode == http.StatusPaymentRequired {
 		return true
 	}
 	if statusCode == http.StatusForbidden {

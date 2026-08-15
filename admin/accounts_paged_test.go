@@ -346,6 +346,15 @@ func TestAccountListUnsampledExcludedFromNormalAndSchedulable(t *testing.T) {
 	}
 }
 
+func TestBuildAccountQuotaAnalysisExcludesErrorFromUnsampled(t *testing.T) {
+	errored := &accountListSnapshotItem{ID: 1, Status: "error", Enabled: true}
+	sampled := &accountListSnapshotItem{ID: 2, Status: "active", Enabled: true, UsagePercent7d: 12, UsagePercent7dOK: true}
+	got := buildAccountQuotaAnalysis([]*accountListSnapshotItem{errored, sampled}, "7d")
+	if got.Total != 1 || got.Sampled != 1 || got.Unsampled != 0 {
+		t.Fatalf("quota analysis = %+v, want total=1 sampled=1 unsampled=0", got)
+	}
+}
+
 func TestCombineAccountStatsState(t *testing.T) {
 	if got := combineAccountStatsState("ready", "stale"); got != "stale" {
 		t.Fatalf("ready+stale=%q", got)

@@ -300,7 +300,7 @@ func buildAccountQuotaAnalysis(items []*accountListSnapshotItem, window string) 
 	}
 	totalUsed := 0.0
 	for _, item := range items {
-		if item.Status == "unauthorized" || item.OpenAIResponses || (window == "5h" && !accountListSubscriptionPlan(item.PlanType)) {
+		if item.Status == "unauthorized" || item.Status == "error" || item.OpenAIResponses || (window == "5h" && !accountListSubscriptionPlan(item.PlanType)) {
 			continue
 		}
 		result.Total++
