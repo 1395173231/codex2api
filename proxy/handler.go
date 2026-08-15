@@ -2318,6 +2318,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.POST("/images/edits", h.ImagesEdits)
+	// Grok 生视频:异步任务创建 + 客户端轮询 + 产物代理下载
+	v1.POST("/videos/generations", h.VideosGenerations)
+	v1.POST("/videos/edits", h.VideosEdits)
+	v1.POST("/videos/extensions", h.VideosExtensions)
+	v1.GET("/videos/:request_id", h.VideosStatus)
+	v1.GET("/videos/:request_id/content", h.VideosContent)
 	v1.POST("/messages", h.Messages)
 	v1.POST("/messages/count_tokens", h.CountTokens)
 	v1.POST("/responses/input_tokens", h.ResponsesInputTokens)
@@ -2336,6 +2342,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.POST("/images/edits", auth, h.ImagesEdits)
+	r.POST("/videos/generations", auth, h.VideosGenerations)
+	r.POST("/videos/edits", auth, h.VideosEdits)
+	r.POST("/videos/extensions", auth, h.VideosExtensions)
+	r.GET("/videos/:request_id", auth, h.VideosStatus)
+	r.GET("/videos/:request_id/content", auth, h.VideosContent)
 	r.POST("/messages", auth, h.Messages)
 	r.POST("/messages/count_tokens", auth, h.CountTokens)
 	r.POST("/responses/input_tokens", auth, h.ResponsesInputTokens)
@@ -4271,7 +4282,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
-	if isImageOnlyModel(model) {
+	if isMediaOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
@@ -4916,7 +4927,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		logModel = model
 		responseModel = model
 	}
-	if isImageOnlyModel(model) {
+	if isMediaOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
@@ -6571,6 +6582,10 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 			// 出现在 /v1/models（否则下游客户端拉不到可用的 Grok 模型名）。
 			if len(declared) == 0 && account.IsGrokAPI() {
 				declared = DefaultGrokModelIDsForAccount(account)
+			}
+			// Grok 账号额外补媒体模型集(生图/生视频走独立准入,不受文本白名单约束)。
+			if account.IsGrokAPI() {
+				declared = append(append([]string{}, declared...), grokMediaModelsForAccount(account)...)
 			}
 			for _, model := range declared {
 				key := strings.ToLower(strings.TrimSpace(model))

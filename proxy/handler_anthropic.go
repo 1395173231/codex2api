@@ -153,8 +153,8 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 	codexBody = h.applyMessagesModelMapping(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
-	if isImageOnlyModel(effectiveModel) {
-		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
+	if isMediaOnlyModel(effectiveModel) {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on %s", effectiveModel, mediaOnlyModelEndpoints(effectiveModel)))
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
