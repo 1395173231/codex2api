@@ -23,7 +23,11 @@ const (
 	// 不需要 10s 级新鲜度;前端静默刷新退避后轮询间隔最长 80s,TTL 太短会让
 	// 几乎每次轮询都撞上过期缓存、stats_state 长期停在 stale(表现为
 	// 「统计刷新中…」常驻)。
-	requestCountCacheTTL = 30 * time.Second
+	// 另一侧约束:刷新是对全渠道账号扫 7 天 usage_logs 的三条 GROUP BY,
+	// 万级号池 + 大日志量下单轮就要秒级;TTL 过短等于让这组重查询近乎
+	// 永续循环,把数据库拖垮(表现为管理页整体变慢、接口超时)。统计本身
+	// 是 7 天累计值,分钟级陈旧完全可接受。
+	requestCountCacheTTL = 5 * time.Minute
 )
 
 type accountListSnapshot struct {
@@ -666,12 +670,16 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		started := time.Now()
 		counts, err := h.db.GetAccountRequestCountsByIDs(ctx, ids)
 		if err != nil {
 			// 静默失败会让请求数/用量排序与统计永久停在 warming 且无从排查
 			// (issue #493),失败必须留痕。
 			log.Printf("刷新账号请求统计失败 channel=%s(排序/统计将继续使用旧值): %v", channel, err)
 			return
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			log.Printf("账号请求统计刷新耗时 %s channel=%s ids=%d(全池 7 天聚合,持续偏慢说明数据库吃紧)", elapsed.Round(time.Millisecond), channel, len(ids))
 		}
 		h.storeRequestCountCache(channel, counts)
 		// stats_state 是烙在列表快照里的:快照重建时统计缓存还没刷完,烙出来

@@ -6505,12 +6505,28 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		return
 	}
 
+	// 402 工作区停用（deactivated_workspace）：重试已换过号仍拿到它说明池内暂无
+	// 可服务账号，与 403 一样改写为 503 池级错误（带 Retry-After 提示退避）。
+	// 文案末尾附上游原始错误体，便于下游直接看到封禁原因。坏账号已被标错隔离，
+	// 稍后重试可落到健康账号。裸 402 保持原样：可能携带用量/计费语义，上面已单独处理。
+	if statusCode == http.StatusPaymentRequired && IsDeactivatedWorkspaceError(body) {
+		if c.Writer.Header().Get("Retry-After") == "" {
+			c.Header("Retry-After", "30")
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": deactivatedPoolErrorMessage(strings.TrimSpace(string(body))),
+				"type":    "server_error",
+				"code":    "account_pool_deactivated",
+			},
+		})
+		return
+	}
+
 	// 上游账号 403（payment_required / deactivated_workspace / codex_access_restricted）
 	// 同样是账号侧问题：重试已换过号仍拿到 403 说明池内暂无可用账号。原样透传 403 会让
 	// 客户端（如 Claude Code）误判为自身无权限而直接停工（issue #396），改写为 503 池级错误。
-	// 402 工作区停用同理（裸 402 保持原样：可能携带用量/计费语义，上面已单独处理）。
-	if statusCode == http.StatusForbidden ||
-		(statusCode == http.StatusPaymentRequired && IsDeactivatedWorkspaceError(body)) {
+	if statusCode == http.StatusForbidden {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error": gin.H{
 				"message": "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试",

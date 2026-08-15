@@ -177,6 +177,35 @@ import AccountGroupFilterSelect, {
 import ChipInput from "../components/ChipInput";
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+
+// 账号导入的体积约束。后端对导入端点放宽到 200MB;单个文件无法再切分,超过
+// 上限直接拒绝。多文件按累计大小切成多批,每批控制在 150MB 内(留余量给
+// multipart 边界与其它表单字段),避免单个请求体触发后端上限。
+const IMPORT_MAX_FILE_BYTES = 200 * 1024 * 1024;
+const IMPORT_BATCH_MAX_BYTES = 150 * 1024 * 1024;
+
+const formatMB = (bytes: number): string =>
+  `${Math.round(bytes / (1024 * 1024))}MB`;
+
+// splitFilesIntoBatches 按累计字节大小把文件分批。单个文件即便超过 batchMax
+// 也自成一批(交由后端上限兜底),保证每个文件都被投递。
+function splitFilesIntoBatches(files: File[], batchMax: number): File[][] {
+  const batches: File[][] = [];
+  let current: File[] = [];
+  let currentSize = 0;
+  for (const file of files) {
+    if (current.length > 0 && currentSize + file.size > batchMax) {
+      batches.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(file);
+    currentSize += file.size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches.length > 0 ? batches : [[]];
+}
+
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -3518,24 +3547,55 @@ export default function Accounts() {
     }
   };
 
-  const readImportSSE = async (res: Response) => {
-    setImportProgress({
-      show: true,
+  // readImportSSE 读取单批导入的 SSE 进度流。baseline 是此前已完成批次的累计值,
+  // 本批实时进度叠加其上;markDoneOnComplete=false 时(还有后续批次)不置 done,
+  // 让进度条跨批保持运行态。本批结束后把本批终值累加进 baseline(原地修改)。
+  const readImportSSE = async (
+    res: Response,
+    baseline?: {
+      current: number;
+      total: number;
+      success: number;
+      updated: number;
+      duplicate: number;
+      failed: number;
+    },
+    markDoneOnComplete = true,
+  ) => {
+    const base = baseline ?? {
       current: 0,
       total: 0,
       success: 0,
       updated: 0,
       duplicate: 0,
       failed: 0,
+    };
+    setImportProgress({
+      show: true,
+      current: base.current,
+      total: base.total,
+      success: base.success,
+      updated: base.updated,
+      duplicate: base.duplicate,
+      failed: base.failed,
       done: false,
     });
     const reader = res.body?.getReader();
     if (!reader) {
-      setImportProgress((p) => ({ ...p, done: true }));
+      setImportProgress((p) => ({ ...p, done: markDoneOnComplete }));
       return;
     }
     const decoder = new TextDecoder();
     let buffer = "";
+    // 本批最后一次事件的终值,用于结束后累加进 baseline。
+    let last = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -3554,21 +3614,39 @@ export default function Accounts() {
             duplicate: number;
             failed: number;
           };
+          last = {
+            current: event.current ?? 0,
+            total: event.total ?? 0,
+            success: event.success ?? 0,
+            updated: event.updated ?? 0,
+            duplicate: event.duplicate ?? 0,
+            failed: event.failed ?? 0,
+          };
           setImportProgress((p) => ({
             ...p,
-            current: event.current,
-            total: event.total,
-            success: event.success,
-            updated: event.updated ?? 0,
-            duplicate: event.duplicate,
-            failed: event.failed,
-            done: event.type === "complete",
+            current: base.current + last.current,
+            total: base.total + last.total,
+            success: base.success + last.success,
+            updated: base.updated + last.updated,
+            duplicate: base.duplicate + last.duplicate,
+            failed: base.failed + last.failed,
+            done: markDoneOnComplete && event.type === "complete",
           }));
-          if (event.type === "complete") void reload();
+          // 单批(旧调用方)或分批最后一批完成时刷新列表;中间批不刷新,
+          // 避免多批导入反复整表重载。
+          if (markDoneOnComplete && event.type === "complete") void reload();
         } catch {
           /* 忽略解析异常 */
         }
       }
+    }
+    if (baseline) {
+      baseline.current += last.current;
+      baseline.total += last.total;
+      baseline.success += last.success;
+      baseline.updated += last.updated;
+      baseline.duplicate += last.duplicate;
+      baseline.failed += last.failed;
     }
   };
 
@@ -3584,6 +3662,24 @@ export default function Accounts() {
       showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
       return;
     }
+
+    // 单个文件超过后端导入上限(200MB)无法再切分,直接拒绝并提示。
+    const oversized = files.find((f) => f.size > IMPORT_MAX_FILE_BYTES);
+    if (oversized) {
+      showToast(
+        t("accounts.importFileTooLarge", {
+          name: oversized.name,
+          max: formatMB(IMPORT_MAX_FILE_BYTES),
+        }),
+        "error",
+      );
+      return;
+    }
+
+    // 按累计大小把文件切成多批,每批控制在 IMPORT_BATCH_MAX_BYTES 内,避免单个
+    // 请求体过大触发后端限制;后端导入无状态且按凭据幂等去重,分批完全安全。
+    const batches = splitFilesIntoBatches(files, IMPORT_BATCH_MAX_BYTES);
+
     setImporting(true);
     setImportProgress({
       show: true,
@@ -3595,67 +3691,79 @@ export default function Accounts() {
       failed: 0,
       done: false,
     });
+
+    // 跨批累加的基线:每批的 SSE/JSON 进度都是相对本批的,叠加到已完成批次之上。
+    const totals = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
+
     try {
-      const formData = new FormData();
-      if (format !== "txt") formData.append("format", format);
-      const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
-      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
-      const routedHeaders = applyOptionalWorkspaceRouteHeader(
-        parsedCustomHeaders.value,
-        workspaceOverride,
-      );
-      if (routedHeaders) {
-        formData.append(
-          "custom_headers",
-          JSON.stringify(routedHeaders),
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        const formData = new FormData();
+        if (format !== "txt") formData.append("format", format);
+        const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
+        if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+        const routedHeaders = applyOptionalWorkspaceRouteHeader(
+          parsedCustomHeaders.value,
+          workspaceOverride,
         );
-      }
-      if (allowDuplicate) formData.append("allow_duplicate", "true");
-      if (importGroupIds.length > 0) {
-        formData.append("group_ids", JSON.stringify(importGroupIds));
-      }
-      for (const f of files) formData.append("file", f);
-      const res = await fetch("/api/admin/accounts/import", {
-        method: "POST",
-        body: formData,
-        headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
-      });
-      if (res.headers.get("content-type")?.includes("text/event-stream")) {
-        await readImportSSE(res);
-      } else {
-        const data = await res.json();
-        if (!res.ok) {
-          setImportProgress((p) => ({ ...p, show: false }));
-          showToast(
-            data.error
-              ? t("accounts.importFailedWithReason", { error: data.error })
-              : t("accounts.importFailed"),
-            "error",
-          );
+        if (routedHeaders) {
+          formData.append("custom_headers", JSON.stringify(routedHeaders));
+        }
+        if (allowDuplicate) formData.append("allow_duplicate", "true");
+        if (importGroupIds.length > 0) {
+          formData.append("group_ids", JSON.stringify(importGroupIds));
+        }
+        for (const f of batch) formData.append("file", f);
+
+        const res = await fetch("/api/admin/accounts/import", {
+          method: "POST",
+          body: formData,
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        });
+
+        // 只有最后一批完成后才标记 done,让进度条在多批之间保持运行态。
+        const isLastBatch = i === batches.length - 1;
+        if (res.headers.get("content-type")?.includes("text/event-stream")) {
+          await readImportSSE(res, totals, isLastBatch);
         } else {
-          setImportProgress({
-            show: true,
-            current: data.total ?? 0,
-            total: data.total ?? 0,
-            success: data.success ?? 0,
-            updated: data.updated ?? 0,
-            duplicate: data.duplicate ?? 0,
-            failed: data.failed ?? 0,
-            done: true,
-          });
-          showToast(t("accounts.importCompleted"));
-          void reload();
+          const data = await res.json();
+          if (!res.ok) {
+            setImportProgress((p) => ({ ...p, show: false }));
+            showToast(
+              data.error
+                ? t("accounts.importFailedWithReason", { error: data.error })
+                : t("accounts.importFailed"),
+              "error",
+            );
+            return;
+          }
+          totals.current += data.total ?? 0;
+          totals.total += data.total ?? 0;
+          totals.success += data.success ?? 0;
+          totals.updated += data.updated ?? 0;
+          totals.duplicate += data.duplicate ?? 0;
+          totals.failed += data.failed ?? 0;
+          setImportProgress({ show: true, ...totals, done: isLastBatch });
+          if (isLastBatch) void reload();
         }
       }
+      showToast(t("accounts.importCompleted"));
     } catch (error) {
       setImportProgress({
         show: true,
-        current: 1,
-        total: 1,
-        success: 0,
-        updated: 0,
-        duplicate: 0,
-        failed: 1,
+        current: Math.max(totals.current, 1),
+        total: Math.max(totals.total, 1),
+        success: totals.success,
+        updated: totals.updated,
+        duplicate: totals.duplicate,
+        failed: totals.failed + 1,
         done: true,
       });
       showToast(

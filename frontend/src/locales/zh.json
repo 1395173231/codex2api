@@ -808,6 +808,7 @@
     "importFailed": "导入失败",
     "importFailedWithReason": "导入失败：{{error}}",
     "importCompleted": "导入完成",
+    "importFileTooLarge": "文件 {{name}} 过大，超过导入上限 {{max}}，请拆分后再导入",
     "deleteTitle": "删除账号",
     "deleteDesc": "账号 {{account}} 将移入回收站，可随时在回收站中恢复或彻底删除。",
     "deleteConfirm": "确认删除",

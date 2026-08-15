@@ -7191,24 +7191,58 @@ func (s *Store) recomputeAllEffectiveAutoPause() {
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
-	if acc == nil {
+	s.AddAccounts([]*Account{acc})
+}
+
+// AddAccounts 批量把账号加入内存池。全局写锁只取一次，DBID 索引增量插入，
+// 调度器桶也只在最后合并处理一次——批量导入几千个账号时，逐条 AddAccount
+// 会让每一条都付出 O(号池大小) 的索引重建 + 整桶重排，把这把所有请求都要用
+// 的全局锁占满，表现为导入期间整个网关卡住。
+func (s *Store) AddAccounts(accounts []*Account) {
+	if s == nil || len(accounts) == 0 {
 		return
 	}
-	// 记录加入时间（用于过期清理）
-	if atomic.LoadInt64(&acc.AddedAt) == 0 {
-		atomic.StoreInt64(&acc.AddedAt, time.Now().UnixNano())
+
+	now := time.Now().UnixNano()
+	added := make([]*Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		// 记录加入时间（用于过期清理）
+		if atomic.LoadInt64(&acc.AddedAt) == 0 {
+			atomic.StoreInt64(&acc.AddedAt, now)
+		}
+		added = append(added, acc)
 	}
+	if len(added) == 0 {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	acc.mu.Lock()
-	acc.grokRuntimeSink = s
-	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
-	acc.recomputeEffectiveGroupBaseConcurrency(s)
-	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-	acc.mu.Unlock()
-	s.accounts = append(s.accounts, acc)
-	s.rebuildAccountIndex()
-	s.fastSchedulerUpdate(acc)
+
+	ignoreUsageLimit := s.IgnoreUsageLimitStatus()
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	for _, acc := range added {
+		acc.mu.Lock()
+		acc.grokRuntimeSink = s
+		acc.recomputeEffectiveIgnoreUsageLimitStatus(ignoreUsageLimit)
+		acc.recomputeEffectiveGroupBaseConcurrency(s)
+		acc.recomputeSchedulerLocked(maxConcurrency)
+		acc.mu.Unlock()
+	}
+	s.accounts = append(s.accounts, added...)
+	if s.accountsByID == nil {
+		s.rebuildAccountIndex()
+	} else {
+		for _, acc := range added {
+			s.accountsByID[acc.DBID] = acc
+		}
+	}
+	for _, acc := range added {
+		s.fastSchedulerUpdate(acc)
+	}
 }
 
 // RemoveAccount 从内存池移除账号

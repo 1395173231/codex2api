@@ -808,6 +808,7 @@
     "importFailed": "Import failed",
     "importFailedWithReason": "Import failed: {{error}}",
     "importCompleted": "Import completed",
+    "importFileTooLarge": "File {{name}} is too large (exceeds the {{max}} import limit); please split it before importing",
     "deleteTitle": "Delete Account",
     "deleteDesc": "Account {{account}} will be moved to the recycle bin. You can restore it or delete it permanently there.",
     "deleteConfirm": "Confirm Delete",
