@@ -49,7 +49,59 @@ func (db *DB) GetAccountRequestCountsByIDs(ctx context.Context, ids []int64) (ma
 		}
 		result[value.AccountID] = value
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := db.attachErrorStatusCounts(ctx, result, ids); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (db *DB) attachErrorStatusCounts(ctx context.Context, result map[int64]*AccountRequestCount, ids []int64) error {
+	if len(result) == 0 {
+		return nil
+	}
+	args := []interface{}{db.timeArg(time.Now().AddDate(0, 0, -7))}
+	idFilter := ""
+	if ids != nil {
+		ids = positiveUniqueIDs(ids)
+		if len(ids) == 0 {
+			return nil
+		}
+		placeholders := make([]string, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		idFilter = fmt.Sprintf(" AND account_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	query := fmt.Sprintf(`
+		SELECT account_id, status_code, COUNT(*)
+		FROM usage_logs
+		WHERE created_at >= $1 AND status_code >= 400 AND %s AND %s%s
+		GROUP BY account_id, status_code`, db.nonRetryUsageLogPredicate(), db.endUserUsageLogPredicate(), idFilter)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID, count int64
+		var statusCode int
+		if err := rows.Scan(&accountID, &statusCode, &count); err != nil {
+			return err
+		}
+		rc := result[accountID]
+		if rc == nil {
+			continue
+		}
+		if rc.ErrorStatusCounts == nil {
+			rc.ErrorStatusCounts = make(map[int]int64)
+		}
+		rc.ErrorStatusCounts[statusCode] = count
+	}
+	return rows.Err()
 }
 
 // GetAccountUsageWindowsByIDs computes the list-page usage fields without a

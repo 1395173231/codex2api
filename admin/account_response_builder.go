@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -288,6 +289,12 @@ func (h *Handler) buildAccountResponse(
 		resp.ErrorRequests = requestCount.ErrorCount
 		resp.RetryErrorRequests = requestCount.RetryErrorCount
 		resp.RateLimitAttempts = requestCount.RateLimitAttemptCount
+		if len(requestCount.ErrorStatusCounts) > 0 {
+			resp.ErrorStatusCounts = make(map[string]int64, len(requestCount.ErrorStatusCounts))
+			for code, count := range requestCount.ErrorStatusCounts {
+				resp.ErrorStatusCounts[strconv.Itoa(code)] = count
+			}
+		}
 	}
 	if usage5h != nil {
 		resp.Usage5hDetail = &accountUsageWindow{

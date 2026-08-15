@@ -1065,6 +1065,7 @@ type accountResponse struct {
 	ErrorRequests                 int64                       `json:"error_requests"`
 	RetryErrorRequests            int64                       `json:"retry_error_requests"`
 	RateLimitAttempts             int64                       `json:"rate_limit_attempts"`
+	ErrorStatusCounts             map[string]int64            `json:"error_status_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`

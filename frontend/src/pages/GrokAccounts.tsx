@@ -50,6 +50,11 @@ import type {
   AccountLiveStateResponse,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills from "../components/RequestCountPills";
+import {
+  disabledAccountSurfaceClass,
+  renderDisabledAccountOverlay,
+} from "../components/AccountStateOverlay";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   isAccountGroupFilterEmpty,
@@ -3753,9 +3758,8 @@ function GrokAccountCard({
           ? "border-primary/60 ring-1 ring-primary/30"
           : selected
             ? "border-primary/40 ring-1 ring-primary/20"
-            : disabled
-              ? "border-border/70 opacity-80"
-              : "border-border hover:border-border hover:shadow-md",
+            : "border-border hover:border-border hover:shadow-md",
+        disabledAccountSurfaceClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3769,6 +3773,7 @@ function GrokAccountCard({
         onOpenDetail();
       }}
     >
+      {renderDisabledAccountOverlay(account, t)}
       <div className="flex flex-1 flex-col gap-3.5 p-4 sm:p-5">
         {/* Header: identity + status + actions */}
         <div className="flex min-w-0 items-start gap-3">
@@ -3785,10 +3790,7 @@ function GrokAccountCard({
             size={44}
             variant="ring"
             title="Grok"
-            className={cn(
-              "shrink-0 shadow-sm",
-              disabled && "opacity-60 grayscale",
-            )}
+            className="shrink-0 shadow-sm"
           />
 
           <div className="min-w-0 flex-1">
@@ -3870,12 +3872,6 @@ function GrokAccountCard({
             onClick={onEditGroups}
             emptyLabel={t("accounts.groupQuickEdit")}
           />
-          {disabled ? (
-            <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
-              <PowerOff className="mr-0.5 size-2.5" />
-              {t("accounts.disabled")}
-            </span>
-          ) : null}
         </div>
 
         {/* Usage panel */}
@@ -4084,8 +4080,8 @@ function GrokAccountTableRow({
     <TableRow
       className={cn(
         "cursor-pointer",
-        disabled && "opacity-70",
         detailOpen ? "bg-primary/8" : selected && "bg-primary/5",
+        disabledAccountSurfaceClass(account, " relative"),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -4100,6 +4096,7 @@ function GrokAccountTableRow({
       }}
     >
       <TableCell className="w-9">
+        {renderDisabledAccountOverlay(account, t, { compact: true })}
         <input
           type="checkbox"
           className="size-4 cursor-pointer rounded border-border accent-primary"
@@ -4119,7 +4116,7 @@ function GrokAccountTableRow({
             size={32}
             variant="ring"
             title="Grok"
-            className={cn("shrink-0", disabled && "opacity-60 grayscale")}
+            className="shrink-0"
           />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -4193,24 +4190,7 @@ function GrokAccountTableRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="space-y-0.5 text-[13px]">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="font-medium tabular-nums text-[hsl(var(--success))]">
-              {account.success_requests ?? 0}
-            </span>
-            <span className="text-muted-foreground">/</span>
-            <span className="font-medium tabular-nums text-destructive">
-              {account.error_requests ?? 0}
-            </span>
-          </div>
-          {((account.retry_error_requests ?? 0) > 0 ||
-            (account.rate_limit_attempts ?? 0) > 0) && (
-            <div className="whitespace-nowrap text-[11px] text-muted-foreground">
-              retry {account.retry_error_requests ?? 0} · 429{" "}
-              {account.rate_limit_attempts ?? 0}
-            </div>
-          )}
-        </div>
+        <RequestCountPills account={account} compact />
       </TableCell>
       <TableCell className="min-w-[170px]">
         <GrokUsageCell account={account} onRefreshed={onUsageRefreshed} />

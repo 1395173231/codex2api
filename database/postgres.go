@@ -5765,6 +5765,10 @@ type AccountRequestCount struct {
 	ErrorCount            int64
 	RetryErrorCount       int64
 	RateLimitAttemptCount int64
+	// ErrorStatusCounts is the 7-day non-retry 4xx/5xx breakdown keyed by
+	// HTTP status. It matches ErrorCount so the list tooltip can show each
+	// code's share of the red capsule.
+	ErrorStatusCounts map[int]int64
 }
 
 // AccountTimeRangeUsage 每个账号在指定时间窗口内的真实请求/token 统计。
@@ -5836,7 +5840,13 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 		}
 		result[rc.AccountID] = rc
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := db.attachErrorStatusCounts(ctx, result, nil); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GetAccountTimeRangeUsage 按 account_id 聚合 since 之后的请求数和 token 数。

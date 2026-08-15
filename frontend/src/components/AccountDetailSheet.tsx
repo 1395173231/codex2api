@@ -28,6 +28,7 @@ import AccountHealthBar from "./AccountHealthBar";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
+import RequestCountPills from "./RequestCountPills";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -658,22 +659,7 @@ export default function AccountDetailSheet({
             <Section title={t("accounts.detailMetrics")}>
               <div className="grid grid-cols-2 gap-2">
                 <MetricCard label={t("accounts.requests")}>
-                  <div className="flex items-baseline gap-1.5 tabular-nums">
-                    <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-                      {account.success_requests ?? 0}
-                    </span>
-                    <span className="text-muted-foreground">/</span>
-                    <span className="font-semibold text-red-500">
-                      {account.error_requests ?? 0}
-                    </span>
-                  </div>
-                  {((account.retry_error_requests ?? 0) > 0 ||
-                    (account.rate_limit_attempts ?? 0) > 0) && (
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      retry {account.retry_error_requests ?? 0} · 429{" "}
-                      {account.rate_limit_attempts ?? 0}
-                    </div>
-                  )}
+                  <RequestCountPills account={account} />
                 </MetricCard>
                 <MetricCard label={t("accounts.billed")}>
                   {h5 === null && d7 === null ? (
