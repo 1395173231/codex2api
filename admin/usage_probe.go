@@ -112,6 +112,21 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 			return fmt.Errorf("%w: 上游返回 %d: %s", errWhamUnauthorized, resp.StatusCode, truncate(string(body), 300))
 		case http.StatusTooManyRequests:
 			h.store.ReportRequestFailure(account, "client", 0)
+		case http.StatusPaymentRequired, http.StatusForbidden:
+			// 与 wham 401 不同，deactivated_workspace 是上游对工作区状态的明确裁决
+			// （错误体带 detail.code），不存在鉴权口径差异导致的误报；wham-only 模式
+			// 下若不在此标错，被封 team 空间的账号会以"可用"无限留在池里、采样
+			// 永远失败。仅在错误体确认时动手，裸 402/403 保持通用失败路径。
+			if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
+				h.store.ReportRequestFailure(account, "client", 0)
+				errorMsg := fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+				if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
+					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
+				} else {
+					h.store.MarkError(account, errorMsg)
+				}
+				return nil
+			}
 		}
 	}
 	if err != nil {

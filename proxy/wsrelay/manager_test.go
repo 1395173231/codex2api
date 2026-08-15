@@ -889,7 +889,7 @@ func TestAcquireConnectionDial401ReturnsTypedHandshakeError(t *testing.T) {
 		t.Fatalf("StatusCode = %d, want 401", hs.StatusCode)
 	}
 
-	resp, ok := handshakeUnauthorizedHTTPResponse(err)
+	resp, ok := handshakeAccountErrorHTTPResponse(err)
 	if !ok {
 		t.Fatal("expected 401 handshake error to convert to HTTP response")
 	}

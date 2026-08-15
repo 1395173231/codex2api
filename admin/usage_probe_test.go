@@ -293,3 +293,54 @@ func TestProbeUsageSnapshotResponses429PreservesIgnoredUsageCooldown(t *testing.
 		t.Fatal("Responses 429 left the account cooling without a reason")
 	}
 }
+
+// team 空间被封时 wham 返回 402 {"detail":{"code":"deactivated_workspace"}}。
+// 即使处于 wham-only 模式(无 /responses 佐证)也必须标错隔离——这是上游对
+// 工作区状态的明确裁决,不存在 401 那种鉴权口径误报;否则账号永远"可用"。
+func TestProbeUsageSnapshotWhamDeactivatedWorkspaceMarksError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"detail":{"code":"deactivated_workspace"}}`, http.StatusPaymentRequired)
+	}))
+	defer server.Close()
+	restore := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restore()
+
+	store := auth.NewStore(nil, nil, nil)
+	store.SetUsageProbeResponsesFallbackEnabled(false) // wham-only
+	account := &auth.Account{DBID: 1, AccessToken: "team-token", Status: auth.StatusReady}
+	store.AddAccount(account)
+
+	h := &Handler{store: store}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() = %v, want nil (classified)", err)
+	}
+	if account.Status != auth.StatusError {
+		t.Fatalf("account status = %v, want error", account.Status)
+	}
+	if !strings.Contains(account.ErrorMsg, "deactivated_workspace") {
+		t.Fatalf("error message = %q, want deactivated_workspace detail", account.ErrorMsg)
+	}
+}
+
+// 裸 402(无 deactivated_workspace 证据)不定罪,保持通用失败路径。
+func TestProbeUsageSnapshotWhamBarePaymentRequiredDoesNotBan(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"detail":"Payment Required"}`, http.StatusPaymentRequired)
+	}))
+	defer server.Close()
+	restore := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restore()
+
+	store := auth.NewStore(nil, nil, nil)
+	store.SetUsageProbeResponsesFallbackEnabled(false)
+	account := &auth.Account{DBID: 1, AccessToken: "team-token", Status: auth.StatusReady}
+	store.AddAccount(account)
+
+	h := &Handler{store: store}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err == nil {
+		t.Fatal("ProbeUsageSnapshot() expected generic error for bare 402")
+	}
+	if account.Status != auth.StatusReady {
+		t.Fatalf("account status = %v, want ready (bare 402 must not ban)", account.Status)
+	}
+}
