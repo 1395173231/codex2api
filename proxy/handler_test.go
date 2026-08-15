@@ -3311,7 +3311,12 @@ func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 
 func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	account := &auth.Account{DBID: 42, AccessToken: "at"}
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	other := &auth.Account{DBID: 44, AccessToken: "at-3", AccountID: "team-B", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	store.AddAccount(other)
 	handler := &Handler{store: store}
 	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
 
@@ -3332,6 +3337,33 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "deactivated_workspace") {
 		t.Fatalf("ErrorMsg = %q, want deactivated_workspace", errorMsg)
+	}
+	if sibling.RuntimeStatus() != "error" {
+		t.Fatalf("same-workspace sibling status = %q, want error", sibling.RuntimeStatus())
+	}
+	sibling.Mu().RLock()
+	siblingMsg := sibling.ErrorMsg
+	sibling.Mu().RUnlock()
+	if !strings.Contains(siblingMsg, "工作区联动") {
+		t.Fatalf("sibling ErrorMsg = %q, want workspace-linked annotation", siblingMsg)
+	}
+	if other.RuntimeStatus() == "error" {
+		t.Fatal("other workspace must not be marked")
+	}
+}
+
+func TestGeneric402DoesNotLinkWorkspaceSiblings(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	handler := &Handler{store: store}
+
+	handler.applyCooldownForModel(account, http.StatusPaymentRequired, []byte(`{"error":{"message":"insufficient balance"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if sibling.RuntimeStatus() == "error" {
+		t.Fatal("generic 402 must not fan out to workspace siblings")
 	}
 }
 

@@ -2996,6 +2996,8 @@ type Store struct {
 	tokenCache                         cache.TokenCache
 	oauthRefreshLocksMu                sync.Mutex
 	oauthRefreshLocks                  map[string]*oauthRefreshLocalLock
+	workspaceLinkedMu                  sync.Mutex           // 工作区联动熔断进程内去重
+	workspaceLinkedRecent              map[string]time.Time // workspaceID → 去重窗口截止时间
 	apiKeyGroupsMu                     sync.RWMutex
 	apiKeyAllowedGroups                map[int64][]int64
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}

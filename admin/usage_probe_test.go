@@ -307,8 +307,10 @@ func TestProbeUsageSnapshotWhamDeactivatedWorkspaceMarksError(t *testing.T) {
 
 	store := auth.NewStore(nil, nil, nil)
 	store.SetUsageProbeResponsesFallbackEnabled(false) // wham-only
-	account := &auth.Account{DBID: 1, AccessToken: "team-token", Status: auth.StatusReady}
+	account := &auth.Account{DBID: 1, AccessToken: "team-token", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 2, AccessToken: "team-token-2", AccountID: "team-A", Status: auth.StatusReady}
 	store.AddAccount(account)
+	store.AddAccount(sibling)
 
 	h := &Handler{store: store}
 	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
@@ -319,6 +321,9 @@ func TestProbeUsageSnapshotWhamDeactivatedWorkspaceMarksError(t *testing.T) {
 	}
 	if !strings.Contains(account.ErrorMsg, "deactivated_workspace") {
 		t.Fatalf("error message = %q, want deactivated_workspace detail", account.ErrorMsg)
+	}
+	if sibling.RuntimeStatus() != "error" {
+		t.Fatalf("same-workspace sibling status = %q, want error", sibling.RuntimeStatus())
 	}
 }
 

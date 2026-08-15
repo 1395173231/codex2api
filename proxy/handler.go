@@ -6185,7 +6185,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
 			if h.store != nil {
-				h.store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
+				h.store.MarkDeactivatedWorkspace(account, upstreamAccountErrorMessage(statusCode, body))
 			}
 			return codex429Decision{}
 		}

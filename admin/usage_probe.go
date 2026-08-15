@@ -123,7 +123,7 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 				if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
 					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
 				} else {
-					h.store.MarkError(account, errorMsg)
+					h.store.MarkDeactivatedWorkspace(account, errorMsg)
 				}
 				return nil
 			}
@@ -258,7 +258,7 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 			if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
 				h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
 			} else {
-				h.store.MarkError(account, errorMsg)
+				h.store.MarkDeactivatedWorkspace(account, errorMsg)
 			}
 			return nil
 		}
