@@ -61,6 +61,9 @@ type accountListSnapshotItem struct {
 	UsagePercent7d     float64
 	UsagePercent7dOK   bool
 	RequestCount       int64
+	TodayRequests      int64
+	TodayTokens        int64
+	TodayAccountBilled float64
 	SchedulerPriority  int64
 	HealthTier         string
 	DispatchScore      float64
@@ -291,7 +294,7 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 		return query, fmt.Errorf("order must be asc or desc")
 	}
 	validSorts := map[string]bool{
-		"": true, "requests": true, "usage": true, "created_at": true, "updated_at": true,
+		"": true, "requests": true, "today": true, "usage": true, "created_at": true, "updated_at": true,
 		"scheduler_priority": true, "group": true, "risk": true, "dispatch_score": true,
 		"latency_penalty": true, "unauthorized": true,
 	}
@@ -497,10 +500,10 @@ func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string
 	for _, row := range rows {
 		channelIDs = append(channelIDs, row.ID)
 	}
-	requestCounts, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
+	requestCounts, todayUsage, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
 	items := make([]*accountListSnapshotItem, 0, len(rows))
 	for _, row := range rows {
-		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, groupNames, groupSort))
+		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, todayUsage, groupNames, groupSort))
 	}
 	snapshot := &accountListSnapshot{
 		Channel: channel, Items: items, BuiltAt: time.Now(), StatsState: statsState,
@@ -525,7 +528,7 @@ func (h *Handler) installAccountListSnapshot(channel string, snapshot *accountLi
 	h.accountListCacheMu.Unlock()
 }
 
-func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
+func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, todayUsage map[int64]*database.AccountTimeRangeUsage, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isGrok := strings.EqualFold(upstreamType, auth.UpstreamGrok)
 	isOpenAIResponses := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
@@ -598,6 +601,11 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 	if counts := requestCounts[row.ID]; counts != nil {
 		item.RequestCount = counts.SuccessCount + counts.ErrorCount
 	}
+	if today := todayUsage[row.ID]; today != nil {
+		item.TodayRequests = today.Requests
+		item.TodayTokens = today.Tokens
+		item.TodayAccountBilled = today.AccountBilled
+	}
 	groupKeys := make([]string, 0, len(item.GroupIDs))
 	groupLabels := make([]string, 0, len(item.GroupIDs))
 	for _, id := range item.GroupIDs {
@@ -629,26 +637,38 @@ func valueOrZero(value *int64) int64 {
 
 // requestCountCacheEntry 是单个渠道的请求数统计缓存。
 type requestCountCacheEntry struct {
-	counts    map[int64]*database.AccountRequestCount
-	expiresAt time.Time
+	counts     map[int64]*database.AccountRequestCount
+	today      map[int64]*database.AccountTimeRangeUsage
+	todayStart time.Time
+	expiresAt  time.Time
+}
+
+func requestCountCacheReady(entry *requestCountCacheEntry, now time.Time) bool {
+	if entry == nil || !now.Before(entry.expiresAt) {
+		return false
+	}
+	if entry.todayStart.IsZero() {
+		return true
+	}
+	return database.StartOfDay(now).Equal(entry.todayStart)
 }
 
 // getCachedRequestCountsNonBlocking 返回指定渠道的请求数统计。统计按渠道独立
 // 缓存与刷新:在 codex 页刷新只扫 codex 账号的日志行,不为 grok 账号买单,
 // 反之亦然。ids 是该渠道当前的账号列表,过期时交给后台刷新用。
-func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, string) {
+func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, map[int64]*database.AccountTimeRangeUsage, string) {
 	now := time.Now()
 	h.reqCountMu.RLock()
 	entry := h.reqCountCache[channel]
 	h.reqCountMu.RUnlock()
-	if entry != nil && now.Before(entry.expiresAt) {
-		return entry.counts, "ready"
+	if requestCountCacheReady(entry, now) {
+		return entry.counts, entry.today, "ready"
 	}
 	h.refreshRequestCountsAsync(channel, ids)
 	if entry != nil {
-		return entry.counts, "stale"
+		return entry.counts, entry.today, "stale"
 	}
-	return map[int64]*database.AccountRequestCount{}, "warming"
+	return map[int64]*database.AccountRequestCount{}, map[int64]*database.AccountTimeRangeUsage{}, "warming"
 }
 
 func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
@@ -678,10 +698,21 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 			log.Printf("刷新账号请求统计失败 channel=%s(排序/统计将继续使用旧值): %v", channel, err)
 			return
 		}
+		todayStart := database.StartOfDay(time.Now())
+		today, todayErr := h.db.GetAccountUsageSinceByIDs(ctx, ids, todayStart)
+		if todayErr != nil {
+			log.Printf("刷新账号今日统计失败 channel=%s(今日排序将继续使用旧值): %v", channel, todayErr)
+			h.reqCountMu.RLock()
+			if old := h.reqCountCache[channel]; old != nil {
+				today = old.today
+				todayStart = old.todayStart
+			}
+			h.reqCountMu.RUnlock()
+		}
 		if elapsed := time.Since(started); elapsed > 2*time.Second {
 			log.Printf("账号请求统计刷新耗时 %s channel=%s ids=%d(全池 7 天聚合,持续偏慢说明数据库吃紧)", elapsed.Round(time.Millisecond), channel, len(ids))
 		}
-		h.storeRequestCountCache(channel, counts)
+		h.storeRequestCountCache(channel, counts, today, todayStart)
 		// stats_state 是烙在列表快照里的:快照重建时统计缓存还没刷完,烙出来
 		// 就是 stale,并一直随快照被返回。统计刷完后把本渠道快照标记为过期,
 		// 下一次轮询即触发重建、烙上 ready——否则要等快照自然过期再叠一轮轮询,
@@ -690,14 +721,16 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 	}()
 }
 
-func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount) {
+func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount, today map[int64]*database.AccountTimeRangeUsage, todayStart time.Time) {
 	h.reqCountMu.Lock()
 	if h.reqCountCache == nil {
 		h.reqCountCache = make(map[string]*requestCountCacheEntry)
 	}
 	h.reqCountCache[channel] = &requestCountCacheEntry{
-		counts:    counts,
-		expiresAt: time.Now().Add(requestCountCacheTTL),
+		counts:     counts,
+		today:      today,
+		todayStart: todayStart,
+		expiresAt:  time.Now().Add(requestCountCacheTTL),
 	}
 	h.reqCountMu.Unlock()
 }
@@ -822,7 +855,7 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	case "error":
 		return errorState
 	case "unsampled":
-		return !item.OpenAIResponses && !item.UsagePercent5hOK && !item.UsagePercent7dOK
+		return accountListUnsampled(item)
 	case "disabled":
 		return !item.Enabled
 	case "locked":
@@ -836,8 +869,19 @@ func accountListOverloadPaused(item *accountListSnapshotItem) bool {
 		strings.EqualFold(item.CooldownReason, "overload_paused")
 }
 
-func accountListNormal(item *accountListSnapshotItem) bool {
+func accountListUnsampled(item *accountListSnapshotItem) bool {
+	if item == nil || item.OpenAIResponses || item.GrokAuthKind != "" {
+		return false
+	}
 	if item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	// k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样。
+	return !item.UsagePercent5hOK && !item.UsagePercent7dOK
+}
+
+func accountListNormal(item *accountListSnapshotItem) bool {
+	if item.Status == "unauthorized" || item.Status == "error" || accountListUnsampled(item) {
 		return false
 	}
 	if !item.Enabled || accountListOverloadPaused(item) {
@@ -850,6 +894,7 @@ func accountListSchedulable(item *accountListSnapshotItem) bool {
 	return item.Enabled &&
 		item.Status != "unauthorized" &&
 		item.Status != "error" &&
+		!accountListUnsampled(item) &&
 		!accountListRateLimited(item) &&
 		!accountListOverloadPaused(item)
 }
@@ -878,6 +923,14 @@ func sortAccountListItems(items []*accountListSnapshotItem, key, order string) {
 		switch key {
 		case "requests":
 			cmp = compareInt64(a.RequestCount, b.RequestCount)
+		case "today":
+			cmp = compareInt64(a.TodayRequests, b.TodayRequests)
+			if cmp == 0 {
+				cmp = compareInt64(a.TodayTokens, b.TodayTokens)
+			}
+			if cmp == 0 {
+				cmp = compareFloat64(a.TodayAccountBilled, b.TodayAccountBilled)
+			}
 		case "usage":
 			cmp = compareFloat64(accountListUsageValue(a), accountListUsageValue(b))
 		case "created_at":
@@ -1011,7 +1064,7 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		if item.Locked {
 			summary.Locked++
 		}
-		if !item.OpenAIResponses && !item.UsagePercent5hOK && !item.UsagePercent7dOK {
+		if accountListUnsampled(item) {
 			summary.Unsampled++
 		}
 		switch item.HealthTier {

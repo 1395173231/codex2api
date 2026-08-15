@@ -2058,89 +2058,89 @@ func NormalizeSiteName(value string) string {
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	SiteName                            string
-	SiteLogo                            string
-	BackgroundConfig                    string // JSON: {"image":"...","opacity":18,"blur":0}
-	GrokConfig                          string // JSON: {"affinity_mode":"strict"}
-	MaxConcurrency                      int
-	GlobalRPM                           int
-	TestModel                           string
-	TestContent                         string
-	TestConcurrency                     int
-	ProxyURL                            string
-	PgMaxConns                          int
-	RedisPoolSize                       int
-	AutoCleanUnauthorized               bool
-	AutoCleanRateLimited                bool
-	AdminSecret                         string
-	AutoCleanFullUsage                  bool
-	AutoCleanError                      bool
-	AutoCleanExpired                    bool
-	LazyMode                            bool
-	ProxyPoolEnabled                    bool
-	FastSchedulerEnabled                bool
-	MaxRetries                          int
-	MaxRateLimitRetries                 int
-	AllowRemoteMigration                bool
-	ModelMapping                        string // JSON: {"anthropic_model": "codex_model", ...}
-	CodexModelMapping                   string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
-	PayloadRules                        string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
-	ReasoningEffortModels               string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
-	BackgroundRefreshIntervalMinutes    int
-	UsageProbeMaxAgeMinutes             int
-	UsageProbeConcurrency               int
-	UsageProbeResponsesFallbackEnabled  bool
-	RecoveryProbeIntervalMinutes        int
-	SchedulerMode                       string
-	AffinityMode                        string // session 粘性模式: bounded / off / strict
-	SessionAffinitySpread               bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
-	ResinURL                            string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
-	ResinPlatformName                   string // Resin 平台标识，例如 codex2api
-	PromptFilterEnabled                 bool
-	PromptFilterMode                    string
-	PromptFilterThreshold               int
-	PromptFilterStrictThreshold         int
-	PromptFilterStrictTerminalEnabled   bool
-	PromptFilterAdvancedConfig          string
-	PromptFilterLogMatches              bool
-	PromptFilterMaxTextLength           int
-	PromptFilterSensitiveWords          string
-	PromptFilterCustomPatterns          string
-	PromptFilterDisabledPatterns        string
-	PromptFilterReviewEnabled           bool
-	PromptFilterReviewAPIKey            string
-	PromptFilterReviewBaseURL           string
-	PromptFilterReviewModel             string
-	PromptFilterReviewTimeoutSeconds    int
-	PromptFilterReviewFailClosed        bool
-	ClientCompatMode                    string
-	CodexMinCLIVersion                  string
-	CodexUserAgentConfig                string
-	UsageLogMode                        string
-	UsageLogBatchSize                   int
-	UsageLogFlushIntervalSeconds        int
-	StreamFlushPolicy                   string
-	StreamFlushIntervalMS               int
-	FirstTokenMode                      string
-	FirstTokenTimeoutSeconds            int
-	BillingTierPolicy                   string
-	ImageStorageConfig                  string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
-	ShowFullUsageNumbers                bool
-	PublicKeyUsagePageEnabled           bool
-	PublicImageStudioPageEnabled        bool
-	PublicAccountPortalPageEnabled      bool // 账号自助添加公开门户开关，默认 false
-	CodexForceWebsocket                 bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
-	CodexWSWeakNetworkMode              bool // WS 弱网保守复用模式，默认 false
-	CodexWSKeepaliveEnabled             bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
-	CodexWSKeepaliveIntervalSec         int  // WS 保活 Ping 间隔（秒），默认 60
-	CodexWSHideUpstreamErrors           bool // 隐藏上游 WS 原始错误，默认 true
-	CodexWSSilentRetryEnabled           bool // 首包前 WS 上游错误静默换号重试，默认 true
-	CodexWSSilentMaxRetries             int  // WS 静默换号最大重试次数，默认 2
-	CodexWSSizeRouterEnabled            bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
-	CodexWSBusyAcquireMaxWaitSec        int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
-	CodexWSBusyOverflowEnabled          bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
-	CodexWSBusyPatienceSec              int  // 触发溢出前的短等待（秒），默认 2（issue #413）
-	CodexWSStatelessSlots               int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
+	SiteName                           string
+	SiteLogo                           string
+	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
+	GrokConfig                         string // JSON: {"affinity_mode":"strict"}
+	MaxConcurrency                     int
+	GlobalRPM                          int
+	TestModel                          string
+	TestContent                        string
+	TestConcurrency                    int
+	ProxyURL                           string
+	PgMaxConns                         int
+	RedisPoolSize                      int
+	AutoCleanUnauthorized              bool
+	AutoCleanRateLimited               bool
+	AdminSecret                        string
+	AutoCleanFullUsage                 bool
+	AutoCleanError                     bool
+	AutoCleanExpired                   bool
+	LazyMode                           bool
+	ProxyPoolEnabled                   bool
+	FastSchedulerEnabled               bool
+	MaxRetries                         int
+	MaxRateLimitRetries                int
+	AllowRemoteMigration               bool
+	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
+	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
+	PayloadRules                       string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
+	ReasoningEffortModels              string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
+	BackgroundRefreshIntervalMinutes   int
+	UsageProbeMaxAgeMinutes            int
+	UsageProbeConcurrency              int
+	UsageProbeResponsesFallbackEnabled bool
+	RecoveryProbeIntervalMinutes       int
+	SchedulerMode                      string
+	AffinityMode                       string // session 粘性模式: bounded / off / strict
+	SessionAffinitySpread              bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
+	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
+	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
+	PromptFilterEnabled                bool
+	PromptFilterMode                   string
+	PromptFilterThreshold              int
+	PromptFilterStrictThreshold        int
+	PromptFilterStrictTerminalEnabled  bool
+	PromptFilterAdvancedConfig         string
+	PromptFilterLogMatches             bool
+	PromptFilterMaxTextLength          int
+	PromptFilterSensitiveWords         string
+	PromptFilterCustomPatterns         string
+	PromptFilterDisabledPatterns       string
+	PromptFilterReviewEnabled          bool
+	PromptFilterReviewAPIKey           string
+	PromptFilterReviewBaseURL          string
+	PromptFilterReviewModel            string
+	PromptFilterReviewTimeoutSeconds   int
+	PromptFilterReviewFailClosed       bool
+	ClientCompatMode                   string
+	CodexMinCLIVersion                 string
+	CodexUserAgentConfig               string
+	UsageLogMode                       string
+	UsageLogBatchSize                  int
+	UsageLogFlushIntervalSeconds       int
+	StreamFlushPolicy                  string
+	StreamFlushIntervalMS              int
+	FirstTokenMode                     string
+	FirstTokenTimeoutSeconds           int
+	BillingTierPolicy                  string
+	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	ShowFullUsageNumbers               bool
+	PublicKeyUsagePageEnabled          bool
+	PublicImageStudioPageEnabled       bool
+	PublicAccountPortalPageEnabled     bool // 账号自助添加公开门户开关，默认 false
+	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexWSWeakNetworkMode             bool // WS 弱网保守复用模式，默认 false
+	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
+	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
+	CodexWSHideUpstreamErrors          bool // 隐藏上游 WS 原始错误，默认 true
+	CodexWSSilentRetryEnabled          bool // 首包前 WS 上游错误静默换号重试，默认 true
+	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
+	CodexWSSizeRouterEnabled           bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
+	CodexWSBusyAcquireMaxWaitSec       int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
+	CodexWSBusyOverflowEnabled         bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
+	CodexWSBusyPatienceSec             int  // 触发溢出前的短等待（秒），默认 2（issue #413）
+	CodexWSStatelessSlots              int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
 	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -2149,10 +2149,10 @@ type SystemSettings struct {
 	GithubProxyURL string
 	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 占比达到阈值时
 	// 自动暂停调度一段时间（默认关闭）。
-	CodexOverloadPauseEnabled     bool
-	CodexOverloadThresholdPercent int // 触发比例（%），默认 20，范围 1-100
-	CodexOverloadPauseMinutes     int // 暂停时长（分钟），默认 30，范围 1-1440
-	CodexOverloadWindowMinutes    int // 统计窗口（分钟），默认 5，范围 1-120
+	CodexOverloadPauseEnabled           bool
+	CodexOverloadThresholdPercent       int  // 触发比例（%），默认 20，范围 1-100
+	CodexOverloadPauseMinutes           int  // 暂停时长（分钟），默认 30，范围 1-1440
+	CodexOverloadWindowMinutes          int  // 统计窗口（分钟），默认 5，范围 1-120
 	OverflowAutoCompactEnabled          bool // 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）
 	CompactViaResponsesEnabled          bool // /v1/responses/compact 改写为 /responses body-signal 压缩（上游已下线专用端点，默认 false）
 	CodexPreflightSSEPassthroughEnabled bool // 前置元数据 SSE 事件立即透传下游（旧版兼容，默认 false，issue #425）
@@ -5790,6 +5790,12 @@ type AccountTimeRangeUsage struct {
 	Tokens        int64
 	AccountBilled float64
 	UserBilled    float64
+}
+
+// AccountModelCount 某个模型在指定窗口内的请求数与成功数。
+type AccountModelCount struct {
+	Requests int64
+	Success  int64
 }
 
 // nonRetryUsageLogPredicate keeps transport retry attempts out of end-user

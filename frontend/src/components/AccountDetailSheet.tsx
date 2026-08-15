@@ -43,7 +43,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
-import { formatLongUsageWindowLabel } from "../lib/usageFormat";
+import { formatLongUsageWindowLabel, getAccountStatusBadgeStatus } from "../lib/usageFormat";
 
 function isFutureTime(value?: string): boolean {
   if (!value) return false;
@@ -437,7 +437,7 @@ export default function AccountDetailSheet({
               <div className="space-y-3 rounded-xl border border-border bg-card p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge
-                    status={account.status}
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={rateWindow ?? undefined}
                     errorMessage={account.error_message}
                   />

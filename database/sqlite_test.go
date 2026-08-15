@@ -3495,6 +3495,51 @@ func TestAccountUsageAggregatesExcludeStaleCredentialGeneration(t *testing.T) {
 	}
 }
 
+func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode int) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, created_at)
+			VALUES ($1, $2, 10, $3, $4, $5, $6)`, accountID, statusCode, retry, model, effective, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200)
+	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429)
+	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200)
+	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200)
+	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499)
+	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200)
+	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200)
+
+	usage, err := db.GetAccountUsageSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageSinceByIDs: %v", err)
+	}
+	models, err := db.GetAccountModelCountsSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountModelCountsSinceByIDs: %v", err)
+	}
+	if usage[1] == nil || usage[1].Requests != 3 {
+		t.Fatalf("today usage account 1 = %+v, want 3 requests", usage[1])
+	}
+	if models[1]["gpt-5.4"].Requests != 2 || models[1]["gpt-5.4"].Success != 1 || models[1]["gpt-5.2-codex"].Requests != 1 || models[1]["gpt-5.2-codex"].Success != 1 || models[1]["gpt-5.3"].Requests != 0 {
+		t.Fatalf("today models account 1 = %#v, want gpt-5.4=2/1 gpt-5.2-codex=1/1", models[1])
+	}
+	if models[2]["grok-4"].Requests != 1 || models[2]["grok-4"].Success != 1 {
+		t.Fatalf("today models account 2 = %#v, want grok-4=1/1", models[2])
+	}
+}
+
 func TestFlushLogsRequeuesBatchWhenSQLiteBeginFails(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

@@ -63,6 +63,7 @@ import {
 } from "../lib/operationResultsPreference";
 import {
   formatLongUsageWindowLabel,
+  getAccountStatusBadgeStatus,
   needsOfficialCostReload,
   needsUsageReload,
 } from "../lib/usageFormat";
@@ -155,7 +156,10 @@ import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
-import RequestCountPills from "../components/RequestCountPills";
+import RequestCountPills, {
+  CountBreakdownTooltip,
+} from "../components/RequestCountPills";
+import { buildModelCountBreakdown } from "../lib/requestErrorStatus";
 import {
   accountStateSurfaceClass,
   renderAccountStateOverlay,
@@ -1227,11 +1231,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                 >
                                   <div className="flex min-h-6 flex-wrap items-center gap-1.5">
                                     <StatusBadge
-                                      status={
-                                        account.status === "overload_paused"
-                                          ? "active"
-                                          : account.status
-                                      }
+                                      status={getAccountStatusBadgeStatus(account)}
                                       detail={
                                         account.status === "overload_paused"
                                           ? undefined
@@ -1539,7 +1539,13 @@ export default function Accounts() {
     "all",
   );
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
+    | "requests"
+    | "today"
+    | "usage"
+    | "importTime"
+    | "schedulerPriority"
+    | "group"
+    | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
@@ -6271,7 +6277,10 @@ export default function Accounts() {
                       className="w-full min-w-0 sm:w-32"
                       compact
                       value={
-                        sortKey === "requests" || sortKey === "usage" || sortKey === "importTime"
+                        sortKey === "requests" ||
+                        sortKey === "today" ||
+                        sortKey === "usage" ||
+                        sortKey === "importTime"
                           ? sortKey
                           : "default"
                       }
@@ -6279,7 +6288,7 @@ export default function Accounts() {
                         if (value === "default") {
                           setSortKey(null);
                         } else {
-                          setSortKey(value as "requests" | "usage" | "importTime");
+                          setSortKey(value as "requests" | "today" | "usage" | "importTime");
                           setSortDir("desc");
                         }
                         setPage(1);
@@ -6287,11 +6296,15 @@ export default function Accounts() {
                       options={[
                         { value: "default", label: t("accounts.cardSortDefault") },
                         { value: "requests", label: t("accounts.requests") },
+                        { value: "today", label: t("accounts.todayStats") },
                         { value: "usage", label: t("accounts.usage") },
                         { value: "importTime", label: t("accounts.importTime") },
                       ]}
                     />
-                    {(sortKey === "requests" || sortKey === "usage" || sortKey === "importTime") && (
+                    {(sortKey === "requests" ||
+                      sortKey === "today" ||
+                      sortKey === "usage" ||
+                      sortKey === "importTime") && (
                       <Button
                         type="button"
                         variant="outline"
@@ -6792,10 +6805,26 @@ export default function Accounts() {
                         )}
                         {visibleColumns.today && (
                           <TableHead
-                            className="text-[13px] font-semibold"
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
                             title={t("accounts.todayStatsHint")}
+                            onClick={() => {
+                              if (sortKey === "today") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("today");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
                           >
-                            {t("accounts.todayStats")}
+                            {t("accounts.todayStats")}{" "}
+                            {sortKey === "today"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
@@ -11737,22 +11766,6 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   return getAccountRateLimitWindow(account) !== null;
 }
 
-function isUnsampledQuotaAccount(account: AccountRow): boolean {
-  const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
-    return false;
-  }
-  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
-  // 否则这类账号会永远显示"未采样" (issue #282)。
-  const has7d =
-    typeof account.usage_percent_7d === "number" &&
-    Number.isFinite(account.usage_percent_7d);
-  const has5h =
-    typeof account.usage_percent_5h === "number" &&
-    Number.isFinite(account.usage_percent_5h);
-  return !has7d && !has5h;
-}
-
 function getAccountRateLimitWindow(
   account: AccountRow,
 ): RateLimitWindow | null {
@@ -13006,11 +13019,7 @@ function AccountMobileCard({
               <div className="shrink-0">
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <StatusBadge
-                    status={
-                      account.status === "overload_paused"
-                        ? "active"
-                        : account.status
-                    }
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={
                       account.status === "overload_paused"
                         ? undefined
@@ -13295,11 +13304,7 @@ function AccountMobileCard({
               {(!visibleColumns || visibleColumns.status) && (
                 <div className="flex min-w-[112px] shrink-0 flex-col items-end">
                   <StatusBadge
-                    status={
-                      account.status === "overload_paused"
-                        ? "active"
-                        : account.status
-                    }
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={
                       account.status === "overload_paused"
                         ? undefined
@@ -14280,11 +14285,21 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
   ]
     .filter(Boolean)
     .join("\n");
+  const modelBreakdown = buildModelCountBreakdown(detail.model_counts, requests);
 
-  return (
+  const content = (
     <div
-      className="flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums cursor-default"
-      title={tooltip}
+      className={cn(
+        "flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums",
+        requests > 0 ? "cursor-help" : "cursor-default",
+      )}
+      title={requests > 0 ? undefined : tooltip}
+      tabIndex={requests > 0 ? 0 : undefined}
+      aria-label={
+        requests > 0
+          ? t("accounts.todayModelTooltipAria", { count: requests })
+          : undefined
+      }
     >
       <div className="flex items-center gap-2">
         <span
@@ -14355,6 +14370,36 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
         )}
       </div>
     </div>
+  );
+
+  if (requests <= 0) {
+    return content;
+  }
+
+  return (
+    <CountBreakdownTooltip
+      title={t("accounts.todayModelTooltipTitle")}
+      empty={t("accounts.todayModelEmpty")}
+      total={requests}
+      rows={modelBreakdown.map((row) => {
+        const success = detail.model_success_counts?.[row.key];
+        return {
+          key: row.key,
+          label: row.key === "unknown" ? t("accounts.unknownModel") : row.key,
+          count: row.count,
+          percent: row.percent,
+          successRate:
+            typeof success === "number" && row.count > 0
+              ? (success / row.count) * 100
+              : undefined,
+        };
+      })}
+      showModelIcon
+      tone="today"
+      barClassName="bg-gradient-to-r from-sky-400 to-violet-300"
+    >
+      {content}
+    </CountBreakdownTooltip>
   );
 }
 

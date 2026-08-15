@@ -105,13 +105,13 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		{ID: 9, Status: "cooldown", Enabled: true, CooldownReason: auth.ResponsesRateLimitedCooldownReason},
 	}
 
-	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
+	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7dValid: true}
 	unauthorized := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
 	unauthorized.SetCooldownWithReason(time.Hour, "unauthorized")
-	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3"}
+	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UsagePercent7dValid: true}
 	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
-	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5", UsagePercent7dValid: true}
 	responsesLimited := &auth.Account{DBID: 8, Status: auth.StatusReady, AccessToken: "at-8"}
 	responsesLimited.SetCooldownWithReason(time.Hour, auth.ResponsesRateLimitedCooldownReason)
 
@@ -164,6 +164,27 @@ func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
 	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
 		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsExcludesUnsampledFromAvailable(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true},
+		{ID: 2, Status: "active", Enabled: true},
+		{ID: 3, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamGrok}},
+		{ID: 4, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamOpenAIResponses}},
+	}
+	sampled := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7d: 12, UsagePercent7dValid: true}
+	unsampled := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	grok := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UpstreamType: auth.UpstreamGrok}
+	responses := &auth.Account{DBID: 4, Status: auth.StatusReady, APIKey: "sk-test", BaseURL: "https://relay.example", UpstreamType: auth.UpstreamOpenAIResponses}
+
+	got, channels := summarizeDashboardAccounts(rows, []*auth.Account{sampled, unsampled, grok, responses})
+	if got.total != 4 || got.normal != 3 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("counts = %+v, want total=4 normal=3 rateLimited=0 abnormal=0", got)
+	}
+	if channels[database.UpstreamChannelCodex].normal != 2 || channels[database.UpstreamChannelGrok].normal != 1 {
+		t.Fatalf("channel counts = %+v", channels)
 	}
 }
 

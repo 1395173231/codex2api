@@ -138,6 +138,11 @@ func TestListAccountsPageFiltersAndLegacyCompatibility(t *testing.T) {
 		t.Fatalf("empty page status=%d response=%+v", emptyRecorder.Code, empty)
 	}
 
+	todayRecorder := invokeListAccounts(t, handler, "/api/admin/accounts?view=page&channel=codex&page=1&page_size=20&sort=today&order=desc")
+	if todayRecorder.Code != http.StatusOK {
+		t.Fatalf("sort=today status=%d body=%s", todayRecorder.Code, todayRecorder.Body.String())
+	}
+
 	for _, target := range []string{
 		"/api/admin/accounts?view=page&channel=codex&page_size=501",
 		"/api/admin/accounts?view=page&channel=codex&status=typo",
@@ -235,6 +240,16 @@ func TestAccountListSortAlwaysFallsBackToIDAscending(t *testing.T) {
 	if items[0].RequestCount != 3 || items[1].RequestCount != 3 || items[0].ID > items[1].ID {
 		t.Fatalf("descending sort lost stable id fallback: %+v", items)
 	}
+
+	todayItems := []*accountListSnapshotItem{
+		{ID: 3, TodayRequests: 1, TodayTokens: 80, TodayAccountBilled: 0.2},
+		{ID: 1, TodayRequests: 9, TodayTokens: 10, TodayAccountBilled: 0.01},
+		{ID: 2, TodayRequests: 9, TodayTokens: 122, TodayAccountBilled: 0.01},
+	}
+	sortAccountListItems(todayItems, "today", "desc")
+	if todayItems[0].ID != 2 || todayItems[1].ID != 1 || todayItems[2].ID != 3 {
+		t.Fatalf("today sort ids=%v, want [2 1 3]", []int64{todayItems[0].ID, todayItems[1].ID, todayItems[2].ID})
+	}
 }
 
 func TestPagedAccountRuntimeStatusOverridesDatabaseRow(t *testing.T) {
@@ -267,14 +282,14 @@ func TestPagedAccountRuntimeStatusOverridesDatabaseRow(t *testing.T) {
 func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler, _, _ := newPagedAccountsHandler(t)
 	started := time.Now()
-	_, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
+	_, _, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
 	if state != "warming" || time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("cold request stats state=%q elapsed=%s", state, time.Since(started))
 	}
 	// 刷新在后台 goroutine 里完成,轮询等它把本渠道缓存转为 ready。
 	warmDeadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
+		if _, _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
 			break
 		}
 		if time.Now().After(warmDeadline) {
@@ -295,6 +310,39 @@ func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler.accountListBuildMu.Unlock()
 	if err != nil || stale != snapshot || elapsed > 100*time.Millisecond {
 		t.Fatalf("stale snapshot blocked or changed: err=%v elapsed=%s", err, elapsed)
+	}
+}
+
+func TestAccountListUnsampledExcludedFromNormalAndSchedulable(t *testing.T) {
+	unsampled := &accountListSnapshotItem{ID: 1, Status: "active", Enabled: true}
+	sampled := &accountListSnapshotItem{ID: 2, Status: "active", Enabled: true, UsagePercent7d: 12, UsagePercent7dOK: true}
+	only5h := &accountListSnapshotItem{ID: 3, Status: "active", Enabled: true, UsagePercent5h: 8, UsagePercent5hOK: true}
+	responses := &accountListSnapshotItem{ID: 4, Status: "active", Enabled: true, OpenAIResponses: true}
+	grok := &accountListSnapshotItem{ID: 5, Status: "active", Enabled: true, GrokAuthKind: auth.GrokAuthKindOAuth}
+	banned := &accountListSnapshotItem{ID: 6, Status: "unauthorized", Enabled: true}
+
+	if !accountListUnsampled(unsampled) {
+		t.Fatal("active account without usage windows should be unsampled")
+	}
+	if accountListNormal(unsampled) || accountListSchedulable(unsampled) {
+		t.Fatal("unsampled account must not count as normal or schedulable")
+	}
+	if accountListUnsampled(sampled) || accountListUnsampled(only5h) || accountListUnsampled(responses) || accountListUnsampled(grok) || accountListUnsampled(banned) {
+		t.Fatal("sampled, 5h-only, responses, grok, and banned accounts must not be unsampled")
+	}
+	if !accountListNormal(sampled) || !accountListSchedulable(sampled) || !accountListNormal(only5h) || !accountListSchedulable(responses) || !accountListSchedulable(grok) {
+		t.Fatal("sampled / responses / grok accounts should stay available")
+	}
+	if accountListStatusMatches(unsampled, "normal", database.UpstreamChannelCodex) || accountListStatusMatches(unsampled, "scheduling", database.UpstreamChannelCodex) {
+		t.Fatal("unsampled filter buckets must exclude normal and scheduling")
+	}
+	if !accountListStatusMatches(unsampled, "unsampled", database.UpstreamChannelCodex) {
+		t.Fatal("unsampled filter should match accounts without usage windows")
+	}
+
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{unsampled, sampled, only5h, responses}, database.UpstreamChannelCodex)
+	if summary.Normal != 3 || summary.Active != 3 || summary.Unsampled != 1 {
+		t.Fatalf("summary = %+v, want normal=3 active=3 unsampled=1", summary)
 	}
 }
 
@@ -597,8 +645,8 @@ func TestListAccountsPageKeepsGrokQuotaBars(t *testing.T) {
 }
 
 func TestCodexNormalIncludesDisabledButSchedulingExcludesIt(t *testing.T) {
-	enabled := &accountListSnapshotItem{Status: "active", Enabled: true}
-	disabled := &accountListSnapshotItem{Status: "active", Enabled: false}
+	enabled := &accountListSnapshotItem{Status: "active", Enabled: true, UsagePercent7dOK: true}
+	disabled := &accountListSnapshotItem{Status: "active", Enabled: false, UsagePercent7dOK: true}
 	codex := database.UpstreamChannelCodex
 	if !accountListStatusMatches(enabled, "normal", codex) {
 		t.Fatal("enabled healthy account should match normal")
@@ -620,9 +668,10 @@ func TestCodexNormalIncludesDisabledButSchedulingExcludesIt(t *testing.T) {
 
 func TestOverloadPausedCountsAsNormalNotRateLimitedOrScheduling(t *testing.T) {
 	item := &accountListSnapshotItem{
-		Status:         "overload_paused",
-		Enabled:        true,
-		CooldownReason: "overload_paused",
+		Status:           "overload_paused",
+		Enabled:          true,
+		CooldownReason:   "overload_paused",
+		UsagePercent7dOK: true,
 	}
 	codex := database.UpstreamChannelCodex
 	if accountListRateLimited(item) {

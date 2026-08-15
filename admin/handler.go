@@ -1000,7 +1000,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		}
 		usingCredits := false
-		if acc, ok := runtimeByID[row.ID]; ok {
+		acc := runtimeByID[row.ID]
+		if acc != nil {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
 			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
@@ -1023,6 +1024,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		case !usingCredits && isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
 			perChannel.rateLimited++
+		case isDashboardUnsampledAccount(row, acc):
+			// 未采样不当作可用：仪表盘「可用」与账号页正常/调度中对齐。
 		default:
 			counts.normal++
 			perChannel.normal++
@@ -1034,6 +1037,32 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 
 func isDashboardAbnormalAccount(status string) bool {
 	return status == "unauthorized" || status == "error"
+}
+
+func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
+	if acc != nil {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+			return false
+		}
+		snapshot := acc.GetAccountListRuntimeSnapshot()
+		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
+		if status == "unauthorized" || status == "error" {
+			return false
+		}
+		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
+	}
+	if row == nil {
+		return false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(row.Status))
+	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	return true
 }
 
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
@@ -1171,10 +1200,12 @@ type modelCooldownResponse struct {
 }
 
 type accountUsageWindow struct {
-	Requests      int64   `json:"requests"`
-	Tokens        int64   `json:"tokens"`
-	AccountBilled float64 `json:"account_billed"`
-	UserBilled    float64 `json:"user_billed"`
+	Requests           int64            `json:"requests"`
+	Tokens             int64            `json:"tokens"`
+	AccountBilled      float64          `json:"account_billed"`
+	UserBilled         float64          `json:"user_billed"`
+	ModelCounts        map[string]int64 `json:"model_counts,omitempty"`
+	ModelSuccessCounts map[string]int64 `json:"model_success_counts,omitempty"`
 }
 
 func accountEmailDomain(email string) string {
@@ -2544,7 +2575,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-	h.storeRequestCountCache(cacheKey, counts)
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
 	return counts
 }
 

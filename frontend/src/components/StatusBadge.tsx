@@ -24,6 +24,7 @@ const statusConfig: Record<string, { variant: 'default' | 'secondary' | 'destruc
   error: { variant: 'destructive', dotColor: 'bg-red-400' },
   refreshing: { variant: 'secondary', dotColor: 'bg-blue-500 animate-pulse' },
   paused: { variant: 'outline', dotColor: 'bg-blue-500' },
+  unsampled: { variant: 'outline', dotColor: 'bg-slate-400' },
 }
 
 export default function StatusBadge({ status, detail, errorMessage }: StatusBadgeProps) {

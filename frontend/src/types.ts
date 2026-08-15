@@ -35,6 +35,8 @@ export interface AccountUsageWindow {
   tokens: number
   account_billed?: number
   user_billed?: number
+  model_counts?: Record<string, number>
+  model_success_counts?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -303,7 +305,7 @@ export interface AccountsPageParams {
   healthTier?: 'healthy' | 'warm' | 'risky' | 'banned' | 'attention'
   proxyUrl?: string
   proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
-  sort?: 'requests' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
+  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
   order?: 'asc' | 'desc'
 }
 

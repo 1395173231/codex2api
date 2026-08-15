@@ -237,6 +237,44 @@ func (db *DB) GetAccountUsageSinceByIDs(ctx context.Context, ids []int64, since 
 	return result, rows.Err()
 }
 
+// GetAccountModelCountsSinceByIDs 按模型拆分指定账号在 since 之后的请求数与成功数。
+// 过滤口径与 GetAccountUsageSinceByIDs 一致，保证浮层合计对得上今日统计数字。
+func (db *DB) GetAccountModelCountsSinceByIDs(ctx context.Context, ids []int64, since time.Time) (map[int64]map[string]AccountModelCount, error) {
+	result := make(map[int64]map[string]AccountModelCount, len(ids))
+	ids = positiveUniqueIDs(ids)
+	if len(ids) == 0 {
+		return result, nil
+	}
+	args := []interface{}{db.timeArg(since)}
+	idFilter := db.appendAccountIDFilter(&args, ids)
+	query := fmt.Sprintf(`SELECT account_id,
+		COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown'),
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0)
+		FROM usage_logs
+		WHERE created_at >= $1 AND status_code <> 499 AND %s AND %s AND %s
+		GROUP BY account_id, COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown')`,
+		db.nonRetryUsageLogPredicate(), db.currentAccountUsageGenerationPredicate(), idFilter)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID int64
+		var model string
+		var count AccountModelCount
+		if err := rows.Scan(&accountID, &model, &count.Requests, &count.Success); err != nil {
+			return nil, err
+		}
+		if result[accountID] == nil {
+			result[accountID] = make(map[string]AccountModelCount)
+		}
+		result[accountID][model] = count
+	}
+	return result, rows.Err()
+}
+
 func positiveUniqueIDs(ids []int64) []int64 {
 	seen := make(map[int64]struct{}, len(ids))
 	result := make([]int64, 0, len(ids))

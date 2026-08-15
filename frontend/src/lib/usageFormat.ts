@@ -63,6 +63,44 @@ export function needsUsageReload(account: {
   return !has5h && !has7d
 }
 
+type AccountStatusSource = {
+  status?: string | null
+  openai_responses_api?: boolean
+  grok_api?: boolean
+  usage_percent_5h?: number | null
+  usage_percent_7d?: number | null
+}
+
+export function isUnsampledQuotaAccount(account: AccountStatusSource): boolean {
+  const status = (account.status || '').toLowerCase()
+  if (
+    status === 'unauthorized' ||
+    status === 'error' ||
+    account.openai_responses_api ||
+    account.grok_api
+  ) {
+    return false
+  }
+  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样。
+  const has7d =
+    typeof account.usage_percent_7d === 'number' &&
+    Number.isFinite(account.usage_percent_7d)
+  const has5h =
+    typeof account.usage_percent_5h === 'number' &&
+    Number.isFinite(account.usage_percent_5h)
+  return !has7d && !has5h
+}
+
+export function getAccountStatusBadgeStatus(account: AccountStatusSource): string {
+  const status = account.status || 'unknown'
+  if (status === 'overload_paused') return 'active'
+  const key = status.toLowerCase()
+  if ((key === 'active' || key === 'ready') && isUnsampledQuotaAccount(account)) {
+    return 'unsampled'
+  }
+  return status
+}
+
 // Codex OAuth/AT 账号的官方 7d 成本来自本地快照。列表打开时快照经常还是空的，
 // 需要重拉 page-stats 直到回补完成（中转/Grok 没有该字段，不要空转）。
 // official_usage_synced 表示后端已成功同步过但上游没有数据（官方统计有

@@ -70,7 +70,7 @@ export default function RequestCountPills({
         )}
       >
         {success > 0 ? (
-          <BreakdownTooltip
+          <CountBreakdownTooltip
             title={t("accounts.successModelTooltipTitle")}
             empty={t("accounts.successModelEmpty")}
             total={success}
@@ -84,13 +84,13 @@ export default function RequestCountPills({
             barClassName="bg-gradient-to-r from-emerald-400 to-lime-300"
           >
             {successPill}
-          </BreakdownTooltip>
+          </CountBreakdownTooltip>
         ) : (
           successPill
         )}
 
         {errors > 0 ? (
-          <BreakdownTooltip
+          <CountBreakdownTooltip
             title={t("accounts.errorStatusTooltipTitle")}
             empty={t("accounts.errorStatusEmpty")}
             total={errors}
@@ -113,7 +113,7 @@ export default function RequestCountPills({
               <span className="size-1.5 shrink-0 rounded-full bg-red-500" aria-hidden />
               {errors.toLocaleString()}
             </span>
-          </BreakdownTooltip>
+          </CountBreakdownTooltip>
         ) : (
           <span
             className={cn(
@@ -146,23 +146,33 @@ export default function RequestCountPills({
   );
 }
 
-function BreakdownTooltip({
+export function CountBreakdownTooltip({
   title,
   empty,
   total,
   rows,
   barClassName,
   showModelIcon = false,
+  tone = "default",
   children,
 }: {
   title: string;
   empty: string;
   total: number;
-  rows: Array<{ key: string; label: string; count: number; percent: number }>;
+  rows: Array<{
+    key: string;
+    label: string;
+    count: number;
+    percent: number;
+    successRate?: number;
+  }>;
   barClassName: string;
   showModelIcon?: boolean;
+  tone?: "default" | "today";
   children: ReactNode;
 }) {
+  const { t } = useTranslation();
+  const isToday = tone === "today";
   return (
     <TooltipProvider delayDuration={120}>
       <Tooltip>
@@ -170,36 +180,71 @@ function BreakdownTooltip({
         <TooltipContent
           side="top"
           sideOffset={10}
-          className="min-w-[240px] max-w-[320px] rounded-xl border border-white/10 bg-zinc-950/95 px-3.5 py-3 text-left text-xs text-zinc-50 shadow-2xl backdrop-blur-md"
+          className={cn(
+            "min-w-[240px] max-w-[320px] rounded-xl px-3.5 py-3 text-left text-xs shadow-2xl",
+            isToday
+              ? "min-w-[268px] max-w-[360px] border border-sky-200/25 bg-sky-950/80 text-sky-50 shadow-sky-950/25 backdrop-blur-2xl supports-[backdrop-filter]:bg-sky-950/40"
+              : "border border-white/10 bg-zinc-950/95 text-zinc-50 backdrop-blur-md",
+          )}
+          arrowClassName={
+            isToday
+              ? "bg-sky-950/55 fill-sky-950/55 backdrop-blur-2xl"
+              : "bg-zinc-950 fill-zinc-950"
+          }
         >
           <div className="mb-2 flex items-baseline justify-between gap-3">
-            <span className="text-[11px] font-semibold tracking-wide text-zinc-300">
+            <span
+              className={cn(
+                "text-[11px] font-semibold tracking-wide",
+                isToday ? "text-sky-100/90" : "text-zinc-300",
+              )}
+            >
               {title}
             </span>
-            <span className="font-mono text-[11px] tabular-nums text-zinc-500">
+            <span
+              className={cn(
+                "font-mono text-[11px] tabular-nums",
+                isToday ? "text-sky-200/55" : "text-zinc-500",
+              )}
+            >
               {total.toLocaleString()}
             </span>
           </div>
           {rows.length === 0 ? (
-            <div className="text-zinc-500">{empty}</div>
+            <div className={isToday ? "text-sky-200/55" : "text-zinc-500"}>{empty}</div>
           ) : (
             <div className="space-y-2">
               {rows.map((row) => (
                 <div key={row.key} className="space-y-1">
                   <div className="flex items-center justify-between gap-3 font-mono tabular-nums">
                     <span
-                      className="inline-flex min-w-0 items-center gap-1 rounded-md bg-white/8 px-1.5 py-0.5 text-[11px] font-semibold text-zinc-100"
+                      className={cn(
+                        "inline-flex min-w-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold",
+                        isToday ? "bg-white/12 text-sky-50" : "bg-white/8 text-zinc-100",
+                      )}
                       title={row.label}
                     >
                       {showModelIcon ? <ModelNameIcon model={row.key} /> : null}
                       <span className="truncate">{row.label}</span>
                     </span>
-                    <span className="shrink-0 text-zinc-200">{row.count.toLocaleString()}</span>
-                    <span className="shrink-0 text-zinc-500">
+                    <span className={cn("shrink-0", isToday ? "text-sky-50" : "text-zinc-200")}>
+                      {row.count.toLocaleString()}
+                    </span>
+                    <span className={cn("shrink-0", isToday ? "text-sky-200/55" : "text-zinc-500")}>
                       {formatErrorStatusPercent(row.percent)}
                     </span>
+                    {row.successRate != null ? (
+                      <span
+                        className="shrink-0 text-emerald-300"
+                        title={t("accounts.todayModelSuccessRate")}
+                      >
+                        {t("accounts.todayModelSuccessRateShort", {
+                          rate: formatErrorStatusPercent(row.successRate),
+                        })}
+                      </span>
+                    ) : null}
                   </div>
-                  <div className="h-1 overflow-hidden rounded-full bg-white/8">
+                  <div className={cn("h-1 overflow-hidden rounded-full", isToday ? "bg-white/12" : "bg-white/8")}>
                     <div
                       className={cn("h-full rounded-full", barClassName)}
                       style={{ width: `${Math.max(row.percent, 4)}%` }}

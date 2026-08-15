@@ -317,3 +317,57 @@ func TestGetAccountPageStatsSkipsOfficialBackfillWhenSnapshotExists(t *testing.T
 		t.Fatalf("official_usd_7d = %v, want 1", got)
 	}
 }
+
+func TestGetAccountPageStatsIncludesTodayModelCounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
+		"refresh_token": "rt-today-models",
+		"access_token":  "at-today-models",
+		"email":         "today-models@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	for _, item := range []struct {
+		model      string
+		statusCode int
+	}{
+		{model: "gpt-5.4", statusCode: http.StatusOK},
+		{model: "gpt-5.4", statusCode: http.StatusTooManyRequests},
+		{model: "gpt-5.2", statusCode: http.StatusOK},
+	} {
+		if err := db.InsertUsageLog(ctx, &database.UsageLogInput{
+			AccountID:   id,
+			Endpoint:    "/v1/responses",
+			Model:       item.model,
+			StatusCode:  item.statusCode,
+			TotalTokens: 40,
+		}); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", item.model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+
+	stats := invokeAccountPageStats(t, handler, []int64{id})
+	today := stats[strconv.FormatInt(id, 10)].UsageTodayDetail
+	if today == nil || today.Requests != 3 {
+		t.Fatalf("today detail = %+v, want 3 requests", today)
+	}
+	if today.ModelCounts["gpt-5.4"] != 2 || today.ModelCounts["gpt-5.2"] != 1 {
+		t.Fatalf("today model counts = %#v, want gpt-5.4=2 gpt-5.2=1", today.ModelCounts)
+	}
+	if today.ModelSuccessCounts["gpt-5.4"] != 1 || today.ModelSuccessCounts["gpt-5.2"] != 1 {
+		t.Fatalf("today model success = %#v, want gpt-5.4=1 gpt-5.2=1", today.ModelSuccessCounts)
+	}
+}
