@@ -1029,7 +1029,17 @@ func (h *Handler) streamResponsesWSUpstream(
 		// 首 token 前上游失败且未向客户端写过任何帧:发结构化 error 帧后按错误类别
 		// 关闭连接,避免下游把"正常收尾的会话"当成功并按预估 input token 计费。
 		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
-		clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
+		preserveErrorCode := isPreviousResponseNotFoundBody(terminalFailurePayload)
+		if preserveErrorCode {
+			// This is deterministic continuation state, not an infrastructure error.
+			// Preserve the official code so Codex can classify the failed turn even
+			// when generic upstream-error details are hidden.
+			apiErr = api.NewAPIError(api.ErrorCode("previous_response_not_found"), outcome.failureMessage, api.ErrorTypeInvalidRequest)
+		}
+		clientErr := apiErr
+		if !preserveErrorCode {
+			clientErr = responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
+		}
 		_ = writeResponsesWSError(conn, clientErr)
 		return newResponsesWSCloseError(responsesWSCloseCodeForStatus(outcome.logStatusCode), clientErr.Message, apiErr)
 	}

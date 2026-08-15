@@ -331,6 +331,12 @@ func TestCleanByRuntimeStatusSkipsPremium5hRateLimitedAccount(t *testing.T) {
 	if store.AccountCount() != 1 {
 		t.Fatalf("AccountCount() = %d, want premium 5h account to remain", store.AccountCount())
 	}
+	if store.FindByID(acc.ID()) == nil {
+		t.Fatal("premium 5h account should remain")
+	}
+	if store.FindByID(authoritative.ID()) != nil {
+		t.Fatal("authoritative Responses-limited account should be removed")
+	}
 }
 
 func TestCleanRateLimitedManualClearsAllRateLimitFlavors(t *testing.T) {

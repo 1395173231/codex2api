@@ -468,9 +468,7 @@ func TestResponsesWebSocketPinnedTurnForwardsPreviousResponseFailure(t *testing.
 	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
 
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
-		body := "" +
-			`data: {"type":"error","error":{"code":"previous_response_not_found","message":"missing response"}}` + "\n\n" +
-			`data: {"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}` + "\n\n"
+		body := `data: {"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}` + "\n\n"
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	}
 
@@ -504,5 +502,8 @@ func TestResponsesWebSocketPinnedTurnForwardsPreviousResponseFailure(t *testing.
 	}
 	if eventType := gjson.GetBytes(event, "type").String(); eventType != "error" {
 		t.Fatalf("event type = %q, want error; body=%s", eventType, event)
+	}
+	if code := gjson.GetBytes(event, "error.code").String(); code != "previous_response_not_found" {
+		t.Fatalf("error.code = %q, want previous_response_not_found; body=%s", code, event)
 	}
 }

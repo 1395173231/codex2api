@@ -3838,6 +3838,11 @@ func TestResponseFailedRetryableClassification(t *testing.T) {
 			want:    false,
 		},
 		{
+			name:    "previous response not found",
+			payload: `{"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}`,
+			want:    false,
+		},
+		{
 			name:    "empty payload",
 			payload: ``,
 			want:    false,

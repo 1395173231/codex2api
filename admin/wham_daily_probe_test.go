@@ -25,7 +25,7 @@ func TestWhamDailyUsageDueTargetsUsesPerStatusIntervals(t *testing.T) {
 	authoritative.SetCooldownUntil(now.Add(12*time.Hour), auth.ResponsesRateLimitedCooldownReason)
 	all := []*auth.Account{active, limited, authoritative}
 
-	// 首轮：没有计时记录，两个账号都要刷。
+	// 首轮：没有计时记录，三个账号都要刷。
 	lastAttempt := map[int64]time.Time{}
 	if targets := whamDailyUsageDueTargets(all, lastAttempt, now); len(targets) != 3 {
 		t.Fatalf("first round targets = %d, want 3", len(targets))
