@@ -211,6 +211,29 @@ func sessionAffinityKey(sessionID string, apiKeyID int64) string {
 	return fmt.Sprintf("%s::api-key:%d", sessionID, apiKeyID)
 }
 
+const codexTurnStateHeader = "X-Codex-Turn-State"
+
+// codexTurnContinuationToken follows the official Codex per-turn contract:
+// HTTP sends the token as a header, while Responses WebSocket v2 sends it in
+// response.create client_metadata after the first request in that turn.
+func codexTurnContinuationToken(headers http.Header, body []byte) string {
+	if headers != nil {
+		if token := strings.TrimSpace(headers.Get(codexTurnStateHeader)); token != "" {
+			return token
+		}
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-turn-state").String())
+}
+
+func copyCodexTurnStateResponseHeader(c *gin.Context, headers http.Header) {
+	if c == nil || headers == nil {
+		return
+	}
+	if token := strings.TrimSpace(headers.Get(codexTurnStateHeader)); token != "" {
+		c.Header(codexTurnStateHeader, token)
+	}
+}
+
 // applyAffinityGroupRouting keeps fingerprinted requests on the API key's original groups
 // and routes requests without either a Codex engine fingerprint or the dedicated local
 // affinity header to the configured split groups.
@@ -2822,6 +2845,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	turnContinuationPinned := turnContinuation && turnHasBinding
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -2916,6 +2942,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		if !retainedHTTPFallback {
 			if continuationUnavailable && !relayContinuationAttempted {
 				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			} else if turnContinuationPinned {
+				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			} else {
 				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			}
@@ -2928,6 +2956,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
+			if h.store.HasUsageLimitedCandidateWithFilter(apiKeyID, retryExclusions.ForSelection(), accountFilter) {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
 				return
 			}
 			if continuationUnavailable && !relayContinuationAttempted {
@@ -3155,6 +3187,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
+			copyCodexTurnStateResponseHeader(c, resp.Header)
 			if isGrokNativeRouteResponse(resp) {
 				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard)
 				totalDuration := int(time.Since(start).Milliseconds())
@@ -3671,6 +3704,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
+		copyCodexTurnStateResponseHeader(c, resp.Header)
 		SyncCodexUsageState(h.store, account, resp)
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
@@ -6051,10 +6085,10 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		return decision
 	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
-		store.MarkPremium5hRateLimited(account, decision.ResetAt)
+		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
 		return decision
 	}
-	store.MarkCooldown(account, decision.Cooldown, "rate_limited")
+	store.MarkCooldown(account, decision.Cooldown, auth.ResponsesRateLimitedCooldownReason)
 	return decision
 }
 

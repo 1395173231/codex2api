@@ -6940,6 +6940,16 @@ func grokIdentityCredentialChanged(before, after map[string]interface{}) bool {
 	return false
 }
 
+func openAIResponsesIdentityCredentialChanged(before, after map[string]interface{}) bool {
+	if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(after, "upstream_type")), "openai_responses") {
+		return false
+	}
+	return strings.TrimRight(strings.TrimSpace(credentialStringFromMap(before, "base_url")), "/") !=
+		strings.TrimRight(strings.TrimSpace(credentialStringFromMap(after, "base_url")), "/") ||
+		strings.TrimSpace(credentialStringFromMap(before, "api_key")) !=
+			strings.TrimSpace(credentialStringFromMap(after, "api_key"))
+}
+
 func sqliteJSONSetKeySupported(key string) bool {
 	if key == "" {
 		return false
@@ -6970,15 +6980,21 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 		return err
 	}
 
-	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	current := decodeCredentials(currentRaw)
+	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
+	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
 	credJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
 
-	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	identityUpdate := ""
+	if identityChanged {
+		identityUpdate = ", credential_generation = credential_generation + 1, status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL"
+	}
+	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api'` + identityUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
 	if !db.isSQLite() {
-		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api'` + identityUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
 	}
 	res, err := tx.ExecContext(ctx, updateQuery, name, credJSON, proxyURL, id)
 	if err != nil {
@@ -6990,6 +7006,11 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	}
 	if affected == 0 {
 		return sql.ErrNoRows
+	}
+	if identityChanged {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_model_cooldowns WHERE account_id = $1`, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

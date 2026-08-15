@@ -854,9 +854,15 @@ func TestApplyWhamUsage_IgnoredUsageStatusRemainsMetadataOnly(t *testing.T) {
 	if result.Premium5hRateLimited || result.Usage7dRateLimited {
 		t.Fatalf("WHAM metadata created a cooldown: %+v", result)
 	}
-	if !account.IsAvailable() {
-		t.Fatal("WHAM 100% metadata must not remove an account from scheduling")
+	if account.IsAvailable() {
+		t.Fatal("WHAM 100% metadata must fence the account from fresh scheduling")
 	}
+	store.BindSessionAffinity("working-turn", account, "")
+	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
+	if continued != account {
+		t.Fatal("WHAM 100% metadata prevented the existing turn from continuing")
+	}
+	store.Release(continued)
 	if pct5h, _, ok := account.GetUsageSnapshot5h(); !ok || pct5h != 100 {
 		t.Fatalf("5h snapshot = (%v, %v), want 100 and valid", pct5h, ok)
 	}
