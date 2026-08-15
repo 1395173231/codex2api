@@ -64,6 +64,8 @@ import {
 import {
   formatLongUsageWindowLabel,
   getAccountStatusBadgeStatus,
+  isOfficialCostHiddenAccount,
+  isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
 } from "../lib/usageFormat";
@@ -2430,21 +2432,23 @@ export default function Accounts() {
     };
   }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
 
-  const loadAccountAnalysis = useCallback(async () => {
+  const loadAccountAnalysis = useCallback(async (opts?: { silent?: boolean }) => {
     accountAnalysisAbortRef.current?.abort();
     const controller = new AbortController();
     accountAnalysisAbortRef.current = controller;
-    setAccountAnalysisLoading(true);
-    setAccountAnalysisError(null);
+    if (!opts?.silent) {
+      setAccountAnalysisLoading(true);
+      setAccountAnalysisError(null);
+    }
     try {
       const response = await api.getAccountAnalysis("codex", controller.signal);
       if (!controller.signal.aborted) setAccountAnalysis(response);
     } catch (analysisError) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && !opts?.silent) {
         setAccountAnalysisError(getErrorMessage(analysisError));
       }
     } finally {
-      if (!controller.signal.aborted) setAccountAnalysisLoading(false);
+      if (!controller.signal.aborted && !opts?.silent) setAccountAnalysisLoading(false);
     }
   }, []);
 
@@ -5999,12 +6003,9 @@ export default function Accounts() {
                 analysis={accountAnalysis.quota}
                 compact
                 className="min-w-0"
+                onRefreshAnalysis={() => loadAccountAnalysis({ silent: true })}
                 onProbeStarted={() => {
                   showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
-                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
-                  window.setTimeout(() => {
-                    void loadAccountAnalysis()
-                  }, 4000)
                 }}
                 onProbeError={(message) => showToast(message, 'error')}
               />
@@ -14541,11 +14542,17 @@ function BilledCell({
   const { t } = useTranslation();
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
-  const showOfficial = isCodexOfficialAccount(account);
+  const showOfficial =
+    isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
+  // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
   const officialSynced = account.official_usage_synced === true;
-  const officialPending = showOfficial && official === null && !officialSynced;
+  const officialPending =
+    showOfficial &&
+    official === null &&
+    !officialSynced &&
+    !isOfficialCostTooNew(account);
   const [officialSpinTimedOut, setOfficialSpinTimedOut] = useState(false);
   useEffect(() => {
     if (!officialPending) return undefined;

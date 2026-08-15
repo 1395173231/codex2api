@@ -9949,15 +9949,6 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		log.Printf("[账号 %d] 清理错误状态失败: %v", dbID, err)
 	}
 
-	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等）
-	if appliedPlanType != "" && atomic.LoadInt32(&acc.Locked) == 0 {
-		if appliedPlanType != "free" {
-			atomic.StoreInt32(&acc.Locked, 1)
-			_ = s.db.SetAccountLocked(ctx, dbID, true)
-			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, appliedPlanType)
-		}
-	}
-
 	if expiredCooldown {
 		s.deleteCachedAccountCooldown(dbID)
 		if err := s.db.ClearCooldown(ctx, dbID); err != nil {

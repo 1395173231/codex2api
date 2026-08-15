@@ -75,6 +75,33 @@ func TestWhamDailyUsageDueTargetsRecoveredAccountResumesHourly(t *testing.T) {
 	}
 }
 
+func TestWhamDailyUsageAutoRefreshEligibleSkipsErrorBannedAndNewAccounts(t *testing.T) {
+	now := time.Now()
+	ready := &auth.Account{DBID: 1, AccessToken: "at", AddedAt: now.Add(-25 * time.Hour).UnixNano()}
+	if !whamDailyUsageAutoRefreshEligible(ready, now) {
+		t.Fatal("account older than one day should auto-refresh")
+	}
+
+	fresh := &auth.Account{DBID: 2, AccessToken: "at", AddedAt: now.Add(-2 * time.Hour).UnixNano()}
+	if whamDailyUsageAutoRefreshEligible(fresh, now) {
+		t.Fatal("account imported within one day should wait for official settlement")
+	}
+
+	errored := &auth.Account{DBID: 3, AccessToken: "at", Status: auth.StatusError, AddedAt: now.Add(-48 * time.Hour).UnixNano()}
+	if whamDailyUsageAutoRefreshEligible(errored, now) {
+		t.Fatal("error account should not auto-refresh official usage")
+	}
+
+	banned := &auth.Account{
+		DBID: 4, AccessToken: "at", Status: auth.StatusCooldown,
+		CooldownUtil: now.Add(time.Hour), CooldownReason: "unauthorized",
+		AddedAt: now.Add(-48 * time.Hour).UnixNano(),
+	}
+	if whamDailyUsageAutoRefreshEligible(banned, now) {
+		t.Fatal("banned account should not auto-refresh official usage")
+	}
+}
+
 func TestWhamDailyUsageBackfillEligibleSkipsRelayAndGrok(t *testing.T) {
 	if !whamDailyUsageBackfillEligible(&auth.Account{DBID: 1, AccessToken: "at"}) {
 		t.Fatal("codex oauth account should be eligible")

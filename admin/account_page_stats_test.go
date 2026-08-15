@@ -40,6 +40,15 @@ func invokeAccountPageStats(t *testing.T, handler *Handler, ids []int64) map[str
 	return payload.Stats
 }
 
+func ageAccountForOfficialUsage(t *testing.T, store *auth.Store, id int64) {
+	t.Helper()
+	account := store.FindByID(id)
+	if account == nil {
+		t.Fatalf("account %d not in store", id)
+	}
+	account.AddedAt = time.Now().Add(-25 * time.Hour).UnixNano()
+}
+
 func waitAccountDailyUsage(t *testing.T, db *database.DB, id int64) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -86,6 +95,7 @@ func TestGetAccountPageStatsBackfillsMissingOfficialUsage(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	ageAccountForOfficialUsage(t, store, codexID)
 
 	var mu sync.Mutex
 	called := make([]int64, 0, 2)
@@ -153,6 +163,7 @@ func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	ageAccountForOfficialUsage(t, store, id)
 
 	var mu sync.Mutex
 	calls := 0
@@ -218,6 +229,7 @@ func TestWhamDailyBackfillFailureCooldownSkipsRetry(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	ageAccountForOfficialUsage(t, store, id)
 
 	var mu sync.Mutex
 	calls := 0
@@ -275,6 +287,36 @@ func TestWhamDailyBackfillFailureCooldownSkipsRetry(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func TestGetAccountPageStatsSkipsOfficialBackfillForNewAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
+		"refresh_token": "rt-new",
+		"access_token":  "at-new",
+		"email":         "new@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
+		t.Fatal("new account must not hit official usage upstream")
+		return nil, nil, nil
+	}
+
+	invokeAccountPageStats(t, handler, []int64{id})
+	time.Sleep(80 * time.Millisecond)
 }
 
 func TestGetAccountPageStatsSkipsOfficialBackfillWhenSnapshotExists(t *testing.T) {

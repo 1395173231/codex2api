@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   getAccountStatusBadgeStatus,
+  isOfficialCostHiddenAccount,
+  isOfficialCostTooNew,
   isUnsampledQuotaAccount,
   needsOfficialCostReload,
   needsUsageReload,
@@ -63,6 +65,28 @@ test("official cost reload only retries Codex accounts missing the snapshot", ()
   assert.equal(needsOfficialCostReload({ official_usd_7d: 12.5 }), false);
   assert.equal(needsOfficialCostReload({ openai_responses_api: true }), false);
   assert.equal(needsOfficialCostReload({ grok_api: true }), false);
+  assert.equal(needsOfficialCostReload({ status: "error" }), false);
+  assert.equal(needsOfficialCostReload({ status: "unauthorized" }), false);
+  assert.equal(
+    needsOfficialCostReload({
+      created_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    }),
+    false,
+  );
+  assert.equal(
+    needsOfficialCostReload({
+      created_at: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    }),
+    true,
+  );
+  assert.equal(isOfficialCostHiddenAccount({ status: "error" }), true);
+  assert.equal(isOfficialCostHiddenAccount({ status: "active" }), false);
+  assert.equal(
+    isOfficialCostTooNew({
+      created_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    }),
+    true,
+  );
 });
 
 test("official cost reload stops once the backend reports a completed sync", () => {
