@@ -407,6 +407,26 @@ func TestNormalizeResponsesWebSocketClientPayload(t *testing.T) {
 			t.Fatalf("error = %#v, want previous_response_id rejection", apiErr)
 		}
 	})
+
+	t.Run("preserves v2 prewarm fields", func(t *testing.T) {
+		got, model, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[],"generate":false,"client_metadata":{"x-codex-turn-state":"turn_123"}}`))
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %v", apiErr)
+		}
+		if model != "gpt-5.6-sol" || gjson.GetBytes(got, "generate").Bool() {
+			t.Fatalf("v2 prewarm changed: model=%q body=%s", model, got)
+		}
+		if turnState := gjson.GetBytes(got, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("turn state = %q, want turn_123; body=%s", turnState, got)
+		}
+		prepared, _ := PrepareResponsesWebSocketBody(got)
+		if generate := gjson.GetBytes(prepared, "generate"); !generate.Exists() || generate.Bool() {
+			t.Fatalf("prepared v2 prewarm lost generate=false: %s", prepared)
+		}
+		if turnState := gjson.GetBytes(prepared, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("prepared turn state = %q, want turn_123; body=%s", turnState, prepared)
+		}
+	})
 }
 
 func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
@@ -569,7 +589,7 @@ func TestResponsesWebSocketContinuationKeepsBoundAccountPastBoundedLimit(t *test
 	for turn := 1; turn <= 52; turn++ {
 		payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","input":"turn-%d"}`, turn)
 		if previousResponseID != "" {
-			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d"}`, previousResponseID, turn)
+			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d","client_metadata":{"x-codex-turn-state":"turn-state-1"}}`, previousResponseID, turn)
 		}
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 			t.Fatalf("turn %d write request: %v", turn, err)
@@ -3815,6 +3835,11 @@ func TestResponseFailedRetryableClassification(t *testing.T) {
 		{
 			name:    "non-retryable invalid_request",
 			payload: `{"type":"response.failed","response":{"error":{"type":"invalid_request_error","message":"bad input"}}}`,
+			want:    false,
+		},
+		{
+			name:    "previous response not found",
+			payload: `{"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}`,
 			want:    false,
 		},
 		{

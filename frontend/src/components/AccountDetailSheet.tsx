@@ -57,7 +57,13 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   if (status === "rate_limited_7d") return "7d";
   if (reason === "rate_limited_5h") return "5h";
   if (reason === "rate_limited_7d") return "7d";
-  if (status === "rate_limited" || status === "quota_paused" || status === "usage_exhausted") {
+  if (
+    status === "rate_limited" ||
+    status === "responses_rate_limited" ||
+    status === "quota_paused" ||
+    status === "usage_exhausted" ||
+    reason === "responses_rate_limited"
+  ) {
     if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
     if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
     if (typeof account.usage_percent_5h === "number" && account.usage_percent_5h >= 100)

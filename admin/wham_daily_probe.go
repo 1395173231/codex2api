@@ -98,7 +98,7 @@ func (h *Handler) StartWhamDailyUsageProbe(ctx context.Context) {
 // 账号额度短期不会变化，降频到 6 小时；其余账号按小时刷新。
 func whamDailyUsageProbeIntervalFor(account *auth.Account) time.Duration {
 	switch account.RuntimeStatus() {
-	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit", "usage_exhausted":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_7d", "usage_limited", "usage_limit", "usage_exhausted":
 		return whamDailyUsageProbeRateLimitedInterval
 	}
 	return whamDailyUsageProbeBaseInterval

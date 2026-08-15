@@ -22,11 +22,15 @@ import (
 // 须由 ProbeUsageSnapshot 决定是否用 /responses 探针裁决。
 var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 
+type usageProbeRequestFunc func(context.Context, *auth.Account, []byte, string, string, string, *proxy.DeviceProfileConfig, http.Header, ...bool) (*http.Response, error)
+
 // ProbeUsageSnapshot 主动刷新账号用量。
 //
 // 优先尝试 /backend-api/wham/usage（零额度成本的结构化端点）；
 // 失败时（4xx/5xx/网络）回退到给 /backend-api/codex/responses 发一个最小请求
-// （会真实计入用量但保证向下兼容）。
+// （会真实计入用量但保证向下兼容）。Responses 权威限流判定开启且账号已处于
+// 用量冷却时，即使 wham 成功也会补一次 /responses 探针：wham 只更新展示元数据，
+// 只有真实 Responses 结果能确认账号是否已经恢复。
 // 鉴权裁决：wham 401 不单方面封号，由 /responses 回退探针定夺（issue #328）。
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
 	if account == nil {
@@ -52,14 +56,21 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		return nil
 	}
 
-	// 限流/冷却（429 或 premium 5h 限流）状态下只做 wham（零成本），
-	// 失败也不回退 /responses，避免加重限流或额外消耗额度。
+	// 默认在限流/冷却（429 或 premium 5h 限流）状态下只做 wham（零成本）。
+	// Responses 权威模式例外：若一直只做 wham，已进入冷却的账号永远没有机会用
+	// Responses 200 自证恢复，整个池可能长期只剩本地 503。
 	limited := account.InLimitedState()
-	whamOnly := limited || h.store.GetLazyMode() || !h.store.UsageProbeResponsesFallbackEnabled()
+	responsesFallback := h.store.UsageProbeResponsesFallbackEnabled()
+	lazyMode := h.store.GetLazyMode()
+	authoritativeRecovery := limited && account.IgnoresUsageLimitStatus() && responsesFallback
+	whamOnly := (limited && !authoritativeRecovery) || (lazyMode && !authoritativeRecovery) || !responsesFallback
 
 	// 1) 优先用 wham（零成本）
 	if err := h.probeUsageViaWham(ctx, account, limited); err == nil {
-		return nil
+		if !authoritativeRecovery {
+			return nil
+		}
+		log.Printf("[账号 %d] wham 用量元数据刷新成功，继续用 /responses 裁决限流恢复", account.DBID)
 	} else if errors.Is(err, errWhamUnauthorized) {
 		// wham 401 不直接封号（codex_at 账号可能 wham 恒 401 但流量可用，issue #328）：
 		// 能回退时交给 /responses 探针做鉴权最终裁决（200 恢复 / 401 才封）；
@@ -191,7 +202,11 @@ func (h *Handler) probeUsageViaGrokBilling(ctx context.Context, account *auth.Ac
 func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Account) error {
 	probeStartedAt := time.Now()
 	payload := buildConnectionTestPayload(h.store, h.store.GetTestModel())
-	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
+	executeRequest := usageProbeRequestFunc(proxy.ExecuteRequest)
+	if h.executeUsageProbe != nil {
+		executeRequest = h.executeUsageProbe
+	}
+	resp, err := executeRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	if err != nil {
 		return err
 	}

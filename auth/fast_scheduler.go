@@ -539,6 +539,14 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 }
 
 func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
+	return a.fastSchedulerSnapshotWithUsageOverride(baseLimit, now, false)
+}
+
+func (a *Account) fastSchedulerSnapshotForContinuation(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
+	return a.fastSchedulerSnapshotWithUsageOverride(baseLimit, now, true)
+}
+
+func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, now time.Time, continuation bool) (AccountHealthTier, float64, int64, bool, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -569,21 +577,22 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		limit = a.smartPacingConcurrencyLimitLocked(limit, now)
 	}
 
+	continuationUsageOverride := continuation && a.usageLimitContinuationEligibleLocked(now)
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
 	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		available = false
 	}
-	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
-		available = false
-	}
-	if a.premium5hRateLimitedLocked(now) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !continuationUsageOverride {
 		available = false
 	}
 	if a.quotaAutoPausedLocked(now) {
 		available = false
 	}
-	// Free 账号 7d 用量耗尽，不参与调度
-	if a.usageExhaustedLocked() {
+	// Fresh dispatch remains fenced by WHAM-reported usage windows even when
+	// IgnoreUsageLimitStatus is enabled. Continuations use a separate, narrow
+	// account-selection path in Store.
+	if a.usageWindowBlocksFreshDispatchLocked(now) &&
+		!continuationUsageOverride {
 		available = false
 	}
 

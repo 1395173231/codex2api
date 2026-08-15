@@ -3,8 +3,10 @@ package admin
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,5 +188,108 @@ func TestProbeUsageSnapshotWhamCannotClearResponsesCooldownWhenUsageStatusIgnore
 	}
 	if !account.HasActiveCooldown() {
 		t.Fatal("WHAM metadata cleared a cooldown that requires Responses success")
+	}
+}
+
+func TestProbeUsageSnapshotResponsesSuccessRecoversIgnoredUsageCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type":"plus",
+			"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_after_seconds":1800}}
+		}`))
+	}))
+	defer server.Close()
+	restoreWham := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restoreWham()
+
+	executeCalls := 0
+	executeRequest := func(context.Context, *auth.Account, []byte, string, string, string, *proxy.DeviceProfileConfig, http.Header, ...bool) (*http.Response, error) {
+		executeCalls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"type":"response.completed"}`)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+		LazyMode:               true,
+	})
+	store.SetUsageProbeResponsesFallbackEnabled(true)
+	account := &auth.Account{DBID: 4, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.BindSessionAffinity("working-turn", account, "")
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+
+	h := &Handler{store: store, executeUsageProbe: executeRequest}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() error = %v", err)
+	}
+	if executeCalls != 1 {
+		t.Fatalf("Responses probe calls = %d, want 1 after successful WHAM metadata refresh", executeCalls)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("authoritative Responses 200 did not clear the prior cooldown")
+	}
+	if account.IsAvailable() {
+		t.Fatal("WHAM 100% account became available to fresh sessions")
+	}
+	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
+	if continued != account {
+		t.Fatal("authoritative Responses 200 did not preserve active-turn continuation")
+	}
+	store.Release(continued)
+}
+
+func TestProbeUsageSnapshotResponses429PreservesIgnoredUsageCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type":"plus",
+			"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_after_seconds":1800}}
+		}`))
+	}))
+	defer server.Close()
+	restoreWham := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restoreWham()
+
+	executeCalls := 0
+	executeRequest := func(context.Context, *auth.Account, []byte, string, string, string, *proxy.DeviceProfileConfig, http.Header, ...bool) (*http.Response, error) {
+		executeCalls++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached","plan_type":"plus","resets_in_seconds":1800}}`)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	store.SetUsageProbeResponsesFallbackEnabled(true)
+	account := &auth.Account{DBID: 5, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+
+	h := &Handler{store: store, executeUsageProbe: executeRequest}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() error = %v", err)
+	}
+	if executeCalls != 1 {
+		t.Fatalf("Responses probe calls = %d, want 1", executeCalls)
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("authoritative Responses 429 did not preserve account cooldown")
+	}
+	if reason := account.GetCooldownReason(); reason == "" {
+		t.Fatal("Responses 429 left the account cooling without a reason")
 	}
 }

@@ -194,6 +194,28 @@ func TestAccountListItemMatchesEveryFilter(t *testing.T) {
 	}
 }
 
+func TestResponsesRateLimitedClassification(t *testing.T) {
+	item := &accountListSnapshotItem{
+		Row:      &database.AccountRow{ID: 1},
+		ID:       1,
+		Status:   auth.ResponsesRateLimitedCooldownReason,
+		Enabled:  true,
+		PlanType: "plus",
+	}
+	if !accountListRateLimited(item) || !accountListItemMatches(item, accountPageQuery{Status: "rate_limited"}, database.UpstreamChannelCodex) {
+		t.Fatal("authoritative Responses limit was not classified as rate limited")
+	}
+	if !accountAnalysisShortRateLimited(item) {
+		t.Fatal("authoritative Responses limit was omitted from short-window analysis")
+	}
+
+	item.Status = "cooldown"
+	item.CooldownReason = auth.ResponsesRateLimitedCooldownReason
+	if !accountListRateLimited(item) || !accountAnalysisShortRateLimited(item) {
+		t.Fatal("authoritative Responses cooldown reason was not classified as rate limited")
+	}
+}
+
 func TestAccountListSortAlwaysFallsBackToIDAscending(t *testing.T) {
 	items := []*accountListSnapshotItem{
 		{ID: 3, RequestCount: 5},
