@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.8.0 - 2026-08-16
+
+### Features
+
+- **Large Codex and Grok account pools keep the accounts page responsive while seven-day usage statistics warm in the background.** Pools above 500 accounts now aggregate request and today counters in 100-account batches with resumable progress and a size-aware timeout instead of repeatedly attempting one full-table scan. Usage-backed sorts are temporarily disabled only during the first cold aggregation and automatically return when the cache is complete; pools of at least 2,000 accounts reuse their lightweight list snapshot for 30 seconds. Deleting or cleaning accounts prunes warm server and browser snapshots in place rather than forcing a blocking full-pool reload. Regression coverage exercises batching, resume-after-timeout/error, sort gating, non-blocking cold starts, cache pruning, and both Codex and Grok frontend sort behavior.
+- **Account cleanup reports per-account progress across Codex and Grok pools.** Banned, rate-limited, error, and Grok cleanup actions can stream start/progress/complete events, update deleted/failed totals without stale “already cleaned” messages during the run, and quietly reconcile the visible page when rows disappear. Team/K12/education plan badges also expose the effective workspace ID in a tooltip so operators can identify the workspace a seat actually routes through.
+
+### Fixes
+
+- **Imported OAuth accounts recover from transient refresh failures without being stranded in `error`, while permanently dead credentials reach a bounded terminal state.** A newly imported refresh token now retries timeout, proxy, upstream 5xx, and refresh-lock failures up to three times without occupying an import worker while waiting; invalidated/reused refresh tokens and ended sessions enter the existing unauthorized recovery cadence, then become terminal `error` after three consecutive permanent failures so the recovery probe no longer retries a dead credential forever. A successful refresh or manual cooldown clear resets the counter.
+- **Responses probes and connection tests no longer treat an HTTP 200 stream with a failed terminal event as success.** `response.failed`, failed/incomplete `response.completed`, and `error` events are classified explicitly; embedded `usage_limit_reached` errors apply the authoritative account cooldown, other failures remain failures, and a missing terminal event is rejected. Runtime status now keeps hard account errors ahead of usage badges and uses the same fresh-dispatch usage-window rule as the scheduler.
+- **Deactivated Team, K12, and education workspaces isolate every native seat and avoid redundant batch-test handshakes.** Workspace linkage now recognizes seats whose native account IDs differ but whose effective workspace and plan identify the same organization, preserves the triggering account for the 60-second deduplication window, and short-circuits sibling tests locally. Header-only workspace overrides on personal accounts remain excluded.
+- **SQLite account-group changes, soft deletes, and usage-log flushes share one serialized writer gate (PR #529 by @ifThink404).** These write paths previously opened transactions outside the existing SQLite write semaphore, allowing concurrent mutations to contend until `SQLITE_BUSY` or starve buffered usage logs. Top-level SQLite transactions now enter one lock while PostgreSQL keeps its normal transaction behavior; regression tests cover group mutations, single/batch soft delete, and flush contention.
+- **Prompt-risk reconciliation and admin aggregation scale to production-sized datasets (PR #530 by @ifThink404).** Request-ID and fingerprint reconciliation now use separate index-friendly queries backed by targeted partial indexes, avoiding the cross-branch `OR` plan that degraded as `prompt_risk_events` grew. Dashboard aggregation gets a bounded 15-second budget and the 30-day risk-profile list gets 20 seconds instead of failing at five; schema, migration, query-plan, API-timeout, and race tests cover PostgreSQL and SQLite.
+
 ## v2.7.9 - 2026-08-16
 
 ### Features
