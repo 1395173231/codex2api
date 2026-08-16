@@ -8025,6 +8025,27 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	s.markCooldown(acc, duration, reason, "", false)
 }
 
+// MarkResponsesRateLimited records an authoritative account-scoped Responses
+// rejection and immediately refreshes its WHAM usage snapshot. The first
+// transition is probed once; repeated 429s while the cooldown is active do not
+// create a probe storm.
+func (s *Store) MarkResponsesRateLimited(acc *Account, duration time.Duration) {
+	if s == nil || acc == nil {
+		return
+	}
+	now := time.Now()
+	acc.mu.RLock()
+	alreadyLimited := acc.Status == StatusCooldown &&
+		acc.CooldownReason == ResponsesRateLimitedCooldownReason &&
+		(acc.CooldownUtil.IsZero() || now.Before(acc.CooldownUtil))
+	acc.mu.RUnlock()
+
+	s.MarkCooldown(acc, duration, ResponsesRateLimitedCooldownReason)
+	if !alreadyLimited {
+		s.TriggerUsageProbeForAccountAsync(acc)
+	}
+}
+
 // MarkCooldownWithError 标记账号进入冷却，并同时记录本次上游错误详情。
 func (s *Store) MarkCooldownWithError(acc *Account, duration time.Duration, reason string, errorMsg string) {
 	s.markCooldown(acc, duration, reason, errorMsg, false)
@@ -9046,6 +9067,32 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbeMu.Lock()
 	defer s.usageProbeMu.Unlock()
 	s.usageProbe = fn
+}
+
+// TriggerUsageProbeForAccountAsync immediately probes one account without
+// waiting for the periodic max-age sweep. ProbeUsageSnapshot sees the account
+// in a limited state and starts with WHAM as the zero-cost source of truth.
+func (s *Store) TriggerUsageProbeForAccountAsync(account *Account) {
+	if s == nil || account == nil {
+		return
+	}
+	s.usageProbeMu.RLock()
+	probeFn := s.usageProbe
+	s.usageProbeMu.RUnlock()
+	if probeFn == nil || !account.TryBeginUsageProbe() {
+		return
+	}
+
+	if !s.startDBBackgroundTask(func(parent context.Context) {
+		defer account.FinishUsageProbe()
+		ctx, cancel := context.WithTimeout(parent, 25*time.Second)
+		defer cancel()
+		if err := probeFn(ctx, account); err != nil {
+			log.Printf("[账号 %d] Responses 限流后立即刷新 WHAM 用量失败: %v", account.DBID, err)
+		}
+	}) {
+		account.FinishUsageProbe()
+	}
 }
 
 // wsAuthVerifyMinInterval 限制同一账号 WS 鉴权验证探针的最小触发间隔，

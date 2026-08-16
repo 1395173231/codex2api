@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -95,6 +96,42 @@ func TestApply429CooldownUsageLimitWithoutResetStaysAccountScoped(t *testing.T) 
 	}
 	if acc.IsModelRateLimited("gpt-5.4") {
 		t.Fatal("usage_limit_reached should not be stored as a model cooldown")
+	}
+}
+
+func TestApply429CooldownUsageLimitTriggersImmediateUsageProbe(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	acc := &auth.Account{
+		DBID:        2,
+		AccessToken: "token",
+		PlanType:    "plus",
+		Status:      auth.StatusReady,
+	}
+	store.AddAccount(acc)
+	probed := make(chan *auth.Account, 1)
+	store.SetUsageProbeFunc(func(_ context.Context, account *auth.Account) error {
+		probed <- account
+		return nil
+	})
+
+	Apply429Cooldown(
+		store,
+		acc,
+		[]byte(`{"error":{"type":"usage_limit_reached"}}`),
+		nil,
+		"gpt-5.4",
+	)
+
+	select {
+	case got := <-probed:
+		if got != acc {
+			t.Fatalf("usage probe account = %p, want %p", got, acc)
+		}
+		if !got.InLimitedState() {
+			t.Fatal("usage probe started before the Responses cooldown was visible")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered immediately after Responses limit")
 	}
 }
 

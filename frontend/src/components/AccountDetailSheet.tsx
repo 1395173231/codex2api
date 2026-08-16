@@ -58,21 +58,34 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   if (status === "rate_limited_7d") return "7d";
   if (reason === "rate_limited_5h") return "5h";
   if (reason === "rate_limited_7d") return "7d";
-  if (
+  const explicitlyRateLimited =
     status === "rate_limited" ||
     status === "responses_rate_limited" ||
     status === "quota_paused" ||
     status === "usage_exhausted" ||
-    reason === "responses_rate_limited"
+    reason === "responses_rate_limited";
+  if (!explicitlyRateLimited) return null;
+
+  if (
+    typeof account.usage_percent_7d === "number" &&
+    account.usage_percent_7d >= 100 &&
+    (!account.reset_7d_at || isFutureTime(account.reset_7d_at))
   ) {
-    if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
-    if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
-    if (typeof account.usage_percent_5h === "number" && account.usage_percent_5h >= 100)
-      return "5h";
-    if (typeof account.usage_percent_7d === "number" && account.usage_percent_7d >= 100)
-      return "7d";
+    return "7d";
   }
-  return null;
+  if (
+    typeof account.usage_percent_5h === "number" &&
+    account.usage_percent_5h >= 100 &&
+    (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
+  ) {
+    return "5h";
+  }
+
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" || !!account.reset_7d_at;
+  return has7dWindow && !has5hWindow ? "7d" : "5h";
 }
 
 // 复制邮箱按钮。navigator.clipboard 在非安全上下文（局域网 http 访问）下不存在，

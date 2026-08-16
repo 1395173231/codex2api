@@ -6104,7 +6104,7 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
 		return decision
 	}
-	store.MarkCooldown(account, decision.Cooldown, auth.ResponsesRateLimitedCooldownReason)
+	store.MarkResponsesRateLimited(account, decision.Cooldown)
 	return decision
 }
 

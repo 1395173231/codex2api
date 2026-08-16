@@ -11942,7 +11942,23 @@ function getAccountRateLimitWindow(
     return "5h";
   }
 
-  return explicitlyRateLimited ? "5h" : null;
+  if (!explicitlyRateLimited) {
+    return null;
+  }
+
+  // A generic Responses 429 does not identify its quota window. Until the
+  // immediate WHAM refresh replaces that transient state, keep the badge
+  // aligned with the usage bar that actually exists instead of inventing 5h.
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" ||
+    hasUsageWindowDetail(account.usage_7d_detail) ||
+    !!account.reset_7d_at;
+  if (has7dWindow && !has5hWindow) {
+    return "7d";
+  }
+  return "5h";
 }
 
 function getRateLimitedWindowStats(accounts: AccountRow[]): {

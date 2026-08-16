@@ -383,6 +383,41 @@ func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source strin
 	})
 }
 
+// scheduleImportedAccountWarmup 导入后的换 AT / 用量探测。脚本批量加号和文件导入
+// 必须走同一道并发闸：裸 RT 换 AT 也会打上游，不限流会把网关和鉴权接口一起打满。
+func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, source string) {
+	if h == nil || acc == nil || id <= 0 {
+		return
+	}
+	if acc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, source)
+		return
+	}
+	if h.store != nil && !h.store.GetLazyMode() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
+		})
+	}
+}
+
+// commitImportedRuntimeAccounts 一次写入内存池，再按需排队预热。逐条 AddAccount
+// 会反复抢号池写锁；预热必须在入池之后，refreshAccountByID 靠 DBID 回查运行时账号。
+func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source string, skipRefresh bool) {
+	if h == nil || h.store == nil || len(accounts) == 0 {
+		return
+	}
+	h.store.AddAccounts(accounts)
+	if skipRefresh {
+		return
+	}
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		h.scheduleImportedAccountWarmup(acc, acc.DBID, source)
+	}
+}
+
 func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
 	if h == nil || h.store == nil || account == nil {
 		return
@@ -2677,6 +2712,9 @@ type addAccountReq struct {
 	ProxyURL       string            `json:"proxy_url"`
 	CustomHeaders  map[string]string `json:"custom_headers"`
 	AllowDuplicate bool              `json:"allow_duplicate"`
+	// SkipRefresh 只入库、不换 AT、不打用量探测。大批量脚本导入时应打开，
+	// 避免每批 50 个裸 RT 立刻拉起无上限的上游刷新把网关打卡。
+	SkipRefresh bool `json:"skip_refresh"`
 	// GroupIDs 让添加时就把新账号绑进指定分组；重复跳过的账号不受影响。
 	GroupIDs json.RawMessage `json:"group_ids"`
 }
@@ -2836,6 +2874,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	failCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	var dedup *accountCredentialDedup
 	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != "" {
@@ -2866,20 +2905,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		successCount++
 		createdIDs.add(id)
 		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		// 热加载：直接加入内存池
-		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 	}
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
@@ -2928,6 +2956,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		dedup = h.newAccountCredentialDedup(ctx)
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -2960,23 +2989,14 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		successCount++
 		createdIDs.add(id)
 		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 
 		sendImportEvent(c, importEvent{
 			Type: "progress", Current: i + 1, Total: total,
 			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -9428,8 +9448,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.db.SetMaxOpenConns(v)
 		h.pgMaxConns = v
@@ -9441,8 +9461,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.cache.SetPoolSize(v)
 		h.redisPoolSize = v

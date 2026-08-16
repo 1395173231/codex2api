@@ -965,6 +965,102 @@ func TestAddAccountStreamReportsProgressAndProbesAfterRefresh(t *testing.T) {
 	}
 }
 
+func TestAddAccountSkipRefreshDoesNotWarmup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	var refreshed atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			refreshed.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			t.Fatal("usage probe should not run when skip_refresh is set")
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-skip-1\nrt-skip-2","skip_refresh":true}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if got := refreshed.Load(); got != 0 {
+		t.Fatalf("refresh count = %d, want 0", got)
+	}
+	if store.AccountCount() != 2 {
+		t.Fatalf("runtime accounts = %d, want 2", store.AccountCount())
+	}
+}
+
+func TestAddAccountRTRefreshUsesImportProbeGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 1,
+	})
+	store.SetUsageProbeConcurrency(1)
+	t.Cleanup(store.Stop)
+
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var finished atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			n := current.Add(1)
+			for {
+				prev := maxConcurrent.Load()
+				if n <= prev || maxConcurrent.CompareAndSwap(prev, n) {
+					break
+				}
+			}
+			time.Sleep(80 * time.Millisecond)
+			current.Add(-1)
+			finished.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-gate-1\nrt-gate-2\nrt-gate-3\nrt-gate-4"}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	deadline := time.After(2 * time.Second)
+	for finished.Load() < 4 {
+		select {
+		case <-deadline:
+			t.Fatalf("finished refreshes = %d, want 4", finished.Load())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Fatalf("max concurrent refreshes = %d, want 1", got)
+	}
+}
+
 func newMultipartJSONRequest(t *testing.T, filename string, content string) *http.Request {
 	t.Helper()
 
@@ -1814,11 +1910,11 @@ func TestParseImportJSONTokensAgentIdentityFlatCredentials(t *testing.T) {
 // 单个平铺对象(带 BOM)、sub2api {accounts:[...]}、多余顶层字段、空 accounts。
 func TestParseImportJSONTokensStreamMatchesFullParse(t *testing.T) {
 	cases := map[string]string{
-		"flat-array":       `[{"refresh_token":"rt-1","email":"a@x.com"},{"access_token":"at-2","email":"b@x.com"},{"refresh_token":"","access_token":""}]`,
-		"flat-single":      `{"refresh_token":"rt-flat","email":"flat@x.com"}`,
-		"sub2api":          `{"exported_at":"2026-01-01T00:00:00Z","proxies":[{"proxy_key":"ignored"}],"accounts":[{"name":"P","credentials":{"refresh_token":"rt-p","access_token":"at-p","email":"p@x.com"}},{"credentials":{"access_token":"at-f","email":"f@x.com"}}]}`,
-		"sub2api-empty":    `{"accounts":[{"credentials":{}}],"proxies":[{"proxy_key":"ignored"}]}`,
-		"sub2api-reorder":  `{"accounts":[{"credentials":{"refresh_token":"rt-z"}}],"exported_at":"2026-01-01T00:00:00Z"}`,
+		"flat-array":      `[{"refresh_token":"rt-1","email":"a@x.com"},{"access_token":"at-2","email":"b@x.com"},{"refresh_token":"","access_token":""}]`,
+		"flat-single":     `{"refresh_token":"rt-flat","email":"flat@x.com"}`,
+		"sub2api":         `{"exported_at":"2026-01-01T00:00:00Z","proxies":[{"proxy_key":"ignored"}],"accounts":[{"name":"P","credentials":{"refresh_token":"rt-p","access_token":"at-p","email":"p@x.com"}},{"credentials":{"access_token":"at-f","email":"f@x.com"}}]}`,
+		"sub2api-empty":   `{"accounts":[{"credentials":{}}],"proxies":[{"proxy_key":"ignored"}]}`,
+		"sub2api-reorder": `{"accounts":[{"credentials":{"refresh_token":"rt-z"}}],"exported_at":"2026-01-01T00:00:00Z"}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -3383,7 +3383,7 @@ export default function Settings() {
                     <SettingField label={t('settings.pgMaxConns')} description={t('settings.pgMaxConnsRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.pg_max_conns}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, pg_max_conns: value }))}
                       />
@@ -3393,7 +3393,7 @@ export default function Settings() {
                     <SettingField label={t('settings.redisPoolSize')} description={t('settings.redisPoolSizeRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.redis_pool_size}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, redis_pool_size: value }))}
                       />

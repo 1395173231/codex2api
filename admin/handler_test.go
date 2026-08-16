@@ -1564,6 +1564,46 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsConnectionPoolCeilingIs5000(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"pg_max_conns":6000,"redis_pool_size":6000}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.PgMaxConns != 5000 {
+		t.Fatalf("pg_max_conns = %d, want 5000", response.PgMaxConns)
+	}
+	if response.RedisPoolSize != 5000 {
+		t.Fatalf("redis_pool_size = %d, want 5000", response.RedisPoolSize)
+	}
+}
+
 func TestUpdateSettingsPersistsWeakNetworkMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
