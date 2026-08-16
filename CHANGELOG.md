@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Local Prompt Filter blocks can show an operator-defined message.** The advanced enforcement settings accept a trimmed, 2,000-character message and use it consistently for direct OpenAI, Anthropic, text/image, signed NewAPI-local, and Responses WebSocket blocks. Empty values preserve the existing default, while upstream policy, conversation-lock, and cooldown messages keep their dedicated diagnostics.
+
 ## v2.8.0 - 2026-08-16
 
 ### Features
