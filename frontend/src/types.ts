@@ -269,6 +269,7 @@ export interface AccountsPageResponse extends AccountsResponse {
   }
   snapshot_at: ISODateString
   stats_state: 'ready' | 'stale' | 'warming'
+  disabled_sorts?: string[]
 }
 
 export interface AccountPageStatsItem {

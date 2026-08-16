@@ -57,10 +57,15 @@ import {
   type AccountOperationResult,
   type AccountOperationResultsState,
 } from "../lib/accountOperationResults";
+import { operationProgressMessage } from "../lib/operationProgressMessage";
 import {
   readOperationResultsVisibility,
   writeOperationResultsVisibility,
 } from "../lib/operationResultsPreference";
+import {
+  isLargePoolSortDisabled,
+  resolveDisabledAccountSorts,
+} from "../lib/accountListSort";
 import {
   formatLongUsageWindowLabel,
   getAccountStatusBadgeStatus,
@@ -79,6 +84,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Table,
   TableBody,
@@ -750,7 +761,7 @@ function useMediaQuery(query: string) {
   return matches;
 }
 
-type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
+type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh" | "clean";
 
 interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
@@ -1196,7 +1207,10 @@ const AccountTableRow = memo(function AccountTableRow({
                             {visibleColumns.plan && (
                               <TableCell>
                                 <div className="flex flex-wrap items-center gap-1.5">
-                                  <PlanBadge planType={account.plan_type} />
+                                  <PlanBadge
+                                    planType={account.plan_type}
+                                    workspaceId={accountWorkspaceId(account)}
+                                  />
                                   <ExpiryBadge
                                     expiresAt={account.subscription_expires_at}
                                     planType={account.plan_type}
@@ -2293,7 +2307,7 @@ export default function Accounts() {
         rateLimited: event.rate_limited ?? prev?.rateLimited ?? 0,
         deleted: event.deleted ?? prev?.deleted ?? 0,
         done: event.type === "complete",
-        message: event.error || event.message || prev?.message,
+        message: operationProgressMessage(event, prev?.message),
       }));
       if (event.type === "complete") {
         if (
@@ -2429,6 +2443,7 @@ export default function Accounts() {
       facets: accountsResponse.facets,
       snapshotAt: accountsResponse.snapshot_at,
       statsState: accountsResponse.stats_state,
+      disabledSorts: accountsResponse.disabled_sorts ?? [],
     };
   }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
 
@@ -2477,6 +2492,7 @@ export default function Accounts() {
     facets: { tags: string[]; email_domains: AccountEmailDomainFacet[] };
     snapshotAt: string;
     statsState: "ready" | "stale" | "warming";
+    disabledSorts: string[];
   }>({
     initialData: {
       accounts: [],
@@ -2486,12 +2502,30 @@ export default function Accounts() {
       facets: { tags: [], email_domains: [] },
       snapshotAt: "",
       statsState: "warming",
+      disabledSorts: [],
     },
     load: loadAccounts,
     // Grok 视图与本组件共用挂载:此时 codex 列表链(列表→health-bars→page-stats
     // →静默重载循环)必须整体停摆,否则在 Grok 页后台空转并连带整树重渲染。
     enabled: providerView === "codex",
   });
+  const disabledSorts = useMemo(
+    () => resolveDisabledAccountSorts(data.disabledSorts, data.summary?.total),
+    [data.disabledSorts, data.summary?.total],
+  );
+  const usageSortBlocked = isLargePoolSortDisabled("requests", disabledSorts);
+  const guardUsageSort = useCallback(
+    (key: "requests" | "today") => {
+      if (!isLargePoolSortDisabled(key, disabledSorts)) {
+        return false;
+      }
+      showToast(t("accounts.largePoolSortDisabled"), "warning");
+      return true;
+    },
+    [disabledSorts, showToast, t],
+  );
+  // 禁用窗口(冷启动首轮聚合)只拦截新的排序点击,不清用户已选的排序:
+  // 后端会把被禁用的排序静默降级成默认序,聚合完成后自动按原选择恢复。
   // data.snapshotAt 变化说明列表快照重建过(含删除/封禁后的缓存失效),
   // 分析图跟着重取,避免统计卡已更新而额度分布仍显示旧账号集。
   useEffect(() => {
@@ -2511,6 +2545,42 @@ export default function Accounts() {
     }));
     return account;
   }, [setData]);
+  // 删除后先本地摘行,再静默对齐统计卡。reload() 会把顶部打成「加载中」,
+  // 大号池上连点删除等于反复整页转圈。
+  const refreshAfterAccountRemoval = useCallback((ids: number[]) => {
+    if (ids.length === 0) {
+      void reloadSilently();
+      return;
+    }
+    const drop = new Set(ids);
+    let remainingOnPage = 0;
+    setData((current) => {
+      const accounts = current.accounts.filter((account) => !drop.has(account.id));
+      remainingOnPage = accounts.length;
+      return {
+        ...current,
+        accounts,
+        total: Math.max(0, current.total - ids.length),
+        summary: current.summary
+          ? { ...current.summary, total: Math.max(0, current.summary.total - ids.length) }
+          : current.summary,
+      };
+    });
+    setSelected((current) => {
+      if (current.size === 0) return current;
+      const next = new Set(current);
+      let changed = false;
+      for (const id of ids) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : current;
+    });
+    if (remainingOnPage === 0 && page > 1) {
+      setPage(page - 1);
+      return;
+    }
+    void reloadSilently();
+  }, [page, reloadSilently, setData]);
   const visibleAccountIDs = useMemo(
     () => data.accounts.map((account) => account.id),
     [data.accounts],
@@ -2763,7 +2833,8 @@ export default function Accounts() {
       statsStaleRetriesRef.current = 0;
       return undefined;
     }
-    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const maxStatsRetries = data.disabledSorts.includes("requests") ? 60 : 5;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
@@ -4203,7 +4274,7 @@ export default function Accounts() {
     try {
       await api.deleteAccount(account.id);
       showToast(t("accounts.deleted"));
-      void reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (error) {
       showToast(
         t("accounts.deleteFailed", { error: getErrorMessage(error) }),
@@ -4326,7 +4397,7 @@ export default function Accounts() {
     try {
       await api.deleteAccount(account.id);
       showToast(t("accounts.pendingReview.rejected"));
-      void reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (error) {
       showToast(
         t("accounts.deleteFailed", { error: getErrorMessage(error) }),
@@ -4364,7 +4435,7 @@ export default function Accounts() {
       const fail = result?.failed ?? 0;
       showToast(t("accounts.batchDeleteDone", { success, fail }));
       setSelected(new Set());
-      void reload();
+      void reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.batchDeleteFailed", { error: getErrorMessage(error) }),
@@ -4961,9 +5032,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningBanned(true);
     try {
-      await api.cleanBanned();
-      showToast(t("accounts.cleanBannedSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-banned?stream=true",
+        undefined,
+        t("accounts.cleanBannedProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanBannedSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanBannedFailed", { error: getErrorMessage(error) }),
@@ -4984,9 +5063,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningRateLimited(true);
     try {
-      await api.cleanRateLimited();
-      showToast(t("accounts.cleanRateLimitedSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-rate-limited?stream=true",
+        undefined,
+        t("accounts.cleanRateLimitedProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanRateLimitedSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanRateLimitedFailed", { error: getErrorMessage(error) }),
@@ -5007,9 +5094,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningError(true);
     try {
-      await api.cleanError();
-      showToast(t("accounts.cleanErrorSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-error?stream=true",
+        undefined,
+        t("accounts.cleanErrorProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanErrorSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanErrorFailed", { error: getErrorMessage(error) }),
@@ -5921,14 +6016,10 @@ export default function Accounts() {
               </Button>
             </div>
           ) : null}
-          {loading || data.statsState !== "ready" ? (
+          {loading || disabledSorts.length > 0 ? (
             <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
-              {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-              {loading
-                ? t("common.loading")
-                : data.statsState === "warming"
-                  ? t("accounts.statsWarming")
-                  : t("accounts.statsStale")}
+              <Loader2 className="size-3 animate-spin" />
+              {loading ? t("common.loading") : t("accounts.statsWarming")}
             </div>
           ) : null}
           <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-5">
@@ -6286,6 +6377,9 @@ export default function Accounts() {
                           : "default"
                       }
                       onValueChange={(value) => {
+                        if (value === "requests" || value === "today") {
+                          if (guardUsageSort(value)) return;
+                        }
                         if (value === "default") {
                           setSortKey(null);
                         } else {
@@ -6806,9 +6900,18 @@ export default function Accounts() {
                         )}
                         {visibleColumns.today && (
                           <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                            title={t("accounts.todayStatsHint")}
+                            className={`text-[13px] font-semibold select-none transition-colors ${
+                              usageSortBlocked
+                                ? "cursor-not-allowed text-muted-foreground"
+                                : "cursor-pointer hover:text-primary"
+                            }`}
+                            title={
+                              usageSortBlocked
+                                ? t("accounts.largePoolSortDisabled")
+                                : t("accounts.todayStatsHint")
+                            }
                             onClick={() => {
+                              if (guardUsageSort("today")) return;
                               if (sortKey === "today") {
                                 setSortDir((d) =>
                                   d === "asc" ? "desc" : "asc",
@@ -6830,8 +6933,18 @@ export default function Accounts() {
                         )}
                         {visibleColumns.requests && (
                           <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            className={`text-[13px] font-semibold select-none transition-colors ${
+                              usageSortBlocked
+                                ? "cursor-not-allowed text-muted-foreground"
+                                : "cursor-pointer hover:text-primary"
+                            }`}
+                            title={
+                              usageSortBlocked
+                                ? t("accounts.largePoolSortDisabled")
+                                : undefined
+                            }
                             onClick={() => {
+                              if (guardUsageSort("requests")) return;
                               if (sortKey === "requests") {
                                 setSortDir((d) =>
                                   d === "asc" ? "desc" : "asc",
@@ -12117,7 +12230,7 @@ function OperationProgressToast({
       ? Math.min(100, Math.max(0, Math.round((progress.current / progress.total) * 100)))
       : 0;
   const metrics =
-    progress.action === "batch_delete"
+    progress.action === "batch_delete" || progress.action === "clean"
       ? [
           {
             label: t("accounts.operationProgressDeleted"),
@@ -12281,7 +12394,29 @@ function ExpiryBadge({ expiresAt, planType }: { expiresAt?: string; planType?: s
   return null;
 }
 
-function PlanBadge({ planType }: { planType?: string }) {
+function isWorkspacePlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType);
+  return (
+    normalized === "team" ||
+    normalized === "teamplus" ||
+    normalized === "k12" ||
+    normalized === "edu" ||
+    normalized === "education"
+  );
+}
+
+function accountWorkspaceId(account: Pick<AccountRow, "effective_workspace_id" | "token_workspace_id">): string {
+  return (account.effective_workspace_id || account.token_workspace_id || "").trim();
+}
+
+function PlanBadge({
+  planType,
+  workspaceId,
+}: {
+  planType?: string;
+  workspaceId?: string;
+}) {
+  const { t } = useTranslation();
   const label = formatPlanLabel(planType);
   if (label === "-")
     return <span className="text-[12px] text-muted-foreground">-</span>;
@@ -12302,14 +12437,35 @@ function PlanBadge({ planType }: { planType?: string }) {
   const cls =
     style[key] ||
     "bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20";
-
-  return (
+  const trimmedWorkspaceId = workspaceId?.trim() ?? "";
+  const badge = (
     <span
       className={`inline-flex min-w-0 max-w-full items-center truncate rounded-md px-2.5 py-1 text-[13px] font-semibold ring-1 ring-inset ${cls}`}
-      title={label}
     >
       {label}
     </span>
+  );
+  if (!isWorkspacePlan(planType) || !trimmedWorkspaceId) {
+    return badge;
+  }
+
+  return (
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex min-w-0 max-w-full cursor-help">
+            {badge}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          sideOffset={6}
+          className="max-w-[360px] font-mono text-[11px]"
+        >
+          {t("accounts.planWorkspaceId", { id: trimmedWorkspaceId })}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -12976,7 +13132,10 @@ function AccountMobileCard({
               <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
                 #{sequence}
               </span>
-              <PlanBadge planType={account.plan_type} />
+              <PlanBadge
+                planType={account.plan_type}
+                workspaceId={accountWorkspaceId(account)}
+              />
               <SchedulerPriorityBadge account={account} />
               <UsingCreditsBadge account={account} />
               {account.status !== "overload_paused" && (
@@ -13269,7 +13428,10 @@ function AccountMobileCard({
                     </span>
                   )}
                   {(!visibleColumns || visibleColumns.plan) && (
-                    <PlanBadge planType={account.plan_type} />
+                    <PlanBadge
+                      planType={account.plan_type}
+                      workspaceId={accountWorkspaceId(account)}
+                    />
                   )}
                   {(!visibleColumns || visibleColumns.priority) && (
                     <SchedulerPriorityBadge account={account} />

@@ -209,7 +209,9 @@ func TestProbeUsageSnapshotResponsesSuccessRecoversIgnoredUsageCooldown(t *testi
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"type":"response.completed"}`)),
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+			)),
 		}, nil
 	}
 
@@ -244,6 +246,51 @@ func TestProbeUsageSnapshotResponsesSuccessRecoversIgnoredUsageCooldown(t *testi
 		t.Fatal("authoritative Responses 200 did not preserve active-turn continuation")
 	}
 	store.Release(continued)
+}
+
+func TestProbeUsageSnapshotResponsesFailureInsideHTTP200PreservesCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type":"plus",
+			"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_after_seconds":1800}}
+		}`))
+	}))
+	defer server.Close()
+	restoreWham := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restoreWham()
+
+	executeRequest := func(context.Context, *auth.Account, []byte, string, string, string, *proxy.DeviceProfileConfig, http.Header, ...bool) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"status_details\":{\"error\":{\"type\":\"usage_limit_reached\",\"plan_type\":\"plus\",\"resets_in_seconds\":1800}}}}\n\n",
+			)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	store.SetUsageProbeResponsesFallbackEnabled(true)
+	account := &auth.Account{DBID: 6, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+
+	h := &Handler{store: store, executeUsageProbe: executeRequest}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() error = %v", err)
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("HTTP 200 response.failed usage_limit_reached cleared the account cooldown")
+	}
+	if reason := account.GetCooldownReason(); reason != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatalf("CooldownReason = %q, want %q", reason, auth.ResponsesRateLimitedCooldownReason)
+	}
 }
 
 func TestProbeUsageSnapshotResponses429PreservesIgnoredUsageCooldown(t *testing.T) {

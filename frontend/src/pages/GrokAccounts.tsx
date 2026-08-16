@@ -101,6 +101,10 @@ import {
   resolveAccountGrokPlan,
   type GrokPlanFilter,
 } from "../lib/grokPlan";
+import {
+  isLargePoolSortDisabled,
+  resolveDisabledAccountSorts,
+} from "../lib/accountListSort";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
@@ -443,6 +447,7 @@ function GrokAccounts({
   const [totalAccounts, setTotalAccounts] = useState(0);
   const [serverSummary, setServerSummary] = useState<AccountListSummary | null>(null);
   const [statsState, setStatsState] = useState<"ready" | "stale" | "warming">("warming");
+  const [disabledSorts, setDisabledSorts] = useState<string[]>([]);
   const requestAbortRef = useRef<AbortController | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
@@ -615,6 +620,7 @@ function GrokAccounts({
       setTotalAccounts(res.total ?? 0);
       setServerSummary(res.summary ?? null);
       setStatsState(res.stats_state ?? "ready");
+      setDisabledSorts(res.disabled_sorts ?? []);
       if (res.page !== page) setPage(res.page);
       // 选择集只保留仍然存在的账号，避免已删除账号残留在批量选择里。
       setError(null);
@@ -649,6 +655,30 @@ function GrokAccounts({
     setDetailAccountData((current) => current?.id === id ? account : current);
     return account;
   }, []);
+  const refreshAfterAccountRemoval = useCallback((ids: number[]) => {
+    if (ids.length === 0) {
+      void reload({ silent: true });
+      return;
+    }
+    const drop = new Set(ids);
+    let remainingOnPage = 0;
+    setAccounts((current) => {
+      const next = current.filter((account) => !drop.has(account.id));
+      remainingOnPage = next.length;
+      return next;
+    });
+    setTotalAccounts((current) => Math.max(0, current - ids.length));
+    setServerSummary((current) =>
+      current
+        ? { ...current, total: Math.max(0, current.total - ids.length) }
+        : current,
+    );
+    if (remainingOnPage === 0 && page > 1) {
+      setPage(page - 1);
+      return;
+    }
+    void reload({ silent: true });
+  }, [page, reload]);
   const visibleAccountIDs = useMemo(
     () => accounts.map((account) => account.id),
     [accounts],
@@ -684,7 +714,8 @@ function GrokAccounts({
       statsStaleRetriesRef.current = 0;
       return undefined;
     }
-    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const maxStatsRetries = disabledSorts.includes("requests") ? 60 : 5;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
@@ -693,7 +724,7 @@ function GrokAccounts({
     return () => window.clearTimeout(timer);
     // accounts 作为"每次响应都会变化"的信号:连续两次都返回 stale 时
     // statsState 字符串不变,不依赖它定时器就不会被重新拉起。
-  }, [loading, statsState, reload, accounts]);
+  }, [accounts, disabledSorts, loading, reload, statsState]);
 
   // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
   // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
@@ -821,7 +852,16 @@ function GrokAccounts({
     }
   }, [currentPage, detailNavIndex, sortedAccounts, totalPages]);
 
+  const resolvedDisabledSorts = useMemo(
+    () => resolveDisabledAccountSorts(disabledSorts, serverSummary?.total ?? totalAccounts),
+    [disabledSorts, serverSummary?.total, totalAccounts],
+  );
+  const usageSortBlocked = isLargePoolSortDisabled("requests", resolvedDisabledSorts);
   const toggleSort = useCallback((key: GrokSortKey) => {
+    if (isLargePoolSortDisabled(key, resolvedDisabledSorts)) {
+      showToast(t("accounts.largePoolSortDisabled"), "warning");
+      return;
+    }
     setSortKey((current) => {
       if (current === key) {
         setSortDir((dir) => (dir === "desc" ? "asc" : "desc"));
@@ -830,7 +870,9 @@ function GrokAccounts({
       setSortDir(key === "group" || key === "updated" ? "asc" : "desc");
       return key;
     });
-  }, []);
+  }, [resolvedDisabledSorts, showToast, t]);
+  // 禁用窗口(冷启动首轮聚合)只拦截新的排序点击,不清用户已选的排序:
+  // 后端会把被禁用的排序静默降级成默认序,聚合完成后自动按原选择恢复。
 
   useEffect(() => {
     if (detailAccountId == null) return undefined;
@@ -1524,7 +1566,7 @@ function GrokAccounts({
     try {
       await api.deleteAccount(account.id);
       if (detailAccountId === account.id) setDetailAccountId(null);
-      await reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -1791,7 +1833,7 @@ function GrokAccounts({
         }),
       );
       clearSelection();
-      await reload();
+      await reload({ silent: true });
     } catch (err) {
       showToast(
         t("accounts.batchDeleteFailed", { error: getErrorMessage(err) }),
@@ -1814,8 +1856,12 @@ function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokBanned();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-banned?stream=true",
+        undefined,
+        t("grok.cleanBannedProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1835,8 +1881,12 @@ function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokError();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-error?stream=true",
+        undefined,
+        t("grok.cleanErrorProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1979,14 +2029,10 @@ function GrokAccounts({
             </Button>
           </div>
         ) : null}
-        {loading || statsState !== "ready" ? (
+        {loading || resolvedDisabledSorts.length > 0 ? (
           <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
-            {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-            {loading
-              ? t("common.loading")
-              : statsState === "warming"
-                ? t("accounts.statsWarming")
-                : t("accounts.statsStale")}
+            <Loader2 className="size-3 animate-spin" />
+            {loading ? t("common.loading") : t("accounts.statsWarming")}
           </div>
         ) : null}
         <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
@@ -2176,14 +2222,20 @@ function GrokAccounts({
               <button
                 key={key}
                 type="button"
-                title={hint}
+                title={
+                  key === "requests" && usageSortBlocked
+                    ? t("accounts.largePoolSortDisabled")
+                    : hint
+                }
                 aria-pressed={sortKey === key}
                 onClick={() => toggleSort(key)}
                 className={cn(
                   "inline-flex h-8 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
-                  sortKey === key
-                    ? "border-primary/30 bg-primary/10 text-primary"
-                    : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
+                  key === "requests" && usageSortBlocked
+                    ? "cursor-not-allowed border-border bg-muted/40 text-muted-foreground"
+                    : sortKey === key
+                      ? "border-primary/30 bg-primary/10 text-primary"
+                      : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
                 )}
               >
                 {label}
@@ -2382,7 +2434,17 @@ function GrokAccounts({
                       {t("grok.colStatus")}
                     </TableHead>
                     <TableHead
-                      className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      className={cn(
+                        "select-none text-[13px] font-semibold transition-colors",
+                        usageSortBlocked
+                          ? "cursor-not-allowed text-muted-foreground"
+                          : "cursor-pointer hover:text-primary",
+                      )}
+                      title={
+                        usageSortBlocked
+                          ? t("accounts.largePoolSortDisabled")
+                          : t("grok.sortRequestsHint")
+                      }
                       onClick={() => toggleSort("requests")}
                     >
                       {t("accounts.requests")}{" "}

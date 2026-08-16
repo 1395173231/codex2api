@@ -524,6 +524,98 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 	}
 }
 
+func TestCleanErrorStreamsProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError, Email: "a@example.com"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusError, Email: "b@example.com"})
+	store.AddAccount(&auth.Account{DBID: 3, AccessToken: "at-3", Status: auth.StatusReady, Email: "ok@example.com"})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error?stream=true", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q, want event-stream", got)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"start"`,
+		`"type":"progress"`,
+		`"type":"complete"`,
+		`"action":"clean"`,
+		`"success":2`,
+		`"deleted":2`,
+		`"account_email":"a@example.com"`,
+		`"account_email":"b@example.com"`,
+		`"message":"已清理 2 个账号"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %s:\n%s", want, body)
+		}
+	}
+	if strings.Count(body, `"message":"账号已清理"`) > 0 {
+		t.Fatalf("progress events should not claim the clean is finished:\n%s", body)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] || remaining[2] {
+		t.Fatal("expected error accounts to be removed")
+	}
+	if !remaining[3] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func TestCleanErrorJSONKeepsHealthyAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusReady})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["cleaned"]; got != float64(1) {
+		t.Fatalf("cleaned = %v, want 1", got)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] {
+		t.Fatal("expected error account to be removed")
+	}
+	if !remaining[2] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func accountIDsFromStore(store *auth.Store) map[int64]bool {
+	found := make(map[int64]bool)
+	for _, acc := range store.Accounts() {
+		if acc != nil {
+			found[acc.DBID] = true
+		}
+	}
+	return found
+}
+
 func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

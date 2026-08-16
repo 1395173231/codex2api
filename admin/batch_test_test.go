@@ -462,6 +462,53 @@ func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
 	}
 }
 
+func TestRunSingleBatchTestSkipsDeactivatedWorkspaceHandshake(t *testing.T) {
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	trigger := &auth.Account{
+		DBID:        1,
+		AccessToken: "at-trigger",
+		AccountID:   "org-ws",
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat := &auth.Account{
+		DBID:        2,
+		AccessToken: "at-k12",
+		AccountID:   "seat-k12",
+		PlanType:    "k12",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat.CustomHeaders = map[string]string{"Chatgpt-Account-Id": "org-ws"}
+	store.AddAccount(trigger)
+	store.AddAccount(k12Seat)
+	store.MarkDeactivatedWorkspace(trigger, "WHAM 用量探针返回 402: deactivated_workspace")
+
+	handler := &Handler{store: store}
+	status, msg := handler.runSingleBatchTest(context.Background(), k12Seat)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if !strings.Contains(msg, "工作区联动") {
+		t.Fatalf("message = %q, want linked workspace skip", msg)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("deactivated workspace sibling still probed upstream %d times", hits.Load())
+	}
+	if k12Seat.RuntimeStatus() != "error" {
+		t.Fatalf("k12 status = %q, want error", k12Seat.RuntimeStatus())
+	}
+}
+
 func TestRunSingleBatchTestPaymentRequiredMarksError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

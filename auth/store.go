@@ -248,6 +248,10 @@ type Account struct {
 	LatencyEWMA              float64
 	SuccessStreak            int
 	FailureStreak            int
+	// PermanentRefreshFailures 是连续不可恢复刷新失败(isNonRetryable)的次数,
+	// 仅内存态。刷新成功或人工清理(ClearCooldown)清零;达到
+	// permanentRefreshFailureTerminalLimit 后转 error 终态并退出恢复探测轮换。
+	PermanentRefreshFailures int
 	// LastFailureKind 记录最近一次失败的归因（与 ReportRequestFailure 的 kind
 	// 同义），仅内存态。用于把"传输层抖动"与"账号自身有问题"区分开，见
 	// recomputeSchedulerLocked 里对孤立断流的豁免。
@@ -1908,6 +1912,12 @@ func (a *Account) runtimeStatusLocked(now time.Time) string {
 	if a.healthTierLocked() == HealthTierBanned {
 		return "unauthorized"
 	}
+	// 工作区停用等硬错误必须压过用量窗口限流。Team/K12 座位经常先处于
+	// 5h/7d 100%，再被 deactivated_workspace 联动标错；若限流徽章优先，
+	// 列表会继续显示「限流」，看起来像还会恢复。
+	if a.Status == StatusError {
+		return "error"
+	}
 	// 用积分顶替限流时，显示仍是限流：用量窗口客观上确实打满了，谎称 active 会让人
 	// 以为额度没用完。真正的差别由并列的 UsingCredits 标记表达——前端在限流徽章后面
 	// 挂一个积分徽章，而调度侧（IsAvailable / 冷却）走的是被抑制后的判定，账号照常参与调度。
@@ -1917,11 +1927,13 @@ func (a *Account) runtimeStatusLocked(now time.Time) string {
 		}
 		return "rate_limited"
 	}
-	// Free 账号 7d 用量耗尽，优先于冷却状态展示
-	if a.usageExhaustedLocked() {
+	// 后台状态必须与新请求调度语义一致。ignore_usage_limit_status 仅允许
+	// 已绑定且携带 turn-state 的活跃轮次续传，不会让新轮次绕过 WHAM 100%；
+	// 因此这里使用同一份 fresh-dispatch 判定，避免账号显示 active 却无法调度。
+	if a.usageWindowBlocksFreshDispatchLocked(now) && a.rawUsageExhaustedLocked() {
 		return "usage_exhausted"
 	}
-	if a.premium5hRateLimitedLocked(now) {
+	if a.usageWindowBlocksFreshDispatchLocked(now) {
 		return "rate_limited"
 	}
 	switch a.Status {
@@ -2935,6 +2947,13 @@ func (a *Account) NeedsRecoveryProbe(minInterval time.Duration) bool {
 	if a.RefreshToken == "" {
 		return false
 	}
+	if a.PermanentRefreshFailures >= permanentRefreshFailureTerminalLimit {
+		// RT 已连续判死并转 error 终态,探测的前置刷新用的还是同一个死 RT,
+		// 不可能成功。终态时健康层已降出 banned,这里是兜底:其它路径(如
+		// 请求侧 401)可能把账号重新压回 banned 层,计数不清零就不该再探测。
+		// 刷新成功或 ClearCooldown 清零后自动恢复资格。
+		return false
+	}
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
 	}
@@ -2996,8 +3015,8 @@ type Store struct {
 	tokenCache                         cache.TokenCache
 	oauthRefreshLocksMu                sync.Mutex
 	oauthRefreshLocks                  map[string]*oauthRefreshLocalLock
-	workspaceLinkedMu                  sync.Mutex           // 工作区联动熔断进程内去重
-	workspaceLinkedRecent              map[string]time.Time // workspaceID → 去重窗口截止时间
+	workspaceLinkedMu                  sync.Mutex                     // 工作区联动熔断进程内去重
+	workspaceLinkedRecent              map[string]workspaceLinkedMark // workspaceID → 去重窗口
 	apiKeyGroupsMu                     sync.RWMutex
 	apiKeyAllowedGroups                map[int64][]int64
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
@@ -5247,11 +5266,11 @@ func (s *Store) CleanGrokByRuntimeStatus(ctx context.Context, targetStatus strin
 	return s.cleanByRuntimeStatusMatch(ctx, targetStatus, (*Account).IsGrokAPI)
 }
 
-// cleanByRuntimeStatusMatch 按运行时状态清理账号，match 非 nil 时仅清理命中的账号。
-func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus string, match func(*Account) bool) int {
+// CollectCleanTargets 收集按运行时状态可清理的账号，不执行删除。
+// 管理端流式清理先拿这份名单再逐个 SoftDeleteForClean，才能推进度。
+func (s *Store) CollectCleanTargets(targetStatus string, match func(*Account) bool) []*Account {
 	accounts := s.Accounts()
-	cleaned := 0
-
+	targets := make([]*Account, 0)
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
@@ -5270,28 +5289,66 @@ func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus stri
 		if targetStatus == "rate_limited" && acc.IsPremium5hRateLimited() {
 			continue
 		}
-
-		// 锁定账号跳过自动清理
 		if atomic.LoadInt32(&acc.Locked) == 1 {
 			continue
 		}
+		targets = append(targets, acc)
+	}
+	return targets
+}
 
-		if s.db != nil {
-			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
-				log.Printf("[账号 %d] 清理 %s 状态失败: %v", acc.DBID, targetStatus, err)
-				continue
-			}
+// CollectRateLimitedManualTargets 收集手动一键清理限流时要删的账号。
+func (s *Store) CollectRateLimitedManualTargets() []*Account {
+	accounts := s.Accounts()
+	targets := make([]*Account, 0)
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
 		}
+		status := acc.RuntimeStatus()
+		if status != "rate_limited" && status != ResponsesRateLimitedCooldownReason && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
+			continue
+		}
+		if acc.UsingCredits() {
+			continue
+		}
+		if atomic.LoadInt32(&acc.Locked) == 1 {
+			continue
+		}
+		targets = append(targets, acc)
+	}
+	return targets
+}
 
-		s.RemoveAccount(acc.DBID)
-		cleaned++
-		if s.db != nil {
-			if err := s.db.InsertAccountEvent(ctx, acc.DBID, "deleted", "auto_clean"); err != nil {
-				log.Printf("[账号 %d] 记录自动清理事件失败: %v", acc.DBID, err)
-			}
+// SoftDeleteForClean 把单个账号移出号池并记清理事件。db 为空时只更新内存。
+func (s *Store) SoftDeleteForClean(ctx context.Context, acc *Account, eventReason string) error {
+	if acc == nil {
+		return nil
+	}
+	if s.db != nil {
+		if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
+			return err
 		}
 	}
+	s.RemoveAccount(acc.DBID)
+	if s.db != nil {
+		if err := s.db.InsertAccountEvent(ctx, acc.DBID, "deleted", eventReason); err != nil {
+			log.Printf("[账号 %d] 记录清理事件失败: %v", acc.DBID, err)
+		}
+	}
+	return nil
+}
 
+// cleanByRuntimeStatusMatch 按运行时状态清理账号，match 非 nil 时仅清理命中的账号。
+func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus string, match func(*Account) bool) int {
+	cleaned := 0
+	for _, acc := range s.CollectCleanTargets(targetStatus, match) {
+		if err := s.SoftDeleteForClean(ctx, acc, "auto_clean"); err != nil {
+			log.Printf("[账号 %d] 清理 %s 状态失败: %v", acc.DBID, targetStatus, err)
+			continue
+		}
+		cleaned++
+	}
 	return cleaned
 }
 
@@ -5301,42 +5358,14 @@ func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus stri
 //   - 不跳过 premium 5h 限流：手动触发即代表用户明确意图删除
 //   - 锁定账号依然跳过（与所有清理流程一致）
 func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
-	accounts := s.Accounts()
 	cleaned := 0
-
-	for _, acc := range accounts {
-		if acc == nil {
+	for _, acc := range s.CollectRateLimitedManualTargets() {
+		if err := s.SoftDeleteForClean(ctx, acc, "manual_clean"); err != nil {
+			log.Printf("[账号 %d] 手动清理限流账号失败: %v", acc.DBID, err)
 			continue
 		}
-		status := acc.RuntimeStatus()
-		if status != "rate_limited" && status != ResponsesRateLimitedCooldownReason && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
-			continue
-		}
-		// 同上：积分顶着的账号只是显示为限流，仍可正常调度，不该被"清理限流账号"删掉。
-		if acc.UsingCredits() {
-			continue
-		}
-
-		if atomic.LoadInt32(&acc.Locked) == 1 {
-			continue
-		}
-
-		if s.db != nil {
-			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
-				log.Printf("[账号 %d] 手动清理限流账号失败: %v", acc.DBID, err)
-				continue
-			}
-		}
-
-		s.RemoveAccount(acc.DBID)
 		cleaned++
-		if s.db != nil {
-			if err := s.db.InsertAccountEvent(ctx, acc.DBID, "deleted", "manual_clean"); err != nil {
-				log.Printf("[账号 %d] 记录手动清理事件失败: %v", acc.DBID, err)
-			}
-		}
 	}
-
 	return cleaned
 }
 
@@ -8379,6 +8408,36 @@ func (s *Store) ApplyAccountModelCooldownPolicyOverride(dbID int64, mode *string
 }
 
 // MarkError 标记账号为错误状态，并持久化到数据库。
+// permanentRefreshFailureTerminalLimit 是同一账号连续不可恢复刷新失败的上限。
+// 上限内走 unauthorized 自适应冷却,给并发轮换换出新 RT、用户重新授权这类场景
+// 留自愈窗口;连续到限说明 RT 确已死透,转 error 终态并退出恢复探测轮换——
+// 否则死号会被恢复探测每个冷却周期捞起来重试一次,永无终态。
+const permanentRefreshFailureTerminalLimit = 3
+
+// markPermanentRefreshFailure 记录一次不可恢复的刷新失败并落对应状态。
+// 计数在刷新成功与 ClearCooldown(人工清理/重新授权)时清零。
+func (s *Store) markPermanentRefreshFailure(acc *Account, err error) {
+	if acc == nil || err == nil {
+		return
+	}
+	acc.mu.Lock()
+	acc.PermanentRefreshFailures++
+	failures := acc.PermanentRefreshFailures
+	if failures >= permanentRefreshFailureTerminalLimit && acc.HealthTier == HealthTierBanned {
+		// 前几轮 unauthorized 冷却已把健康层压到 banned,而 banned 层在
+		// runtimeStatusLocked 里无条件显示 unauthorized、且是恢复探测的
+		// 准入层。不先降层,终态账号会永远显示未授权、进不了 error 筛选。
+		acc.HealthTier = HealthTierRisky
+	}
+	acc.mu.Unlock()
+	if failures >= permanentRefreshFailureTerminalLimit {
+		s.MarkError(acc, err.Error())
+		return
+	}
+	// 时长入参会被 unauthorized 自适应策略覆盖：首犯 6h，24h 内再犯 24h。
+	s.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", err.Error())
+}
+
 func (s *Store) MarkError(acc *Account, errorMsg string) {
 	if acc == nil {
 		return
@@ -8431,6 +8490,8 @@ func (s *Store) ClearCooldown(acc *Account) {
 	acc.ErrorMsg = ""
 	acc.CooldownUtil = time.Time{}
 	acc.CooldownReason = ""
+	// 人工清理即重新给自愈机会:重置死 RT 判定,恢复探测资格随之恢复。
+	acc.PermanentRefreshFailures = 0
 	if wasCooling && !premium5hLimited {
 		acc.HealthTier = HealthTierWarm
 	} else if wasError && acc.HealthTier != HealthTierBanned {
@@ -9816,13 +9877,7 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	}
 	if err != nil {
 		if isNonRetryable(err) {
-			acc.mu.Lock()
-			acc.Status = StatusError
-			acc.ErrorMsg = err.Error()
-			acc.mu.Unlock()
-			s.fastSchedulerUpdate(acc)
-
-			_ = s.db.SetError(ctx, dbID, err.Error())
+			s.markPermanentRefreshFailure(acc, err)
 		}
 		return err
 	}
@@ -9860,6 +9915,7 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	acc.SessionToken = st
 	acc.ExpiresAt = td.ExpiresAt
 	acc.ErrorMsg = ""
+	acc.PermanentRefreshFailures = 0
 	if info != nil {
 		if info.ChatGPTAccountID != "" {
 			acc.AccountID = info.ChatGPTAccountID

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -93,6 +94,66 @@ func TestFormatUsageLimitedTestErrorAcceptsSuccessfulProbeWhenIgnored(t *testing
 
 	if limited || msg != "" {
 		t.Fatalf("formatUsageLimitedTestError() = (%q, %v), want empty successful result", msg, limited)
+	}
+}
+
+func TestClassifyResponsesTerminalEvent(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    responsesTerminalOutcome
+	}{
+		{
+			name:    "completed",
+			payload: `{"type":"response.completed","response":{"status":"completed"}}`,
+			want:    responsesTerminalSuccess,
+		},
+		{
+			name:    "usage limited failure",
+			payload: `{"type":"response.failed","response":{"status_details":{"error":{"type":"usage_limit_reached"}}}}`,
+			want:    responsesTerminalUsageLimited,
+		},
+		{
+			name:    "generic failure",
+			payload: `{"type":"response.failed","response":{"error":{"type":"server_error"}}}`,
+			want:    responsesTerminalFailed,
+		},
+		{
+			name:    "non terminal",
+			payload: `{"type":"response.output_text.delta","delta":"pong"}`,
+			want:    responsesTerminalUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyResponsesTerminalEvent([]byte(tt.payload)); got != tt.want {
+				t.Fatalf("classifyResponsesTerminalEvent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyResponsesUsageLimitFailureMarksAuthoritativeCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &auth.Account{DBID: 44, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	payload := []byte(`{"type":"response.failed","response":{"status_details":{"error":{"type":"usage_limit_reached","resets_in_seconds":1800}}}}`)
+
+	if !handler.applyResponsesUsageLimitFailure(account, &http.Response{Header: make(http.Header)}, "gpt-5.4", payload) {
+		t.Fatal("usage_limit_reached terminal event was not handled")
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("usage_limit_reached terminal event did not block the account")
+	}
+	if reason := account.GetCooldownReason(); reason != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatalf("CooldownReason = %q, want %q", reason, auth.ResponsesRateLimitedCooldownReason)
 	}
 }
 
