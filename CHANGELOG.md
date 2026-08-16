@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Encrypted compaction state stays with the upstream that created it.** Responses HTTP, compact, and WebSocket paths record a SHA-256 digest plus the producer account and compatibility domain, prefer that producer on reuse, and permit failover only inside the same native or relay domain. Unknown pre-deployment state keeps legacy scheduling; conflicting known sources return 400, while a known source with no compatible account returns an explicit 503. `CODEX_COMPACTION_AFFINITY_TTL` controls the rolling seven-day default without storing opaque encrypted content.
+
 ## v2.8.0 - 2026-08-16
 
 ### Features
