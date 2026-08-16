@@ -16,7 +16,15 @@ import (
 const (
 	upstreamCyberPolicyUserMessage       = "此内容因可能存在网络安全风险而被标记，本次已记录。请重新表述请求；再次触发可能会停用账号。如果确认是误判，请联系管理员。"
 	upstreamCyberPolicyLockedUserMessage = "此内容因可能存在网络安全风险而被标记，本次已记录并锁定当前对话。请新建对话后继续；再次触发可能会停用账号。如果确认是误判，请联系管理员解锁。"
+	defaultLocalPromptBlockMessage       = "Request contains content blocked by prompt filter"
 )
+
+func localPromptBlockMessage(cfg promptfilter.Config) string {
+	if message := strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage); message != "" {
+		return message
+	}
+	return defaultLocalPromptBlockMessage
+}
 
 // promptFilterFullTextMaxRunes limits the persisted redacted blocked-request text preview.
 const promptFilterFullTextMaxRunes = 32000
@@ -79,7 +87,7 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		"Request contains content blocked by prompt filter",
+		localPromptBlockMessage(cfg),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true
@@ -114,7 +122,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		"Request contains content blocked by prompt filter",
+		localPromptBlockMessage(cfg),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true
@@ -147,7 +155,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 			return true
 		}
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request contains content blocked by prompt filter")
+		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", localPromptBlockMessage(cfg))
 		return true
 	}
 	return false
