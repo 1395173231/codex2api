@@ -2925,13 +2925,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
+	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
 	if compactionAffinityErr != nil {
-		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
-			sendCompactionProvenanceConflict(c)
-		} else {
-			sendCompactionProvenanceUnavailable(c)
-		}
+		sendCompactionProvenanceConflict(c)
 		return
 	}
 	if compactionAffinity.Known {
@@ -4368,13 +4366,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
+	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
 	if compactionAffinityErr != nil {
-		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
-			sendCompactionProvenanceConflict(c)
-		} else {
-			sendCompactionProvenanceUnavailable(c)
-		}
+		sendCompactionProvenanceConflict(c)
 		return
 	}
 	if compactionAffinity.Known {

@@ -143,7 +143,20 @@ func (h *Handler) recordCompactionProvenance(ctx context.Context, account *auth.
 	return h.cache.SetRuntime(cacheCtx, compactionProvenanceCacheNamespace, compactionContentDigest(encryptedContent), raw, compactionProvenanceTTL())
 }
 
+// compactionPayloadMayContainEncryptedState is a cheap prefilter that keeps
+// full JSON walks off bodies and stream frames that cannot contain encrypted
+// compaction items. Every recognized item type literal contains "compaction",
+// so frames carrying only reasoning encrypted_content are skipped too.
+func compactionPayloadMayContainEncryptedState(payload []byte) bool {
+	return len(payload) > 0 &&
+		bytes.Contains(payload, []byte(`"encrypted_content"`)) &&
+		bytes.Contains(payload, []byte("compaction"))
+}
+
 func requestCompactionEncryptedContents(body []byte) []string {
+	if !compactionPayloadMayContainEncryptedState(body) {
+		return nil
+	}
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() {
 		return nil
@@ -179,7 +192,7 @@ func gjsonResultHasEncryptedCompaction(result gjson.Result) bool {
 }
 
 func compactionEncryptedContentsFromPayload(payload []byte) []string {
-	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"encrypted_content"`)) || !gjson.ValidBytes(payload) {
+	if !compactionPayloadMayContainEncryptedState(payload) || !gjson.ValidBytes(payload) {
 		return nil
 	}
 	root := gjson.ParseBytes(payload)
@@ -240,7 +253,11 @@ func (h *Handler) resolveCompactionAffinity(ctx context.Context, body []byte) (c
 		digest := compactionContentDigest(encryptedContent)
 		raw, ok, err := h.cache.GetRuntime(cacheCtx, compactionProvenanceCacheNamespace, digest)
 		if err != nil {
-			return compactionAffinityResolution{}, fmt.Errorf("read compaction provenance: %w", err)
+			// Provenance is a routing optimization; a cache outage must not
+			// take compaction conversations down. Fall back to the same
+			// legacy scheduling used for unknown pre-deployment state.
+			log.Printf("compaction provenance read failed, using normal scheduling: %v", err)
+			return compactionAffinityResolution{}, nil
 		}
 		if !ok {
 			continue
@@ -274,20 +291,12 @@ func compactionProvenanceConflictAPIError() *api.APIError {
 	return api.NewAPIError(api.ErrorCode("compaction_provenance_conflict"), "Compaction state contains conflicting upstream provenance", api.ErrorTypeInvalidRequest)
 }
 
-func compactionProvenanceUnavailableAPIError() *api.APIError {
-	return api.NewAPIError(api.ErrorCode("compaction_provenance_unavailable"), "Compaction provenance is temporarily unavailable", api.ErrorTypeServer)
-}
-
 func compactionUpstreamUnavailableAPIError() *api.APIError {
 	return api.NewAPIError(api.ErrorCode("compaction_upstream_unavailable"), "No account is available for the upstream that created this compaction state", api.ErrorTypeServer)
 }
 
 func sendCompactionProvenanceConflict(c *gin.Context) {
 	api.SendErrorWithStatus(c, compactionProvenanceConflictAPIError(), http.StatusBadRequest)
-}
-
-func sendCompactionProvenanceUnavailable(c *gin.Context) {
-	api.SendErrorWithStatus(c, compactionProvenanceUnavailableAPIError(), http.StatusServiceUnavailable)
 }
 
 func sendCompactionUpstreamUnavailable(c *gin.Context) {

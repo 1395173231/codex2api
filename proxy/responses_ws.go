@@ -339,17 +339,13 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
+	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
 	if compactionAffinityErr != nil {
-		closeCode := websocket.CloseTryAgainLater
-		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
-			apiErr = compactionProvenanceConflictAPIError()
-			closeCode = websocket.ClosePolicyViolation
-		} else {
-			apiErr = compactionProvenanceUnavailableAPIError()
-		}
+		apiErr = compactionProvenanceConflictAPIError()
 		_ = writeResponsesWSError(conn, apiErr)
-		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
+		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)

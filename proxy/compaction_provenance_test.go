@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -715,5 +716,57 @@ func TestResponsesWebSocketPortableCompactionReturnsToNormalPoolScheduling(t *te
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for upstream websocket request")
+	}
+}
+
+type compactionFailingRuntimeCache struct {
+	cache.TokenCache
+}
+
+func (c *compactionFailingRuntimeCache) GetRuntime(context.Context, string, string) (json.RawMessage, bool, error) {
+	return nil, false, errors.New("cache unavailable")
+}
+
+func TestResolveCompactionAffinityFailsOpenOnCacheReadError(t *testing.T) {
+	handler := &Handler{cache: &compactionFailingRuntimeCache{TokenCache: cache.NewMemory(1)}}
+
+	resolution, err := handler.resolveCompactionAffinity(context.Background(), []byte(`{"input":[{"type":"compaction","encrypted_content":"any-state"}]}`))
+
+	if err != nil {
+		t.Fatalf("cache outage should not fail resolution: %v", err)
+	}
+	if resolution.Known {
+		t.Fatalf("cache outage unexpectedly resolved provenance: %+v", resolution)
+	}
+}
+
+func TestResponsesKeepsServingCompactionDuringCacheOutage(t *testing.T) {
+	var calls atomic.Int32
+	upstream := newCompactionAffinityRelay(t, &calls)
+	defer upstream.Close()
+
+	account := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "key", Models: []string{"gpt-4.1-direct"}}
+	handler := NewHandler(newCompactionAffinityStore(account), nil, nil, nil)
+	handler.SetRuntimeCache(&compactionFailingRuntimeCache{TokenCache: cache.NewMemory(1)})
+
+	recorder := runCompactionAffinityResponses(t, handler, `{"model":"gpt-4.1-direct","stream":true,"input":[{"type":"compaction","encrypted_content":"any-state"},{"role":"user","content":"continue"}]}`)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("normal scheduling calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestCompactionPayloadPrefilterSkipsNonCompactionBodies(t *testing.T) {
+	if got := requestCompactionEncryptedContents([]byte(`{"input":[{"type":"reasoning","encrypted_content":"reasoning-state"}]}`)); len(got) != 0 {
+		t.Fatalf("reasoning-only request produced contents: %v", got)
+	}
+	if got := compactionEncryptedContentsFromPayload([]byte(`{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"reasoning-state"}}`)); len(got) != 0 {
+		t.Fatalf("reasoning-only frame produced contents: %v", got)
+	}
+	if got := requestCompactionEncryptedContents([]byte(`{"input":[{"type":"compaction","encrypted_content":"opaque"}]}`)); len(got) != 1 || got[0] != "opaque" {
+		t.Fatalf("compaction request contents = %v", got)
 	}
 }
