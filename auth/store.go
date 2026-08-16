@@ -6112,6 +6112,14 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	return s.takeByIDMode(id, apiKeyID, exclude, filter, false)
 }
 
+// TakePreferredAccountWithFilter attempts to acquire one specific account
+// while applying the same availability, API-key, egress, filter, cooldown, and
+// concurrency gates as normal scheduling. It intentionally bypasses session
+// affinity policy so callers can preserve opaque upstream-owned state.
+func (s *Store) TakePreferredAccountWithFilter(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	return s.takeByIDExcluding(id, apiKeyID, exclude, filter)
+}
+
 func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	return s.takeByIDMode(id, apiKeyID, exclude, filter, true)
 }

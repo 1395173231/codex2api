@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,6 +56,14 @@ func TestAccountCompactionDomain(t *testing.T) {
 			},
 			want: "responses:https://other.example.com/v1",
 		},
+		{
+			name: "grok route stays account isolated",
+			account: &auth.Account{
+				DBID: 4, UpstreamType: auth.UpstreamGrok,
+				BaseURL: "https://shared-grok.example/v1", APIKey: "key-a",
+			},
+			want: "grok:account:4",
+		},
 	}
 
 	for _, tt := range tests {
@@ -62,6 +72,14 @@ func TestAccountCompactionDomain(t *testing.T) {
 				t.Fatalf("accountCompactionDomain() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGrokCompactionDomainsDoNotAssumeConfiguredBaseURLIsResolvedRoute(t *testing.T) {
+	first := &auth.Account{DBID: 4, UpstreamType: auth.UpstreamGrok, BaseURL: "https://shared-grok.example/v1", APIKey: "key-a"}
+	second := &auth.Account{DBID: 5, UpstreamType: auth.UpstreamGrok, BaseURL: "https://shared-grok.example/v1", APIKey: "key-b"}
+	if firstDomain, secondDomain := accountCompactionDomain(first), accountCompactionDomain(second); firstDomain == secondDomain {
+		t.Fatalf("Grok accounts with model-resolved routes shared domain %q", firstDomain)
 	}
 }
 
@@ -133,6 +151,13 @@ func TestResolveCompactionAffinity(t *testing.T) {
 		}
 	})
 
+	t.Run("encrypted compaction summary resolves like output recorder", func(t *testing.T) {
+		resolution, err := handler.resolveCompactionAffinity(context.Background(), []byte(`{"input":[{"type":"compaction_summary","encrypted_content":"known"}]}`))
+		if err != nil || !resolution.Known || resolution.PreferredAccountID != relay.ID() {
+			t.Fatalf("resolution = %+v, err = %v", resolution, err)
+		}
+	})
+
 	t.Run("conflicting known domains are rejected", func(t *testing.T) {
 		other := &auth.Account{DBID: 8, AccessToken: "native"}
 		if err := handler.recordCompactionProvenance(context.Background(), other, "other"); err != nil {
@@ -143,6 +168,39 @@ func TestResolveCompactionAffinity(t *testing.T) {
 			t.Fatalf("conflict error = %v", err)
 		}
 	})
+}
+
+type compactionRuntimeTrackingCache struct {
+	cache.TokenCache
+	mu      sync.Mutex
+	setTTLs []time.Duration
+}
+
+func (c *compactionRuntimeTrackingCache) SetRuntime(ctx context.Context, namespace, key string, value json.RawMessage, ttl time.Duration) error {
+	c.mu.Lock()
+	c.setTTLs = append(c.setTTLs, ttl)
+	c.mu.Unlock()
+	return c.TokenCache.SetRuntime(ctx, namespace, key, value, ttl)
+}
+
+func TestResolveCompactionAffinityRefreshesRollingTTL(t *testing.T) {
+	t.Setenv(compactionAffinityTTLEnv, "36h")
+	tracking := &compactionRuntimeTrackingCache{TokenCache: cache.NewMemory(1)}
+	handler := &Handler{cache: tracking}
+	account := &auth.Account{DBID: 31, AccessToken: "native"}
+	if err := handler.recordCompactionProvenance(context.Background(), account, "rolling-state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handler.resolveCompactionAffinity(context.Background(), []byte(`{"input":[{"type":"compaction","encrypted_content":"rolling-state"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	tracking.mu.Lock()
+	ttls := append([]time.Duration(nil), tracking.setTTLs...)
+	tracking.mu.Unlock()
+	if len(ttls) != 2 || ttls[0] != 36*time.Hour || ttls[1] != 36*time.Hour {
+		t.Fatalf("runtime Set TTLs = %v, want initial + refreshed 36h", ttls)
+	}
 }
 
 func TestCompactionDomainFilter(t *testing.T) {
@@ -246,7 +304,10 @@ func TestResponsesRoutesKnownCompactionToProducerDomain(t *testing.T) {
 
 	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: otherUpstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
 	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: producerUpstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}}
-	handler := NewHandler(newCompactionAffinityStore(other, producer), nil, nil, nil)
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, nil, nil)
 	handler.SetRuntimeCache(cache.NewMemory(1))
 	if err := handler.recordCompactionProvenance(context.Background(), producer, "known-state"); err != nil {
 		t.Fatal(err)
@@ -261,6 +322,72 @@ func TestResponsesRoutesKnownCompactionToProducerDomain(t *testing.T) {
 	}
 	if _, ok, err := handler.cache.GetRuntime(context.Background(), compactionProvenanceCacheNamespace, compactionContentDigest("stream-output-state")); err != nil || !ok {
 		t.Fatalf("stream output provenance = ok %v, err %v", ok, err)
+	}
+}
+
+func TestResponsesPrefersProducerIndependentOfSessionAffinityMode(t *testing.T) {
+	var seenAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuthorization = r.Header.Get("Authorization")
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_preferred\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
+	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}, HealthTier: auth.HealthTierWarm}
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, nil, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, "producer-state"); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := runCompactionAffinityResponses(t, handler, `{"model":"gpt-4.1-direct","stream":true,"input":[{"type":"compaction","encrypted_content":"producer-state"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if seenAuthorization != "Bearer producer" {
+		t.Fatalf("Authorization = %q, want producer credential", seenAuthorization)
+	}
+}
+
+func TestResponsesNonStreamRoutesAndRecordsKnownCompaction(t *testing.T) {
+	var otherCalls, producerCalls atomic.Int32
+	newJSONRelay := func(calls *atomic.Int32, outputState string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_nonstream","status":"completed","output":[{"type":"compaction","encrypted_content":"`+outputState+`"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+		}))
+	}
+	otherUpstream := newJSONRelay(&otherCalls, "wrong-output")
+	defer otherUpstream.Close()
+	producerUpstream := newJSONRelay(&producerCalls, "nonstream-output-state")
+	defer producerUpstream.Close()
+
+	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: otherUpstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
+	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: producerUpstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}, HealthTier: auth.HealthTierWarm}
+	other.SetSchedulerPriority(100)
+	handler := NewHandler(newCompactionAffinityStore(other, producer), nil, nil, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, "nonstream-known-state"); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := runCompactionAffinityResponses(t, handler, `{"model":"gpt-4.1-direct","stream":false,"input":[{"type":"compaction","encrypted_content":"nonstream-known-state"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if producerCalls.Load() != 1 || otherCalls.Load() != 0 {
+		t.Fatalf("producer calls = %d, other calls = %d", producerCalls.Load(), otherCalls.Load())
+	}
+	if _, ok, err := handler.cache.GetRuntime(context.Background(), compactionProvenanceCacheNamespace, compactionContentDigest("nonstream-output-state")); err != nil || !ok {
+		t.Fatalf("nonstream output provenance = ok %v, err %v", ok, err)
 	}
 }
 

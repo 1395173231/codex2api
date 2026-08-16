@@ -91,9 +91,12 @@ func accountCompactionDomain(account *auth.Account) string {
 		return ""
 	}
 	if account.IsGrokAPI() {
-		baseURL, _ := account.GrokCredentials()
-		if canonical := canonicalCompactionBaseURL(baseURL); canonical != "" {
-			return "grok:" + canonical
+		// Grok resolves the actual upstream route from the model catalog at
+		// request time. The configured base URL is therefore not a safe
+		// compatibility boundary for opaque compaction state. Keep Grok state
+		// account-local until the resolved route is available at record time.
+		if account.ID() > 0 {
+			return fmt.Sprintf("grok:account:%d", account.ID())
 		}
 		return ""
 	}
@@ -147,7 +150,7 @@ func requestCompactionEncryptedContents(body []byte) []string {
 	}
 	contents := make([]string, 0, 1)
 	inspect := func(item gjson.Result) {
-		if !gjsonResultIsCompactionHistory(item) {
+		if !gjsonResultHasEncryptedCompaction(item) {
 			return
 		}
 		if encrypted := strings.TrimSpace(item.Get("encrypted_content").String()); encrypted != "" {

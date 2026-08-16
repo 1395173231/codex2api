@@ -2935,9 +2935,6 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
-		if preferred := h.store.FindByID(compactionAffinity.PreferredAccountID); preferred != nil && accountFilter(preferred) {
-			h.store.BindSessionAffinity(affinityKey, preferred, preferred.GetProxyURL())
-		}
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -2969,7 +2966,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			if continuationUnavailable && !relayContinuationAttempted {
+			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
+				account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			}
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			} else if continuationUnavailable && !relayContinuationAttempted {
 				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
 			} else if turnContinuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
@@ -4375,9 +4377,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
-		if preferred := h.store.FindByID(compactionAffinity.PreferredAccountID); preferred != nil && accountFilter(preferred) {
-			h.store.BindSessionAffinity(affinityKey, preferred, preferred.GetProxyURL())
-		}
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -4397,7 +4396,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	relayContinuationAttempted := false
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		var account *auth.Account
+		var stickyProxyURL string
+		if attempt == 0 && compactionAffinity.Known {
+			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter)
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			}
+		}
+		if account == nil {
+			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		}
 		if account == nil {
 			if compactionAffinity.Known {
 				sendCompactionUpstreamUnavailable(c)
