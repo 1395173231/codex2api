@@ -2924,6 +2924,21 @@ func (h *Handler) Responses(c *gin.Context) {
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
+			sendCompactionProvenanceConflict(c)
+		} else {
+			sendCompactionProvenanceUnavailable(c)
+		}
+		return
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+		if preferred := h.store.FindByID(compactionAffinity.PreferredAccountID); preferred != nil && accountFilter(preferred) {
+			h.store.BindSessionAffinity(affinityKey, preferred, preferred.GetProxyURL())
+		}
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -2965,6 +2980,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				return
+			}
+			if compactionAffinity.Known {
+				sendCompactionUpstreamUnavailable(c)
 				return
 			}
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
@@ -3294,6 +3313,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					streamDiag.markUpstreamFrame()
+					h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
 					ttftGuard.MarkProgress(eventType)
@@ -3372,6 +3392,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
@@ -3788,6 +3809,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			forward := func(data []byte) bool {
 				streamDiag.markUpstreamFrame()
+				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				downstreamMu.Lock()
 				defer downstreamMu.Unlock()
 				parsed := gjson.ParseBytes(data)
@@ -3988,6 +4010,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
@@ -4341,6 +4364,21 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
+			sendCompactionProvenanceConflict(c)
+		} else {
+			sendCompactionProvenanceUnavailable(c)
+		}
+		return
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+		if preferred := h.store.FindByID(compactionAffinity.PreferredAccountID); preferred != nil && accountFilter(preferred) {
+			h.store.BindSessionAffinity(affinityKey, preferred, preferred.GetProxyURL())
+		}
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -4361,6 +4399,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
+			if compactionAffinity.Known {
+				sendCompactionUpstreamUnavailable(c)
+				return
+			}
 			if continuationUnavailable && !relayContinuationAttempted {
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
@@ -4377,6 +4419,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
+				if compactionAffinity.Known {
+					sendCompactionUpstreamUnavailable(c)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
@@ -4547,6 +4593,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
 				return
 			}
+			h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
@@ -4761,6 +4808,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
 			return
 		}
+		h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 
 		// body-signal 兼容模式：SSE 内的 response.failed 终态按上游错误处理，
 		// 语义对齐传统 compact 链路的 HTTP 非 200 分支（含 encrypted_content 剥离重试）。

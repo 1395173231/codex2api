@@ -338,6 +338,24 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		closeCode := websocket.CloseTryAgainLater
+		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
+			apiErr = compactionProvenanceConflictAPIError()
+			closeCode = websocket.ClosePolicyViolation
+		} else {
+			apiErr = compactionProvenanceUnavailableAPIError()
+		}
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+		if preferred := h.store.FindByID(compactionAffinity.PreferredAccountID); preferred != nil && accountFilter(preferred) {
+			h.store.BindSessionAffinity(affinityKey, preferred, preferred.GetProxyURL())
+		}
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -403,7 +421,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 		}
 		if account == nil {
-			if lastRetryableUpstreamErr != nil {
+			if compactionAffinity.Known {
+				apiErr = compactionUpstreamUnavailableAPIError()
+			} else if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
 			} else if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				apiErr = responsesWSUpstreamAPIError(lastStatusCode, lastBody)
@@ -763,6 +783,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+		h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
 		clientData := data

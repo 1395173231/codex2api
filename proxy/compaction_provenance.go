@@ -1,18 +1,23 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -22,6 +27,7 @@ const (
 	nativeCodexCompactionDomain        = "codex:openai"
 	defaultCompactionProvenanceTTL     = 7 * 24 * time.Hour
 	compactionProvenanceRecordVersion  = 1
+	compactionProvenanceCacheTimeout   = 500 * time.Millisecond
 )
 
 var errConflictingCompactionProvenance = errors.New("conflicting compaction provenance domains")
@@ -114,6 +120,11 @@ func (h *Handler) recordCompactionProvenance(ctx context.Context, account *auth.
 	if encryptedContent == "" || domain == "" || account.ID() <= 0 {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, compactionProvenanceCacheTimeout)
+	defer cancel()
 	now := time.Now().UTC()
 	record := compactionProvenanceRecord{
 		Version:             compactionProvenanceRecordVersion,
@@ -126,7 +137,7 @@ func (h *Handler) recordCompactionProvenance(ctx context.Context, account *auth.
 	if err != nil {
 		return err
 	}
-	return h.cache.SetRuntime(ctx, compactionProvenanceCacheNamespace, compactionContentDigest(encryptedContent), raw, compactionProvenanceTTL())
+	return h.cache.SetRuntime(cacheCtx, compactionProvenanceCacheNamespace, compactionContentDigest(encryptedContent), raw, compactionProvenanceTTL())
 }
 
 func requestCompactionEncryptedContents(body []byte) []string {
@@ -154,6 +165,59 @@ func requestCompactionEncryptedContents(body []byte) []string {
 	return contents
 }
 
+func gjsonResultHasEncryptedCompaction(result gjson.Result) bool {
+	if !result.IsObject() {
+		return false
+	}
+	itemType := strings.TrimSpace(result.Get("type").String())
+	return strings.EqualFold(itemType, "compaction") ||
+		strings.EqualFold(itemType, "context_compaction") ||
+		strings.EqualFold(itemType, "compaction_summary")
+}
+
+func compactionEncryptedContentsFromPayload(payload []byte) []string {
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"encrypted_content"`)) || !gjson.ValidBytes(payload) {
+		return nil
+	}
+	root := gjson.ParseBytes(payload)
+	contents := make([]string, 0, 1)
+	seen := make(map[string]struct{})
+	inspect := func(item gjson.Result) {
+		if !gjsonResultHasEncryptedCompaction(item) {
+			return
+		}
+		encrypted := strings.TrimSpace(item.Get("encrypted_content").String())
+		if encrypted == "" {
+			return
+		}
+		if _, ok := seen[encrypted]; ok {
+			return
+		}
+		seen[encrypted] = struct{}{}
+		contents = append(contents, encrypted)
+	}
+	inspect(root)
+	inspect(root.Get("item"))
+	for _, path := range []string{"output", "response.output"} {
+		items := root.Get(path)
+		if items.IsArray() {
+			items.ForEach(func(_, item gjson.Result) bool {
+				inspect(item)
+				return true
+			})
+		}
+	}
+	return contents
+}
+
+func (h *Handler) recordCompactionProvenanceFromPayload(ctx context.Context, account *auth.Account, payload []byte) {
+	for _, encryptedContent := range compactionEncryptedContentsFromPayload(payload) {
+		if err := h.recordCompactionProvenance(ctx, account, encryptedContent); err != nil {
+			log.Printf("record compaction provenance failed: account=%d err=%v", account.ID(), err)
+		}
+	}
+}
+
 func (h *Handler) resolveCompactionAffinity(ctx context.Context, body []byte) (compactionAffinityResolution, error) {
 	if h == nil || h.cache == nil {
 		return compactionAffinityResolution{}, nil
@@ -162,11 +226,16 @@ func (h *Handler) resolveCompactionAffinity(ctx context.Context, body []byte) (c
 	if len(contents) == 0 {
 		return compactionAffinityResolution{}, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, compactionProvenanceCacheTimeout)
+	defer cancel()
 
 	var resolution compactionAffinityResolution
 	for _, encryptedContent := range contents {
 		digest := compactionContentDigest(encryptedContent)
-		raw, ok, err := h.cache.GetRuntime(ctx, compactionProvenanceCacheNamespace, digest)
+		raw, ok, err := h.cache.GetRuntime(cacheCtx, compactionProvenanceCacheNamespace, digest)
 		if err != nil {
 			return compactionAffinityResolution{}, fmt.Errorf("read compaction provenance: %w", err)
 		}
@@ -175,7 +244,7 @@ func (h *Handler) resolveCompactionAffinity(ctx context.Context, body []byte) (c
 		}
 		record, err := decodeCompactionProvenanceRecord(raw)
 		if err != nil {
-			_ = h.cache.DeleteRuntime(ctx, compactionProvenanceCacheNamespace, digest)
+			_ = h.cache.DeleteRuntime(cacheCtx, compactionProvenanceCacheNamespace, digest)
 			continue
 		}
 		if resolution.Known && resolution.CompatibilityDomain != record.CompatibilityDomain {
@@ -192,10 +261,34 @@ func (h *Handler) resolveCompactionAffinity(ctx context.Context, body []byte) (c
 		record.LastSeenAt = time.Now().UTC()
 		refreshed, marshalErr := json.Marshal(record)
 		if marshalErr == nil {
-			_ = h.cache.SetRuntime(ctx, compactionProvenanceCacheNamespace, digest, refreshed, compactionProvenanceTTL())
+			_ = h.cache.SetRuntime(cacheCtx, compactionProvenanceCacheNamespace, digest, refreshed, compactionProvenanceTTL())
 		}
 	}
 	return resolution, nil
+}
+
+func compactionProvenanceConflictAPIError() *api.APIError {
+	return api.NewAPIError(api.ErrorCode("compaction_provenance_conflict"), "Compaction state contains conflicting upstream provenance", api.ErrorTypeInvalidRequest)
+}
+
+func compactionProvenanceUnavailableAPIError() *api.APIError {
+	return api.NewAPIError(api.ErrorCode("compaction_provenance_unavailable"), "Compaction provenance is temporarily unavailable", api.ErrorTypeServer)
+}
+
+func compactionUpstreamUnavailableAPIError() *api.APIError {
+	return api.NewAPIError(api.ErrorCode("compaction_upstream_unavailable"), "No account is available for the upstream that created this compaction state", api.ErrorTypeServer)
+}
+
+func sendCompactionProvenanceConflict(c *gin.Context) {
+	api.SendErrorWithStatus(c, compactionProvenanceConflictAPIError(), http.StatusBadRequest)
+}
+
+func sendCompactionProvenanceUnavailable(c *gin.Context) {
+	api.SendErrorWithStatus(c, compactionProvenanceUnavailableAPIError(), http.StatusServiceUnavailable)
+}
+
+func sendCompactionUpstreamUnavailable(c *gin.Context) {
+	api.SendErrorWithStatus(c, compactionUpstreamUnavailableAPIError(), http.StatusServiceUnavailable)
 }
 
 func compactionDomainFilter(domain string, next auth.AccountFilter) auth.AccountFilter {
