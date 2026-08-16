@@ -217,6 +217,16 @@ func TestNormalizeAdvancedConfigLocalBlockMessageRuneLimit(t *testing.T) {
 	}
 }
 
+func TestNormalizeAdvancedConfigLocalBlockMessageTrimsAfterRuneLimit(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = strings.Repeat("界", MaxLocalBlockMessageRunes-1) + "   尾"
+
+	got := NormalizeAdvancedConfig(cfg)
+	if strings.HasSuffix(got.Enforcement.LocalBlockMessage, " ") {
+		t.Fatalf("message retains trailing whitespace after truncation: %q", got.Enforcement.LocalBlockMessage[len(got.Enforcement.LocalBlockMessage)-4:])
+	}
+}
+
 func compressedBase64(t *testing.T, value string, useGzip bool) string {
 	t.Helper()
 	var compressed bytes.Buffer

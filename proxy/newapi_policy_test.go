@@ -1001,15 +1001,17 @@ func TestSignedNewAPIPolicyBlockUsesAnthropicErrorEnvelopeForMessages(t *testing
 }
 
 func TestConfiguredLocalBlockMessageDoesNotReplaceRestrictionMessages(t *testing.T) {
-	locked := newAPIPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptConversationLockedReasonCode})
+	cfg := promptfilter.DefaultConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = "Blocked by Example Gateway"
+	locked := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptConversationLockedReasonCode}, cfg)
 	if locked.Message != promptConversationLockedMessage {
 		t.Fatalf("conversation lock message = %q", locked.Message)
 	}
-	cooldown := newAPIPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptUserCyberCooldownReasonCode})
+	cooldown := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptUserCyberCooldownReasonCode}, cfg)
 	if cooldown.Message != promptUserCyberCooldownMessage {
 		t.Fatalf("cooldown message = %q", cooldown.Message)
 	}
-	upstream := newAPIPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: newAPIUpstreamCyberPolicyReasonCode})
+	upstream := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: newAPIUpstreamCyberPolicyReasonCode}, cfg)
 	if upstream.Message != upstreamCyberPolicyUserMessage {
 		t.Fatalf("upstream policy message = %q", upstream.Message)
 	}

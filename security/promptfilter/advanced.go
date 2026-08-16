@@ -778,7 +778,7 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 	if len(localBlockMessage) > MaxLocalBlockMessageRunes {
 		localBlockMessage = localBlockMessage[:MaxLocalBlockMessageRunes]
 	}
-	cfg.Enforcement.LocalBlockMessage = string(localBlockMessage)
+	cfg.Enforcement.LocalBlockMessage = strings.TrimSpace(string(localBlockMessage))
 	if cfg.Enforcement.ConversationLockTTLHours <= 0 {
 		cfg.Enforcement.ConversationLockTTLHours = d.Enforcement.ConversationLockTTLHours
 	}

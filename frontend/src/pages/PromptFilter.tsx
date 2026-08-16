@@ -1193,10 +1193,9 @@ function AdvancedProtectionEditor({
             <CompactField label={t('promptFilter.localBlockMessage')} hint={t('promptFilter.help.localBlockMessage')}>
               <Textarea
                 rows={3}
-                maxLength={2000}
                 value={config.enforcement.local_block_message}
                 placeholder={t('promptFilter.localBlockMessagePlaceholder')}
-                onChange={(event) => update('enforcement', { local_block_message: event.target.value })}
+                onChange={(event) => update('enforcement', { local_block_message: Array.from(event.target.value).slice(0, 2000).join('') })}
               />
             </CompactField>
             <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />

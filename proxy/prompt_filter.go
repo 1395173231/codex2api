@@ -42,11 +42,23 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 // jobs. writeBlock may preserve an endpoint-specific error envelope; verified
 // NewAPI policy decisions still take precedence when they own the response.
 func (h *Handler) InspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
+	var messageWriter func(*gin.Context, string)
+	if writeBlock != nil {
+		messageWriter = func(c *gin.Context, _ string) { writeBlock(c) }
+	}
+	return h.InspectPromptFilterOpenAIWithBlockMessage(c, rawBody, endpoint, model, messageWriter)
+}
+
+// InspectPromptFilterOpenAIWithBlockMessage is the message-aware variant for
+// endpoints that keep their own error envelope. The callback receives the
+// configured local block message, or an empty string when the endpoint should
+// retain its existing default.
+func (h *Handler) InspectPromptFilterOpenAIWithBlockMessage(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context, string)) bool {
 	h.capturePromptRequestIngress(c, rawBody)
 	return h.inspectPromptFilterOpenAIWithBlockWriter(c, rawBody, endpoint, model, writeBlock)
 }
 
-func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
+func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context, string)) bool {
 	if c != nil && c.GetBool("prompt_intelligence_internal") {
 		return false
 	}
@@ -82,7 +94,7 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 		return true
 	}
 	if writeBlock != nil {
-		writeBlock(c)
+		writeBlock(c, strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage))
 		return true
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(

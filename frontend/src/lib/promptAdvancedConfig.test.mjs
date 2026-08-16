@@ -319,8 +319,8 @@ test('local block message editor round-trips through enforcement config', () => 
   assert.match(source, /local_block_message: string/)
   assert.match(source, /local_block_message: ''/)
   assert.match(source, /typeof enforcement\.local_block_message === 'string'/)
-  assert.match(source, /maxLength=\{2000\}/)
-  assert.match(source, /update\('enforcement', \{ local_block_message: event\.target\.value \}\)/)
+  assert.doesNotMatch(source, /maxLength=\{2000\}/)
+  assert.match(source, /Array\.from\(event\.target\.value\)\.slice\(0, 2000\)\.join\(''\)/)
   assert.match(source, /promptFilter\.localBlockMessagePlaceholder/)
   for (const locale of locales) {
     assert.equal(typeof locale.promptFilter.localBlockMessage, 'string')
