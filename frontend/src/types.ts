@@ -35,6 +35,8 @@ export interface AccountUsageWindow {
   tokens: number
   account_billed?: number
   user_billed?: number
+  model_counts?: Record<string, number>
+  model_success_counts?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -156,6 +158,8 @@ export interface AccountRow {
   error_requests?: number
   retry_error_requests?: number
   rate_limit_attempts?: number
+  error_status_counts?: Record<string, number>
+  success_model_counts?: Record<string, number>
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
@@ -227,6 +231,7 @@ export interface AccountListSummary {
   total: number
   normal: number
   active: number
+  overload_paused: number
   rate_limited: number
   rate_limited_5h: number
   rate_limited_7d: number
@@ -300,7 +305,7 @@ export interface AccountsPageParams {
   healthTier?: 'healthy' | 'warm' | 'risky' | 'banned' | 'attention'
   proxyUrl?: string
   proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
-  sort?: 'requests' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
+  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
   order?: 'asc' | 'desc'
 }
 
@@ -644,6 +649,18 @@ export interface AddGrokAccountRequest {
 }
 
 export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface BatchUpdateGrokModelsRequest {
+  ids: number[]
+  models: string[]
+}
+
+export interface BatchUpdateGrokModelsResponse {
+  message: string
+  success: number
+  failed: number
+  models: string[]
+}
 
 export interface FetchGrokModelsResponse {
   models: string[]
@@ -1333,6 +1350,16 @@ export interface SystemSettings {
   codex_ws_busy_acquire_max_wait_sec: number
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
+  codex_ws_stateless_slots: number
+  // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
+  github_token?: string
+  github_token_configured?: boolean
+  github_proxy_url: string
+  // Codex 过载熔断：窗口内 server_is_overloaded 占比达阈值自动暂停调度
+  codex_overload_pause_enabled: boolean
+  codex_overload_threshold_percent: number
+  codex_overload_pause_minutes: number
+  codex_overload_window_minutes: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
   compact_via_responses_enabled: boolean

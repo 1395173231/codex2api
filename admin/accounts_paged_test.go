@@ -138,6 +138,11 @@ func TestListAccountsPageFiltersAndLegacyCompatibility(t *testing.T) {
 		t.Fatalf("empty page status=%d response=%+v", emptyRecorder.Code, empty)
 	}
 
+	todayRecorder := invokeListAccounts(t, handler, "/api/admin/accounts?view=page&channel=codex&page=1&page_size=20&sort=today&order=desc")
+	if todayRecorder.Code != http.StatusOK {
+		t.Fatalf("sort=today status=%d body=%s", todayRecorder.Code, todayRecorder.Body.String())
+	}
+
 	for _, target := range []string{
 		"/api/admin/accounts?view=page&channel=codex&page_size=501",
 		"/api/admin/accounts?view=page&channel=codex&status=typo",
@@ -194,6 +199,28 @@ func TestAccountListItemMatchesEveryFilter(t *testing.T) {
 	}
 }
 
+func TestResponsesRateLimitedClassification(t *testing.T) {
+	item := &accountListSnapshotItem{
+		Row:      &database.AccountRow{ID: 1},
+		ID:       1,
+		Status:   auth.ResponsesRateLimitedCooldownReason,
+		Enabled:  true,
+		PlanType: "plus",
+	}
+	if !accountListRateLimited(item) || !accountListItemMatches(item, accountPageQuery{Status: "rate_limited"}, database.UpstreamChannelCodex) {
+		t.Fatal("authoritative Responses limit was not classified as rate limited")
+	}
+	if !accountAnalysisShortRateLimited(item) {
+		t.Fatal("authoritative Responses limit was omitted from short-window analysis")
+	}
+
+	item.Status = "cooldown"
+	item.CooldownReason = auth.ResponsesRateLimitedCooldownReason
+	if !accountListRateLimited(item) || !accountAnalysisShortRateLimited(item) {
+		t.Fatal("authoritative Responses cooldown reason was not classified as rate limited")
+	}
+}
+
 func TestAccountListSortAlwaysFallsBackToIDAscending(t *testing.T) {
 	items := []*accountListSnapshotItem{
 		{ID: 3, RequestCount: 5},
@@ -212,6 +239,16 @@ func TestAccountListSortAlwaysFallsBackToIDAscending(t *testing.T) {
 	sortAccountListItems(items, "requests", "desc")
 	if items[0].RequestCount != 3 || items[1].RequestCount != 3 || items[0].ID > items[1].ID {
 		t.Fatalf("descending sort lost stable id fallback: %+v", items)
+	}
+
+	todayItems := []*accountListSnapshotItem{
+		{ID: 3, TodayRequests: 1, TodayTokens: 80, TodayAccountBilled: 0.2},
+		{ID: 1, TodayRequests: 9, TodayTokens: 10, TodayAccountBilled: 0.01},
+		{ID: 2, TodayRequests: 9, TodayTokens: 122, TodayAccountBilled: 0.01},
+	}
+	sortAccountListItems(todayItems, "today", "desc")
+	if todayItems[0].ID != 2 || todayItems[1].ID != 1 || todayItems[2].ID != 3 {
+		t.Fatalf("today sort ids=%v, want [2 1 3]", []int64{todayItems[0].ID, todayItems[1].ID, todayItems[2].ID})
 	}
 }
 
@@ -245,14 +282,14 @@ func TestPagedAccountRuntimeStatusOverridesDatabaseRow(t *testing.T) {
 func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler, _, _ := newPagedAccountsHandler(t)
 	started := time.Now()
-	_, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
+	_, _, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
 	if state != "warming" || time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("cold request stats state=%q elapsed=%s", state, time.Since(started))
 	}
 	// 刷新在后台 goroutine 里完成,轮询等它把本渠道缓存转为 ready。
 	warmDeadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
+		if _, _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
 			break
 		}
 		if time.Now().After(warmDeadline) {
@@ -273,6 +310,48 @@ func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler.accountListBuildMu.Unlock()
 	if err != nil || stale != snapshot || elapsed > 100*time.Millisecond {
 		t.Fatalf("stale snapshot blocked or changed: err=%v elapsed=%s", err, elapsed)
+	}
+}
+
+func TestAccountListUnsampledExcludedFromNormalAndSchedulable(t *testing.T) {
+	unsampled := &accountListSnapshotItem{ID: 1, Status: "active", Enabled: true}
+	sampled := &accountListSnapshotItem{ID: 2, Status: "active", Enabled: true, UsagePercent7d: 12, UsagePercent7dOK: true}
+	only5h := &accountListSnapshotItem{ID: 3, Status: "active", Enabled: true, UsagePercent5h: 8, UsagePercent5hOK: true}
+	responses := &accountListSnapshotItem{ID: 4, Status: "active", Enabled: true, OpenAIResponses: true}
+	grok := &accountListSnapshotItem{ID: 5, Status: "active", Enabled: true, GrokAuthKind: auth.GrokAuthKindOAuth}
+	banned := &accountListSnapshotItem{ID: 6, Status: "unauthorized", Enabled: true}
+
+	if !accountListUnsampled(unsampled) {
+		t.Fatal("active account without usage windows should be unsampled")
+	}
+	if accountListNormal(unsampled) || accountListSchedulable(unsampled) {
+		t.Fatal("unsampled account must not count as normal or schedulable")
+	}
+	if accountListUnsampled(sampled) || accountListUnsampled(only5h) || accountListUnsampled(responses) || accountListUnsampled(grok) || accountListUnsampled(banned) {
+		t.Fatal("sampled, 5h-only, responses, grok, and banned accounts must not be unsampled")
+	}
+	if !accountListNormal(sampled) || !accountListSchedulable(sampled) || !accountListNormal(only5h) || !accountListSchedulable(responses) || !accountListSchedulable(grok) {
+		t.Fatal("sampled / responses / grok accounts should stay available")
+	}
+	if accountListStatusMatches(unsampled, "normal", database.UpstreamChannelCodex) || accountListStatusMatches(unsampled, "scheduling", database.UpstreamChannelCodex) {
+		t.Fatal("unsampled filter buckets must exclude normal and scheduling")
+	}
+	if !accountListStatusMatches(unsampled, "unsampled", database.UpstreamChannelCodex) {
+		t.Fatal("unsampled filter should match accounts without usage windows")
+	}
+
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{unsampled, sampled, only5h, responses}, database.UpstreamChannelCodex)
+	if summary.Normal != 3 || summary.Active != 3 || summary.Unsampled != 1 {
+		t.Fatalf("summary = %+v, want normal=3 active=3 unsampled=1", summary)
+	}
+}
+
+func TestBuildAccountQuotaAnalysisExcludesErrorFromUnsampled(t *testing.T) {
+	errored := &accountListSnapshotItem{ID: 1, Status: "error", Enabled: true}
+	sampled := &accountListSnapshotItem{ID: 2, Status: "active", Enabled: true, UsagePercent7d: 12, UsagePercent7dOK: true}
+	got := buildAccountQuotaAnalysis([]*accountListSnapshotItem{errored, sampled}, "7d")
+	if got.Total != 1 || got.Sampled != 1 || got.Unsampled != 0 {
+		t.Fatalf("quota analysis = %+v, want total=1 sampled=1 unsampled=0", got)
 	}
 }
 
@@ -519,4 +598,123 @@ func TestListAccountsPageSortsBySchedulerPriority(t *testing.T) {
 
 	assertOrder("desc", []int64{codexIDs[1], codexIDs[2], codexIDs[0]})
 	assertOrder("asc", []int64{codexIDs[0], codexIDs[2], codexIDs[1]})
+}
+
+func TestListAccountsPageKeepsGrokQuotaBars(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithUpstream(ctx, "grok-quota", "xai", "oauth", map[string]interface{}{
+		"upstream_type":       "grok",
+		"refresh_token":       "rt-grok",
+		"email":               "grok@example.net",
+		"plan_type":           "supergrok",
+		"grok_billing_detail": `{"weekly_percent":42.5,"weekly_period_end":"2026-08-15T00:00:00Z"}`,
+	}, "")
+	if err != nil {
+		t.Fatalf("insert grok: %v", err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	account := store.FindByID(id)
+	if account == nil {
+		t.Fatal("runtime account missing")
+	}
+	account.SetGrokRateLimitSnapshot(auth.GrokRateLimitSnapshot{
+		LimitTokens: 1000, RemainingTokens: 400, UpdatedAt: time.Now(),
+	})
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+
+	recorder := invokeListAccounts(t, handler, "/api/admin/accounts?view=page&channel=grok&page=1&page_size=20")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var page accountsPageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page.Accounts) != 1 || page.Accounts[0].ID != id {
+		t.Fatalf("page rows = %+v", page.Accounts)
+	}
+	row := page.Accounts[0]
+	if row.DetailLoaded || row.Usage5hDetail != nil || row.ModelMapping != "" {
+		t.Fatalf("paged grok row leaked expensive details: %+v", row)
+	}
+	if len(row.GrokBilling) == 0 || !strings.Contains(string(row.GrokBilling), `"weekly_percent":42.5`) {
+		t.Fatalf("paged grok row dropped quota bar payload: %s", row.GrokBilling)
+	}
+	if row.GrokRateLimit == nil || row.GrokRateLimit.LimitTokens != 1000 || row.GrokRateLimit.RemainingTokens != 400 {
+		t.Fatalf("paged grok row dropped rate-limit snapshot: %+v", row.GrokRateLimit)
+	}
+}
+
+func TestCodexNormalIncludesDisabledButSchedulingExcludesIt(t *testing.T) {
+	enabled := &accountListSnapshotItem{Status: "active", Enabled: true, UsagePercent7dOK: true}
+	disabled := &accountListSnapshotItem{Status: "active", Enabled: false, UsagePercent7dOK: true}
+	codex := database.UpstreamChannelCodex
+	if !accountListStatusMatches(enabled, "normal", codex) {
+		t.Fatal("enabled healthy account should match normal")
+	}
+	if !accountListStatusMatches(disabled, "normal", codex) {
+		t.Fatal("disabled account should classify as normal")
+	}
+	if accountListStatusMatches(disabled, "scheduling", codex) || accountListStatusMatches(disabled, "active", codex) {
+		t.Fatal("disabled account must be excluded from scheduling")
+	}
+	if !accountListStatusMatches(disabled, "disabled", codex) {
+		t.Fatal("disabled account should match disabled filter")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{enabled, disabled}, codex)
+	if summary.Normal != 2 || summary.Active != 1 || summary.Disabled != 1 || summary.Total != 2 {
+		t.Fatalf("summary = %+v, want Normal=2 Active=1 Disabled=1 Total=2", summary)
+	}
+}
+
+func TestOverloadPausedCountsAsNormalNotRateLimitedOrScheduling(t *testing.T) {
+	item := &accountListSnapshotItem{
+		Status:           "overload_paused",
+		Enabled:          true,
+		CooldownReason:   "overload_paused",
+		UsagePercent7dOK: true,
+	}
+	codex := database.UpstreamChannelCodex
+	if accountListRateLimited(item) {
+		t.Fatal("overload_paused must not count as rate limited")
+	}
+	if !accountListStatusMatches(item, "normal", codex) {
+		t.Fatal("overload_paused should classify as normal")
+	}
+	if accountListStatusMatches(item, "scheduling", codex) || accountListStatusMatches(item, "active", codex) {
+		t.Fatal("overload_paused must be excluded from scheduling")
+	}
+	if accountListStatusMatches(item, "rate_limited", codex) {
+		t.Fatal("overload_paused must not match rate_limited")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{item}, codex)
+	if summary.Normal != 1 || summary.Active != 0 || summary.RateLimited != 0 || summary.OverloadPaused != 1 {
+		t.Fatalf("summary = %+v, want Normal=1 Active=0 RateLimited=0 OverloadPaused=1", summary)
+	}
+}
+
+func TestCodexAuthKindFilterSplitsOAuthAndResponsesAPI(t *testing.T) {
+	oauthItem := &accountListSnapshotItem{Status: "active", Enabled: true}
+	apiItem := &accountListSnapshotItem{Status: "active", Enabled: true, OpenAIResponses: true}
+	codex := database.UpstreamChannelCodex
+	if !accountListItemMatches(oauthItem, accountPageQuery{AuthKind: "oauth"}, codex) ||
+		accountListItemMatches(apiItem, accountPageQuery{AuthKind: "oauth"}, codex) {
+		t.Fatal("auth_kind=oauth should match only non-Responses accounts on codex channel")
+	}
+	if !accountListItemMatches(apiItem, accountPageQuery{AuthKind: "api_key"}, codex) ||
+		accountListItemMatches(oauthItem, accountPageQuery{AuthKind: "api_key"}, codex) {
+		t.Fatal("auth_kind=api_key should match only Responses API accounts on codex channel")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{oauthItem, apiItem}, codex)
+	if summary.OAuth != 1 || summary.APIKey != 1 {
+		t.Fatalf("summary = %+v, want OAuth=1 APIKey=1", summary)
+	}
 }

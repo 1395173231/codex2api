@@ -33,6 +33,12 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "bare payment required is account scoped",
+			statusCode: http.StatusPaymentRequired,
+			body:       []byte(`{"detail":"Payment Required"}`),
+			want:       true,
+		},
+		{
 			name:       "invalid grant bad request is account scoped",
 			statusCode: http.StatusBadRequest,
 			body:       []byte(`{"error":"invalid_grant"}`),
@@ -453,6 +459,42 @@ func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "token_invalidated") {
 		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+}
+
+func TestRunSingleBatchTestPaymentRequiredMarksError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":"Payment Required"}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "402") {
+		t.Fatalf("ErrorMsg = %q, want 402", errorMsg)
 	}
 }
 

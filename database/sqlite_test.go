@@ -3337,22 +3337,26 @@ func TestAccountUsageAggregatesExcludeTransportRetries(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
-	insertUsage := func(accountID int64, createdAt time.Time, tokens int, billed float64, retry any, statusCode int, internalReason ...string) {
+	insertUsage := func(accountID int64, createdAt time.Time, tokens int, billed float64, retry any, statusCode int, extras ...string) {
 		t.Helper()
 		reason := ""
-		if len(internalReason) > 0 {
-			reason = internalReason[0]
+		model := ""
+		if len(extras) > 0 {
+			reason = extras[0]
+		}
+		if len(extras) > 1 {
+			model = extras[1]
 		}
 		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
-			(account_id, status_code, total_tokens, account_billed, user_billed, is_retry_attempt, internal_reason, created_at)
-			VALUES ($1, $2, $3, $4, $4, $5, $6, $7)`, accountID, statusCode, tokens, billed, retry, reason, sqliteTimeParam(createdAt)); err != nil {
+			(account_id, status_code, total_tokens, account_billed, user_billed, is_retry_attempt, internal_reason, model, created_at)
+			VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)`, accountID, statusCode, tokens, billed, retry, reason, model, sqliteTimeParam(createdAt)); err != nil {
 			t.Fatalf("insert usage log: %v", err)
 		}
 	}
 
 	// NULL is a legacy/non-retry row and must remain part of all aggregates.
-	insertUsage(1, now.Add(-time.Hour), 100, 1, nil, 200)
-	insertUsage(1, now.Add(-2*time.Hour), 200, 2, 0, 200)
+	insertUsage(1, now.Add(-time.Hour), 100, 1, nil, 200, "", "gpt-5.4")
+	insertUsage(1, now.Add(-2*time.Hour), 200, 2, 0, 200, "", "gpt-5.2")
 	// A transport retry carries usage-like fields but must not double count them.
 	insertUsage(1, now.Add(-30*time.Minute), 900, 9, 1, 502)
 	// Client-cancelled rows remain excluded independently of retry classification.
@@ -3414,12 +3418,24 @@ func TestAccountUsageAggregatesExcludeTransportRetries(t *testing.T) {
 	if got := requestCounts[1]; got == nil || got.SuccessCount != 2 || got.ErrorCount != 1 || got.RetryErrorCount != 1 {
 		t.Fatalf("global request counts account 1 = %+v, want success=2 error=1 retry_error=1", got)
 	}
+	if got := requestCounts[1]; got.ErrorStatusCounts[499] != 1 || got.ErrorStatusCounts[502] != 0 {
+		t.Fatalf("global error status counts = %#v, want 499=1 and no retry 502", got.ErrorStatusCounts)
+	}
+	if got := requestCounts[1]; got.SuccessModelCounts["gpt-5.4"] != 1 || got.SuccessModelCounts["gpt-5.2"] != 1 {
+		t.Fatalf("global success model counts = %#v, want gpt-5.4=1 gpt-5.2=1", got.SuccessModelCounts)
+	}
 	requestCountsByID, err := db.GetAccountRequestCountsByIDs(ctx, []int64{1, 2})
 	if err != nil {
 		t.Fatalf("GetAccountRequestCountsByIDs: %v", err)
 	}
 	if got := requestCountsByID[1]; got == nil || got.SuccessCount != 2 || got.ErrorCount != 1 || got.RetryErrorCount != 1 {
 		t.Fatalf("scoped request counts account 1 = %+v, want success=2 error=1 retry_error=1", got)
+	}
+	if got := requestCountsByID[1]; got.ErrorStatusCounts[499] != 1 || got.ErrorStatusCounts[502] != 0 {
+		t.Fatalf("scoped error status counts = %#v, want 499=1 and no retry 502", got.ErrorStatusCounts)
+	}
+	if got := requestCountsByID[1]; got.SuccessModelCounts["gpt-5.4"] != 1 || got.SuccessModelCounts["gpt-5.2"] != 1 {
+		t.Fatalf("scoped success model counts = %#v, want gpt-5.4=1 gpt-5.2=1", got.SuccessModelCounts)
 	}
 	billed, err := db.GetAccountBilledSince(ctx, 1, now.Add(-3*time.Hour))
 	if err != nil || billed != 12 {
@@ -3529,6 +3545,51 @@ func TestAccountUsageAggregatesExcludeStaleCredentialGeneration(t *testing.T) {
 	}
 	if got := longWindow[accountID]; got == nil || got.Requests != 2 || got.Tokens != 400 {
 		t.Fatalf("generation-filtered scoped usage = %+v, want legacy + current only", got)
+	}
+}
+
+func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode int) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, created_at)
+			VALUES ($1, $2, 10, $3, $4, $5, $6)`, accountID, statusCode, retry, model, effective, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200)
+	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429)
+	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200)
+	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200)
+	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499)
+	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200)
+	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200)
+
+	usage, err := db.GetAccountUsageSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageSinceByIDs: %v", err)
+	}
+	models, err := db.GetAccountModelCountsSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountModelCountsSinceByIDs: %v", err)
+	}
+	if usage[1] == nil || usage[1].Requests != 3 {
+		t.Fatalf("today usage account 1 = %+v, want 3 requests", usage[1])
+	}
+	if models[1]["gpt-5.4"].Requests != 2 || models[1]["gpt-5.4"].Success != 1 || models[1]["gpt-5.2-codex"].Requests != 1 || models[1]["gpt-5.2-codex"].Success != 1 || models[1]["gpt-5.3"].Requests != 0 {
+		t.Fatalf("today models account 1 = %#v, want gpt-5.4=2/1 gpt-5.2-codex=1/1", models[1])
+	}
+	if models[2]["grok-4"].Requests != 1 || models[2]["grok-4"].Success != 1 {
+		t.Fatalf("today models account 2 = %#v, want grok-4=1/1", models[2])
 	}
 }
 

@@ -443,7 +443,7 @@ func accountConnectionLimit(account *auth.Account) int {
 	}
 	// 尚未完成调度快照初始化的账号保留原有槽位上限，生产请求进入账号池后
 	// DynamicConcurrencyLimit 会始终为正数。
-	return StatelessConnectionSlots
+	return statelessConnectionSlots()
 }
 
 type idleAccountConnection struct {

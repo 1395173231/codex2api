@@ -101,15 +101,19 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		{ID: 5, Status: "active", Enabled: true},  // normal
 		{ID: 6, Status: "error", Enabled: true},   // DB error without runtime override
 		{ID: 7, Status: "cooldown", Enabled: true, CooldownReason: "rate_limited"},
+		{ID: 8, Status: "active", Enabled: true}, // runtime authoritative Responses limit
+		{ID: 9, Status: "cooldown", Enabled: true, CooldownReason: auth.ResponsesRateLimitedCooldownReason},
 	}
 
-	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
+	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7dValid: true}
 	unauthorized := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
 	unauthorized.SetCooldownWithReason(time.Hour, "unauthorized")
-	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3"}
+	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UsagePercent7dValid: true}
 	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
-	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5", UsagePercent7dValid: true}
+	responsesLimited := &auth.Account{DBID: 8, Status: auth.StatusReady, AccessToken: "at-8"}
+	responsesLimited.SetCooldownWithReason(time.Hour, auth.ResponsesRateLimitedCooldownReason)
 
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
@@ -117,10 +121,11 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		disabled,
 		rateLimited,
 		normal,
+		responsesLimited,
 	})
 
-	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
-		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	if got.total != 9 || got.normal != 3 || got.rateLimited != 4 || got.abnormal != 2 || got.disabled != 1 {
+		t.Fatalf("counts = %+v, want total=9 normal=3 rateLimited=4 abnormal=2 disabled=1", got)
 	}
 }
 
@@ -159,6 +164,27 @@ func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
 	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
 		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsExcludesUnsampledFromAvailable(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true},
+		{ID: 2, Status: "active", Enabled: true},
+		{ID: 3, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamGrok}},
+		{ID: 4, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamOpenAIResponses}},
+	}
+	sampled := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7d: 12, UsagePercent7dValid: true}
+	unsampled := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	grok := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UpstreamType: auth.UpstreamGrok}
+	responses := &auth.Account{DBID: 4, Status: auth.StatusReady, APIKey: "sk-test", BaseURL: "https://relay.example", UpstreamType: auth.UpstreamOpenAIResponses}
+
+	got, channels := summarizeDashboardAccounts(rows, []*auth.Account{sampled, unsampled, grok, responses})
+	if got.total != 4 || got.normal != 3 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("counts = %+v, want total=4 normal=3 rateLimited=0 abnormal=0", got)
+	}
+	if channels[database.UpstreamChannelCodex].normal != 2 || channels[database.UpstreamChannelGrok].normal != 1 {
+		t.Fatalf("channel counts = %+v", channels)
 	}
 }
 
@@ -540,6 +566,45 @@ func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	}
 	if _, ok := account.GetUsagePercent7d(); ok {
 		t.Fatal("expected reset to clear cached usage")
+	}
+}
+
+func TestResetAccountStatusKeepsUsageWhenOverloadPaused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{DBID: 42, AccessToken: "at", PlanType: "free"}
+	account.SetUsageSnapshot(12, time.Now())
+	account.SetCooldownUntil(time.Now().Add(time.Hour), "overload_paused")
+	store.AddAccount(account)
+
+	synced := make(chan struct{}, 1)
+	handler := &Handler{
+		store: store,
+		syncAccountPlanOnReset: func(_ context.Context, _ *auth.Account) error {
+			synced <- struct{}{}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "42"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/42/reset-status", nil)
+
+	handler.ResetAccountStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	pct, ok := account.GetUsagePercent7d()
+	if !ok || pct != 12 {
+		t.Fatalf("usage_percent_7d = (%v, %v), want (12, true)", pct, ok)
+	}
+	select {
+	case <-synced:
+		t.Fatal("overload resume should not re-probe plan or clear usage")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 

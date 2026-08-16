@@ -407,6 +407,26 @@ func TestNormalizeResponsesWebSocketClientPayload(t *testing.T) {
 			t.Fatalf("error = %#v, want previous_response_id rejection", apiErr)
 		}
 	})
+
+	t.Run("preserves v2 prewarm fields", func(t *testing.T) {
+		got, model, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[],"generate":false,"client_metadata":{"x-codex-turn-state":"turn_123"}}`))
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %v", apiErr)
+		}
+		if model != "gpt-5.6-sol" || gjson.GetBytes(got, "generate").Bool() {
+			t.Fatalf("v2 prewarm changed: model=%q body=%s", model, got)
+		}
+		if turnState := gjson.GetBytes(got, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("turn state = %q, want turn_123; body=%s", turnState, got)
+		}
+		prepared, _ := PrepareResponsesWebSocketBody(got)
+		if generate := gjson.GetBytes(prepared, "generate"); !generate.Exists() || generate.Bool() {
+			t.Fatalf("prepared v2 prewarm lost generate=false: %s", prepared)
+		}
+		if turnState := gjson.GetBytes(prepared, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("prepared turn state = %q, want turn_123; body=%s", turnState, prepared)
+		}
+	})
 }
 
 func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
@@ -569,7 +589,7 @@ func TestResponsesWebSocketContinuationKeepsBoundAccountPastBoundedLimit(t *test
 	for turn := 1; turn <= 52; turn++ {
 		payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","input":"turn-%d"}`, turn)
 		if previousResponseID != "" {
-			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d"}`, previousResponseID, turn)
+			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d","client_metadata":{"x-codex-turn-state":"turn-state-1"}}`, previousResponseID, turn)
 		}
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 			t.Fatalf("turn %d write request: %v", turn, err)
@@ -1913,6 +1933,26 @@ func TestUsageLogAndClientErrorsOmitUnstructuredUpstreamBodies(t *testing.T) {
 	(&Handler{}).sendUpstreamError(ctx, http.StatusBadGateway, body)
 	if strings.Contains(recorder.Body.String(), "secret request-id") || strings.Contains(recorder.Body.String(), "internal route") {
 		t.Fatalf("unstructured upstream body leaked to client: %s", recorder.Body.String())
+	}
+}
+
+func TestUsageLogFailureMessageKeepsGatewayDiagnostics(t *testing.T) {
+	// 断流类诊断是网关自产纯文本，必须保留原文而不是退化成裸状态码（issue #524）。
+	diag := "上游流读取失败: stream error: stream ID 277; INTERNAL_ERROR; received from peer [上游帧 147, 下游写阻塞 0ms, 距上游末帧 52484ms]"
+	got := usageLogFailureMessage(logStatusUpstreamStreamBreak, diag)
+	if !strings.Contains(got, "INTERNAL_ERROR") || !strings.Contains(got, "stream ID 277") {
+		t.Fatalf("usageLogFailureMessage() dropped diagnostics: %q", got)
+	}
+
+	// 诊断文本包含上游 JSON 错误帧时仍走结构化提取。
+	jsonDiag := `{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`
+	if got := usageLogFailureMessage(http.StatusTooManyRequests, jsonDiag); got != "rate_limit_exceeded · Too many requests" {
+		t.Fatalf("usageLogFailureMessage() json path = %q", got)
+	}
+
+	// 空文本仍回落裸状态码。
+	if got := usageLogFailureMessage(http.StatusBadGateway, "  "); got != "HTTP 502" {
+		t.Fatalf("usageLogFailureMessage() empty = %q", got)
 	}
 }
 
@@ -3271,7 +3311,12 @@ func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 
 func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	account := &auth.Account{DBID: 42, AccessToken: "at"}
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	other := &auth.Account{DBID: 44, AccessToken: "at-3", AccountID: "team-B", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	store.AddAccount(other)
 	handler := &Handler{store: store}
 	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
 
@@ -3292,6 +3337,33 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "deactivated_workspace") {
 		t.Fatalf("ErrorMsg = %q, want deactivated_workspace", errorMsg)
+	}
+	if sibling.RuntimeStatus() != "error" {
+		t.Fatalf("same-workspace sibling status = %q, want error", sibling.RuntimeStatus())
+	}
+	sibling.Mu().RLock()
+	siblingMsg := sibling.ErrorMsg
+	sibling.Mu().RUnlock()
+	if !strings.Contains(siblingMsg, "工作区联动") {
+		t.Fatalf("sibling ErrorMsg = %q, want workspace-linked annotation", siblingMsg)
+	}
+	if other.RuntimeStatus() == "error" {
+		t.Fatal("other workspace must not be marked")
+	}
+}
+
+func TestGeneric402DoesNotLinkWorkspaceSiblings(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	handler := &Handler{store: store}
+
+	handler.applyCooldownForModel(account, http.StatusPaymentRequired, []byte(`{"error":{"message":"insufficient balance"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if sibling.RuntimeStatus() == "error" {
+		t.Fatal("generic 402 must not fan out to workspace siblings")
 	}
 }
 
@@ -3795,6 +3867,11 @@ func TestResponseFailedRetryableClassification(t *testing.T) {
 		{
 			name:    "non-retryable invalid_request",
 			payload: `{"type":"response.failed","response":{"error":{"type":"invalid_request_error","message":"bad input"}}}`,
+			want:    false,
+		},
+		{
+			name:    "previous response not found",
+			payload: `{"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}`,
 			want:    false,
 		},
 		{

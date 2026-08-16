@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -569,6 +570,46 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 		Endpoint: result.Endpoint,
 		Model:    result.Model,
 	})
+}
+
+type promptReviewModelsRequest struct {
+	BaseURL        string `json:"base_url"`
+	APIKey         string `json:"api_key"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+// ListPromptReviewModels 从审查供应商拉取 OpenAI 兼容的模型列表,供前端选择审查模型。
+// base_url/api_key 允许携带表单草稿值覆盖已存配置,便于保存前先拉列表。
+func (h *Handler) ListPromptReviewModels(c *gin.Context) {
+	if h == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	var req promptReviewModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	reviewCfg := h.store.GetPromptFilterConfig().Review
+	if key := strings.TrimSpace(req.APIKey); key != "" {
+		reviewCfg.APIKey = key
+	}
+	if baseURL := strings.TrimSpace(req.BaseURL); baseURL != "" {
+		reviewCfg.BaseURL = baseURL
+	}
+	if req.TimeoutSeconds > 0 {
+		reviewCfg.TimeoutSeconds = req.TimeoutSeconds
+	}
+	if len(promptfilter.NormalizeReviewConfig(reviewCfg).APIKeyList()) == 0 {
+		writeError(c, http.StatusBadRequest, "请先配置审查 API Key")
+		return
+	}
+	models, endpoint, err := promptfilter.DefaultReviewClient.ListReviewModels(c.Request.Context(), reviewCfg)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "拉取模型列表失败: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"endpoint": endpoint, "models": models})
 }
 
 func (h *Handler) TestPromptReviewConnection(c *gin.Context) {

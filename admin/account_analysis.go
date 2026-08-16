@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -299,7 +300,7 @@ func buildAccountQuotaAnalysis(items []*accountListSnapshotItem, window string) 
 	}
 	totalUsed := 0.0
 	for _, item := range items {
-		if item.Status == "unauthorized" || item.OpenAIResponses || (window == "5h" && !accountListSubscriptionPlan(item.PlanType)) {
+		if item.Status == "unauthorized" || item.Status == "error" || item.OpenAIResponses || (window == "5h" && !accountListSubscriptionPlan(item.PlanType)) {
 			continue
 		}
 		result.Total++
@@ -440,8 +441,10 @@ func accountAnalysisUsage(item *accountListSnapshotItem, window string) (float64
 func accountAnalysisShortRateLimited(item *accountListSnapshotItem) bool {
 	status := strings.ToLower(item.Status)
 	reason := strings.ToLower(item.CooldownReason)
-	return status == "rate_limited" || status == "rate_limited_5h" || status == "cooldown" ||
-		reason == "rate_limited" || reason == "rate_limited_5h"
+	return status == "rate_limited" || status == auth.ResponsesRateLimitedCooldownReason ||
+		status == "rate_limited_5h" || status == "cooldown" ||
+		reason == "rate_limited" || reason == auth.ResponsesRateLimitedCooldownReason ||
+		reason == "rate_limited_5h"
 }
 
 func accountAnalysisWindowRateLimited(item *accountListSnapshotItem, window string) bool {

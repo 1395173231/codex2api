@@ -117,9 +117,18 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+			case http.StatusPaymentRequired:
+				// 测连 402 是账号侧计费/工作区拒绝，标成错误，避免继续显示成「未采样」。
+				if proxy.IsDeactivatedWorkspaceError(errBody) {
+					h.store.MarkDeactivatedWorkspace(account, errMsg)
+				} else {
+					h.store.MarkError(account, errMsg)
+				}
 			case http.StatusForbidden:
 				if proxy.IsAgentRuntimeDeletedError(errBody) {
 					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errMsg)
+				} else if proxy.IsDeactivatedWorkspaceError(errBody) {
+					h.store.MarkDeactivatedWorkspace(account, errMsg)
 				}
 			case http.StatusTooManyRequests:
 				// Grok 虽是 relay 风格，但有自己的免费额度语义（free-usage-exhausted → 24h），
@@ -1066,7 +1075,11 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return "banned", msg
 		}
 		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
-			h.store.MarkError(acc, "批量测试"+msg)
+			if proxy.IsDeactivatedWorkspaceError(body) {
+				h.store.MarkDeactivatedWorkspace(acc, "批量测试"+msg)
+			} else {
+				h.store.MarkError(acc, "批量测试"+msg)
+			}
 		}
 		return "failed", msg
 	}
@@ -1236,7 +1249,11 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 		default:
 			if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
 				msg := fmt.Sprintf("WHAM 用量探针返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
-				h.store.MarkError(acc, msg)
+				if proxy.IsDeactivatedWorkspaceError(body) {
+					h.store.MarkDeactivatedWorkspace(acc, msg)
+				} else {
+					h.store.MarkError(acc, msg)
+				}
 				return "failed", msg, true
 			}
 		}
@@ -1379,7 +1396,7 @@ func batchTestContextFailure(ctx context.Context, err error) (string, bool) {
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
 	msg := strings.ToLower(string(body))
-	if statusCode == http.StatusPaymentRequired && proxy.IsDeactivatedWorkspaceError(body) {
+	if statusCode == http.StatusPaymentRequired {
 		return true
 	}
 	if statusCode == http.StatusForbidden {

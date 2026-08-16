@@ -339,6 +339,75 @@ func (h *Handler) UpdateGrokAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "Grok 账号设置已更新")
 }
 
+type batchUpdateGrokModelsReq struct {
+	IDs    []int64  `json:"ids"`
+	Models []string `json:"models"`
+}
+
+// BatchUpdateGrokModels 批量替换 Grok 账号的模型白名单
+// （POST /api/admin/accounts/grok/batch-models）。
+// 空数组 = 清空白名单（未声明，仅 grok 渠道 Key 可调度）；非空则整体替换。
+// 非 Grok / 不存在的 ID 计入 failed，不中断整批。
+func (h *Handler) BatchUpdateGrokModels(c *gin.Context) {
+	var req batchUpdateGrokModelsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要更新的账号 ID 列表")
+		return
+	}
+	models := auth.NormalizeAccountModels(req.Models)
+	if len(models) > 200 {
+		writeError(c, http.StatusBadRequest, "模型数量不能超过 200")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	timeout := 15*time.Second + time.Duration(len(ids))*50*time.Millisecond
+	if timeout > 60*time.Second {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+	defer cancel()
+
+	var success, failed int64
+	for _, id := range ids {
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			failed++
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamGrok) {
+			failed++
+			continue
+		}
+		if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"models": models}); err != nil {
+			failed++
+			continue
+		}
+		if h.store != nil {
+			h.store.ApplyAccountModels(id, models)
+		}
+		h.db.InsertAccountEventAsync(id, "updated", "batch_grok_models")
+		success++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已更新 %d 个账号，失败 %d 个", success, failed),
+		"success": success,
+		"failed":  failed,
+		"models":  models,
+	})
+}
+
 // FetchGrokModels 用请求内凭据或已保存账号凭据探测 Grok 上游模型目录
 // （POST /api/admin/accounts/grok/models）。
 func (h *Handler) FetchGrokModels(c *gin.Context) {

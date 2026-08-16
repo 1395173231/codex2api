@@ -244,7 +244,7 @@ func TestIgnoreUsageLimitStatusOverridePrecedence(t *testing.T) {
 	}
 }
 
-func TestIgnoreUsageLimitStatusKeepsExhaustedAccountSchedulable(t *testing.T) {
+func TestIgnoreUsageLimitStatusOnlyAllowsAuthoritativeBoundContinuation(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:         2,
 		TestConcurrency:        1,
@@ -265,20 +265,79 @@ func TestIgnoreUsageLimitStatusKeepsExhaustedAccountSchedulable(t *testing.T) {
 	}
 	store.AddAccount(account)
 
-	if !account.IsAvailable() {
-		t.Fatal("account should remain available when usage windows are informational")
+	if account.IsAvailable() {
+		t.Fatal("fresh dispatch must remain blocked by the 100% usage snapshot")
 	}
-	if got := store.Next(); got != account {
-		t.Fatalf("Next() = %p, want exhausted-but-usable account %p", got, account)
-	} else {
+	if got := store.Next(); got != nil {
 		store.Release(got)
+		t.Fatalf("Next() = %p, want nil for a fresh request", got)
 	}
 	store.BindSessionAffinity("continued-session", account, "")
-	if got, _ := store.NextForSession("continued-session", 0, nil); got != account {
-		t.Fatalf("NextForSession() = %p, want bound exhausted-but-usable account %p", got, account)
-	} else {
+	if got, _ := store.NextForSession("continued-session", 0, nil); got != nil {
 		store.Release(got)
+		t.Fatalf("ordinary bound account = %p, want nil", got)
 	}
+
+	got, _ := store.NextForContinuationWithFilter("continued-session", 0, nil, nil)
+	if got != account {
+		t.Fatalf("authoritative continuation account = %p, want bound account %p", got, account)
+	}
+	store.Release(got)
+
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+	got, _ = store.NextForContinuationWithFilter("continued-session", 0, nil, nil)
+	if got != account {
+		t.Fatalf("continuation did not bypass local WHAM cooldown: %p", got)
+	}
+	store.Release(got)
+
+	store.MarkResponsesPremium5hRateLimited(account, time.Now().Add(time.Hour))
+	if got, _ := store.NextForContinuationWithFilter("continued-session", 0, nil, nil); got != nil {
+		store.Release(got)
+		t.Fatalf("continuation bypassed authoritative upstream cooldown: %p", got)
+	}
+}
+
+func TestIgnoreUsageLimitStatusKeepsFreeAccountSessionAffinityHealthy(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	bound := &Account{
+		DBID:                204,
+		AccessToken:         "bound",
+		Status:              StatusReady,
+		PlanType:            "free",
+		UsagePercent7d:      100,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(24 * time.Hour),
+	}
+	alternative := &Account{DBID: 205, AccessToken: "alternative", Status: StatusReady, PlanType: "plus"}
+	store.AddAccount(bound)
+	store.AddAccount(alternative)
+
+	if snapshot := bound.GetSchedulerDebugSnapshot(2); snapshot.HealthTier != string(HealthTierHealthy) || snapshot.Breakdown.UsagePenalty7d != 0 {
+		t.Fatalf("ignored WHAM usage changed scheduler health: %+v", snapshot)
+	}
+
+	store.BindSessionAffinity("working-free-session", bound, "")
+	got, _ := store.NextForSession("working-free-session", 0, nil)
+	if got != alternative {
+		if got != nil {
+			store.Release(got)
+		}
+		t.Fatalf("fresh NextForSession() = %p, want alternative account %p", got, alternative)
+	}
+	store.Release(got)
+
+	store.BindSessionAffinity("working-free-session", bound, "")
+	got, _ = store.NextForContinuationWithFilter("working-free-session", 0, nil, nil)
+	if got != bound {
+		t.Fatalf("authoritative continuation account = %p, want bound account %p", got, bound)
+	}
+	store.Release(got)
 }
 
 func TestCleanFullUsageSkipsAccountsIgnoringUsageLimitStatus(t *testing.T) {
@@ -331,8 +390,14 @@ func TestResponsesSuccessClearsOnlyUsageCooldownWhenIgnored(t *testing.T) {
 	if !store.ConfirmResponsesAvailable(account) {
 		t.Fatal("ConfirmResponsesAvailable() = false, want usage cooldown cleared")
 	}
-	if !account.IsAvailable() {
-		t.Fatal("successful Responses evidence should restore scheduling despite the 100% snapshot")
+	if account.IsAvailable() {
+		t.Fatal("Responses success must not open the account to fresh sessions while WHAM is 100%")
+	}
+	store.BindSessionAffinity("working-response", account, "")
+	if got, _ := store.NextForContinuationWithFilter("working-response", 0, nil, nil); got != account {
+		t.Fatalf("authoritative continuation account = %p, want %p", got, account)
+	} else {
+		store.Release(got)
 	}
 
 	account.mu.Lock()

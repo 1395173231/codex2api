@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,10 +34,11 @@ func (h *Handler) buildAccountResponse(
 		} else {
 			grokAuthKind = auth.GrokAuthKindOAuth
 		}
-		if includeDetails {
-			if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
-				grokBilling = json.RawMessage(detail)
-			}
+		// Quota bars on the paged Grok list need this compact credential
+		// (issue #521). It is a small JSON projection, not the expensive
+		// control-plane / cooldown / mapping payload gated by includeDetails.
+		if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
+			grokBilling = json.RawMessage(detail)
 		}
 	}
 	email := row.GetCredential("email")
@@ -160,7 +162,7 @@ func (h *Handler) buildAccountResponse(
 		}
 		resp.UsageLimitOverride = runtimeAccount.GetIgnoreUsageLimitStatusOverride()
 		resp.UsageLimitEffective = runtimeAccount.IgnoresUsageLimitStatus()
-		if isGrokAccount && includeDetails {
+		if isGrokAccount {
 			if snap, hasSnap := runtimeAccount.GetGrokRateLimitSnapshot(); hasSnap {
 				resp.GrokRateLimit = &snap
 			}
@@ -287,6 +289,18 @@ func (h *Handler) buildAccountResponse(
 		resp.ErrorRequests = requestCount.ErrorCount
 		resp.RetryErrorRequests = requestCount.RetryErrorCount
 		resp.RateLimitAttempts = requestCount.RateLimitAttemptCount
+		if len(requestCount.ErrorStatusCounts) > 0 {
+			resp.ErrorStatusCounts = make(map[string]int64, len(requestCount.ErrorStatusCounts))
+			for code, count := range requestCount.ErrorStatusCounts {
+				resp.ErrorStatusCounts[strconv.Itoa(code)] = count
+			}
+		}
+		if len(requestCount.SuccessModelCounts) > 0 {
+			resp.SuccessModelCounts = make(map[string]int64, len(requestCount.SuccessModelCounts))
+			for model, count := range requestCount.SuccessModelCounts {
+				resp.SuccessModelCounts[model] = count
+			}
+		}
 	}
 	if usage5h != nil {
 		resp.Usage5hDetail = &accountUsageWindow{
@@ -314,9 +328,6 @@ func stripAccountDetailFields(resp *accountResponse) {
 	if resp == nil {
 		return
 	}
-	resp.GrokBilling = nil
-	resp.GrokRateLimit = nil
-	resp.GrokFreeQuota = nil
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
 	resp.CustomHeaders = nil

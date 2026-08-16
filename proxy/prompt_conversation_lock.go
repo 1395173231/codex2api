@@ -436,6 +436,23 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 	return item != nil && item.Status == database.PromptConversationLockStatusActive
 }
 
+// promptGuardBlockHasLocalEvidence 判断最终 block 是否有本地检测证据(规则命中/
+// 终局类别/分类器信号)支撑。仅由外部审核层产生的 block——审核模型对本地放行的
+// 请求打了 flag,或 fail-closed 下审核调用本身失败——只拒绝当次请求,不触发会话
+// 锁:概率型审核分数(如 moderation 各分类阈值)对正常会话存在误报,
+// finalizePromptGuardDecision 也早已把这类命中归为不计违规笔数的弱证据。
+// 一次误报锁死整段会话七天,代价与证据强度不匹配(issue #527)。
+func promptGuardBlockHasLocalEvidence(decision promptfilter.Decision, verdict promptfilter.Verdict) bool {
+	if decision.PrimaryDetector == promptGuardDetectorExternalReview {
+		return false
+	}
+	if verdict.Reviewed && verdict.ReviewError != "" && len(verdict.Matched) == 0 &&
+		!verdict.TerminalStrictHit && !verdict.TerminalCategoryHit {
+		return false
+	}
+	return true
+}
+
 // lockPromptConversationOnLocalBlock 在本地规则判定 block 时立即锁定会话,
 // 使风险在**发往上游供应商之前**就被扼杀。
 //
@@ -444,15 +461,18 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 // 规则打到上游,从而产生真实的 cyber_policy 封号信号。等上游返回 CYB 再锁,
 // 风险已经泄露。会话级封锁把"逐条命中"变成"一次命中即封死整段会话",这是纵深
 // 防御里唯一能覆盖未知变形的一层。
-func (h *Handler) lockPromptConversationOnLocalBlock(c *gin.Context, cfg promptfilter.Config, signedBody []byte, endpoint, model, reasonCode string) bool {
+func (h *Handler) lockPromptConversationOnLocalBlock(c *gin.Context, cfg promptfilter.Config, signedBody []byte, endpoint, model string, decision promptfilter.Decision, verdict promptfilter.Verdict) bool {
 	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
+		return false
+	}
+	if !promptGuardBlockHasLocalEvidence(decision, verdict) {
 		return false
 	}
 	identity, ok := h.resolvePromptConversationLockIdentity(c, cfg, signedBody)
 	if !ok {
 		return false
 	}
-	reasonCode = strings.TrimSpace(reasonCode)
+	reasonCode := strings.TrimSpace(decision.ReasonCode)
 	if reasonCode == "" {
 		reasonCode = "local_prompt_block"
 	}

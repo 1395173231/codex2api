@@ -358,6 +358,12 @@ const (
 	codexResponsesLiteWSMetadataPath = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
+const (
+	codexBetaFeaturesHeader = "X-Codex-Beta-Features"
+	// defaultCodexBetaFeatures 是默认安装的真实 Codex 发出的会话级特性协商值。
+	defaultCodexBetaFeatures = "remote_compaction_v2"
+)
+
 var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
@@ -895,6 +901,12 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
+	// 指纹收敛：与 ExecuteRequest 同样在请求体定稿后、构造出站请求前改写
+	// client_metadata。漏掉这一步会让 compact 路径只收敛请求头、请求体仍带客户端
+	// 真实标识，上游看到「头说设备 A、体说设备 B」这种真实客户端不会有的矛盾。
+	// 必须用 prepareCodexResponsesLiteTransport 之后的 headers（它可能返回克隆），
+	// 与下方 applyCodexRequestHeaders 取同一份下游头，两处推导结果才一致。
+	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
 
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
@@ -1111,6 +1123,18 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Originator", Originator)
 	}
 	applyCodexAllowedForwardHeaders(req, downstreamHeaders)
+	// 会话级 beta-features:真实 Codex 每个 /responses 请求、WS 握手与 compact 都带
+	// x-codex-beta-features,默认恰为 remote_compaction_v2(codex-rs
+	// build_model_client_beta_features_header,无实验特性默认开启)。下游声明的原样
+	// 保留——非空但无 v2 表示用户显式关闭,不改写;未声明时补默认,避免"只有部分
+	// 请求带头"这种真实客户端不会产生的模式。
+	if strings.TrimSpace(req.Header.Get(codexBetaFeaturesHeader)) == "" {
+		value := defaultCodexBetaFeatures
+		if deviceCfg != nil && strings.TrimSpace(deviceCfg.BetaFeatures) != "" {
+			value = strings.TrimSpace(deviceCfg.BetaFeatures)
+		}
+		req.Header.Set(codexBetaFeaturesHeader, value)
+	}
 	// 指纹收敛必须在白名单透传之后（覆盖客户端原值）、账号自定义头之前（运维显式
 	// 配置保持最终优先）。off 档为空操作。
 	ApplyCodexFingerprintHeaders(req.Header, account, downstreamHeaders)

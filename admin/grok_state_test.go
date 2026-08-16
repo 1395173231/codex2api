@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -216,8 +218,8 @@ func TestSyncGrokAccountStatePersistsRichCatalogAndETags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAccountByID: %v", err)
 	}
-	if got := row.GetCredentialStringSlice("models"); len(got) != 1 || got[0] != "grok-test" {
-		t.Fatalf("legacy models = %#v, want visible catalog IDs", got)
+	if got := row.GetCredentialStringSlice("models"); len(got) != 0 {
+		t.Fatalf("catalog sync must not write visible IDs into credentials.models: %#v", got)
 	}
 	credentialsJSON, _ := json.Marshal(row.Credentials)
 	if strings.Contains(string(credentialsJSON), "must-drop") {
@@ -227,6 +229,53 @@ func TestSyncGrokAccountStatePersistsRichCatalogAndETags(t *testing.T) {
 		if _, ok := row.Credentials[forbidden]; ok {
 			t.Fatalf("legacy model projection persisted rich catalog field %q", forbidden)
 		}
+	}
+}
+
+// TestSyncGrokAccountStatePreservesDeclaredModels 守护批量/编辑设置的模型白名单
+// 不会被 5 分钟目录刷新盖成上游当前可见集（免费 OAuth 常见只剩 grok-4.6）。
+func TestSyncGrokAccountStatePreservesDeclaredModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"grok-4.6","supportedInApi":true,"hidden":false}]}`))
+	}))
+	defer server.Close()
+
+	h, db, id := newGrokAdminTestAccount(t, server.URL, false)
+	ctx := context.Background()
+	declared := []string{"grok-4.5", "grok-4.6"}
+	if err := db.UpdateCredentials(ctx, id, map[string]interface{}{"models": declared}); err != nil {
+		t.Fatalf("UpdateCredentials: %v", err)
+	}
+	if !h.store.ApplyAccountModels(id, declared) {
+		t.Fatal("ApplyAccountModels failed")
+	}
+
+	result, err := h.syncGrokAccountState(ctx, id)
+	if err != nil {
+		t.Fatalf("syncGrokAccountState: %v", err)
+	}
+	if len(result.Models) != 1 || result.Models[0] != "grok-4.6" {
+		t.Fatalf("sync response models = %#v, want visible catalog [grok-4.6]", result.Models)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredentialStringSlice("models"); !reflect.DeepEqual(got, declared) {
+		t.Fatalf("declared models overwritten: %#v, want %#v", got, declared)
+	}
+	account := h.store.FindByID(id)
+	if account == nil {
+		t.Fatal("runtime account missing")
+	}
+	if got := append([]string(nil), account.Models...); !reflect.DeepEqual(got, declared) {
+		t.Fatalf("runtime models overwritten: %#v, want %#v", got, declared)
 	}
 }
 
@@ -370,5 +419,34 @@ func TestRunGrokCapabilityProbeKnownEmptyCatalogDoesNotUseDefaults(t *testing.T)
 	}
 	if len(result.Results) != 0 || inferenceCalls.Load() != 0 {
 		t.Fatalf("known empty catalog produced results=%v calls=%d", result.Results, inferenceCalls.Load())
+	}
+}
+
+func TestInspectGrokProbeResponseRecordsFirstTokenFromDelta(t *testing.T) {
+	started := time.Now().Add(-80 * time.Millisecond)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" +
+				"data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")),
+	}
+	observation := inspectGrokProbeResponse(context.Background(), proxy.GrokProtocolChatCompletions, resp, nil, started)
+	if observation.status != "ok" || observation.firstTokenMs < 80 {
+		t.Fatalf("delta first token = %+v", observation)
+	}
+}
+
+func TestInspectGrokProbeResponseUsesCompletionWhenNoDelta(t *testing.T) {
+	started := time.Now().Add(-50 * time.Millisecond)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")),
+	}
+	observation := inspectGrokProbeResponse(context.Background(), proxy.GrokProtocolResponses, resp, nil, started)
+	if observation.status != "ok" || observation.firstTokenMs < 50 {
+		t.Fatalf("completed-only first token = %+v", observation)
 	}
 }

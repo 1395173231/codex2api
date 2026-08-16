@@ -190,6 +190,11 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 		if account != nil {
 			return account, stickyProxyURL
 		}
+		if changed, err := h.store.ReconcileDispatchState(ctx); err != nil {
+			log.Printf("调度 miss 后同步数据库账号状态失败: %v", err)
+		} else if changed {
+			continue
+		}
 		if !exclusions.ResetSoft() {
 			return nil, ""
 		}

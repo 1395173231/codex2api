@@ -13,6 +13,8 @@ import type {
   AddOpenAIResponsesAccountRequest,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
+  BatchUpdateGrokModelsRequest,
+  BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
   GrokDeviceStartRequest,
   GrokDeviceStartResponse,
@@ -619,6 +621,11 @@ export const api = {
     }),
   updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
+  batchUpdateGrokModels: (data: BatchUpdateGrokModelsRequest) =>
+    request<BatchUpdateGrokModelsResponse>('/accounts/grok/batch-models', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getGrokAccountState: (id: number, signal?: AbortSignal) =>
     request<GrokAccountState>(`/accounts/${id}/grok/state`, { signal }),
   syncGrokAccountState: (id: number) =>
@@ -1110,6 +1117,8 @@ export const api = {
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptReview: (data: PromptReviewTestRequest) =>
     request<PromptReviewTestResponse>('/prompt-filter/review/test', { method: 'POST', body: JSON.stringify(data) }),
+  listPromptReviewModels: (data: { base_url?: string; api_key?: string; timeout_seconds?: number }) =>
+    request<{ endpoint: string; models: string[] }>('/prompt-filter/review/models', { method: 'POST', body: JSON.stringify(data) }),
   getPromptReviewAPIKeys: () =>
     request<PromptReviewAPIKeysResponse>('/prompt-filter/review/keys'),
   deletePromptReviewAPIKey: (keyID: string) =>

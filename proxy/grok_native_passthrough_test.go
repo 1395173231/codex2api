@@ -148,6 +148,30 @@ func TestForwardGrokNativeMessagesPreservesEventAndMultilineData(t *testing.T) {
 	}
 }
 
+func TestHoldGrokNativePreOutputResponsesOnlyBuffersLifecycle(t *testing.T) {
+	created := parseRawGrokSSEFrame([]byte("data: {\"type\":\"response.created\"}\n\n"))
+	itemAdded := parseRawGrokSSEFrame([]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n"))
+	text := parseRawGrokSSEFrame([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"))
+	keepAlive := parseRawGrokSSEFrame([]byte(": keep-alive\r\n\r\n"))
+	roleOnly := parseRawGrokSSEFrame([]byte("data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+
+	if !holdGrokNativePreOutput(GrokProtocolResponses, created, false, false, false) {
+		t.Fatal("Responses created should stay buffered for silent retry")
+	}
+	if holdGrokNativePreOutput(GrokProtocolResponses, itemAdded, false, false, false) {
+		t.Fatal("Responses structure frames must flush before first text")
+	}
+	if holdGrokNativePreOutput(GrokProtocolResponses, keepAlive, false, false, false) {
+		t.Fatal("Responses keep-alives must flush so the client sees progress")
+	}
+	if holdGrokNativePreOutput(GrokProtocolResponses, text, false, false, true) {
+		t.Fatal("visible text must never be held")
+	}
+	if !holdGrokNativePreOutput(GrokProtocolChatCompletions, roleOnly, false, false, false) {
+		t.Fatal("Chat role-only frames must stay buffered until first visible delta")
+	}
+}
+
 func TestForwardGrokNativeFirstVisibleStopsTTFTGuard(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

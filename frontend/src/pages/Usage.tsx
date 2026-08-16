@@ -1398,7 +1398,6 @@ type UsageTableColumn = 'status' | 'error' | 'model' | 'account' | 'apiKey' | 'c
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
-  { key: 'error', labelKey: 'usage.tableError' },
   { key: 'model', labelKey: 'usage.tableModel' },
   { key: 'account', labelKey: 'usage.tableAccount' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
@@ -1412,6 +1411,8 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'timing', labelKey: 'usage.tableTiming' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
   { key: 'cost', labelKey: 'usage.tableCost' },
+  // 错误摘要宽度随内容波动，放倒数第二列避免撑开中段（issue #522）
+  { key: 'error', labelKey: 'usage.tableError' },
   { key: 'time', labelKey: 'usage.tableTime' },
 ]
 
@@ -2504,7 +2505,8 @@ export default function Usage() {
                       key={log.id}
                       className="rounded-xl border border-border bg-background/70 p-3.5 shadow-sm"
                     >
-                      <div className="flex items-start justify-between gap-2">
+                      {/* flex-wrap + nowrap 时间：徽标再多也只会把时间挤到下一行，不会挤出视口（issue #522） */}
+                      <div className="flex flex-wrap items-start justify-between gap-2">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                           {visibleColumns.status && (
                             <button
@@ -2550,7 +2552,7 @@ export default function Usage() {
                           <InternalRequestBadge log={log} />
                         </div>
                         {visibleColumns.time && (
-                          <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
+                          <div className="shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
                             {formatBeijingTime(log.created_at)}
                           </div>
                         )}
@@ -2659,7 +2661,6 @@ export default function Usage() {
                   <TableHeader>
                     <TableRow>
                       {visibleColumns.status && <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>}
-                      {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
                       {visibleColumns.model && <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>}
                       {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
                       {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
@@ -2691,6 +2692,7 @@ export default function Usage() {
                         </TableHead>
                       )}
                       {visibleColumns.cost && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableCost')}</TableHead>}
+                      {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
                       {visibleColumns.time && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableTime')}</TableHead>}
                     </TableRow>
                   </TableHeader>
@@ -2710,9 +2712,6 @@ export default function Usage() {
                             </button>
                             {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
                           </div>
-                        </TableCell>}
-                        {visibleColumns.error && <TableCell>
-                          <UsageErrorSummaryCell log={log} />
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
@@ -2851,6 +2850,9 @@ export default function Usage() {
                         )}
                         {visibleColumns.cost && <TableCell className="text-right">
                           <UsageCostCell log={log} />
+                        </TableCell>}
+                        {visibleColumns.error && <TableCell>
+                          <UsageErrorSummaryCell log={log} />
                         </TableCell>}
                         {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-right text-muted-foreground whitespace-nowrap`}>
                           {formatBeijingTime(log.created_at)}

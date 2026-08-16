@@ -287,6 +287,12 @@ export default function Layout({ children }: PropsWithChildren) {
     return location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
   }, [location.pathname])
 
+  // 表格重度页（账号管理 / 使用统计）在超宽屏上放开 96rem 限宽，减少横向滚动
+  const isFullWidthRoute =
+    location.pathname === '/usage' ||
+    location.pathname === '/accounts' ||
+    location.pathname.startsWith('/accounts/')
+
   const mobileMoreActive = useMemo(
     () => mobileMoreNav.some((item) => isNavActive(item)),
     [isNavActive],
@@ -648,8 +654,9 @@ export default function Layout({ children }: PropsWithChildren) {
             </div>
           </header>
 
-          {/* 统一测宽：超宽屏上卡片/表格不再无界拉伸，与 Settings 固定导航的 72rem 上限同族 */}
-          <div className="mx-auto w-full max-w-[96rem]">
+          {/* 统一测宽：超宽屏上卡片/表格不再无界拉伸，与 Settings 固定导航的 72rem 上限同族。
+              账号管理/使用统计是列多的表格重度页，放开限宽让高分屏铺满（issue #522）。 */}
+          <div className={`mx-auto w-full ${isFullWidthRoute ? 'max-w-none' : 'max-w-[96rem]'}`}>
             <SecurityBanner />
             <div className="min-h-full">{children}</div>
           </div>

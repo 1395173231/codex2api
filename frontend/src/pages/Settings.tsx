@@ -1,4 +1,4 @@
-import type { ChangeEvent, ReactNode } from 'react'
+import type { ChangeEvent, FocusEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
@@ -64,6 +64,7 @@ import {
   Database,
   ExternalLink,
   Gauge,
+  Globe,
   Image as ImageIcon,
   Layers,
   Link2,
@@ -1311,6 +1312,13 @@ export default function Settings() {
     codex_ws_busy_acquire_max_wait_sec: 30,
     codex_ws_busy_overflow_enabled: false,
     codex_ws_busy_patience_sec: 2,
+    codex_ws_stateless_slots: 8,
+    github_token_configured: false,
+    github_proxy_url: '',
+    codex_overload_pause_enabled: false,
+    codex_overload_threshold_percent: 20,
+    codex_overload_pause_minutes: 30,
+    codex_overload_window_minutes: 5,
     codex_continue_thinking_enabled: false,
     overflow_auto_compact_enabled: false,
     compact_via_responses_enabled: false,
@@ -1420,6 +1428,8 @@ export default function Settings() {
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
   const [syncingCliVersion, setSyncingCliVersion] = useState(false)
+  // GitHub token 只写不回显：草稿态独立于 settingsForm，提交后清空（issue #522）
+  const [githubTokenDraft, setGithubTokenDraft] = useState('')
   const [syncedCliVersion, setSyncedCliVersion] = useState('')
   const logoFileInputRef = useRef<HTMLInputElement>(null)
   const backgroundFileInputRef = useRef<HTMLInputElement>(null)
@@ -2917,6 +2927,23 @@ export default function Settings() {
                     }}
                   />
                 </SettingField>
+                <SettingField
+                  label={t('settings.codexWSStatelessSlots')}
+                  description={t('settings.codexWSStatelessSlotsDesc')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={32}
+                    value={settingsForm.codex_ws_stateless_slots}
+                    emptyValue={8}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_stateless_slots: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        codex_ws_stateless_slots: value,
+                      })
+                    }}
+                  />
+                </SettingField>
               </div>
             </div>
           </SettingsCard>
@@ -2983,6 +3010,113 @@ export default function Settings() {
                 <Switch
                   checked={settingsForm.codex_preflight_sse_passthrough_enabled}
                   onCheckedChange={(checked) => autoSaveBooleanField('codex_preflight_sse_passthrough_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.codexOverloadPause')} description={t('settings.codexOverloadPauseDesc')} icon={<ShieldAlert className="size-4" />}>
+            <div className="space-y-4">
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.codexOverloadPauseEnabled')} description={t('settings.codexOverloadPauseEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_overload_pause_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_overload_pause_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={cn(SETTINGS_FIELD_GRID_3, !settingsForm.codex_overload_pause_enabled && 'opacity-60')}>
+                <SettingField
+                  label={t('settings.codexOverloadThreshold')}
+                  description={t('settings.codexOverloadThresholdDesc')}
+                  suffix="%"
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={100}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_threshold_percent}
+                    emptyValue={20}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_threshold_percent: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_threshold_percent: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexOverloadPauseMinutes')}
+                  description={t('settings.codexOverloadPauseMinutesDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={1440}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_pause_minutes}
+                    emptyValue={30}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_pause_minutes: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_pause_minutes: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexOverloadWindow')}
+                  description={t('settings.codexOverloadWindowDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={120}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_window_minutes}
+                    emptyValue={5}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_window_minutes: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_window_minutes: value })
+                    }}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.githubAccess')} description={t('settings.githubAccessDesc')} icon={<Globe className="size-4" />}>
+            <div className={SETTINGS_FIELD_GRID}>
+              <SettingField label={t('settings.githubToken')} description={t('settings.githubTokenDesc')}>
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="password"
+                    autoComplete="off"
+                    placeholder={settingsForm.github_token_configured ? t('settings.githubTokenConfiguredPlaceholder') : t('settings.githubTokenPlaceholder')}
+                    value={githubTokenDraft}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setGithubTokenDraft(e.target.value)}
+                    onBlur={() => {
+                      const value = githubTokenDraft.trim()
+                      if (!value) return
+                      void autoSaveSettingsPatch({ github_token: value, github_token_configured: true })
+                      setGithubTokenDraft('')
+                    }}
+                  />
+                  {settingsForm.github_token_configured && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        void autoSaveSettingsPatch({ github_token: '', github_token_configured: false })
+                      }}
+                    >
+                      {t('settings.githubTokenClear')}
+                    </Button>
+                  )}
+                </div>
+              </SettingField>
+              <SettingField label={t('settings.githubProxy')} description={t('settings.githubProxyDesc')}>
+                <Input
+                  value={settingsForm.github_proxy_url}
+                  placeholder="http://host:port / socks5://host:port"
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, github_proxy_url: e.target.value }))}
+                  onBlur={(e: FocusEvent<HTMLInputElement>) => autoSaveStringField('github_proxy_url', e.target.value.trim())}
                 />
               </SettingField>
             </div>

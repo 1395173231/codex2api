@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -53,6 +54,7 @@ type Handler struct {
 	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
+	executeUsageProbe      usageProbeRequestFunc
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
@@ -82,6 +84,12 @@ type Handler struct {
 	cacheLabel                string
 	adminSecretEnv            string
 	imageProxy                *proxy.Handler
+
+	// 导入触发的用量采样并发闸：大批量导入时逐个账号入库即触发采样，若不限流
+	// 会瞬间产生成百上千个并发上游请求打爆号池/触发风控。用一个懒初始化的
+	// 信号量把在途导入采样数压到 usage_probe_concurrency，超出的排队。
+	importProbeSemOnce sync.Once
+	importProbeSem     chan struct{}
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -210,8 +218,8 @@ const (
 	adminUsageRangeCacheTTL        = 35 * time.Second
 	adminChartCacheTTL             = 10 * time.Second
 	adminAccountWindowsCacheTTL    = 30 * time.Second
-	importFileSizeLimitBytes       = 20 * 1024 * 1024
-	importFileSizeLimitLabel       = "20MB"
+	importFileSizeLimitBytes       = 200 * 1024 * 1024
+	importFileSizeLimitLabel       = "200MB"
 	accountRefreshBatchConcurrency = 4
 )
 
@@ -332,8 +340,42 @@ func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task f
 	})
 }
 
-func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
+// importProbeConcurrency 返回导入采样并发闸的容量。取用量探针并行度设置,
+// 兜底 defaultImportProbeConcurrency。
+const defaultImportProbeConcurrency = 16
+
+func (h *Handler) importProbeConcurrency() int {
+	if h != nil && h.store != nil {
+		if n := h.store.GetUsageProbeConcurrency(); n > 0 {
+			return n
+		}
+	}
+	return defaultImportProbeConcurrency
+}
+
+// runImportProbeTask 把一个导入采样任务丢到后台执行,但先占用并发闸的一个槽位
+// (排队等待,ctx 取消则放弃),完成后释放。容量在首次调用时按当时的
+// usage_probe_concurrency 固定,避免运行时改设置导致信号量容量抖动。
+func (h *Handler) runImportProbeTask(fn func(context.Context)) {
+	h.importProbeSemOnce.Do(func() {
+		h.importProbeSem = make(chan struct{}, h.importProbeConcurrency())
+	})
+	sem := h.importProbeSem
 	h.startDBBackgroundTask(func(ctx context.Context) {
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+		}
+		fn(ctx)
+	})
+}
+
+func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
+	h.runImportProbeTask(func(ctx context.Context) {
 		h.probeImportedAccountUsage(ctx, accountID, source)
 	})
 }
@@ -637,6 +679,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
+	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
 	api.GET("/accounts/grok/export", h.ExportGrokAccounts)
 	api.POST("/accounts/grok/oauth/device/start", h.StartGrokDeviceAuth)
 	api.POST("/accounts/grok/oauth/device/poll", h.PollGrokDeviceAuth)
@@ -749,6 +792,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/review/keys", h.ListPromptReviewAPIKeys)
 	api.DELETE("/prompt-filter/review/keys/:key_id", h.DeletePromptReviewAPIKey)
 	api.POST("/prompt-filter/review/test", h.TestPromptReviewConnection)
+	api.POST("/prompt-filter/review/models", h.ListPromptReviewModels)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/prompt-filter/newapi-bindings", h.ListPromptFilterNewAPIBindings)
@@ -958,7 +1002,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		}
 		usingCredits := false
-		if acc, ok := runtimeByID[row.ID]; ok {
+		acc := runtimeByID[row.ID]
+		if acc != nil {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
 			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
@@ -981,6 +1026,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		case !usingCredits && isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
 			perChannel.rateLimited++
+		case isDashboardUnsampledAccount(row, acc):
+			// 未采样不当作可用：仪表盘「可用」与账号页正常/调度中对齐。
 		default:
 			counts.normal++
 			perChannel.normal++
@@ -994,13 +1041,39 @@ func isDashboardAbnormalAccount(status string) bool {
 	return status == "unauthorized" || status == "error"
 }
 
+func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
+	if acc != nil {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+			return false
+		}
+		snapshot := acc.GetAccountListRuntimeSnapshot()
+		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
+		if status == "unauthorized" || status == "error" {
+			return false
+		}
+		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
+	}
+	if row == nil {
+		return false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(row.Status))
+	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	return true
+}
+
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -1065,6 +1138,8 @@ type accountResponse struct {
 	ErrorRequests                 int64                       `json:"error_requests"`
 	RetryErrorRequests            int64                       `json:"retry_error_requests"`
 	RateLimitAttempts             int64                       `json:"rate_limit_attempts"`
+	ErrorStatusCounts             map[string]int64            `json:"error_status_counts,omitempty"`
+	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
@@ -1127,10 +1202,12 @@ type modelCooldownResponse struct {
 }
 
 type accountUsageWindow struct {
-	Requests      int64   `json:"requests"`
-	Tokens        int64   `json:"tokens"`
-	AccountBilled float64 `json:"account_billed"`
-	UserBilled    float64 `json:"user_billed"`
+	Requests           int64            `json:"requests"`
+	Tokens             int64            `json:"tokens"`
+	AccountBilled      float64          `json:"account_billed"`
+	UserBilled         float64          `json:"user_billed"`
+	ModelCounts        map[string]int64 `json:"model_counts,omitempty"`
+	ModelSuccessCounts map[string]int64 `json:"model_success_counts,omitempty"`
 }
 
 func accountEmailDomain(email string) string {
@@ -2500,7 +2577,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-	h.storeRequestCountCache(cacheKey, counts)
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
 	return counts
 }
 
@@ -3164,10 +3241,11 @@ type addOpenAIResponsesAccountReq struct {
 }
 
 type fetchOpenAIResponsesModelsReq struct {
-	AccountID int64  `json:"account_id"`
-	BaseURL   string `json:"base_url"`
-	APIKey    string `json:"api_key"`
-	ProxyURL  string `json:"proxy_url"`
+	AccountID     int64             `json:"account_id"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
 }
 
 func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
@@ -3321,6 +3399,9 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		if strings.TrimSpace(req.ProxyURL) == "" {
 			req.ProxyURL = row.ProxyURL
 		}
+		if len(req.CustomHeaders) == 0 {
+			req.CustomHeaders = row.GetCredentialStringMap("custom_headers")
+		}
 	}
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
 	if err != nil {
@@ -3335,10 +3416,15 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL)
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -3471,7 +3557,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -3489,6 +3575,14 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	for name, value := range customHeaders {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -3591,7 +3685,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		return
 	}
 	if account.IsGrokAPI() {
-		// Grok 账号同步完整富目录并持久化；响应保留 legacy models 字段。
+		// Grok 账号同步完整富目录到 catalog 表；响应 models 是可见目录，不覆盖账号白名单。
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 110*time.Second)
 		defer cancel()
 		result, err := h.syncGrokAccountState(ctx, id)
@@ -3860,6 +3954,107 @@ func parseImportJSONTokens(data []byte) ([]importToken, error) {
 	return nil, nil
 }
 
+// parseUploadedImportJSONFile 打开上传的 JSON 文件并流式解析,不把整个文件读进
+// 内存。multipart 大文件(>32MB)由 ParseMultipartForm 落在临时文件,fh.Open()
+// 返回的 reader 直接喂给流式解析器。
+func parseUploadedImportJSONFile(fh *multipart.FileHeader) ([]importToken, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+	}
+	defer f.Close()
+	return parseImportJSONTokensStream(f)
+}
+
+// parseImportJSONTokensStream 流式解析导入 JSON,避免把整个文件(可达 200MB)
+// 一次性读进内存 + 整体 Unmarshal。逐个数组元素解码,内存峰值降到单条账号量级。
+// 覆盖三种形态:顶层数组 [ {...} ]、sub2api 顶层对象 { "accounts": [ {...} ] }、
+// 单个平铺对象 { ... };无法流式判定时回退到全量 parseImportJSONTokens。
+func parseImportJSONTokensStream(r io.Reader) ([]importToken, error) {
+	// json.Decoder 不剥 UTF-8 BOM,而部分导出文件带 BOM(与全量路径的
+	// trimUTF8BOM 对齐):peek 前 3 字节,是 BOM 就丢弃。
+	br := bufio.NewReader(r)
+	if prefix, err := br.Peek(3); err == nil && prefix[0] == 0xef && prefix[1] == 0xbb && prefix[2] == 0xbf {
+		_, _ = br.Discard(3)
+	}
+	dec := json.NewDecoder(br)
+	first, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid import json")
+	}
+	delim, ok := first.(json.Delim)
+	if !ok {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	switch delim {
+	case '[':
+		// 顶层数组:逐个 jsonAccountEntry 解码。
+		var tokens []importToken
+		for dec.More() {
+			var entry jsonAccountEntry
+			if err := dec.Decode(&entry); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			tokens = append(tokens, jsonAccountEntriesToTokens([]jsonAccountEntry{entry})...)
+		}
+		return tokens, nil
+
+	case '{':
+		// 顶层对象:可能是 sub2api {accounts:[...]} 或单个平铺账号对象。
+		// 遍历顶层字段,accounts 数组逐元素流式解码;其余字段(通常很小)收集
+		// 成 RawMessage,遍历完若未见 accounts 则按单个平铺对象重建解析。
+		var tokens []importToken
+		sawAccounts := false
+		other := map[string]json.RawMessage{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			key, _ := keyTok.(string)
+			if key == "accounts" {
+				sawAccounts = true
+				arrTok, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				if d, ok := arrTok.(json.Delim); !ok || d != '[' {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				for dec.More() {
+					var account sub2apiAccountEntry
+					if err := dec.Decode(&account); err != nil {
+						return nil, fmt.Errorf("invalid import json")
+					}
+					tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+				}
+				if _, err := dec.Token(); err != nil { // consume ']'
+					return nil, fmt.Errorf("invalid import json")
+				}
+				continue
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			other[key] = raw
+		}
+		if sawAccounts {
+			return tokens, nil
+		}
+		// 没有 accounts 字段:这是单个平铺账号对象,用收集到的字段重建后按
+		// 平铺形态解析(单对象很小,无内存压力)。
+		objBytes, err := json.Marshal(other)
+		if err != nil {
+			return nil, fmt.Errorf("invalid import json")
+		}
+		return parseFlatJSONImportTokens(objBytes), nil
+	}
+
+	return nil, fmt.Errorf("invalid import json")
+}
+
 func parseFlatJSONImportTokens(data []byte) []importToken {
 	var entries []jsonAccountEntry
 	if err := json.Unmarshal(data, &entries); err == nil {
@@ -3930,6 +4125,16 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 	tokens := make([]importToken, 0, len(payload.Accounts))
 	for _, account := range payload.Accounts {
+		tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+	}
+	return tokens
+}
+
+// sub2apiAccountEntryToTokens 把单个 sub2api 账号条目转换成 importToken(0 或 1 个)。
+// 从 parseSub2APIJSONImportTokens 抽出,供流式解析逐元素复用,避免两份逻辑漂移。
+func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
+	var tokens []importToken
+	{
 		c := account.Credentials
 		rt := strings.TrimSpace(c.RefreshToken)
 		st := firstNonEmpty(c.SessionToken, c.SessionTokenCamel)
@@ -3952,8 +4157,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
 		}
 		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
-			tokens = append(tokens, tok)
-			continue
+			return append(tokens, tok)
 		}
 
 		if rt != "" || st != "" || at != "" {
@@ -4241,19 +4445,7 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDupli
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4292,19 +4484,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, al
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4349,8 +4529,46 @@ type importEvent struct {
 	Warning string `json:"warning,omitempty"`
 }
 
-func sendImportEvent(c *gin.Context, e importEvent) {
-	sendSSEJSON(c, e)
+// sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
+func sendImportEvent(c *gin.Context, e importEvent) bool {
+	return sendSSEJSON(c, e)
+}
+
+// importProgressInterval 是导入进度事件的推送间隔。
+const importProgressInterval = 200 * time.Millisecond
+
+// runImportProgressPusher 按固定间隔推送导入进度，返回一个在推送协程退出后关闭的
+// channel。三种情况会停：导入结束（done 关闭）、下游断开（reqCtx 取消）、或者写
+// 失败。后两种必须停——导入本身还要继续跑完，但连接已经死了，继续写只会每个
+// 间隔刷一条 broken pipe 日志直到导入结束。
+//
+// 调用方在 close(done) 之后必须等返回的 channel 关闭再写收尾事件：gin 的
+// ResponseWriter 不支持并发写，两边同时写会让事件交错，前端解析不到 complete，
+// 进度条永远停在最后一个百分比。
+func runImportProgressPusher(reqCtx context.Context, done <-chan struct{}, interval time.Duration, snapshot func() importEvent, send func(importEvent) bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	var clientGone <-chan struct{}
+	if reqCtx != nil {
+		clientGone = reqCtx.Done()
+	}
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !send(snapshot()) {
+					return
+				}
+			case <-clientGone:
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return stopped
 }
 
 func setupSSE(c *gin.Context) {
@@ -4608,27 +4826,23 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	sem := make(chan struct{}, 20) // 并发插入上限
 	var wg sync.WaitGroup
 
-	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈
+	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈。
 	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cur := int(atomic.LoadInt64(&current))
-				suc := int(atomic.LoadInt64(&successCount))
-				upd := int(atomic.LoadInt64(&updatedCount))
-				fai := int(atomic.LoadInt64(&failCount))
-				sendImportEvent(c, importEvent{
-					Type: "progress", Current: cur + duplicateCount, Total: total,
-					Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
-				})
-			case <-done:
-				return
+	progressStopped := runImportProgressPusher(
+		c.Request.Context(), done, importProgressInterval,
+		func() importEvent {
+			return importEvent{
+				Type:      "progress",
+				Current:   int(atomic.LoadInt64(&current)) + duplicateCount,
+				Total:     total,
+				Success:   int(atomic.LoadInt64(&successCount)),
+				Updated:   int(atomic.LoadInt64(&updatedCount)),
+				Failed:    int(atomic.LoadInt64(&failCount)),
+				Duplicate: duplicateCount,
 			}
-		}
-	}()
+		},
+		func(e importEvent) bool { return sendImportEvent(c, e) },
+	)
 
 	for i, t := range newTokens {
 		sem <- struct{}{}
@@ -4677,7 +4891,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					if acc := h.store.FindByID(id); acc != nil {
 						h.applyImportedAccountUsageState(acc, importSource)
 						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
-							h.startDBBackgroundTask(func(ctx context.Context) {
+							h.runImportProbeTask(func(ctx context.Context) {
 								h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
 							})
 						}
@@ -4744,7 +4958,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					h.triggerImportedAccountUsageProbe(id, "import")
 				} else if !h.store.GetLazyMode() {
 					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
-					h.startDBBackgroundTask(func(ctx context.Context) {
+					// 同样走并发闸：RT 刷新也会打上游，大批量导入不限流会一起打爆。
+					h.runImportProbeTask(func(ctx context.Context) {
 						h.refreshImportedAccountAndProbe(ctx, id, "import_refresh")
 					})
 				}
@@ -4754,6 +4969,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 	wg.Wait()
 	close(done)
+	// 等推送 goroutine 真正退出再写收尾事件：gin 的 ResponseWriter 不支持并发写，
+	// 只 close(done) 不等待的话，收尾事件可能和最后一帧进度事件交错，
+	// 前端解析不到 complete，进度条永远停在最后一个百分比。
+	<-progressStopped
 
 	// 发送完成事件（并入 Agent Identity 计数）
 	suc := int(atomic.LoadInt64(&successCount)) + agentSuccess
@@ -5404,7 +5623,11 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 	if h.store != nil {
 		for _, id := range updatedIDs {
 			if enabled.Set {
-				h.store.ApplyAccountEnabled(id, enabled.Value)
+				if !h.store.ApplyAccountEnabled(id, enabled.Value) && enabled.Value {
+					if err := h.store.LoadAccountByID(ctx, id); err != nil {
+						log.Printf("批量启用账号 %d 后加载进调度池失败: %v", id, err)
+					}
+				}
 			}
 			if locked.Set {
 				if acc := h.store.FindByID(id); acc != nil {
@@ -5753,6 +5976,29 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	}
 }
 
+func accountIsOverloadPaused(acc *auth.Account) bool {
+	if acc == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(acc.GetCooldownReason()), "overload_paused") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(acc.RuntimeStatus()), "overload_paused")
+}
+
+// resetAccountRuntimeStatus 清冷却/模型冷却。过载暂停只恢复调度，不能清用量快照，
+// 否则 free 账号（只有 30d 窗、没有 5h）列表额度条会先变成 "-"，要等下次探针才回来。
+func (h *Handler) resetAccountRuntimeStatus(ctx context.Context, acc *auth.Account) {
+	keepUsage := accountIsOverloadPaused(acc)
+	h.store.ClearCooldown(acc)
+	h.store.ClearAllModelCooldowns(acc)
+	if keepUsage {
+		return
+	}
+	acc.ClearUsageCache()
+	h.syncAccountPlanAfterReset(ctx, acc)
+}
+
 // ResetAccountStatus 重置单个账号状态为正常
 func (h *Handler) ResetAccountStatus(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -5767,10 +6013,7 @@ func (h *Handler) ResetAccountStatus(c *gin.Context) {
 		return
 	}
 
-	h.store.ClearCooldown(acc)
-	h.store.ClearAllModelCooldowns(acc)
-	acc.ClearUsageCache()
-	h.syncAccountPlanAfterReset(c.Request.Context(), acc)
+	h.resetAccountRuntimeStatus(c.Request.Context(), acc)
 	writeMessage(c, http.StatusOK, "账号状态已重置")
 }
 
@@ -5792,10 +6035,7 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 			fail++
 			continue
 		}
-		h.store.ClearCooldown(acc)
-		h.store.ClearAllModelCooldowns(acc)
-		acc.ClearUsageCache()
-		h.syncAccountPlanAfterReset(c.Request.Context(), acc)
+		h.resetAccountRuntimeStatus(c.Request.Context(), acc)
 		success++
 	}
 
@@ -7672,6 +7912,13 @@ type settingsResponse struct {
 	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	GithubTokenConfigured               bool   `json:"github_token_configured"`
+	GithubProxyURL                      string `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       int    `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           int    `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          int    `json:"codex_overload_window_minutes"`
 	OverflowAutoCompactEnabled          bool   `json:"overflow_auto_compact_enabled"`
 	CompactViaResponsesEnabled          bool   `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled bool   `json:"codex_preflight_sse_passthrough_enabled"`
@@ -7818,6 +8065,13 @@ type updateSettingsReq struct {
 	CodexWSBusyAcquireMaxWaitSec        *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          *bool    `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int     `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               *int     `json:"codex_ws_stateless_slots"`
+	GithubToken                         *string  `json:"github_token"`
+	GithubProxyURL                      *string  `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           *bool    `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       *int     `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           *int     `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          *int     `json:"codex_overload_window_minutes"`
 	OverflowAutoCompactEnabled          *bool    `json:"overflow_auto_compact_enabled"`
 	CompactViaResponsesEnabled          *bool    `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled *bool    `json:"codex_preflight_sse_passthrough_enabled"`
@@ -8541,6 +8795,13 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
 		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
@@ -9234,6 +9495,48 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
 	}
 
+	if req.CodexWSStatelessSlots != nil {
+		v := database.NormalizeCodexWSStatelessSlots(*req.CodexWSStatelessSlots)
+		h.store.SetCodexWSStatelessSlots(v)
+		runtimeCfg.CodexWSStatelessSlots = v
+		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
+	}
+
+	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
+	if req.GithubToken != nil {
+		v := strings.TrimSpace(*req.GithubToken)
+		h.store.SetGithubToken(v)
+		runtimeCfg.GithubToken = v
+		log.Printf("设置已更新: github_token configured=%t", v != "")
+	}
+	if req.GithubProxyURL != nil {
+		v := strings.TrimSpace(*req.GithubProxyURL)
+		h.store.SetGithubProxyURL(v)
+		runtimeCfg.GithubProxyURL = v
+		log.Printf("设置已更新: github_proxy_url = %s", v)
+	}
+
+	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
+	if req.CodexOverloadPauseEnabled != nil {
+		runtimeCfg.CodexOverloadPauseEnabled = *req.CodexOverloadPauseEnabled
+		log.Printf("设置已更新: codex_overload_pause_enabled = %t", *req.CodexOverloadPauseEnabled)
+	}
+	if req.CodexOverloadThresholdPercent != nil {
+		v := database.NormalizeCodexOverloadThresholdPercent(*req.CodexOverloadThresholdPercent)
+		runtimeCfg.CodexOverloadThresholdPercent = v
+		log.Printf("设置已更新: codex_overload_threshold_percent = %d", v)
+	}
+	if req.CodexOverloadPauseMinutes != nil {
+		v := database.NormalizeCodexOverloadPauseMinutes(*req.CodexOverloadPauseMinutes)
+		runtimeCfg.CodexOverloadPauseMinutes = v
+		log.Printf("设置已更新: codex_overload_pause_minutes = %d", v)
+	}
+	if req.CodexOverloadWindowMinutes != nil {
+		v := database.NormalizeCodexOverloadWindowMinutes(*req.CodexOverloadWindowMinutes)
+		runtimeCfg.CodexOverloadWindowMinutes = v
+		log.Printf("设置已更新: codex_overload_window_minutes = %d", v)
+	}
+
 	if req.OverflowAutoCompactEnabled != nil {
 		h.store.SetOverflowAutoCompactEnabled(*req.OverflowAutoCompactEnabled)
 		runtimeCfg.OverflowAutoCompact = *req.OverflowAutoCompactEnabled
@@ -9804,6 +10107,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubToken:                         h.store.GithubToken(),
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
 		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
@@ -10042,6 +10352,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
 		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),

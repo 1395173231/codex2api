@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -349,6 +350,16 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
+	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
+	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			security.MaxImportBodySize = int64(mb) * 1024 * 1024
+		}
+	}
+	if security.MaxImportBodySize < int64(security.MaxRequestBodySize) {
+		security.MaxImportBodySize = int64(security.MaxRequestBodySize)
+	}
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())

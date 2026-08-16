@@ -63,6 +63,9 @@ import {
 } from "../lib/operationResultsPreference";
 import {
   formatLongUsageWindowLabel,
+  getAccountStatusBadgeStatus,
+  isOfficialCostHiddenAccount,
+  isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
 } from "../lib/usageFormat";
@@ -149,11 +152,20 @@ import {
   Shield,
   ArrowUpRight,
   Settings2,
+  ListChecks,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills, {
+  CountBreakdownTooltip,
+} from "../components/RequestCountPills";
+import { buildModelCountBreakdown } from "../lib/requestErrorStatus";
+import {
+  accountStateSurfaceClass,
+  renderAccountStateOverlay,
+} from "../components/AccountStateOverlay";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -171,6 +183,35 @@ import AccountGroupFilterSelect, {
 import ChipInput from "../components/ChipInput";
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+
+// 账号导入的体积约束。后端对导入端点放宽到 200MB;单个文件无法再切分,超过
+// 上限直接拒绝。多文件按累计大小切成多批,每批控制在 150MB 内(留余量给
+// multipart 边界与其它表单字段),避免单个请求体触发后端上限。
+const IMPORT_MAX_FILE_BYTES = 200 * 1024 * 1024;
+const IMPORT_BATCH_MAX_BYTES = 150 * 1024 * 1024;
+
+const formatMB = (bytes: number): string =>
+  `${Math.round(bytes / (1024 * 1024))}MB`;
+
+// splitFilesIntoBatches 按累计字节大小把文件分批。单个文件即便超过 batchMax
+// 也自成一批(交由后端上限兜底),保证每个文件都被投递。
+function splitFilesIntoBatches(files: File[], batchMax: number): File[][] {
+  const batches: File[][] = [];
+  let current: File[] = [];
+  let currentSize = 0;
+  for (const file of files) {
+    if (current.length > 0 && currentSize + file.size > batchMax) {
+      batches.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(file);
+    currentSize += file.size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches.length > 0 ? batches : [[]];
+}
+
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -854,11 +895,46 @@ interface AccountRowActions {
   generateAuthJson: (account: AccountRow) => void;
   toggleEnabled: (account: AccountRow) => void;
   toggleLock: (account: AccountRow) => void;
-  resetStatus: (account: AccountRow) => void;
+  resetStatus: (account: AccountRow) => void | Promise<void>;
   resetCredits: (account: AccountRow) => void;
   openModelsEditor: (account: AccountRow) => void;
   remove: (account: AccountRow) => void;
   usageRefreshed: () => void;
+}
+
+function formatCountdownRemaining(untilMs: number, nowMs: number): string {
+  const diff = Math.max(0, untilMs - nowMs);
+  if (diff <= 0) return "";
+  const hours = Math.floor(diff / 3600000);
+  const minutes = Math.floor((diff % 3600000) / 60000);
+  const seconds = Math.floor((diff % 60000) / 1000);
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  }
+  return `${seconds}s`;
+}
+
+function useCountdownRemaining(until?: string): string {
+  const [remaining, setRemaining] = useState("");
+
+  useEffect(() => {
+    if (!until) {
+      setRemaining("");
+      return;
+    }
+    const target = new Date(until).getTime();
+    const update = () => {
+      setRemaining(formatCountdownRemaining(target, Date.now()));
+    };
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  }, [until]);
+
+  return remaining;
 }
 
 // memo 边界:宿主 Accounts 组件有上百个 state,任何弹窗/表单/进度条状态变化都会
@@ -902,6 +978,10 @@ const AccountTableRow = memo(function AccountTableRow({
                                 : selected
                                   ? "bg-primary/5"
                                   : ""
+                            }${
+                              // 禁用 / 过载暂停用独立遮罩层淡化内容，徽章保持清晰。relative 让遮罩以整行为定位基准。
+                              // 不用 grayscale / 行级 opacity：filter 会破坏定位包含块，opacity 会把徽章一起冲淡。
+                              accountStateSurfaceClass(account, " relative")
                             }`}
                             onClick={(event) => {
                               const target = event.target as HTMLElement | null;
@@ -916,6 +996,10 @@ const AccountTableRow = memo(function AccountTableRow({
                             }}
                           >
                             <TableCell>
+                              {renderAccountStateOverlay(account, t, {
+                                compact: true,
+                                onRecover: () => actions.resetStatus(account),
+                              })}
                               <input
                                 type="checkbox"
                                 className="size-4 cursor-pointer accent-primary"
@@ -987,7 +1071,6 @@ const AccountTableRow = memo(function AccountTableRow({
                                     account.openai_responses_api ||
                                     account.grok_api ||
                                     account.agent_identity ||
-                                    account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
                                       0 ||
@@ -1014,12 +1097,6 @@ const AccountTableRow = memo(function AccountTableRow({
                                         <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
                                           <Sparkles className="size-2.5" />
                                           Grok
-                                        </span>
-                                      )}
-                                      {account.enabled === false && (
-                                        <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
-                                          <PowerOff className="mr-0.5 size-2.5" />
-                                          {t("accounts.disabled")}
                                         </span>
                                       )}
                                       {account.locked && (
@@ -1156,15 +1233,19 @@ const AccountTableRow = memo(function AccountTableRow({
                                 >
                                   <div className="flex min-h-6 flex-wrap items-center gap-1.5">
                                     <StatusBadge
-                                      status={account.status}
+                                      status={getAccountStatusBadgeStatus(account)}
                                       detail={
-                                        getAccountRateLimitWindow(account) ??
-                                        undefined
+                                        account.status === "overload_paused"
+                                          ? undefined
+                                          : getAccountRateLimitWindow(account) ??
+                                            undefined
                                       }
                                       errorMessage={account.error_message}
                                     />
                                     <UsingCreditsBadge account={account} />
-                                    <AccountStatusCountdown account={account} />
+                                    {account.status !== "overload_paused" && (
+                                      <AccountStatusCountdown account={account} />
+                                    )}
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
                                         className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
@@ -1193,26 +1274,7 @@ const AccountTableRow = memo(function AccountTableRow({
                             )}
                             {visibleColumns.requests && (
                               <TableCell>
-                                <div className="space-y-0.5 text-[13px]">
-                                  <div className="flex items-center gap-2">
-                                    <span className="font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
-                                      {account.success_requests ?? 0}
-                                    </span>
-                                    <span className="text-muted-foreground">
-                                      /
-                                    </span>
-                                    <span className="font-medium tabular-nums text-red-500 dark:text-red-400">
-                                      {account.error_requests ?? 0}
-                                    </span>
-                                  </div>
-                                  {((account.retry_error_requests ?? 0) > 0 ||
-                                    (account.rate_limit_attempts ?? 0) > 0) && (
-                                    <div className="text-[11px] text-muted-foreground">
-                                      retry {account.retry_error_requests ?? 0}{" "}
-                                      · 429 {account.rate_limit_attempts ?? 0}
-                                    </div>
-                                  )}
-                                </div>
+                                <RequestCountPills account={account} compact />
                               </TableCell>
                             )}
                             {visibleColumns.usage && (
@@ -1459,6 +1521,7 @@ export default function Accounts() {
   const [statusFilter, setStatusFilter] = useState<
     | "all"
     | "normal"
+    | "scheduling"
     | "rate_limited"
     | "abnormal"
     | "banned"
@@ -1473,8 +1536,18 @@ export default function Accounts() {
   const [planFilter, setPlanFilter] = useState<
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
+  // 账号类型：oauth=官方 OAuth 账号，api_key=Responses API 中转账号（issue #522）
+  const [authFilter, setAuthFilter] = useState<"all" | "oauth" | "api_key">(
+    "all",
+  );
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
+    | "requests"
+    | "today"
+    | "usage"
+    | "importTime"
+    | "schedulerPriority"
+    | "group"
+    | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
@@ -2335,6 +2408,7 @@ export default function Accounts() {
       search: debouncedSearchQuery,
       status: statusFilter,
       plan: planFilter,
+      authKind: authFilter,
       tag: tagFilter,
       emailDomain: domainFilter,
       groupInclude: groupFilter.include,
@@ -2356,23 +2430,25 @@ export default function Accounts() {
       snapshotAt: accountsResponse.snapshot_at,
       statsState: accountsResponse.stats_state,
     };
-  }, [debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
+  }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
 
-  const loadAccountAnalysis = useCallback(async () => {
+  const loadAccountAnalysis = useCallback(async (opts?: { silent?: boolean }) => {
     accountAnalysisAbortRef.current?.abort();
     const controller = new AbortController();
     accountAnalysisAbortRef.current = controller;
-    setAccountAnalysisLoading(true);
-    setAccountAnalysisError(null);
+    if (!opts?.silent) {
+      setAccountAnalysisLoading(true);
+      setAccountAnalysisError(null);
+    }
     try {
       const response = await api.getAccountAnalysis("codex", controller.signal);
       if (!controller.signal.aborted) setAccountAnalysis(response);
     } catch (analysisError) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && !opts?.silent) {
         setAccountAnalysisError(getErrorMessage(analysisError));
       }
     } finally {
-      if (!controller.signal.aborted) setAccountAnalysisLoading(false);
+      if (!controller.signal.aborted && !opts?.silent) setAccountAnalysisLoading(false);
     }
   }, []);
 
@@ -2701,6 +2777,7 @@ export default function Accounts() {
   const accountSummary = {
     totalAccounts: data.summary?.total ?? data.total,
     normalAccounts: data.summary?.normal ?? 0,
+    schedulingAccounts: data.summary?.active ?? 0,
     rateLimitedAccounts: data.summary?.rate_limited ?? 0,
     rateLimited5hAccounts: data.summary?.rate_limited_5h ?? 0,
     rateLimited7dAccounts: data.summary?.rate_limited_7d ?? 0,
@@ -2714,10 +2791,13 @@ export default function Accounts() {
     healthyAccounts: data.summary?.healthy ?? 0,
     warmAccounts: data.summary?.warm ?? 0,
     riskyAccounts: data.summary?.risky ?? 0,
+    oauthAccounts: data.summary?.oauth ?? 0,
+    apiKeyAccounts: data.summary?.api_key ?? 0,
   };
   const {
     totalAccounts,
     normalAccounts,
+    schedulingAccounts,
     rateLimitedAccounts,
     rateLimited5hAccounts,
     rateLimited7dAccounts,
@@ -2731,6 +2811,8 @@ export default function Accounts() {
     healthyAccounts,
     warmAccounts,
     riskyAccounts,
+    oauthAccounts,
+    apiKeyAccounts,
   } = accountSummary;
 
   const allTags = data.facets.tags;
@@ -2740,12 +2822,13 @@ export default function Accounts() {
     search: debouncedSearchQuery || undefined,
     status: statusFilter === "all" ? undefined : statusFilter,
     plan: planFilter === "all" ? undefined : planFilter,
+    auth_kind: authFilter === "all" ? undefined : authFilter,
     tag: tagFilter || undefined,
     email_domain: domainFilter || undefined,
     group_include: groupFilter.include.length > 0 ? groupFilter.include : undefined,
     group_exclude: groupFilter.exclude.length > 0 ? groupFilter.exclude : undefined,
     ungrouped: groupFilter.ungrouped || undefined,
-  }), [debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, statusFilter, tagFilter]);
+  }), [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, statusFilter, tagFilter]);
 
   // 服务端已完成全池筛选、排序和分页。
   const filteredAccounts = accounts;
@@ -3474,24 +3557,55 @@ export default function Accounts() {
     }
   };
 
-  const readImportSSE = async (res: Response) => {
-    setImportProgress({
-      show: true,
+  // readImportSSE 读取单批导入的 SSE 进度流。baseline 是此前已完成批次的累计值,
+  // 本批实时进度叠加其上;markDoneOnComplete=false 时(还有后续批次)不置 done,
+  // 让进度条跨批保持运行态。本批结束后把本批终值累加进 baseline(原地修改)。
+  const readImportSSE = async (
+    res: Response,
+    baseline?: {
+      current: number;
+      total: number;
+      success: number;
+      updated: number;
+      duplicate: number;
+      failed: number;
+    },
+    markDoneOnComplete = true,
+  ) => {
+    const base = baseline ?? {
       current: 0,
       total: 0,
       success: 0,
       updated: 0,
       duplicate: 0,
       failed: 0,
+    };
+    setImportProgress({
+      show: true,
+      current: base.current,
+      total: base.total,
+      success: base.success,
+      updated: base.updated,
+      duplicate: base.duplicate,
+      failed: base.failed,
       done: false,
     });
     const reader = res.body?.getReader();
     if (!reader) {
-      setImportProgress((p) => ({ ...p, done: true }));
+      setImportProgress((p) => ({ ...p, done: markDoneOnComplete }));
       return;
     }
     const decoder = new TextDecoder();
     let buffer = "";
+    // 本批最后一次事件的终值,用于结束后累加进 baseline。
+    let last = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -3510,21 +3624,39 @@ export default function Accounts() {
             duplicate: number;
             failed: number;
           };
+          last = {
+            current: event.current ?? 0,
+            total: event.total ?? 0,
+            success: event.success ?? 0,
+            updated: event.updated ?? 0,
+            duplicate: event.duplicate ?? 0,
+            failed: event.failed ?? 0,
+          };
           setImportProgress((p) => ({
             ...p,
-            current: event.current,
-            total: event.total,
-            success: event.success,
-            updated: event.updated ?? 0,
-            duplicate: event.duplicate,
-            failed: event.failed,
-            done: event.type === "complete",
+            current: base.current + last.current,
+            total: base.total + last.total,
+            success: base.success + last.success,
+            updated: base.updated + last.updated,
+            duplicate: base.duplicate + last.duplicate,
+            failed: base.failed + last.failed,
+            done: markDoneOnComplete && event.type === "complete",
           }));
-          if (event.type === "complete") void reload();
+          // 单批(旧调用方)或分批最后一批完成时刷新列表;中间批不刷新,
+          // 避免多批导入反复整表重载。
+          if (markDoneOnComplete && event.type === "complete") void reload();
         } catch {
           /* 忽略解析异常 */
         }
       }
+    }
+    if (baseline) {
+      baseline.current += last.current;
+      baseline.total += last.total;
+      baseline.success += last.success;
+      baseline.updated += last.updated;
+      baseline.duplicate += last.duplicate;
+      baseline.failed += last.failed;
     }
   };
 
@@ -3540,6 +3672,24 @@ export default function Accounts() {
       showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
       return;
     }
+
+    // 单个文件超过后端导入上限(200MB)无法再切分,直接拒绝并提示。
+    const oversized = files.find((f) => f.size > IMPORT_MAX_FILE_BYTES);
+    if (oversized) {
+      showToast(
+        t("accounts.importFileTooLarge", {
+          name: oversized.name,
+          max: formatMB(IMPORT_MAX_FILE_BYTES),
+        }),
+        "error",
+      );
+      return;
+    }
+
+    // 按累计大小把文件切成多批,每批控制在 IMPORT_BATCH_MAX_BYTES 内,避免单个
+    // 请求体过大触发后端限制;后端导入无状态且按凭据幂等去重,分批完全安全。
+    const batches = splitFilesIntoBatches(files, IMPORT_BATCH_MAX_BYTES);
+
     setImporting(true);
     setImportProgress({
       show: true,
@@ -3551,67 +3701,79 @@ export default function Accounts() {
       failed: 0,
       done: false,
     });
+
+    // 跨批累加的基线:每批的 SSE/JSON 进度都是相对本批的,叠加到已完成批次之上。
+    const totals = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
+
     try {
-      const formData = new FormData();
-      if (format !== "txt") formData.append("format", format);
-      const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
-      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
-      const routedHeaders = applyOptionalWorkspaceRouteHeader(
-        parsedCustomHeaders.value,
-        workspaceOverride,
-      );
-      if (routedHeaders) {
-        formData.append(
-          "custom_headers",
-          JSON.stringify(routedHeaders),
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        const formData = new FormData();
+        if (format !== "txt") formData.append("format", format);
+        const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
+        if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+        const routedHeaders = applyOptionalWorkspaceRouteHeader(
+          parsedCustomHeaders.value,
+          workspaceOverride,
         );
-      }
-      if (allowDuplicate) formData.append("allow_duplicate", "true");
-      if (importGroupIds.length > 0) {
-        formData.append("group_ids", JSON.stringify(importGroupIds));
-      }
-      for (const f of files) formData.append("file", f);
-      const res = await fetch("/api/admin/accounts/import", {
-        method: "POST",
-        body: formData,
-        headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
-      });
-      if (res.headers.get("content-type")?.includes("text/event-stream")) {
-        await readImportSSE(res);
-      } else {
-        const data = await res.json();
-        if (!res.ok) {
-          setImportProgress((p) => ({ ...p, show: false }));
-          showToast(
-            data.error
-              ? t("accounts.importFailedWithReason", { error: data.error })
-              : t("accounts.importFailed"),
-            "error",
-          );
+        if (routedHeaders) {
+          formData.append("custom_headers", JSON.stringify(routedHeaders));
+        }
+        if (allowDuplicate) formData.append("allow_duplicate", "true");
+        if (importGroupIds.length > 0) {
+          formData.append("group_ids", JSON.stringify(importGroupIds));
+        }
+        for (const f of batch) formData.append("file", f);
+
+        const res = await fetch("/api/admin/accounts/import", {
+          method: "POST",
+          body: formData,
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        });
+
+        // 只有最后一批完成后才标记 done,让进度条在多批之间保持运行态。
+        const isLastBatch = i === batches.length - 1;
+        if (res.headers.get("content-type")?.includes("text/event-stream")) {
+          await readImportSSE(res, totals, isLastBatch);
         } else {
-          setImportProgress({
-            show: true,
-            current: data.total ?? 0,
-            total: data.total ?? 0,
-            success: data.success ?? 0,
-            updated: data.updated ?? 0,
-            duplicate: data.duplicate ?? 0,
-            failed: data.failed ?? 0,
-            done: true,
-          });
-          showToast(t("accounts.importCompleted"));
-          void reload();
+          const data = await res.json();
+          if (!res.ok) {
+            setImportProgress((p) => ({ ...p, show: false }));
+            showToast(
+              data.error
+                ? t("accounts.importFailedWithReason", { error: data.error })
+                : t("accounts.importFailed"),
+              "error",
+            );
+            return;
+          }
+          totals.current += data.total ?? 0;
+          totals.total += data.total ?? 0;
+          totals.success += data.success ?? 0;
+          totals.updated += data.updated ?? 0;
+          totals.duplicate += data.duplicate ?? 0;
+          totals.failed += data.failed ?? 0;
+          setImportProgress({ show: true, ...totals, done: isLastBatch });
+          if (isLastBatch) void reload();
         }
       }
+      showToast(t("accounts.importCompleted"));
     } catch (error) {
       setImportProgress({
         show: true,
-        current: 1,
-        total: 1,
-        success: 0,
-        updated: 0,
-        duplicate: 0,
-        failed: 1,
+        current: Math.max(totals.current, 1),
+        total: Math.max(totals.total, 1),
+        success: totals.success,
+        updated: totals.updated,
+        duplicate: totals.duplicate,
+        failed: totals.failed + 1,
         done: true,
       });
       showToast(
@@ -4292,7 +4454,11 @@ export default function Accounts() {
   const handleResetStatus = async (account: AccountRow) => {
     try {
       await api.resetAccountStatus(account.id);
-      showToast(t("accounts.resetStatusSuccess"));
+      showToast(
+        account.status === "overload_paused"
+          ? t("accounts.overloadRecoverSuccess")
+          : t("accounts.resetStatusSuccess"),
+      );
       await refreshAccountRow(account.id);
     } catch (error) {
       showToast(
@@ -5314,7 +5480,7 @@ export default function Accounts() {
     generateAuthJson: (account) => void handleGenerateAuthJSON(account),
     toggleEnabled: (account) => void handleToggleEnabled(account),
     toggleLock: (account) => void handleToggleLock(account),
-    resetStatus: (account) => void handleResetStatus(account),
+    resetStatus: (account) => handleResetStatus(account),
     resetCredits: (account) => void handleResetCredits(account),
     openModelsEditor,
     remove: (account) => void handleDelete(account),
@@ -5765,7 +5931,7 @@ export default function Accounts() {
                   : t("accounts.statsStale")}
             </div>
           ) : null}
-          <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
+          <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-5">
             <CompactStat
               label={t("accounts.totalAccounts")}
               chipLabel={t("accounts.filterAll")}
@@ -5785,6 +5951,17 @@ export default function Accounts() {
               active={statusFilter === "normal"}
               onClick={() => {
                 setStatusFilter("normal");
+                setPage(1);
+              }}
+            />
+            <CompactStat
+              label={t("accounts.schedulingAccounts")}
+              chipLabel={t("accounts.filterScheduling")}
+              value={schedulingAccounts}
+              tone="warning"
+              active={statusFilter === "scheduling"}
+              onClick={() => {
+                setStatusFilter("scheduling");
                 setPage(1);
               }}
             />
@@ -5826,12 +6003,9 @@ export default function Accounts() {
                 analysis={accountAnalysis.quota}
                 compact
                 className="min-w-0"
+                onRefreshAnalysis={() => loadAccountAnalysis({ silent: true })}
                 onProbeStarted={() => {
                   showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
-                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
-                  window.setTimeout(() => {
-                    void loadAccountAnalysis()
-                  }, 4000)
                 }}
                 onProbeError={(message) => showToast(message, 'error')}
               />
@@ -5865,6 +6039,11 @@ export default function Accounts() {
                 [
                   ["all", t("accounts.filterAll"), totalAccounts],
                   ["normal", t("accounts.filterNormal"), normalAccounts],
+                  [
+                    "scheduling",
+                    t("accounts.filterScheduling"),
+                    schedulingAccounts,
+                  ],
                   [
                     "rate_limited",
                     t("accounts.filterRateLimited"),
@@ -5959,6 +6138,32 @@ export default function Accounts() {
                         : key === "k12"
                           ? "K12"
                           : key.charAt(0).toUpperCase() + key.slice(1)}
+                  </button>
+                ))}
+              </div>
+
+              {/* 账号类型：快速把 Responses API 中转账号从 OAuth 官方账号里筛出来（issue #522） */}
+              <div className="flex max-w-full shrink-0 items-center gap-0.5 overflow-x-auto rounded-lg border border-border bg-muted/30 p-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {(
+                  [
+                    ["all", t("accounts.filterAll"), totalAccounts],
+                    ["oauth", "OAuth", oauthAccounts],
+                    ["api_key", "API", apiKeyAccounts],
+                  ] as const
+                ).map(([key, label, count]) => (
+                  <button
+                    key={key}
+                    onClick={() => {
+                      setAuthFilter(key);
+                      setPage(1);
+                    }}
+                    className={`shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors ${
+                      authFilter === key
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {key === "all" ? label : `${label} ${count}`}
                   </button>
                 ))}
               </div>
@@ -6073,7 +6278,10 @@ export default function Accounts() {
                       className="w-full min-w-0 sm:w-32"
                       compact
                       value={
-                        sortKey === "requests" || sortKey === "usage" || sortKey === "importTime"
+                        sortKey === "requests" ||
+                        sortKey === "today" ||
+                        sortKey === "usage" ||
+                        sortKey === "importTime"
                           ? sortKey
                           : "default"
                       }
@@ -6081,7 +6289,7 @@ export default function Accounts() {
                         if (value === "default") {
                           setSortKey(null);
                         } else {
-                          setSortKey(value as "requests" | "usage" | "importTime");
+                          setSortKey(value as "requests" | "today" | "usage" | "importTime");
                           setSortDir("desc");
                         }
                         setPage(1);
@@ -6089,11 +6297,15 @@ export default function Accounts() {
                       options={[
                         { value: "default", label: t("accounts.cardSortDefault") },
                         { value: "requests", label: t("accounts.requests") },
+                        { value: "today", label: t("accounts.todayStats") },
                         { value: "usage", label: t("accounts.usage") },
                         { value: "importTime", label: t("accounts.importTime") },
                       ]}
                     />
-                    {(sortKey === "requests" || sortKey === "usage" || sortKey === "importTime") && (
+                    {(sortKey === "requests" ||
+                      sortKey === "today" ||
+                      sortKey === "usage" ||
+                      sortKey === "importTime") && (
                       <Button
                         type="button"
                         variant="outline"
@@ -6226,6 +6438,8 @@ export default function Accounts() {
                   >
                     {statusFilter === "normal"
                       ? t("accounts.filterNormal")
+                      : statusFilter === "scheduling"
+                        ? t("accounts.filterScheduling")
                       : statusFilter === "rate_limited"
                         ? t("accounts.filterRateLimited")
                         : statusFilter === "abnormal"
@@ -6323,6 +6537,18 @@ export default function Accounts() {
                 {t("common.selected", { count: selected.size })}
               </span>
               <div className="flex flex-wrap items-center justify-end gap-1.5 max-lg:justify-start">
+                {/* 卡片视图（移动端/grid/自用）没有表头全选框，这里是唯一的全选入口（issue #522） */}
+                {!allPageSelected && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={batchLoading || batchTesting}
+                    onClick={toggleSelectAll}
+                  >
+                    <ListChecks className="size-3.5" />
+                    <span>{t("accounts.selectCurrentPage")}</span>
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -6580,10 +6806,26 @@ export default function Accounts() {
                         )}
                         {visibleColumns.today && (
                           <TableHead
-                            className="text-[13px] font-semibold"
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
                             title={t("accounts.todayStatsHint")}
+                            onClick={() => {
+                              if (sortKey === "today") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("today");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
                           >
-                            {t("accounts.todayStats")}
+                            {t("accounts.todayStats")}{" "}
+                            {sortKey === "today"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
@@ -11525,22 +11767,6 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   return getAccountRateLimitWindow(account) !== null;
 }
 
-function isUnsampledQuotaAccount(account: AccountRow): boolean {
-  const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
-    return false;
-  }
-  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
-  // 否则这类账号会永远显示"未采样" (issue #282)。
-  const has7d =
-    typeof account.usage_percent_7d === "number" &&
-    Number.isFinite(account.usage_percent_7d);
-  const has5h =
-    typeof account.usage_percent_5h === "number" &&
-    Number.isFinite(account.usage_percent_5h);
-  return !has7d && !has5h;
-}
-
 function getAccountRateLimitWindow(
   account: AccountRow,
 ): RateLimitWindow | null {
@@ -11548,11 +11774,13 @@ function getAccountRateLimitWindow(
   const reason = (account.cooldown_reason || "").toLowerCase();
   const explicitlyRateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "usage_exhausted" ||
     status === "quota_paused" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d" ||
     reason === "rate_limited" ||
+    reason === "responses_rate_limited" ||
     reason === "rate_limited_5h" ||
     reason === "rate_limited_7d";
   const usageWindowsAreInformational =
@@ -12321,7 +12549,10 @@ function AccountRowActionsMenu({
     },
     {
       key: "reset-status",
-      label: t("accounts.resetStatus"),
+      label:
+        account.status === "overload_paused"
+          ? t("accounts.overloadRecover")
+          : t("accounts.resetStatus"),
       icon: <RotateCcw className="size-3.5" />,
       onSelect: onResetStatus,
     },
@@ -12671,19 +12902,21 @@ function AccountMobileCard({
     account.at_only ||
     account.openai_responses_api ||
     account.grok_api ||
-    account.enabled === false ||
     account.locked;
   const modelCooldownCount = account.model_cooldowns?.length ?? 0;
 
   if (isPersonal) {
     return (
       <article
-        className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition-colors ${
+        className={`group relative flex h-full min-w-0 flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition-colors ${
           detailOpen || selected
             ? "border-primary/40 bg-primary/5 ring-1 ring-primary/20"
             : "border-border hover:border-border/80"
-        }`}
+        }${accountStateSurfaceClass(account)}`}
       >
+        {renderAccountStateOverlay(account, t, {
+          onRecover: onResetStatus,
+        })}
         <div className="flex min-w-0 items-start gap-4 p-5 pb-4">
           <input
             type="checkbox"
@@ -12746,7 +12979,9 @@ function AccountMobileCard({
               <PlanBadge planType={account.plan_type} />
               <SchedulerPriorityBadge account={account} />
               <UsingCreditsBadge account={account} />
-              <AccountStatusCountdown account={account} />
+              {account.status !== "overload_paused" && (
+                <AccountStatusCountdown account={account} />
+              )}
               <ExpiryBadge
                 expiresAt={account.subscription_expires_at}
                 planType={account.plan_type}
@@ -12785,8 +13020,12 @@ function AccountMobileCard({
               <div className="shrink-0">
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <StatusBadge
-                    status={account.status}
-                    detail={getAccountRateLimitWindow(account) ?? undefined}
+                    status={getAccountStatusBadgeStatus(account)}
+                    detail={
+                      account.status === "overload_paused"
+                        ? undefined
+                        : getAccountRateLimitWindow(account) ?? undefined
+                    }
                     errorMessage={account.error_message}
                   />
                   {(account.active_requests ?? 0) > 0 && (
@@ -12824,12 +13063,6 @@ function AccountMobileCard({
                     <Sparkles className="size-2.5" />
                     Grok
                     {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
-                  </span>
-                )}
-                {account.enabled === false && (
-                  <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
-                    <PowerOff className="mr-0.5 size-2.5" />
-                    {t("accounts.disabled")}
                   </span>
                 )}
                 {account.locked && (
@@ -12892,22 +13125,7 @@ function AccountMobileCard({
                 icon={<Zap className="size-3.5" />}
                 tone="emerald"
               >
-                <div className="flex items-baseline gap-2 text-[13px]">
-                  <span className="text-base font-semibold text-emerald-600 dark:text-emerald-400">
-                    {account.success_requests ?? 0}
-                  </span>
-                  <span className="text-muted-foreground">/</span>
-                  <span className="font-semibold text-red-500">
-                    {account.error_requests ?? 0}
-                  </span>
-                </div>
-                {((account.retry_error_requests ?? 0) > 0 ||
-                  (account.rate_limit_attempts ?? 0) > 0) && (
-                  <div className="mt-1 text-[11px] text-muted-foreground">
-                    retry {account.retry_error_requests ?? 0} · 429 {" "}
-                    {account.rate_limit_attempts ?? 0}
-                  </div>
-                )}
+                <RequestCountPills account={account} />
               </AccountPersonalMetric>
               <AccountPersonalMetric
                 label={t("accounts.billed")}
@@ -13023,12 +13241,16 @@ function AccountMobileCard({
 
   return (
     <article
-      className={`min-w-0 rounded-xl border bg-card p-3 shadow-sm transition-colors ${
+      className={`relative min-w-0 rounded-xl border bg-card p-3 shadow-sm transition-colors ${
         detailOpen || selected
           ? "border-primary/40 bg-primary/5 ring-1 ring-primary/20"
           : "border-border"
-      }`}
+      }${accountStateSurfaceClass(account, " overflow-hidden")}`}
     >
+      {renderAccountStateOverlay(account, t, {
+        compact: true,
+        onRecover: onResetStatus,
+      })}
       <div className="flex min-w-0 items-start gap-3">
         <input
           type="checkbox"
@@ -13083,13 +13305,19 @@ function AccountMobileCard({
               {(!visibleColumns || visibleColumns.status) && (
                 <div className="flex min-w-[112px] shrink-0 flex-col items-end">
                   <StatusBadge
-                    status={account.status}
-                    detail={getAccountRateLimitWindow(account) ?? undefined}
+                    status={getAccountStatusBadgeStatus(account)}
+                    detail={
+                      account.status === "overload_paused"
+                        ? undefined
+                        : getAccountRateLimitWindow(account) ?? undefined
+                    }
                     errorMessage={account.error_message}
                   />
                   <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
                     <UsingCreditsBadge account={account} />
-                    <AccountStatusCountdown account={account} />
+                    {account.status !== "overload_paused" && (
+                      <AccountStatusCountdown account={account} />
+                    )}
                   </div>
                 </div>
               )}
@@ -13111,12 +13339,6 @@ function AccountMobileCard({
                 <Sparkles className="size-2.5" />
                 Grok
                 {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
-              </span>
-            )}
-            {account.enabled === false && (
-              <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
-                <PowerOff className="mr-0.5 size-2.5" />
-                {t("accounts.disabled")}
               </span>
             )}
             {account.locked && (
@@ -13179,22 +13401,7 @@ function AccountMobileCard({
       >
         {(!visibleColumns || visibleColumns.requests) && (
           <AccountMobileMetric label={t("accounts.requests")} className="min-h-[84px]">
-            <div className="flex items-center gap-2 text-[13px]">
-              <span className="font-medium text-emerald-600">
-                {account.success_requests ?? 0}
-              </span>
-              <span className="text-muted-foreground">/</span>
-              <span className="font-medium text-red-500">
-                {account.error_requests ?? 0}
-              </span>
-            </div>
-            {((account.retry_error_requests ?? 0) > 0 ||
-              (account.rate_limit_attempts ?? 0) > 0) && (
-              <div className="mt-0.5 text-[11px] text-muted-foreground">
-                retry {account.retry_error_requests ?? 0} · 429{" "}
-                {account.rate_limit_attempts ?? 0}
-              </div>
-            )}
+            <RequestCountPills account={account} compact />
           </AccountMobileMetric>
         )}
         {(!visibleColumns || visibleColumns.billed) && (
@@ -14079,11 +14286,21 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
   ]
     .filter(Boolean)
     .join("\n");
+  const modelBreakdown = buildModelCountBreakdown(detail.model_counts, requests);
 
-  return (
+  const content = (
     <div
-      className="flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums cursor-default"
-      title={tooltip}
+      className={cn(
+        "flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums",
+        requests > 0 ? "cursor-help" : "cursor-default",
+      )}
+      title={requests > 0 ? undefined : tooltip}
+      tabIndex={requests > 0 ? 0 : undefined}
+      aria-label={
+        requests > 0
+          ? t("accounts.todayModelTooltipAria", { count: requests })
+          : undefined
+      }
     >
       <div className="flex items-center gap-2">
         <span
@@ -14154,6 +14371,36 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
         )}
       </div>
     </div>
+  );
+
+  if (requests <= 0) {
+    return content;
+  }
+
+  return (
+    <CountBreakdownTooltip
+      title={t("accounts.todayModelTooltipTitle")}
+      empty={t("accounts.todayModelEmpty")}
+      total={requests}
+      rows={modelBreakdown.map((row) => {
+        const success = detail.model_success_counts?.[row.key];
+        return {
+          key: row.key,
+          label: row.key === "unknown" ? t("accounts.unknownModel") : row.key,
+          count: row.count,
+          percent: row.percent,
+          successRate:
+            typeof success === "number" && row.count > 0
+              ? (success / row.count) * 100
+              : undefined,
+        };
+      })}
+      showModelIcon
+      tone="today"
+      barClassName="bg-gradient-to-r from-sky-400 to-violet-300"
+    >
+      {content}
+    </CountBreakdownTooltip>
   );
 }
 
@@ -14295,11 +14542,17 @@ function BilledCell({
   const { t } = useTranslation();
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
-  const showOfficial = isCodexOfficialAccount(account);
+  const showOfficial =
+    isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
+  // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
   const officialSynced = account.official_usage_synced === true;
-  const officialPending = showOfficial && official === null && !officialSynced;
+  const officialPending =
+    showOfficial &&
+    official === null &&
+    !officialSynced &&
+    !isOfficialCostTooNew(account);
   const [officialSpinTimedOut, setOfficialSpinTimedOut] = useState(false);
   useEffect(() => {
     if (!officialPending) return undefined;
@@ -14394,11 +14647,15 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   const rateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d";
   if (
     account.cooldown_until &&
-    (rateLimited || status === "error" || status === "cooldown")
+    (rateLimited ||
+      status === "error" ||
+      status === "cooldown" ||
+      status === "overload_paused")
   ) {
     return account.cooldown_until;
   }
@@ -14428,36 +14685,8 @@ function AccountStatusCountdown({ account }: { account: AccountRow }) {
 
 // 冷却倒计时组件
 function CooldownTimer({ until }: { until: string }) {
-  const [remaining, setRemaining] = useState("");
+  const remaining = useCountdownRemaining(until);
   const title = formatBeijingTime(until);
-
-  useEffect(() => {
-    const target = new Date(until).getTime();
-
-    const update = () => {
-      const diff = Math.max(0, target - Date.now());
-      if (diff <= 0) {
-        setRemaining("");
-        return;
-      }
-      const h = Math.floor(diff / 3600000);
-      const m = Math.floor((diff % 3600000) / 60000);
-      const s = Math.floor((diff % 60000) / 1000);
-      if (h > 0) {
-        setRemaining(
-          `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`,
-        );
-      } else if (m > 0) {
-        setRemaining(`${m}m ${String(s).padStart(2, "0")}s`);
-      } else {
-        setRemaining(`${s}s`);
-      }
-    };
-
-    update();
-    const id = setInterval(update, 1000);
-    return () => clearInterval(id);
-  }, [until]);
 
   if (!remaining) return null;
   return (

@@ -30,6 +30,7 @@ import {
   RotateCcw,
   Pencil,
   BarChart3,
+  Layers,
 } from "lucide-react";
 import { api, getAdminKey } from "../api";
 import type { ProxyRow } from "../api";
@@ -41,6 +42,7 @@ import type {
   AccountListSummary,
   AccountOperationSelector,
   AddGrokAccountRequest,
+  BatchUpdateGrokModelsRequest,
   GrokSSOImportItem,
   GrokAccountState,
   GrokModelCatalogItem,
@@ -48,6 +50,11 @@ import type {
   AccountLiveStateResponse,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills from "../components/RequestCountPills";
+import {
+  disabledAccountSurfaceClass,
+  renderDisabledAccountOverlay,
+} from "../components/AccountStateOverlay";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   isAccountGroupFilterEmpty,
@@ -167,7 +174,7 @@ interface GrokRowHandlers {
   edit: (account: AccountRow) => void;
   editGroups: (account: AccountRow) => void;
   remove: (account: AccountRow) => void;
-  usageRefreshed: () => void;
+  usageRefreshed: (account: AccountRow) => void;
 }
 
 function resolveAccountGroups(
@@ -180,6 +187,10 @@ function resolveAccountGroups(
 }
 
 function accountUsageSortValue(account: AccountRow): number {
+  const monthly = account.grok_billing?.monthly_percent;
+  if (typeof monthly === "number") return monthly;
+  const weekly = account.grok_billing?.weekly_percent;
+  if (typeof weekly === "number") return weekly;
   if (typeof account.usage_percent_7d === "number") return account.usage_percent_7d;
   if (typeof account.usage_percent_5h === "number") return account.usage_percent_5h;
   return -1;
@@ -518,6 +529,9 @@ function GrokAccounts({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [exporting, setExporting] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [batchModelsOpen, setBatchModelsOpen] = useState(false);
+  const [batchModelsDraft, setBatchModelsDraft] = useState<string[]>([]);
+  const [batchModelInput, setBatchModelInput] = useState("");
   const selectAllRef = useRef<HTMLInputElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -941,7 +955,9 @@ function GrokAccounts({
     edit: (account) => openEdit(account),
     editGroups: (account) => openQuickGroupEditor(account),
     remove: (account) => void handleDelete(account),
-    usageRefreshed: () => void reload(),
+    usageRefreshed: (account) => {
+      void refreshAccountRow(account.id);
+    },
   };
   const rowHandlers = useMemo<GrokRowHandlers>(
     () => ({
@@ -954,7 +970,7 @@ function GrokAccounts({
       edit: (account) => rowHandlersRef.current.edit(account),
       editGroups: (account) => rowHandlersRef.current.editGroups(account),
       remove: (account) => rowHandlersRef.current.remove(account),
-      usageRefreshed: () => rowHandlersRef.current.usageRefreshed(),
+      usageRefreshed: (account) => rowHandlersRef.current.usageRefreshed(account),
     }),
     [],
   );
@@ -1682,6 +1698,65 @@ function GrokAccounts({
     }
   };
 
+  const openBatchSetModels = () => {
+    if (selectedIds.length === 0) return;
+    setBatchModelsDraft([]);
+    setBatchModelInput("");
+    setBatchModelsOpen(true);
+  };
+
+  const batchAddModels = (raw: string) => {
+    const tokens = parseModelTokens(raw);
+    if (tokens.length === 0) return;
+    setBatchModelsDraft((current) => mergeModels(current, tokens));
+    setBatchModelInput("");
+  };
+
+  const batchRemoveModel = (model: string) =>
+    setBatchModelsDraft((current) => current.filter((item) => item !== model));
+
+  const batchTogglePreset = (model: string) => {
+    setBatchModelsDraft((current) => {
+      const exists = current.some(
+        (item) => item.toLowerCase() === model.toLowerCase(),
+      );
+      if (exists) {
+        return current.filter(
+          (item) => item.toLowerCase() !== model.toLowerCase(),
+        );
+      }
+      return mergeModels(current, [model]);
+    });
+  };
+
+  const handleBatchSetModels = async () => {
+    if (selectedIds.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const payload: BatchUpdateGrokModelsRequest = {
+        ids: selectedIds,
+        models: batchModelsDraft,
+      };
+      const res = await api.batchUpdateGrokModels(payload);
+      showToast(
+        t("grok.batchSetModelsDone", {
+          success: res.success ?? 0,
+          fail: res.failed ?? 0,
+        }),
+      );
+      setBatchModelsOpen(false);
+      clearSelection();
+      await reload();
+    } catch (err) {
+      showToast(
+        t("grok.batchSetModelsFailed", { error: getErrorMessage(err) }),
+        "error",
+      );
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   const handleBatchEnabled = async (enabled: boolean) => {
     if (selectedIds.length === 0) return;
     setBatchBusy(true);
@@ -2152,6 +2227,17 @@ function GrokAccounts({
                   {batchTesting
                     ? t("accounts.batchTesting")
                     : t("accounts.batchTest")}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={batchBusy || batchTesting}
+                onClick={openBatchSetModels}
+              >
+                <Layers className="size-3.5" />
+                <span className="hidden sm:inline">
+                  {t("grok.batchSetModels")}
                 </span>
               </Button>
               <Button
@@ -3010,7 +3096,9 @@ function GrokAccounts({
             <GrokUsageCell
               account={detailAccount}
               detailed
-              onRefreshed={() => void reload()}
+              onRefreshed={() => {
+                void refreshAccountRow(detailAccount.id);
+              }}
             />
           ) : null
         }
@@ -3257,6 +3345,131 @@ function GrokAccounts({
       </Modal>
 
       <Modal
+        show={batchModelsOpen}
+        title={t("grok.batchSetModelsTitle")}
+        contentClassName="sm:max-w-[560px]"
+        onClose={() => {
+          if (!batchBusy) setBatchModelsOpen(false);
+        }}
+        footer={
+          <>
+            <Button
+              variant="outline"
+              disabled={batchBusy}
+              onClick={() => setBatchModelsOpen(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              onClick={() => void handleBatchSetModels()}
+              disabled={batchBusy}
+            >
+              {batchBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : null}
+              {t("grok.batchSetModelsApply", { count: selectedIds.length })}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            {t("grok.batchSetModelsDesc", { count: selectedIds.length })}
+          </p>
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label className="text-sm font-medium text-muted-foreground">
+                {t("grok.models")}
+              </label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={batchBusy || batchModelsDraft.length === 0}
+                onClick={() => setBatchModelsDraft([])}
+              >
+                {t("grok.batchSetModelsClear")}
+              </Button>
+            </div>
+            <p className="mb-2 text-xs text-muted-foreground">
+              {t("grok.batchSetModelsPresetHint")}
+            </p>
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {DEFAULT_GROK_TEST_MODELS.map((model) => {
+                const isPicked = batchModelsDraft.some(
+                  (item) => item.toLowerCase() === model.toLowerCase(),
+                );
+                return (
+                  <button
+                    key={model}
+                    type="button"
+                    disabled={batchBusy}
+                    onClick={() => batchTogglePreset(model)}
+                    className={cn(
+                      "rounded-md px-2 py-1 font-mono text-[11px] font-medium ring-1 ring-inset transition-colors",
+                      isPicked
+                        ? "bg-primary/10 text-primary ring-primary/30"
+                        : "bg-muted/40 text-muted-foreground ring-border hover:bg-accent hover:text-foreground",
+                    )}
+                  >
+                    {model}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mb-2 flex gap-2">
+              <Input
+                placeholder={t("grok.modelsPlaceholder")}
+                value={batchModelInput}
+                disabled={batchBusy}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setBatchModelInput(e.target.value)
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    batchAddModels(batchModelInput);
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={batchBusy || !batchModelInput.trim()}
+                onClick={() => batchAddModels(batchModelInput)}
+              >
+                <Plus className="size-3.5" />
+              </Button>
+            </div>
+            {batchModelsDraft.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                {t("grok.batchSetModelsEmptyHint")}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {batchModelsDraft.map((model) => (
+                  <span
+                    key={model}
+                    className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium"
+                  >
+                    {model}
+                    <button
+                      type="button"
+                      disabled={batchBusy}
+                      onClick={() => batchRemoveModel(model)}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
         show={editAccount !== null}
         title={t("grok.editTitle")}
         contentClassName="sm:max-w-[560px]"
@@ -3442,7 +3655,7 @@ const MemoGrokAccountTableRow = memo(function MemoGrokAccountTableRow({
       onEdit={() => handlers.edit(account)}
       onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3488,7 +3701,7 @@ const MemoGrokAccountCard = memo(function MemoGrokAccountCard({
       onEdit={() => handlers.edit(account)}
       onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3545,9 +3758,8 @@ function GrokAccountCard({
           ? "border-primary/60 ring-1 ring-primary/30"
           : selected
             ? "border-primary/40 ring-1 ring-primary/20"
-            : disabled
-              ? "border-border/70 opacity-80"
-              : "border-border hover:border-border hover:shadow-md",
+            : "border-border hover:border-border hover:shadow-md",
+        disabledAccountSurfaceClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3561,6 +3773,7 @@ function GrokAccountCard({
         onOpenDetail();
       }}
     >
+      {renderDisabledAccountOverlay(account, t)}
       <div className="flex flex-1 flex-col gap-3.5 p-4 sm:p-5">
         {/* Header: identity + status + actions */}
         <div className="flex min-w-0 items-start gap-3">
@@ -3577,10 +3790,7 @@ function GrokAccountCard({
             size={44}
             variant="ring"
             title="Grok"
-            className={cn(
-              "shrink-0 shadow-sm",
-              disabled && "opacity-60 grayscale",
-            )}
+            className="shrink-0 shadow-sm"
           />
 
           <div className="min-w-0 flex-1">
@@ -3662,12 +3872,6 @@ function GrokAccountCard({
             onClick={onEditGroups}
             emptyLabel={t("accounts.groupQuickEdit")}
           />
-          {disabled ? (
-            <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
-              <PowerOff className="mr-0.5 size-2.5" />
-              {t("accounts.disabled")}
-            </span>
-          ) : null}
         </div>
 
         {/* Usage panel */}
@@ -3876,8 +4080,8 @@ function GrokAccountTableRow({
     <TableRow
       className={cn(
         "cursor-pointer",
-        disabled && "opacity-70",
         detailOpen ? "bg-primary/8" : selected && "bg-primary/5",
+        disabledAccountSurfaceClass(account, " relative"),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3892,6 +4096,7 @@ function GrokAccountTableRow({
       }}
     >
       <TableCell className="w-9">
+        {renderDisabledAccountOverlay(account, t, { compact: true })}
         <input
           type="checkbox"
           className="size-4 cursor-pointer rounded border-border accent-primary"
@@ -3911,7 +4116,7 @@ function GrokAccountTableRow({
             size={32}
             variant="ring"
             title="Grok"
-            className={cn("shrink-0", disabled && "opacity-60 grayscale")}
+            className="shrink-0"
           />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -3985,24 +4190,7 @@ function GrokAccountTableRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="space-y-0.5 text-[13px]">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="font-medium tabular-nums text-[hsl(var(--success))]">
-              {account.success_requests ?? 0}
-            </span>
-            <span className="text-muted-foreground">/</span>
-            <span className="font-medium tabular-nums text-destructive">
-              {account.error_requests ?? 0}
-            </span>
-          </div>
-          {((account.retry_error_requests ?? 0) > 0 ||
-            (account.rate_limit_attempts ?? 0) > 0) && (
-            <div className="whitespace-nowrap text-[11px] text-muted-foreground">
-              retry {account.retry_error_requests ?? 0} · 429{" "}
-              {account.rate_limit_attempts ?? 0}
-            </div>
-          )}
-        </div>
+        <RequestCountPills account={account} compact />
       </TableCell>
       <TableCell className="min-w-[170px]">
         <GrokUsageCell account={account} onRefreshed={onUsageRefreshed} />

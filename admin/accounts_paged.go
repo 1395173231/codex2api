@@ -23,7 +23,11 @@ const (
 	// 不需要 10s 级新鲜度;前端静默刷新退避后轮询间隔最长 80s,TTL 太短会让
 	// 几乎每次轮询都撞上过期缓存、stats_state 长期停在 stale(表现为
 	// 「统计刷新中…」常驻)。
-	requestCountCacheTTL = 30 * time.Second
+	// 另一侧约束:刷新是对全渠道账号扫 7 天 usage_logs 的三条 GROUP BY,
+	// 万级号池 + 大日志量下单轮就要秒级;TTL 过短等于让这组重查询近乎
+	// 永续循环,把数据库拖垮(表现为管理页整体变慢、接口超时)。统计本身
+	// 是 7 天累计值,分钟级陈旧完全可接受。
+	requestCountCacheTTL = 5 * time.Minute
 )
 
 type accountListSnapshot struct {
@@ -57,6 +61,9 @@ type accountListSnapshotItem struct {
 	UsagePercent7d     float64
 	UsagePercent7dOK   bool
 	RequestCount       int64
+	TodayRequests      int64
+	TodayTokens        int64
+	TodayAccountBilled float64
 	SchedulerPriority  int64
 	HealthTier         string
 	DispatchScore      float64
@@ -78,6 +85,7 @@ type accountListSummary struct {
 	Total                int `json:"total"`
 	Normal               int `json:"normal"`
 	Active               int `json:"active"`
+	OverloadPaused       int `json:"overload_paused"`
 	RateLimited          int `json:"rate_limited"`
 	RateLimited5h        int `json:"rate_limited_5h"`
 	RateLimited7d        int `json:"rate_limited_7d"`
@@ -286,7 +294,7 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 		return query, fmt.Errorf("order must be asc or desc")
 	}
 	validSorts := map[string]bool{
-		"": true, "requests": true, "usage": true, "created_at": true, "updated_at": true,
+		"": true, "requests": true, "today": true, "usage": true, "created_at": true, "updated_at": true,
 		"scheduler_priority": true, "group": true, "risk": true, "dispatch_score": true,
 		"latency_penalty": true, "unauthorized": true,
 	}
@@ -301,8 +309,8 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 
 func validateAccountPageFilters(query accountPageQuery) error {
 	validStatuses := map[string]bool{
-		"": true, "all": true, "normal": true, "active": true,
-		"rate_limited": true, "abnormal": true, "banned": true,
+		"": true, "all": true, "normal": true, "active": true, "scheduling": true,
+		"overload_paused": true, "rate_limited": true, "abnormal": true, "banned": true,
 		"error": true, "unsampled": true, "disabled": true, "locked": true,
 	}
 	if !validStatuses[query.Status] {
@@ -492,10 +500,10 @@ func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string
 	for _, row := range rows {
 		channelIDs = append(channelIDs, row.ID)
 	}
-	requestCounts, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
+	requestCounts, todayUsage, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
 	items := make([]*accountListSnapshotItem, 0, len(rows))
 	for _, row := range rows {
-		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, groupNames, groupSort))
+		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, todayUsage, groupNames, groupSort))
 	}
 	snapshot := &accountListSnapshot{
 		Channel: channel, Items: items, BuiltAt: time.Now(), StatsState: statsState,
@@ -520,7 +528,7 @@ func (h *Handler) installAccountListSnapshot(channel string, snapshot *accountLi
 	h.accountListCacheMu.Unlock()
 }
 
-func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
+func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, todayUsage map[int64]*database.AccountTimeRangeUsage, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isGrok := strings.EqualFold(upstreamType, auth.UpstreamGrok)
 	isOpenAIResponses := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
@@ -593,6 +601,11 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 	if counts := requestCounts[row.ID]; counts != nil {
 		item.RequestCount = counts.SuccessCount + counts.ErrorCount
 	}
+	if today := todayUsage[row.ID]; today != nil {
+		item.TodayRequests = today.Requests
+		item.TodayTokens = today.Tokens
+		item.TodayAccountBilled = today.AccountBilled
+	}
 	groupKeys := make([]string, 0, len(item.GroupIDs))
 	groupLabels := make([]string, 0, len(item.GroupIDs))
 	for _, id := range item.GroupIDs {
@@ -624,26 +637,38 @@ func valueOrZero(value *int64) int64 {
 
 // requestCountCacheEntry 是单个渠道的请求数统计缓存。
 type requestCountCacheEntry struct {
-	counts    map[int64]*database.AccountRequestCount
-	expiresAt time.Time
+	counts     map[int64]*database.AccountRequestCount
+	today      map[int64]*database.AccountTimeRangeUsage
+	todayStart time.Time
+	expiresAt  time.Time
+}
+
+func requestCountCacheReady(entry *requestCountCacheEntry, now time.Time) bool {
+	if entry == nil || !now.Before(entry.expiresAt) {
+		return false
+	}
+	if entry.todayStart.IsZero() {
+		return true
+	}
+	return database.StartOfDay(now).Equal(entry.todayStart)
 }
 
 // getCachedRequestCountsNonBlocking 返回指定渠道的请求数统计。统计按渠道独立
 // 缓存与刷新:在 codex 页刷新只扫 codex 账号的日志行,不为 grok 账号买单,
 // 反之亦然。ids 是该渠道当前的账号列表,过期时交给后台刷新用。
-func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, string) {
+func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, map[int64]*database.AccountTimeRangeUsage, string) {
 	now := time.Now()
 	h.reqCountMu.RLock()
 	entry := h.reqCountCache[channel]
 	h.reqCountMu.RUnlock()
-	if entry != nil && now.Before(entry.expiresAt) {
-		return entry.counts, "ready"
+	if requestCountCacheReady(entry, now) {
+		return entry.counts, entry.today, "ready"
 	}
 	h.refreshRequestCountsAsync(channel, ids)
 	if entry != nil {
-		return entry.counts, "stale"
+		return entry.counts, entry.today, "stale"
 	}
-	return map[int64]*database.AccountRequestCount{}, "warming"
+	return map[int64]*database.AccountRequestCount{}, map[int64]*database.AccountTimeRangeUsage{}, "warming"
 }
 
 func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
@@ -665,6 +690,7 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		started := time.Now()
 		counts, err := h.db.GetAccountRequestCountsByIDs(ctx, ids)
 		if err != nil {
 			// 静默失败会让请求数/用量排序与统计永久停在 warming 且无从排查
@@ -672,7 +698,21 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 			log.Printf("刷新账号请求统计失败 channel=%s(排序/统计将继续使用旧值): %v", channel, err)
 			return
 		}
-		h.storeRequestCountCache(channel, counts)
+		todayStart := database.StartOfDay(time.Now())
+		today, todayErr := h.db.GetAccountUsageSinceByIDs(ctx, ids, todayStart)
+		if todayErr != nil {
+			log.Printf("刷新账号今日统计失败 channel=%s(今日排序将继续使用旧值): %v", channel, todayErr)
+			h.reqCountMu.RLock()
+			if old := h.reqCountCache[channel]; old != nil {
+				today = old.today
+				todayStart = old.todayStart
+			}
+			h.reqCountMu.RUnlock()
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			log.Printf("账号请求统计刷新耗时 %s channel=%s ids=%d(全池 7 天聚合,持续偏慢说明数据库吃紧)", elapsed.Round(time.Millisecond), channel, len(ids))
+		}
+		h.storeRequestCountCache(channel, counts, today, todayStart)
 		// stats_state 是烙在列表快照里的:快照重建时统计缓存还没刷完,烙出来
 		// 就是 stale,并一直随快照被返回。统计刷完后把本渠道快照标记为过期,
 		// 下一次轮询即触发重建、烙上 ready——否则要等快照自然过期再叠一轮轮询,
@@ -681,14 +721,16 @@ func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
 	}()
 }
 
-func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount) {
+func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount, today map[int64]*database.AccountTimeRangeUsage, todayStart time.Time) {
 	h.reqCountMu.Lock()
 	if h.reqCountCache == nil {
 		h.reqCountCache = make(map[string]*requestCountCacheEntry)
 	}
 	h.reqCountCache[channel] = &requestCountCacheEntry{
-		counts:    counts,
-		expiresAt: time.Now().Add(requestCountCacheTTL),
+		counts:     counts,
+		today:      today,
+		todayStart: todayStart,
+		expiresAt:  time.Now().Add(requestCountCacheTTL),
 	}
 	h.reqCountMu.Unlock()
 }
@@ -719,8 +761,15 @@ func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuer
 			return false
 		}
 	}
-	if query.AuthKind != "" && query.AuthKind != "all" && item.GrokAuthKind != query.AuthKind {
-		return false
+	if query.AuthKind != "" && query.AuthKind != "all" {
+		if channel == database.UpstreamChannelGrok {
+			if item.GrokAuthKind != query.AuthKind {
+				return false
+			}
+		} else if item.OpenAIResponses != (query.AuthKind == auth.GrokAuthKindAPIKey) {
+			// Codex 渠道复用 auth_kind：api_key=Responses API 中转账号，oauth=官方账号（issue #522）
+			return false
+		}
 	}
 	if query.Tag != "" && !containsString(item.Tags, query.Tag) {
 		return false
@@ -772,8 +821,12 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	limited := accountListRateLimited(item)
 	if channel == database.UpstreamChannelGrok {
 		switch status {
-		case "active", "normal":
-			return item.Enabled && !banned && !errorState && !limited
+		case "normal":
+			return accountListNormal(item)
+		case "active", "scheduling":
+			return accountListSchedulable(item)
+		case "overload_paused":
+			return accountListOverloadPaused(item)
 		case "rate_limited":
 			return limited
 		case "disabled":
@@ -786,8 +839,13 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 		return true
 	}
 	switch status {
-	case "normal", "active":
-		return !banned && !errorState && !limited
+	case "normal":
+		// 过载暂停、禁用都归入「正常」；真正可调度的账号走 scheduling/active。
+		return accountListNormal(item)
+	case "active", "scheduling":
+		return accountListSchedulable(item)
+	case "overload_paused":
+		return accountListOverloadPaused(item)
 	case "rate_limited":
 		return !banned && !errorState && limited
 	case "abnormal":
@@ -797,7 +855,7 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	case "error":
 		return errorState
 	case "unsampled":
-		return !item.OpenAIResponses && !item.UsagePercent5hOK && !item.UsagePercent7dOK
+		return accountListUnsampled(item)
 	case "disabled":
 		return !item.Enabled
 	case "locked":
@@ -806,13 +864,54 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	return true
 }
 
+func accountListOverloadPaused(item *accountListSnapshotItem) bool {
+	return strings.EqualFold(item.Status, "overload_paused") ||
+		strings.EqualFold(item.CooldownReason, "overload_paused")
+}
+
+func accountListUnsampled(item *accountListSnapshotItem) bool {
+	if item == nil || item.OpenAIResponses || item.GrokAuthKind != "" {
+		return false
+	}
+	if item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	// k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样。
+	return !item.UsagePercent5hOK && !item.UsagePercent7dOK
+}
+
+func accountListNormal(item *accountListSnapshotItem) bool {
+	if item.Status == "unauthorized" || item.Status == "error" || accountListUnsampled(item) {
+		return false
+	}
+	if !item.Enabled || accountListOverloadPaused(item) {
+		return true
+	}
+	return !accountListRateLimited(item)
+}
+
+func accountListSchedulable(item *accountListSnapshotItem) bool {
+	return item.Enabled &&
+		item.Status != "unauthorized" &&
+		item.Status != "error" &&
+		!accountListUnsampled(item) &&
+		!accountListRateLimited(item) &&
+		!accountListOverloadPaused(item)
+}
+
 func accountListRateLimited(item *accountListSnapshotItem) bool {
 	if item.UsingCredits || item.Status == "unauthorized" || item.Status == "error" {
 		return false
 	}
+	if accountListOverloadPaused(item) {
+		return false
+	}
 	limited := map[string]bool{
 		"usage_limited": true, "usage_exhausted": true, "rate_limited": true,
-		"rate_limited_5h": true, "rate_limited_7d": true, "quota_paused": true,
+		auth.ResponsesRateLimitedCooldownReason: true,
+		"rate_limited_5h":                       true,
+		"rate_limited_7d":                       true,
+		"quota_paused":                          true,
 	}
 	return limited[strings.ToLower(item.Status)] || limited[strings.ToLower(item.CooldownReason)]
 }
@@ -824,6 +923,14 @@ func sortAccountListItems(items []*accountListSnapshotItem, key, order string) {
 		switch key {
 		case "requests":
 			cmp = compareInt64(a.RequestCount, b.RequestCount)
+		case "today":
+			cmp = compareInt64(a.TodayRequests, b.TodayRequests)
+			if cmp == 0 {
+				cmp = compareInt64(a.TodayTokens, b.TodayTokens)
+			}
+			if cmp == 0 {
+				cmp = compareFloat64(a.TodayAccountBilled, b.TodayAccountBilled)
+			}
 		case "usage":
 			cmp = compareFloat64(accountListUsageValue(a), accountListUsageValue(b))
 		case "created_at":
@@ -921,6 +1028,7 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		banned := item.Status == "unauthorized"
 		errorState := item.Status == "error"
 		limited := accountListRateLimited(item)
+		overloadPaused := accountListOverloadPaused(item)
 		if banned {
 			summary.Banned++
 		}
@@ -929,6 +1037,9 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if banned || errorState {
 			summary.Abnormal++
+		}
+		if overloadPaused {
+			summary.OverloadPaused++
 		}
 		if limited {
 			summary.RateLimited++
@@ -941,10 +1052,10 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 				summary.RateLimited5h++
 			}
 		}
-		if !banned && !errorState && !limited {
+		if accountListNormal(item) {
 			summary.Normal++
 		}
-		if item.Enabled && !banned && !errorState && !limited {
+		if accountListSchedulable(item) {
 			summary.Active++
 		}
 		if !item.Enabled {
@@ -953,7 +1064,7 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		if item.Locked {
 			summary.Locked++
 		}
-		if !item.OpenAIResponses && !item.UsagePercent5hOK && !item.UsagePercent7dOK {
+		if accountListUnsampled(item) {
 			summary.Unsampled++
 		}
 		switch item.HealthTier {
@@ -969,6 +1080,13 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if item.GrokAuthKind == auth.GrokAuthKindAPIKey {
 			summary.APIKey++
+		}
+		if channel == database.UpstreamChannelCodex {
+			if item.OpenAIResponses {
+				summary.APIKey++
+			} else {
+				summary.OAuth++
+			}
 		}
 		if channel == database.UpstreamChannelCodex && accountListSubscriptionPlan(item.PlanType) && !item.Locked {
 			summary.SubscriptionUnlocked++

@@ -211,6 +211,27 @@ func sessionAffinityKey(sessionID string, apiKeyID int64) string {
 	return fmt.Sprintf("%s::api-key:%d", sessionID, apiKeyID)
 }
 
+const codexTurnStateHeader = "X-Codex-Turn-State"
+
+// codexTurnContinuationToken follows the official Codex per-turn contract:
+// HTTP sends the token as a header, while Responses WebSocket v2 sends it in
+// response.create client_metadata after the first request in that turn.
+func codexTurnContinuationToken(headers http.Header, body []byte) string {
+	if headers != nil {
+		if token := strings.TrimSpace(headers.Get(codexTurnStateHeader)); token != "" {
+			return token
+		}
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-turn-state").String())
+}
+
+// codexWSTurnContinuationToken reads per-frame metadata only. Upgrade headers
+// are connection-scoped and cannot prove that every response.create belongs to
+// the same active turn.
+func codexWSTurnContinuationToken(body []byte) string {
+	return codexTurnContinuationToken(nil, body)
+}
+
 // applyAffinityGroupRouting keeps fingerprinted requests on the API key's original groups
 // and routes requests without either a Codex engine fingerprint or the dedicated local
 // affinity header to the configured split groups.
@@ -509,6 +530,18 @@ func noAvailableAccountError(model string) gin.H {
 }
 
 func usageLogErrorMessage(statusCode int, body []byte) string {
+	return usageLogErrorMessageImpl(statusCode, body, false)
+}
+
+// usageLogFailureMessage 记录网关自产的失败诊断（传输错误、断流原因、重试上下文等）。
+// 与上游任意响应体不同，这些文本由网关代码拼装，脱敏截断后保留原文；否则断流类
+// 错误在用量页只剩裸状态码，根因全靠翻容器日志（issue #524）。仍先尝试 JSON 提取，
+// 因为部分诊断原样包含上游错误帧。
+func usageLogFailureMessage(statusCode int, message string) string {
+	return usageLogErrorMessageImpl(statusCode, []byte(message), true)
+}
+
+func usageLogErrorMessageImpl(statusCode int, body []byte, trustedText bool) string {
 	if statusCode < 400 {
 		return ""
 	}
@@ -559,8 +592,16 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 	if message == "" {
 		// HTML and plain-text provider pages routinely contain request IDs,
 		// internal routing details or echoed credentials. They are not an API
-		// contract, so persist only the transport status instead of the body.
-		return fmt.Sprintf("HTTP %d", statusCode)
+		// contract, so persist only the transport status instead of the body —
+		// unless the caller marked the text as gateway-generated (trustedText).
+		if !trustedText {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		raw := strings.TrimSpace(string(body))
+		if raw == "" {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		message = raw
 	}
 
 	parts := make([]string, 0, 3)
@@ -833,10 +874,12 @@ func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol Gro
 			}
 		}
 		isVisible := frame.HasData && !frame.Done && grokNativeVisibleEvent(protocol, frame.Data)
-		// Preserve the pre-output retry window. Lifecycle/role-only frames are
-		// buffered until the first visible delta; a failure before then produces
-		// no downstream bytes and the handler may safely select another account.
-		if !visible && !isTerminal && !isVisible {
+		// Hold only the frames that must stay invisible for a silent retry.
+		// Responses used to buffer every non-text frame until the first
+		// output_text.delta (issue #207's anti-pattern); reasoning models then
+		// looked synchronous because thinking/structure never reached the client
+		// (issue #521). Chat/Messages still hold role-only / start frames.
+		if holdGrokNativePreOutput(protocol, frame, visible, isTerminal, isVisible) {
 			if pending.Len()+len(frame.Raw) > grokMaxNativeSSEPendingBytes {
 				frameErr = fmt.Errorf("Grok pre-output SSE exceeds %d bytes", grokMaxNativeSSEPendingBytes)
 				return false
@@ -887,6 +930,26 @@ func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol Gro
 		flusher.Flush()
 	}
 	return usage, outcome, wrote, firstTokenMs
+}
+
+func holdGrokNativePreOutput(protocol GrokProtocol, frame rawGrokSSEFrame, alreadyVisible, isTerminal, isVisible bool) bool {
+	if alreadyVisible || isTerminal || isVisible {
+		return false
+	}
+	if auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolResponses {
+		if !frame.HasData || frame.Done {
+			return false
+		}
+		return isPreContentLifecycleEvent(gjson.GetBytes(frame.Data, "type").String())
+	}
+	return true
+}
+
+// GrokStreamEventIsVisible reports whether a native Grok SSE payload carries
+// model output the client can see. Capability probes reuse this so usage_logs
+// first_token_ms is not left at 0 for otherwise successful streams.
+func GrokStreamEventIsVisible(protocol GrokProtocol, payload []byte) bool {
+	return grokNativeVisibleEvent(protocol, payload)
 }
 
 func grokNativeVisibleEvent(protocol GrokProtocol, payload []byte) bool {
@@ -1115,6 +1178,8 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 			}
 		}
 	}
+	// 过载熔断统计（仅 Codex 渠道，需在渠道固化之后）。
+	h.noteOverloadOutcome(input)
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
 
@@ -1211,7 +1276,7 @@ func (h *Handler) logContinueThinkingRounds(c *gin.Context, res continueFoldResu
 			// 否则会污染重试统计并与外层 attempt 编号混淆。
 		}
 		if round.ErrMessage != "" {
-			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(round.ErrMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(statusCode, round.ErrMessage)
 			logInput.UpstreamErrorKind = "continue_thinking_error"
 		}
 		if round.Usage != nil {
@@ -2000,6 +2065,8 @@ func responseFailedStatusCode(payload []byte) int {
 		return http.StatusPaymentRequired
 	case strings.Contains(codeOrType, "forbidden"):
 		return http.StatusForbidden
+	case strings.Contains(codeOrType, "previous_response_not_found"):
+		return http.StatusBadRequest
 	// 确定性客户端错误：输入超上下文窗口/字段超长/模型不存在等，换号重试
 	// 也必然失败。归为 400，避免落入 default 500 触发透明重试并惩罚账号
 	// 健康度 (issue #310)。
@@ -2251,6 +2318,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.POST("/images/edits", h.ImagesEdits)
+	// Grok 生视频:异步任务创建 + 客户端轮询 + 产物代理下载
+	v1.POST("/videos/generations", h.VideosGenerations)
+	v1.POST("/videos/edits", h.VideosEdits)
+	v1.POST("/videos/extensions", h.VideosExtensions)
+	v1.GET("/videos/:request_id", h.VideosStatus)
+	v1.GET("/videos/:request_id/content", h.VideosContent)
 	v1.POST("/messages", h.Messages)
 	v1.POST("/messages/count_tokens", h.CountTokens)
 	v1.POST("/responses/input_tokens", h.ResponsesInputTokens)
@@ -2269,6 +2342,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.POST("/images/edits", auth, h.ImagesEdits)
+	r.POST("/videos/generations", auth, h.VideosGenerations)
+	r.POST("/videos/edits", auth, h.VideosEdits)
+	r.POST("/videos/extensions", auth, h.VideosExtensions)
+	r.GET("/videos/:request_id", auth, h.VideosStatus)
+	r.GET("/videos/:request_id/content", auth, h.VideosContent)
 	r.POST("/messages", auth, h.Messages)
 	r.POST("/messages/count_tokens", auth, h.CountTokens)
 	r.POST("/responses/input_tokens", auth, h.ResponsesInputTokens)
@@ -2485,10 +2563,13 @@ func shouldWriteStreamBreakEvent(gotTerminal, wroteAnyBody bool, ctxErr, writeEr
 // 403 也视为可重试：Codex 上游 403 全是账号侧问题（payment_required /
 // deactivated_workspace / codex_access_restricted 等 OAuth/套餐/工作区维度），
 // 非请求内容问题，换到号池里其他健康账号即可继续（issue #396）。
+// 402 同理：deactivated_workspace（team 空间被封）等计费维度拒绝是纯账号侧
+// 问题，applyCooldownForModel 已把该账号标错隔离，换号重试即可成功。
 func isRetryableStatus(code int) bool {
 	return code == http.StatusServiceUnavailable ||
 		code == http.StatusUnauthorized ||
 		code == http.StatusInternalServerError ||
+		code == http.StatusPaymentRequired ||
 		code == http.StatusForbidden ||
 		code == http.StatusUpgradeRequired
 }
@@ -2778,6 +2859,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	turnContinuationPinned := turnContinuation && turnHasBinding
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -2872,6 +2956,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		if !retainedHTTPFallback {
 			if continuationUnavailable && !relayContinuationAttempted {
 				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			} else if turnContinuationPinned {
+				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			} else {
 				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			}
@@ -2884,6 +2970,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
+			if h.store.HasUsageLimitedCandidateWithFilter(apiKeyID, retryExclusions.ForSelection(), accountFilter) {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
 				return
 			}
 			if continuationUnavailable && !relayContinuationAttempted {
@@ -3111,6 +3201,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
+			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
 			if isGrokNativeRouteResponse(resp) {
 				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard)
 				totalDuration := int(time.Since(start).Milliseconds())
@@ -3140,7 +3231,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				if outcome.logStatusCode != http.StatusOK {
 					logInput.UpstreamErrorKind = outcome.failureKind
-					logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+					logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 				}
 				h.logUsageForRequest(c, logInput)
 				if outcome.penalize {
@@ -3331,7 +3422,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 					InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 					AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-					ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+					ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 				}, promptPolicyIncidentID)
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
@@ -3410,7 +3501,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AttemptIndex:           attempt + 1,
 			}
 			if outcome.logStatusCode != http.StatusOK {
-				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 				logInput.UpstreamErrorKind = outcome.failureKind
 			}
 			if usage != nil {
@@ -3462,6 +3553,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
+		// 换号后剥离旧账号铸造的 turn-state 回带,防止跨账号矛盾信号打到上游。
+		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -3627,6 +3720,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
+		relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
 		SyncCodexUsageState(h.store, account, resp)
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
@@ -3989,7 +4083,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-				ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -4098,7 +4192,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			AttemptIndex:           attempt + 1,
 		}
 		if logStatusCode != http.StatusOK {
-			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(logStatusCode, outcome.failureMessage)
 			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
@@ -4191,7 +4285,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
-	if isImageOnlyModel(model) {
+	if isMediaOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
@@ -4836,7 +4930,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		logModel = model
 		responseModel = model
 	}
-	if isImageOnlyModel(model) {
+	if isMediaOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
@@ -5168,7 +5262,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.UpstreamErrorKind = outcome.failureKind
-				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 			}
 			h.logUsageForRequest(c, logInput)
 			if outcome.penalize {
@@ -5440,7 +5534,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/chat/completions", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-				ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -5530,7 +5624,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			AttemptIndex:           attempt + 1,
 		}
 		if logStatusCode != http.StatusOK {
-			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(logStatusCode, outcome.failureMessage)
 			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
@@ -6007,10 +6101,10 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		return decision
 	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
-		store.MarkPremium5hRateLimited(account, decision.ResetAt)
+		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
 		return decision
 	}
-	store.MarkCooldown(account, decision.Cooldown, "rate_limited")
+	store.MarkCooldown(account, decision.Cooldown, auth.ResponsesRateLimitedCooldownReason)
 	return decision
 }
 
@@ -6091,7 +6185,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
 			if h.store != nil {
-				h.store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
+				h.store.MarkDeactivatedWorkspace(account, upstreamAccountErrorMessage(statusCode, body))
 			}
 			return codex429Decision{}
 		}
@@ -6411,6 +6505,24 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		return
 	}
 
+	// 402 工作区停用（deactivated_workspace）：重试已换过号仍拿到它说明池内暂无
+	// 可服务账号，与 403 一样改写为 503 池级错误（带 Retry-After 提示退避）。
+	// 文案末尾附上游原始错误体，便于下游直接看到封禁原因。坏账号已被标错隔离，
+	// 稍后重试可落到健康账号。裸 402 保持原样：可能携带用量/计费语义，上面已单独处理。
+	if statusCode == http.StatusPaymentRequired && IsDeactivatedWorkspaceError(body) {
+		if c.Writer.Header().Get("Retry-After") == "" {
+			c.Header("Retry-After", "30")
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": deactivatedPoolErrorMessage(strings.TrimSpace(string(body))),
+				"type":    "server_error",
+				"code":    "account_pool_deactivated",
+			},
+		})
+		return
+	}
+
 	// 上游账号 403（payment_required / deactivated_workspace / codex_access_restricted）
 	// 同样是账号侧问题：重试已换过号仍拿到 403 说明池内暂无可用账号。原样透传 403 会让
 	// 客户端（如 Claude Code）误判为自身无权限而直接停工（issue #396），改写为 503 池级错误。
@@ -6491,6 +6603,10 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 			// 出现在 /v1/models（否则下游客户端拉不到可用的 Grok 模型名）。
 			if len(declared) == 0 && account.IsGrokAPI() {
 				declared = DefaultGrokModelIDsForAccount(account)
+			}
+			// Grok 账号额外补媒体模型集(生图/生视频走独立准入,不受文本白名单约束)。
+			if account.IsGrokAPI() {
+				declared = append(append([]string{}, declared...), grokMediaModelsForAccount(account)...)
 			}
 			for _, model := range declared {
 				key := strings.ToLower(strings.TrimSpace(model))
