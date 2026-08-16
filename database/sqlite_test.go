@@ -1788,6 +1788,54 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	}
 }
 
+func TestSQLiteAccountGroupMutationsWaitForUnifiedWriteLock(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupA, err := db.CreateAccountGroup(ctx, "lock-a", "", "", 0, 0, sql.NullInt64{})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup A: %v", err)
+	}
+	groupB, err := db.CreateAccountGroup(ctx, "lock-b", "", "", 0, 0, sql.NullInt64{})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup B: %v", err)
+	}
+	accountID, err := db.InsertAccount(ctx, "lock-account", "refresh-token", "")
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+
+	assertBlocked := func(name string, operation func() error) {
+		t.Helper()
+		db.sqliteWriteSem <- struct{}{}
+		done := make(chan error, 1)
+		go func() { done <- operation() }()
+		select {
+		case err := <-done:
+			t.Fatalf("%s bypassed SQLite write lock: %v", name, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		<-db.sqliteWriteSem
+		if err := <-done; err != nil {
+			t.Fatalf("%s after lock release: %v", name, err)
+		}
+	}
+
+	assertBlocked("SetAccountGroups", func() error {
+		return db.SetAccountGroups(ctx, accountID, []int64{groupA})
+	})
+	assertBlocked("BatchSetAccountGroups", func() error {
+		return db.BatchSetAccountGroups(ctx, []int64{accountID}, []int64{groupB})
+	})
+	assertBlocked("DeleteAccountGroup", func() error {
+		return db.DeleteAccountGroup(ctx, groupA, true)
+	})
+}
+
 func TestUsageLogsPersistEffectiveModel(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
