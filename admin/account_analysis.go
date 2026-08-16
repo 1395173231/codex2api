@@ -205,6 +205,13 @@ func (h *Handler) rebuildAccountAnalysis(ctx context.Context, channel string) (*
 	return result, nil
 }
 
+func (h *Handler) largeAccountList(channel string) bool {
+	h.accountListCacheMu.RLock()
+	defer h.accountListCacheMu.RUnlock()
+	cached := h.accountListCache[channel]
+	return cached != nil && len(cached.Items) > requestCountFullPoolScanMax
+}
+
 func (h *Handler) getAccountAnalysisTrafficNonBlocking(channel string) (accountAnalysisTraffic, string) {
 	now := time.Now()
 	h.accountAnalysisTrafficMu.RLock()
@@ -212,6 +219,13 @@ func (h *Handler) getAccountAnalysisTrafficNonBlocking(channel string) (accountA
 	h.accountAnalysisTrafficMu.RUnlock()
 	if cached != nil && now.Before(cached.expiresAt) {
 		return cached.traffic, "ready"
+	}
+	if h.largeAccountList(channel) {
+		traffic := accountAnalysisTraffic{}
+		if h.rateLimiter != nil {
+			traffic.rpmLimit = float64(h.rateLimiter.GetRPM())
+		}
+		return traffic, "ready"
 	}
 
 	h.refreshAccountAnalysisTrafficAsync(channel)

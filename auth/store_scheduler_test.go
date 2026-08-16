@@ -265,6 +265,9 @@ func TestIgnoreUsageLimitStatusOnlyAllowsAuthoritativeBoundContinuation(t *testi
 	}
 	store.AddAccount(account)
 
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited while fresh dispatch is blocked", got)
+	}
 	if account.IsAvailable() {
 		t.Fatal("fresh dispatch must remain blocked by the 100% usage snapshot")
 	}

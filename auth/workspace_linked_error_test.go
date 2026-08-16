@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codex2api/internal/openaiidentity"
 )
@@ -127,6 +128,86 @@ func TestMarkDeactivatedWorkspaceOverrideTargetsNativeWorkspace(t *testing.T) {
 	}
 	if nativeB.RuntimeStatus() == "error" {
 		t.Fatal("trigger native workspace must not be marked when 402 is about the override target")
+	}
+}
+
+func TestMarkDeactivatedWorkspaceLinksTeamAndK12SeatsByEffectiveWorkspace(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	trigger := newWorkspaceLinkedAccount(1, "seat-trigger")
+	trigger.PlanType = "team"
+	trigger.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "org-ws"}
+	k12Seat := newWorkspaceLinkedAccount(2, "seat-k12")
+	k12Seat.PlanType = "k12"
+	k12Seat.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "org-ws"}
+	plusRouted := newWorkspaceLinkedAccount(3, "personal-plus")
+	plusRouted.PlanType = "plus"
+	plusRouted.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "org-ws"}
+	otherK12 := newWorkspaceLinkedAccount(4, "seat-other")
+	otherK12.PlanType = "k12"
+	otherK12.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "other-ws"}
+	for _, acc := range []*Account{trigger, k12Seat, plusRouted, otherK12} {
+		store.AddAccount(acc)
+	}
+
+	store.MarkDeactivatedWorkspace(trigger, "上游返回 402: deactivated_workspace")
+
+	if k12Seat.RuntimeStatus() != "error" {
+		t.Fatal("k12 seat in the same effective workspace should be marked")
+	}
+	if plusRouted.RuntimeStatus() == "error" {
+		t.Fatal("header-only plus account must not be marked")
+	}
+	if otherK12.RuntimeStatus() == "error" {
+		t.Fatal("k12 seat in another workspace must not be marked")
+	}
+}
+
+func TestMarkDeactivatedWorkspaceOverridesRateLimitedDisplay(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	trigger := newWorkspaceLinkedAccount(1, "org-ws")
+	trigger.PlanType = "team"
+	limited := newWorkspaceLinkedAccount(2, "org-ws")
+	limited.PlanType = "k12"
+	limited.SetUsagePercent7d(100)
+	limited.SetReset7dAt(time.Now().Add(time.Hour))
+	if !store.MarkUsage7dRateLimited(limited) {
+		t.Fatal("expected 7d rate limit")
+	}
+	if got := limited.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("before link RuntimeStatus() = %q, want rate_limited", got)
+	}
+	store.AddAccount(trigger)
+	store.AddAccount(limited)
+
+	store.MarkDeactivatedWorkspace(trigger, "上游返回 402: deactivated_workspace")
+
+	if got := limited.RuntimeStatus(); got != "error" {
+		t.Fatalf("after link RuntimeStatus() = %q, want error (not rate_limited)", got)
+	}
+	if !strings.Contains(accountErrorMsg(limited), "工作区联动") {
+		t.Fatalf("ErrorMsg = %q, want linked annotation", accountErrorMsg(limited))
+	}
+}
+
+func TestLinkedDeactivatedWorkspaceResultSkipsSameWorkspaceSeats(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	trigger := newWorkspaceLinkedAccount(1, "org-ws")
+	trigger.PlanType = "team"
+	lateK12 := newWorkspaceLinkedAccount(2, "seat-late")
+	lateK12.PlanType = "k12"
+	lateK12.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "org-ws"}
+	plusRouted := newWorkspaceLinkedAccount(3, "personal-plus")
+	plusRouted.PlanType = "plus"
+	plusRouted.CustomHeaders = map[string]string{openaiidentity.ChatGPTAccountIDHeader: "org-ws"}
+	store.AddAccount(trigger)
+	store.MarkDeactivatedWorkspace(trigger, "上游返回 402: deactivated_workspace")
+
+	msg, ok := store.LinkedDeactivatedWorkspaceResult(lateK12)
+	if !ok || !strings.Contains(msg, "工作区联动") || !strings.Contains(msg, "账号 1") {
+		t.Fatalf("late k12 skip = (%q, %v)", msg, ok)
+	}
+	if msg, ok := store.LinkedDeactivatedWorkspaceResult(plusRouted); ok {
+		t.Fatalf("header-only plus must not skip probe: %q", msg)
 	}
 }
 

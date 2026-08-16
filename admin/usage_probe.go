@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,31 @@ import (
 var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 
 type usageProbeRequestFunc func(context.Context, *auth.Account, []byte, string, string, string, *proxy.DeviceProfileConfig, http.Header, ...bool) (*http.Response, error)
+
+func inspectResponsesProbeBody(body []byte) (responsesTerminalOutcome, []byte, error) {
+	outcome := responsesTerminalUnknown
+	var terminalPayload []byte
+	err := proxy.ReadSSEStream(bytes.NewReader(body), func(data []byte) bool {
+		classified := classifyResponsesTerminalEvent(data)
+		if classified == responsesTerminalUnknown {
+			return true
+		}
+		outcome = classified
+		terminalPayload = append(terminalPayload[:0], data...)
+		return false
+	})
+	if err != nil {
+		return responsesTerminalUnknown, nil, err
+	}
+	// 测试替身或非流式兼容端点可能直接返回单个事件 JSON。
+	if outcome == responsesTerminalUnknown {
+		outcome = classifyResponsesTerminalEvent(body)
+		if outcome != responsesTerminalUnknown {
+			terminalPayload = append(terminalPayload[:0], body...)
+		}
+	}
+	return outcome, terminalPayload, nil
+}
 
 // ProbeUsageSnapshot 主动刷新账号用量。
 //
@@ -233,6 +259,19 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		outcome, terminalPayload, inspectErr := inspectResponsesProbeBody(body)
+		if inspectErr != nil {
+			return fmt.Errorf("读取 Responses 恢复探针终止事件失败: %w", inspectErr)
+		}
+		switch outcome {
+		case responsesTerminalUsageLimited:
+			h.applyResponsesUsageLimitFailure(account, resp, h.store.GetTestModel(), terminalPayload)
+			return nil
+		case responsesTerminalFailed:
+			return fmt.Errorf("Responses 恢复探针未成功: %s", formatUpstreamTestError(terminalPayload, "上游返回失败终止事件"))
+		case responsesTerminalUnknown:
+			return fmt.Errorf("Responses 恢复探针缺少明确终止事件")
+		}
 		h.store.ReportRequestSuccess(account, 0)
 		// 只有用量未耗尽时才重置状态
 		if !applyUsageLimitedAccountState(h.store, account, usageState) {

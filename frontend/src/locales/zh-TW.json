@@ -3,6 +3,7 @@
   "accounts": {
     "todayStats": "今日統計",
     "todayStatsHint": "今日(0 點起)經由本閘道的請求數、Token 與成本",
+    "largePoolSortDisabled": "後台正在聚合查詢中，請稍後再試",
     "todayNoUsage": "無使用",
     "todayReqUnit": "次",
     "modelCooldownPolicy": "模型冷卻策略",
@@ -15,7 +16,8 @@
     "modelCooldownPolicySaved": "帳號模型冷卻策略已儲存",
     "modelCooldownPolicySaveFailed": "儲存模型冷卻策略失敗：{{error}}",
     "modelCooldownCleared": "已清除 {{model}} 的模型冷卻",
-    "allModelCooldownsCleared": "已清除 {{count}} 條模型冷卻"
+    "allModelCooldownsCleared": "已清除 {{count}} 條模型冷卻",
+    "planWorkspaceId": "空間 ID：{{id}}"
   },
   "settings": {
     "modelCooldownTitle": "模型 429 冷卻策略",

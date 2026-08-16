@@ -9,6 +9,10 @@ import (
 	"github.com/lib/pq"
 )
 
+// accountRequestCountBreakdownMaxIDs 是错误码/成功模型拆分的 ID 上限。
+// 与管理页单页上限一致:再大就是全池刷新,那两条额外 GROUP BY 不应再跑。
+const accountRequestCountBreakdownMaxIDs = 500
+
 // appendAccountIDFilter 生成 account_id 的匹配子句并把绑定值追加进 args。
 // PostgreSQL 走单个数组参数 `= ANY($n)`:几万账号的全池统计刷新若逐个展开
 // 占位符,解析/规划开销随池规模线性放大,且触及扩展协议 65535 个参数的硬上限
@@ -29,6 +33,17 @@ func (db *DB) appendAccountIDFilter(args *[]interface{}, ids []int64) string {
 // GetAccountRequestCountsByIDs returns the same seven-day counters as
 // GetAccountRequestCounts, but restricts the scan to the visible account page.
 func (db *DB) GetAccountRequestCountsByIDs(ctx context.Context, ids []int64) (map[int64]*AccountRequestCount, error) {
+	return db.getAccountRequestCountsByIDs(ctx, ids, true)
+}
+
+// GetAccountRequestCountTotalsByIDs 只聚合成功/失败/429 计数,不附带错误码和
+// 成功模型拆分。全池分批刷新走这条路径:拆分只给当前页胶囊用,每批再扫两遍
+// usage_logs 没有收益。
+func (db *DB) GetAccountRequestCountTotalsByIDs(ctx context.Context, ids []int64) (map[int64]*AccountRequestCount, error) {
+	return db.getAccountRequestCountsByIDs(ctx, ids, false)
+}
+
+func (db *DB) getAccountRequestCountsByIDs(ctx context.Context, ids []int64, withBreakdown bool) (map[int64]*AccountRequestCount, error) {
 	result := make(map[int64]*AccountRequestCount, len(ids))
 	ids = positiveUniqueIDs(ids)
 	if len(ids) == 0 {
@@ -67,11 +82,15 @@ func (db *DB) GetAccountRequestCountsByIDs(ctx context.Context, ids []int64) (ma
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := db.attachErrorStatusCounts(ctx, result, ids); err != nil {
-		return nil, err
-	}
-	if err := db.attachSuccessModelCounts(ctx, result, ids); err != nil {
-		return nil, err
+	// 错误码/成功模型拆分只给当前页胶囊用。全池分批刷新若也跑这两条
+	// GROUP BY,每一批都会把 usage_logs 再扫两遍。
+	if withBreakdown && len(ids) <= accountRequestCountBreakdownMaxIDs {
+		if err := db.attachErrorStatusCounts(ctx, result, ids); err != nil {
+			return nil, err
+		}
+		if err := db.attachSuccessModelCounts(ctx, result, ids); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }

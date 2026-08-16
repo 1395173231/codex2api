@@ -81,17 +81,17 @@ func (h *Handler) buildAccountResponse(
 	modelMapping := ""
 	var customHeaders map[string]string
 	var allowedAPIKeyIDs []int64
-	tokenWorkspaceID := ""
-	workspaceIDOverride := ""
-	effectiveWorkspaceID := ""
+	// 工作区 ID 不是密钥:Team/K12 徽章悬停要显示空间 ID。当前页
+	// ListActiveByIDs 已带完整凭据;custom_headers 只用来算生效空间,
+	// 摘要响应仍会剥掉原文。
+	headers := row.GetCredentialStringMap("custom_headers")
+	tokenWorkspaceID := openaiidentity.NormalizeWorkspaceID(row.GetCredential("workspace_id"))
+	workspaceIDOverride := openaiidentity.WorkspaceOverrideFromHeaders(headers)
+	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, headers)
 	if includeDetails {
 		modelMapping = row.GetCredential("model_mapping")
-		customHeaders = row.GetCredentialStringMap("custom_headers")
+		customHeaders = headers
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
-		// workspace 路由字段依赖 custom_headers,与其余详情字段同档加载(PR #485)。
-		tokenWorkspaceID = openaiidentity.NormalizeWorkspaceID(row.GetCredential("workspace_id"))
-		workspaceIDOverride = openaiidentity.WorkspaceOverrideFromHeaders(customHeaders)
-		effectiveWorkspaceID = openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, customHeaders)
 	}
 	resp := accountResponse{
 		DetailLoaded:             includeDetails,

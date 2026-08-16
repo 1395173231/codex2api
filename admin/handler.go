@@ -101,6 +101,9 @@ type Handler struct {
 	reqCountCache      map[string]*requestCountCacheEntry
 	reqCountRefreshMu  sync.Mutex
 	reqCountRefreshing map[string]bool
+	// 大池分批聚合的断点续跑半成品,见 requestCountStaging。
+	reqCountStagingMu sync.Mutex
+	reqCountStaging   map[string]*requestCountStaging
 
 	// 管理后台账号分页使用的轻量快照。快照按渠道缓存，只保存筛选、排序和
 	// 当前页定位所需的信息；完整账号响应仍只为当前页构建。
@@ -389,7 +392,20 @@ func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source s
 	}
 }
 
+// importRefreshTransientRetryLimit 是导入换 AT 瞬时失败(超时/代理抖动/上游
+// 5xx/刷新锁竞争)的额外重试次数。瞬时失败不能一次就标粘性 error——error 没有
+// 任何自动重试,语义反而比 RT 死透(有冷却自愈)更重;批量导入撞上代理抖动
+// 会把一批好号永久标死。
+const importRefreshTransientRetryLimit = 3
+
+// importRefreshTransientRetryDelay 是两次导入刷新重试的间隔。var 便于测试缩短。
+var importRefreshTransientRetryDelay = 2 * time.Minute
+
 func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID int64, source string) {
+	h.refreshImportedAccountWithRetry(ctx, accountID, source, 0)
+}
+
+func (h *Handler) refreshImportedAccountWithRetry(ctx context.Context, accountID int64, source string, attempt int) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -397,7 +413,11 @@ func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID 
 	err := h.refreshAccountByID(refreshCtx, accountID)
 	cancel()
 	if err != nil {
-		log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+		log.Printf("导入账号 %d 刷新失败(第 %d 次): %v", accountID, attempt+1, err)
+		if h.scheduleImportedRefreshRetry(accountID, source, attempt, err) {
+			return
+		}
+		h.markImportedRefreshFailure(accountID, err)
 		return
 	}
 	log.Printf("导入账号 %d 刷新成功", accountID)
@@ -407,6 +427,53 @@ func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID 
 		return
 	}
 	h.probeImportedAccountUsage(ctx, accountID, source)
+}
+
+// scheduleImportedRefreshRetry 对瞬时刷新失败安排一次延迟重试:到点后重新走
+// 导入并发闸,不在闸内睡眠占槽。重试窗口内账号保持「刷新中」——这是真实状态
+// 且有界(最多 limit+1 次尝试)。永久失败或重试耗尽返回 false,交给调用方落状态。
+func (h *Handler) scheduleImportedRefreshRetry(accountID int64, source string, attempt int, err error) bool {
+	if h == nil || h.store == nil || err == nil {
+		return false
+	}
+	if auth.IsPermanentRefreshFailure(err) || attempt >= importRefreshTransientRetryLimit {
+		return false
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return false
+	}
+	time.AfterFunc(importRefreshTransientRetryDelay, func() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountWithRetry(ctx, accountID, source, attempt+1)
+		})
+	})
+	return true
+}
+
+// markImportedRefreshFailure 导入后换 AT 失败(瞬时失败已重试耗尽)时落状态，
+// 避免裸 RT 一直停在「刷新中」。会话作废 / RT 失效标未授权（时长由 unauthorized
+// 自适应 6/24h 策略决定，入参只是兜底）；其它失败标错误。
+func (h *Handler) markImportedRefreshFailure(accountID int64, err error) {
+	if h == nil || h.store == nil || err == nil {
+		return
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return
+	}
+	// store 的刷新路径对不可重试错误已经标过未授权冷却；再标一次会让
+	// FailureStreak 翻倍、自适应冷却直接跳 24h 档，并重复落库。
+	switch acc.RuntimeStatus() {
+	case "unauthorized", "error":
+		return
+	}
+	msg := err.Error()
+	if auth.IsPermanentRefreshFailure(err) {
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+		return
+	}
+	h.store.MarkError(acc, msg)
 }
 
 // mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
@@ -1395,6 +1462,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Page:     pageSelection.Page, PageSize: pageSelection.PageSize, Total: pageSelection.Total,
 			Summary: pageSelection.Summary, Facets: pageSelection.Facets,
 			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: pageSelection.StatsState,
+			DisabledSorts: pageSelection.DisabledSorts,
 		})
 		return
 	}
@@ -5143,6 +5211,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	h.pruneAccountsFromSnapshotCaches([]int64{id})
 
 	writeMessage(c, http.StatusOK, "账号已删除")
 }
@@ -5463,6 +5532,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 	total := len(ids)
 	var success int64
 	var fail int64
+	deleted := make([]int64, 0, len(ids))
 
 	for i, id := range ids {
 		if ctx.Err() != nil {
@@ -5489,6 +5559,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 			}
 		} else {
 			success++
+			deleted = append(deleted, id)
 			event.Deleted = success
 			event.Message = "账号已删除"
 		}
@@ -5499,6 +5570,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 		}
 	}
 
+	h.pruneAccountsFromSnapshotCaches(deleted)
 	return success, fail
 }
 
@@ -10947,12 +11019,7 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 
 // CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
 func (h *Handler) CleanRateLimited(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanRateLimitedManual(ctx)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectRateLimitedManualTargets(), "manual_clean")
 }
 
 // CleanError 清理错误（error）账号
@@ -10972,22 +11039,100 @@ func (h *Handler) CleanGrokError(c *gin.Context) {
 
 // cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
 func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanGrokByRuntimeStatus(ctx, targetStatus)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, (*auth.Account).IsGrokAPI), "auto_clean")
 }
 
 // cleanByStatus 按运行时状态清理账号
 func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, nil), "auto_clean")
+}
+
+func (h *Handler) cleanAccountTargets(c *gin.Context, targets []*auth.Account, eventReason string) {
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamCleanAccounts(c, targets, eventReason)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+	success, _ := h.runCleanAccounts(ctx, targets, eventReason, nil)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", success), "cleaned": success})
+}
 
-	cleaned := h.store.CleanByRuntimeStatus(ctx, targetStatus)
+func (h *Handler) streamCleanAccounts(c *gin.Context, targets []*auth.Account, eventReason string) {
+	setupSSE(c)
+	total := len(targets)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "clean", Total: total})
+	success, fail := h.runCleanAccounts(c.Request.Context(), targets, eventReason, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "clean",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+		Message: fmt.Sprintf("已清理 %d 个账号", success),
+	})
+}
 
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+func (h *Handler) runCleanAccounts(ctx context.Context, targets []*auth.Account, eventReason string, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(targets)
+	var success int64
+	var fail int64
+	deleted := make([]int64, 0, len(targets))
+
+	for i, acc := range targets {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+		if acc == nil {
+			fail++
+			if onProgress != nil {
+				onProgress(batchOperationEvent{
+					Type:    "progress",
+					Action:  "clean",
+					Current: i + 1,
+					Total:   total,
+					Success: success,
+					Failed:  fail,
+					Error:   "账号不存在",
+				})
+			}
+			continue
+		}
+
+		name, email := runtimeAccountOperationIdentity(acc)
+		err := h.store.SoftDeleteForClean(ctx, acc, eventReason)
+		event := batchOperationEvent{
+			Type:         "progress",
+			Action:       "clean",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    acc.DBID,
+			AccountName:  name,
+			AccountEmail: email,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+		} else {
+			success++
+			deleted = append(deleted, acc.DBID)
+			event.Deleted = success
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	h.pruneAccountsFromSnapshotCaches(deleted)
+	return success, fail
 }
 
 // ==================== Proxies ====================
