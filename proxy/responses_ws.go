@@ -234,6 +234,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	c.Set("raw_body", rawBody)
 	if mappedModel != "" {
 		model = mappedModel
@@ -338,6 +339,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		closeCode := websocket.CloseTryAgainLater
+		if errors.Is(compactionAffinityErr, errConflictingCompactionProvenance) {
+			apiErr = compactionProvenanceConflictAPIError()
+			closeCode = websocket.ClosePolicyViolation
+		} else {
+			apiErr = compactionProvenanceUnavailableAPIError()
+		}
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -396,14 +412,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					}
 				}
 			}
-			if continuationPinned {
+			if attempt == 0 && compactionAffinity.Known && !continuationPinned {
+				account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			}
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			} else if continuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			} else {
 				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			}
 		}
 		if account == nil {
-			if lastRetryableUpstreamErr != nil {
+			if compactionAffinity.Known {
+				apiErr = compactionUpstreamUnavailableAPIError()
+			} else if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
 			} else if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				apiErr = responsesWSUpstreamAPIError(lastStatusCode, lastBody)
@@ -763,6 +786,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+		h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
 		clientData := data
