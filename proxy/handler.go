@@ -2805,6 +2805,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	}
+	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -4266,6 +4267,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
 	// 没有命中映射时，再按兼容规则剥离后缀。
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
+	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request

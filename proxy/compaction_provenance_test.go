@@ -325,6 +325,72 @@ func TestResponsesRoutesKnownCompactionToProducerDomain(t *testing.T) {
 	}
 }
 
+func TestResponsesPortableCompactionReturnsToNormalPoolScheduling(t *testing.T) {
+	var otherCalls, producerCalls atomic.Int32
+	var receivedBody []byte
+	otherUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherCalls.Add(1)
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_portable\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+	}))
+	defer otherUpstream.Close()
+	producerUpstream := newCompactionAffinityRelay(t, &producerCalls)
+	defer producerUpstream.Close()
+
+	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: otherUpstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
+	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: producerUpstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}}
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, nil, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, portableCompactionFixture); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := runCompactionAffinityResponses(t, handler, `{"model":"gpt-4.1-direct","stream":true,"input":[{"type":"compaction","encrypted_content":"`+portableCompactionFixture+`"},{"role":"user","content":"continue"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if otherCalls.Load() != 1 || producerCalls.Load() != 0 {
+		t.Fatalf("normal scheduler should select higher-priority account: other calls = %d, producer calls = %d", otherCalls.Load(), producerCalls.Load())
+	}
+	if bytes.Contains(receivedBody, []byte(portableCompactionEnvelopePrefix)) {
+		t.Fatalf("portable envelope reached upstream: %s", receivedBody)
+	}
+	if !bytes.Contains(receivedBody, []byte("portable context")) {
+		t.Fatalf("decoded summary missing upstream: %s", receivedBody)
+	}
+}
+
+func TestResponsesMixedPortableAndOpaqueCompactionRetainsOpaqueAffinity(t *testing.T) {
+	var otherCalls, producerCalls atomic.Int32
+	otherUpstream := newCompactionAffinityRelay(t, &otherCalls)
+	defer otherUpstream.Close()
+	producerUpstream := newCompactionAffinityRelay(t, &producerCalls)
+	defer producerUpstream.Close()
+
+	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: otherUpstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
+	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: producerUpstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}}
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, nil, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, "known-opaque"); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := runCompactionAffinityResponses(t, handler, `{"model":"gpt-4.1-direct","stream":true,"input":[{"type":"compaction","encrypted_content":"`+portableCompactionFixture+`"},{"type":"compaction","encrypted_content":"known-opaque"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if producerCalls.Load() != 1 || otherCalls.Load() != 0 {
+		t.Fatalf("remaining opaque state must retain producer affinity: producer calls = %d, other calls = %d", producerCalls.Load(), otherCalls.Load())
+	}
+}
+
 func TestResponsesPrefersProducerIndependentOfSessionAffinityMode(t *testing.T) {
 	var seenAuthorization string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +571,40 @@ func TestResponsesCompactRoutesKnownCompactionToProducerDomain(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactPortableCompactionReturnsToNormalPoolScheduling(t *testing.T) {
+	var otherCalls, producerCalls atomic.Int32
+	otherUpstream := newCompactionAffinityCompactRelay(t, &otherCalls)
+	defer otherUpstream.Close()
+	producerUpstream := newCompactionAffinityCompactRelay(t, &producerCalls)
+	defer producerUpstream.Close()
+
+	other := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: otherUpstream.URL, APIKey: "other", Models: []string{"gpt-4.1-direct"}}
+	producer := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: producerUpstream.URL, APIKey: "producer", Models: []string{"gpt-4.1-direct"}}
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, nil, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, portableCompactionFixture); err != nil {
+		t.Fatal(err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewBufferString(`{"model":"gpt-4.1-direct","input":[{"type":"compaction","encrypted_content":"`+portableCompactionFixture+`"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	ginContext.Request = req
+	handler.ResponsesCompact(ginContext)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if otherCalls.Load() != 1 || producerCalls.Load() != 0 {
+		t.Fatalf("compact normal scheduler should select higher-priority account: other calls = %d, producer calls = %d", otherCalls.Load(), producerCalls.Load())
+	}
+}
+
 func TestResponsesWebSocketRoutesAndRecordsKnownCompaction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousExec := WebsocketExecuteFunc
@@ -559,5 +659,61 @@ func TestResponsesWebSocketRoutesAndRecordsKnownCompaction(t *testing.T) {
 	}
 	if _, ok, err := handler.cache.GetRuntime(context.Background(), compactionProvenanceCacheNamespace, compactionContentDigest("ws-output-state")); err != nil || !ok {
 		t.Fatalf("websocket output provenance = ok %v, err %v", ok, err)
+	}
+}
+
+func TestResponsesWebSocketPortableCompactionReturnsToNormalPoolScheduling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	type selection struct {
+		accountID int64
+		body      []byte
+	}
+	selected := make(chan selection, 1)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		selected <- selection{accountID: account.ID(), body: append([]byte(nil), requestBody...)}
+		sse := `data: {"type":"response.completed","response":{"id":"resp_ws_portable","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(sse))}, nil
+	}
+
+	other := &auth.Account{DBID: 1, AccessToken: "other", PlanType: "plus", AccountID: "other"}
+	producer := &auth.Account{DBID: 2, AccessToken: "producer", PlanType: "plus", AccountID: "producer"}
+	other.SetSchedulerPriority(100)
+	store := newCompactionAffinityStore(other, producer)
+	store.SetAffinityMode(auth.AffinityModeOff)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	if err := handler.recordCompactionProvenance(context.Background(), producer, portableCompactionFixture); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial websocket: %v status=%d", err, response.StatusCode)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","input":[{"type":"compaction","encrypted_content":"`+portableCompactionFixture+`"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-selected:
+		if got.accountID != other.ID() {
+			t.Fatalf("selected account = %d, want normal higher-priority account %d", got.accountID, other.ID())
+		}
+		if bytes.Contains(got.body, []byte(portableCompactionEnvelopePrefix)) || !bytes.Contains(got.body, []byte("portable context")) {
+			t.Fatalf("portable compaction was not normalized before WebSocket dispatch: %s", got.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream websocket request")
 	}
 }
