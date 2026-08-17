@@ -1551,9 +1551,8 @@ func requestBodyHasCompactionTrigger(body []byte) bool {
 }
 
 // storeHasAvailableCodexAccount 判断账号池中是否还有可调度的官方（非中转）账号。
-// 注意这是池级判断，不含 API Key 级的账号分组/套餐约束——极端情况下（Key 被限定
-// 只能用中转账号且池中有官方账号）body-signal 请求会等待官方账号而非提升，
-// 该组合目前视为配置矛盾，不做额外处理。
+// 这是池级判断，不含 API Key 级的账号分组/套餐约束。流式 Remote Compact 不再
+// 用它来排除中转账号（issue #540）。
 func (h *Handler) storeHasAvailableCodexAccount() bool {
 	if h == nil || h.store == nil {
 		return false
@@ -2787,21 +2786,17 @@ func (h *Handler) Responses(c *gin.Context) {
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
 
-	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
-	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
-	// /responses/compact。官方 ChatGPT OAuth 账号的原生上游直接接受该形态，
-	// 透传即正确；中转（OpenAI Responses API）账号的普通 /v1/responses 通常
-	// 不接受，会 400 或返回非压缩响应导致客户端报
-	// "expected exactly one compaction output item"。
-	// 处理：池中还有可用官方账号时，把这类请求钉在官方账号上保持原生透传；
-	// 纯中转池的流式请求也必须继续走 /responses SSE，否则 ResponsesCompact 的
-	// 一次性 JSON 会让客户端在收到 response.completed 前遇到 EOF（issue #361）。
-	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
-	// 中转兼容性。
+	// Native remote compaction v2：较新的 Codex 客户端把会话压缩触发器作为
+	// input item（type=compaction_trigger）嵌进普通 /responses，并带 stream=true。
+	// 这条线就是原生 /responses，不要求 /responses/compact 能力，也不把请求
+	// 钉死在官方 OAuth 账号上——能打普通 /responses 的中转同样可以接
+	// compaction_trigger。旧逻辑在池里还有官方号时 exclude 中转，官方号限流
+	// 或模型白名单对不上就会立刻 503（issue #540）。
+	// 非流式 body-signal 仍提升到 compact 专用链路，兼容只实现
+	// /responses/compact 的中转（issue #361：流式不能走一次性 JSON）。
 	bodySignalCompact := compactionMeta.ProtocolTriggered
-	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount()
-	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
-	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
+	nativeRemoteCompactionV2 := bodySignalCompact && gjson.GetBytes(rawBody, "stream").Bool()
+	if bodySignalCompact && !nativeRemoteCompactionV2 {
 		h.ResponsesCompact(c)
 		return
 	}
@@ -2809,7 +2804,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	var requestModel, mappedModel string
 	var mappingApplied bool
-	if streamingRelayBodySignal {
+	if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -2919,15 +2914,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
 	var accountFilter auth.AccountFilter
-	if streamingRelayBodySignal {
+	if nativeRemoteCompactionV2 {
 		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	if pinBodySignalToCodexAccounts && !continuationUnavailable {
-		accountFilter = excludeRelayAccountsFilter(accountFilter)
-	}
 	if continuationUnavailable {
 		accountFilter = relayOnlyAccountFilter(accountFilter)
 	}
@@ -3082,7 +3074,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var mappedBody []byte
 			var mappedModel string
 			var accountMappingApplied bool
-			if streamingRelayBodySignal {
+			if nativeRemoteCompactionV2 {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
 			} else {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
