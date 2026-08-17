@@ -207,7 +207,7 @@ type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; local_block_message: string; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -298,7 +298,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], local_block_message: '', conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -394,6 +394,9 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       terminal_bypass_models: Array.isArray(enforcement.terminal_bypass_models)
         ? enforcement.terminal_bypass_models.filter((model: unknown): model is string => typeof model === 'string')
         : [...defaultAdvancedProtection.enforcement.terminal_bypass_models],
+      local_block_message: typeof enforcement.local_block_message === 'string'
+        ? enforcement.local_block_message
+        : defaultAdvancedProtection.enforcement.local_block_message,
       conversation_lock_enabled: typeof enforcement.conversation_lock_enabled === 'boolean'
         ? enforcement.conversation_lock_enabled
         : defaultAdvancedProtection.enforcement.conversation_lock_enabled,
@@ -1191,6 +1194,14 @@ function AdvancedProtectionEditor({
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
             <CompactField label={t('promptFilter.terminalBypassModels')} hint={t('promptFilter.help.terminalBypassModels')}><Input value={terminalBypassModelsText} placeholder="codex-auto-review" onChange={(e) => update('enforcement', { terminal_bypass_models: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalBypassModelsHint')}</p>
+            <CompactField label={t('promptFilter.localBlockMessage')} hint={t('promptFilter.help.localBlockMessage')}>
+              <Textarea
+                rows={3}
+                value={config.enforcement.local_block_message}
+                placeholder={t('promptFilter.localBlockMessagePlaceholder')}
+                onChange={(event) => update('enforcement', { local_block_message: Array.from(event.target.value).slice(0, 2000).join('') })}
+              />
+            </CompactField>
             <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />
             {config.enforcement.conversation_lock_enabled ? <div className="grid gap-3 sm:grid-cols-2">
               <CompactField label={t('promptFilter.conversationLockTTL')} hint={t('promptFilter.help.conversationLockTTL')}><DraftNumberInput min={1} max={720} value={config.enforcement.conversation_lock_ttl_hours} onValueChange={(next) => update('enforcement', { conversation_lock_ttl_hours: next })} /></CompactField>

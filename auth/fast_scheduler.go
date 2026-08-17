@@ -275,6 +275,23 @@ func (s *FastScheduler) Update(acc *Account) {
 	s.updateLocked(acc, time.Now())
 }
 
+// UpdateMany applies one import batch while holding the scheduler lock once.
+// A hot Acquire path must not observe the bucket as unsorted between individual
+// additions, otherwise it can sort the whole pool once per imported account.
+func (s *FastScheduler) UpdateMany(accounts []*Account) {
+	if s == nil || len(accounts) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for _, acc := range accounts {
+		s.updateLocked(acc, now)
+	}
+}
+
 // updateLocked 优先就地更新已在桶内的条目：只有当新的排序键真的破坏了它与相邻
 // 条目的顺序时，才给该桶打上待重排标记。这样一次 Release / 用量刷新 / 冷却标记
 // 的代价是 O(1)，而不是"整桶重排 + 全量重建位置索引"。

@@ -3031,6 +3031,7 @@ type Store struct {
 	promptRiskTrustPolicies            map[string]database.PromptRiskTrustPolicy
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
+	usageProbeCompletion               func()
 	usageProbeBatch                    atomic.Bool
 	recoveryProbeBatch                 atomic.Bool
 	autoCleanUnauthorized              atomic.Bool
@@ -6112,6 +6113,14 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	return s.takeByIDMode(id, apiKeyID, exclude, filter, false)
 }
 
+// TakePreferredAccountWithFilter attempts to acquire one specific account
+// while applying the same availability, API-key, egress, filter, cooldown, and
+// concurrency gates as normal scheduling. It intentionally bypasses session
+// affinity policy so callers can preserve opaque upstream-owned state.
+func (s *Store) TakePreferredAccountWithFilter(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	return s.takeByIDExcluding(id, apiKeyID, exclude, filter)
+}
+
 func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	return s.takeByIDMode(id, apiKeyID, exclude, filter, true)
 }
@@ -7271,8 +7280,8 @@ func (s *Store) AddAccounts(accounts []*Account) {
 			s.accountsByID[acc.DBID] = acc
 		}
 	}
-	for _, acc := range added {
-		s.fastSchedulerUpdate(acc)
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		scheduler.UpdateMany(added)
 	}
 }
 
@@ -8023,6 +8032,27 @@ func normalizeAccountErrorMessage(errorMsg string, fallback string) string {
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
 func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string) {
 	s.markCooldown(acc, duration, reason, "", false)
+}
+
+// MarkResponsesRateLimited records an authoritative account-scoped Responses
+// rejection and immediately refreshes its WHAM usage snapshot. The first
+// transition is probed once; repeated 429s while the cooldown is active do not
+// create a probe storm.
+func (s *Store) MarkResponsesRateLimited(acc *Account, duration time.Duration) {
+	if s == nil || acc == nil {
+		return
+	}
+	now := time.Now()
+	acc.mu.RLock()
+	alreadyLimited := acc.Status == StatusCooldown &&
+		acc.CooldownReason == ResponsesRateLimitedCooldownReason &&
+		(acc.CooldownUtil.IsZero() || now.Before(acc.CooldownUtil))
+	acc.mu.RUnlock()
+
+	s.MarkCooldown(acc, duration, ResponsesRateLimitedCooldownReason)
+	if !alreadyLimited {
+		s.TriggerUsageProbeForAccountAsync(acc)
+	}
 }
 
 // MarkCooldownWithError 标记账号进入冷却，并同时记录本次上游错误详情。
@@ -9048,6 +9078,51 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbe = fn
 }
 
+// SetUsageProbeCompletionFunc registers a callback invoked after a batch usage
+// probe has fully completed. It lets read-model caches refresh only after all
+// per-account state and persistence writes are visible.
+func (s *Store) SetUsageProbeCompletionFunc(fn func()) {
+	s.usageProbeMu.Lock()
+	defer s.usageProbeMu.Unlock()
+	s.usageProbeCompletion = fn
+}
+
+func (s *Store) finishUsageProbeBatch() {
+	s.usageProbeBatch.Store(false)
+	s.usageProbeMu.RLock()
+	onComplete := s.usageProbeCompletion
+	s.usageProbeMu.RUnlock()
+	if onComplete != nil {
+		onComplete()
+	}
+}
+
+// TriggerUsageProbeForAccountAsync immediately probes one account without
+// waiting for the periodic max-age sweep. ProbeUsageSnapshot sees the account
+// in a limited state and starts with WHAM as the zero-cost source of truth.
+func (s *Store) TriggerUsageProbeForAccountAsync(account *Account) {
+	if s == nil || account == nil {
+		return
+	}
+	s.usageProbeMu.RLock()
+	probeFn := s.usageProbe
+	s.usageProbeMu.RUnlock()
+	if probeFn == nil || !account.TryBeginUsageProbe() {
+		return
+	}
+
+	if !s.startDBBackgroundTask(func(parent context.Context) {
+		defer account.FinishUsageProbe()
+		ctx, cancel := context.WithTimeout(parent, 25*time.Second)
+		defer cancel()
+		if err := probeFn(ctx, account); err != nil {
+			log.Printf("[账号 %d] Responses 限流后立即刷新 WHAM 用量失败: %v", account.DBID, err)
+		}
+	}) {
+		account.FinishUsageProbe()
+	}
+}
+
 // wsAuthVerifyMinInterval 限制同一账号 WS 鉴权验证探针的最小触发间隔，
 // 避免高频 WS 上游异常关闭下反复探针。
 const wsAuthVerifyMinInterval = 30 * time.Second
@@ -9103,7 +9178,7 @@ func (s *Store) TriggerUsageProbeAsync() {
 	}
 
 	if !s.startDBBackgroundTask(func(ctx context.Context) {
-		defer s.usageProbeBatch.Store(false)
+		defer s.finishUsageProbeBatch()
 		s.parallelProbeUsage(ctx)
 	}) {
 		s.usageProbeBatch.Store(false)
@@ -9457,7 +9532,7 @@ func (s *Store) TriggerUsageProbeForceAsync() {
 	}
 
 	if !s.startDBBackgroundTask(func(ctx context.Context) {
-		defer s.usageProbeBatch.Store(false)
+		defer s.finishUsageProbeBatch()
 		s.parallelProbeUsageWith(ctx, 0)
 	}) {
 		s.usageProbeBatch.Store(false)

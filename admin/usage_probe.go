@@ -14,6 +14,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // errWhamUnauthorized 标记 wham 探针遭遇 401。
@@ -133,6 +134,15 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 		_ = resp.Body.Close()
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
+			if isDefinitiveRevokedTokenError(body) {
+				// 与缺少 workspace claim 等普通 WHAM 401 不同，token_revoked /
+				// token_invalidated 是上游对 OAuth 凭据失效的明确裁决，不需要
+				// /responses 二次佐证。否则关闭 fallback 时账号会永久停在“未采样”。
+				h.store.ReportRequestFailure(account, "client", 0)
+				errorMsg := fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errorMsg)
+				return nil
+			}
 			// 不在此处上报失败/封号：wham 401 对 codex_at 账号可能是误报，
 			// 反复计入失败样本还会污染健康统计。交由 ProbeUsageSnapshot 裁决。
 			return fmt.Errorf("%w: 上游返回 %d: %s", errWhamUnauthorized, resp.StatusCode, truncate(string(body), 300))
@@ -308,6 +318,16 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 		}
 		return fmt.Errorf("探针返回状态 %d", resp.StatusCode)
 	}
+}
+
+func isDefinitiveRevokedTokenError(body []byte) bool {
+	for _, path := range []string{"error.code", "detail.code", "code"} {
+		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String())) {
+		case "token_revoked", "token_invalidated":
+			return true
+		}
+	}
+	return false
 }
 
 func shouldMarkUsageProbeAccountError(statusCode int, body []byte) bool {

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Local Prompt Filter blocks can show an operator-defined message.** The advanced enforcement settings accept a trimmed, 2,000-character message and use it consistently for direct OpenAI, Anthropic, text/image, signed NewAPI-local, and Responses WebSocket blocks. Empty values preserve the existing default, while upstream policy, conversation-lock, and cooldown messages keep their dedicated diagnostics.
+
+### Fixes
+
+- **Compaction provenance fails open during cache outages and stays off the hot path for non-compaction traffic.** A runtime-cache read failure while resolving compaction affinity now falls back to normal scheduling instead of returning 503, so conversations keep flowing while Redis is loading or unavailable; conflicting known provenance still returns 400. Request bodies and stream frames are pre-screened with a cheap byte scan for both `"encrypted_content"` and a compaction item type before any full JSON walk, keeping large conversations and reasoning-only stream frames out of the provenance parser.
+- **Encrypted compaction state stays with the upstream that created it.** Responses HTTP, compact, and WebSocket paths record a SHA-256 digest plus the producer account and compatibility domain, prefer that producer on reuse, and permit failover only inside the same native or relay domain. Unknown pre-deployment state keeps legacy scheduling; conflicting known sources return 400, while a known source with no compatible account returns an explicit 503. `CODEX_COMPACTION_AFFINITY_TTL` controls the rolling seven-day default without storing opaque encrypted content.
+
 ## v2.8.0 - 2026-08-16
 
 ### Features

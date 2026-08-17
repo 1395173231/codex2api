@@ -816,9 +816,9 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 // them to be forwarded as conversation context; the upstream rejects the type
 // with "Invalid input type 'compaction' at index N", so we translate in place.
 //
-// Compact v2 (newer Codex CLI) items are left untouched: compaction items
-// carrying "encrypted_content" originate from the upstream itself and must be
-// forwarded verbatim, or the compacted conversation context is lost.
+// Opaque Compact v2 items are left untouched so they remain source-affine.
+// Known reversible emulated envelopes are decoded into the same developer
+// summary representation as plaintext compaction items.
 func normalizeResponsesCompactionItems(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -828,8 +828,6 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 		return false
 	}
 
-	const summaryPrefix = "[Conversation summary from earlier turns]\n"
-
 	modified := false
 	out := make([]any, 0, len(inputItems))
 	for _, raw := range inputItems {
@@ -838,13 +836,24 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			out = append(out, raw)
 			continue
 		}
-		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+		itemType := firstNonEmptyAnyString(itemMap["type"])
+		if !isResponsesCompactionItemType(itemType) {
 			out = append(out, raw)
 			continue
 		}
 
-		// compact v2: 加密压缩项由上游生成并原生支持，必须原样透传
-		if firstNonEmptyAnyString(itemMap["encrypted_content"]) != "" {
+		if encryptedContent := firstNonEmptyAnyString(itemMap["encrypted_content"]); encryptedContent != "" {
+			rawEncryptedContent, _ := itemMap["encrypted_content"].(string)
+			if summaryText, portable := decodePortableCompactionSummary(rawEncryptedContent); portable {
+				out = append(out, responsesCompactionDeveloperMessage(summaryText))
+				modified = true
+				continue
+			}
+			// Unknown encrypted state must be forwarded verbatim.
+			out = append(out, raw)
+			continue
+		}
+		if itemType != "compaction" {
 			out = append(out, raw)
 			continue
 		}
@@ -858,16 +867,7 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 
-		out = append(out, map[string]any{
-			"type": "message",
-			"role": "developer",
-			"content": []any{
-				map[string]any{
-					"type": "input_text",
-					"text": summaryPrefix + summaryText,
-				},
-			},
-		})
+		out = append(out, responsesCompactionDeveloperMessage(summaryText))
 		modified = true
 	}
 

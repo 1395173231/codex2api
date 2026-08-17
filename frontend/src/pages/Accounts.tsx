@@ -11942,7 +11942,23 @@ function getAccountRateLimitWindow(
     return "5h";
   }
 
-  return explicitlyRateLimited ? "5h" : null;
+  if (!explicitlyRateLimited) {
+    return null;
+  }
+
+  // A generic Responses 429 does not identify its quota window. Until the
+  // immediate WHAM refresh replaces that transient state, keep the badge
+  // aligned with the usage bar that actually exists instead of inventing 5h.
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" ||
+    hasUsageWindowDetail(account.usage_7d_detail) ||
+    !!account.reset_7d_at;
+  if (has7dWindow && !has5hWindow) {
+    return "7d";
+  }
+  return "5h";
 }
 
 function getRateLimitedWindowStats(accounts: AccountRow[]): {
@@ -13912,6 +13928,7 @@ function TestConnectionModal({
   restoreOnSuccess?: boolean;
 }) {
   const { t } = useTranslation();
+  const { showToast } = useToast();
   const [output, setOutput] = useState<string[]>([]);
   const [status, setStatus] = useState<
     "connecting" | "streaming" | "success" | "error"
@@ -14111,13 +14128,11 @@ function TestConnectionModal({
                 case "test_complete":
                   receivedTerminalEvent = true;
                   setStatus(event.success ? "success" : "error");
-                  markSettled();
                   break;
                 case "error":
                   receivedTerminalEvent = true;
                   setStatus("error");
                   setErrorMsg(event.error || t("accounts.unknownError"));
-                  markSettled();
                   break;
               }
             } catch {
@@ -14143,7 +14158,11 @@ function TestConnectionModal({
           processEventLines([buffer]);
         }
 
-        if (!receivedTerminalEvent) {
+        if (receivedTerminalEvent) {
+          // 等服务端关闭 SSE 后再刷新列表：后端会在连接结束时提交状态并失效
+          // 账号快照，提前刷新会重新读到“未采样”的旧缓存。
+          markSettled();
+        } else {
           setStatus("error");
           setErrorMsg(t("accounts.connectionEndedUnexpectedly"));
           markSettled();
@@ -14201,6 +14220,14 @@ function TestConnectionModal({
     error: "text-red-500",
   }[status];
   const formattedErrorMsg = errorMsg ? formatTestErrorMessage(errorMsg) : "";
+  const handleCopyFailureDetails = async () => {
+    try {
+      await copyTextToClipboard(formattedErrorMsg);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
+    }
+  };
 
   return (
     <Modal
@@ -14264,12 +14291,25 @@ function TestConnectionModal({
         )}
 
         {errorMsg && (
-          <div className="max-h-[40vh] overflow-auto rounded-xl border border-red-200 bg-red-50 p-3.5 text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
-            <div className="mb-2 text-sm font-semibold">
-              {t("accounts.failureDetails")}
+          <div className="rounded-xl border border-red-200 bg-red-50 p-3.5 text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold">
+                {t("accounts.failureDetails")}
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 px-2 text-red-600 hover:bg-red-100 hover:text-red-700 dark:text-red-400 dark:hover:bg-red-900/40 dark:hover:text-red-300"
+                onClick={() => void handleCopyFailureDetails()}
+                title={t("common.copy")}
+              >
+                <Copy className="size-3.5" />
+                {t("common.copy")}
+              </Button>
             </div>
             <pre
-              className="text-[13px] leading-relaxed whitespace-pre-wrap break-all"
+              className="max-h-[34vh] overflow-auto text-[13px] leading-relaxed whitespace-pre-wrap break-all"
               style={{ fontFamily: "var(--font-geist-mono)" }}
             >
               {formattedErrorMsg}

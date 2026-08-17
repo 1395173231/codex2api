@@ -182,6 +182,7 @@ func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	router := gin.New()
 	router.GET("/api/admin/accounts/:id/test", handler.TestConnection)
 
+	beforeGeneration := handler.accountCachesGen.Load()
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/accounts/42/test", nil)
 	router.ServeHTTP(recorder, request)
@@ -200,6 +201,9 @@ func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "token_invalidated") {
 		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+	if got := handler.accountCachesGen.Load(); got <= beforeGeneration {
+		t.Fatalf("account cache generation = %d, want > %d after stateful connection test", got, beforeGeneration)
 	}
 }
 
