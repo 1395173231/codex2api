@@ -240,11 +240,38 @@ func TestApplyCodexFingerprintHeadersSkipsNonCodexClients(t *testing.T) {
 	}
 }
 
-func TestApplyCodexFingerprintHeadersAddsIdentityHeadersForCodexClients(t *testing.T) {
+// TestApplyCodexFingerprintHeadersNeverAddsAbsentIdentityHeaders 锁定「只覆盖、不新增」
+// 对请求头同样成立。实测真实 Codex CLI 只发 x-codex-window-id，从不发
+// x-codex-installation-id（该值只存在于 turn metadata JSON 里）——凭空补发等于给请求
+// 添一个真实客户端不会有的头。
+func TestApplyCodexFingerprintHeadersNeverAddsAbsentIdentityHeaders(t *testing.T) {
 	outbound := http.Header{}
 	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
 	downstream := codexClientHeaders(`{"installation_id":"client-install"}`, "client-session")
 	outbound.Set("X-Codex-Turn-Metadata", downstream.Get("X-Codex-Turn-Metadata"))
+
+	ApplyCodexFingerprintHeaders(outbound, account, downstream)
+
+	if got := outbound.Get("X-Codex-Installation-Id"); got != "" {
+		t.Fatalf("X-Codex-Installation-Id = %q, want unset (downstream never sent it)", got)
+	}
+	if got := outbound.Get("X-Codex-Window-Id"); got != "" {
+		t.Fatalf("X-Codex-Window-Id = %q, want unset (downstream never sent it)", got)
+	}
+	// metadata 内部的 installation_id 仍应收敛——收敛面本来就在 JSON 里。
+	if got := gjson.Get(outbound.Get("X-Codex-Turn-Metadata"), "installation_id").String(); got == "client-install" {
+		t.Fatal("metadata installation_id was left at the client value")
+	}
+}
+
+// TestApplyCodexFingerprintHeadersOverridesPresentIdentityHeaders 验证下游确实发过时，
+// 出站取值被收敛值覆盖（真实 CLI 会发 window id，这条是它的主路径）。
+func TestApplyCodexFingerprintHeadersOverridesPresentIdentityHeaders(t *testing.T) {
+	outbound := http.Header{}
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	downstream := codexClientHeaders(`{"installation_id":"client-install"}`, "client-session")
+	downstream.Set("X-Codex-Window-Id", "client-window:0")
+	downstream.Set("X-Codex-Installation-Id", "client-install")
 
 	ApplyCodexFingerprintHeaders(outbound, account, downstream)
 
@@ -336,6 +363,9 @@ func TestCodexFingerprintHeaderAndBodyAgree(t *testing.T) {
 	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
 	const raw = `{"installation_id":"client-install","session_id":"client-session","thread_id":"client-thread","window_id":"client-window:0"}`
 	downstream := codexClientHeaders(raw, "client-session")
+	// 标识头只在下游发过时才被覆盖，这里补上以便断言头与 metadata 的一致性。
+	downstream.Set("X-Codex-Installation-Id", "client-install")
+	downstream.Set("X-Codex-Window-Id", "client-window:0")
 
 	outbound := http.Header{}
 	outbound.Set("X-Codex-Turn-Metadata", raw)
@@ -435,9 +465,10 @@ func TestApplyCodexFingerprintSkipsRelayAccounts(t *testing.T) {
 func TestExecuteCompactRequestConvergesBodyAndHeaders(t *testing.T) {
 	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
 	account.AccessToken = "token-compact"
-	// 带 turn metadata 才算真 Codex 客户端，身份头补发才会生效（见
-	// ApplyCodexFingerprintHeaders 的 EvaluateEngineFingerprint 门）。
+	// 带 turn metadata 才算真 Codex 客户端（见 ApplyCodexFingerprintHeaders 的
+	// EvaluateEngineFingerprint 门）；标识头还需下游确实发过才会被覆盖。
 	downstream := codexClientHeaders(`{"installation_id":"client-install","session_id":"client-session"}`, "client-session")
+	downstream.Set("X-Codex-Installation-Id", "client-install")
 	ids := resolveCodexFingerprintIDs(account, downstream)
 	if ids == nil {
 		t.Fatal("expected convergence ids for session mode")
@@ -482,5 +513,232 @@ func TestExecuteCompactRequestConvergesBodyAndHeaders(t *testing.T) {
 	}
 	if got := gjson.GetBytes(capturedBody, "client_metadata.x-codex-installation-id").String(); got != capturedHeader.Get(codexInstallationIDHeader) {
 		t.Fatalf("header/body installation id disagree: body=%q header=%q", got, capturedHeader.Get(codexInstallationIDHeader))
+	}
+}
+
+// TestConvergedClientRequestIDFollowsClientIdentity 覆盖 issue #536 的主诉：
+// 实测真实客户端把 X-Client-Request-Id 取成与自身 thread_id 相同的值，收敛必须跟上，
+// 否则原始线程标识会绕过 metadata 改写直达上游。
+func TestConvergedClientRequestIDFollowsClientIdentity(t *testing.T) {
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+
+	t.Run("matches thread id", func(t *testing.T) {
+		const raw = `{"session_id":"client-session","thread_id":"client-thread"}`
+		downstream := codexClientHeaders(raw, "client-session")
+		downstream.Set("Thread-Id", "client-thread")
+		outbound := http.Header{}
+		outbound.Set("X-Client-Request-Id", "client-thread") // 白名单原样透传的结果
+		outbound.Set("X-Codex-Turn-Metadata", raw)
+
+		ApplyCodexFingerprintHeaders(outbound, account, downstream)
+
+		ids := resolveCodexFingerprintIDs(account, downstream)
+		if got := outbound.Get("X-Client-Request-Id"); got != ids.threadID {
+			t.Fatalf("X-Client-Request-Id = %q, want converged thread id %q", got, ids.threadID)
+		}
+	})
+
+	t.Run("matches session id", func(t *testing.T) {
+		downstream := codexClientHeaders("", "client-session")
+		outbound := http.Header{}
+		outbound.Set("X-Client-Request-Id", "client-session")
+
+		ApplyCodexFingerprintHeaders(outbound, account, downstream)
+
+		ids := resolveCodexFingerprintIDs(account, downstream)
+		if got := outbound.Get("X-Client-Request-Id"); got != ids.sessionID {
+			t.Fatalf("X-Client-Request-Id = %q, want converged session id %q", got, ids.sessionID)
+		}
+	})
+
+	// 与任何自报身份都对不上时说明它确实是每请求随机值，改写它反而制造不一致。
+	t.Run("leaves unrelated values alone", func(t *testing.T) {
+		downstream := codexClientHeaders("", "client-session")
+		outbound := http.Header{}
+		outbound.Set("X-Client-Request-Id", "per-request-random-value")
+
+		ApplyCodexFingerprintHeaders(outbound, account, downstream)
+
+		if got := outbound.Get("X-Client-Request-Id"); got != "per-request-random-value" {
+			t.Fatalf("X-Client-Request-Id = %q, want the client value preserved", got)
+		}
+	})
+
+	// device 档不收敛会话级标识，也就不该动这个头。
+	t.Run("device mode is a noop", func(t *testing.T) {
+		downstream := codexClientHeaders("", "client-session")
+		outbound := http.Header{}
+		outbound.Set("X-Client-Request-Id", "client-session")
+
+		ApplyCodexFingerprintHeaders(outbound, fingerprintAccount(t, auth.CodexFingerprintModeDevice), downstream)
+
+		if got := outbound.Get("X-Client-Request-Id"); got != "client-session" {
+			t.Fatalf("X-Client-Request-Id = %q, want untouched in device mode", got)
+		}
+	})
+}
+
+// TestScrubCodexWorkspacesRemovesWorkspaceIdentity 验证工作区身份被抹掉：本地绝对
+// 路径含系统用户名、associated_remote_urls 含仓库归属，多人共享账号时这些会把每个
+// 下游用户的身份原样送到上游。
+func TestScrubCodexWorkspacesRemovesWorkspaceIdentity(t *testing.T) {
+	const raw = `{"request_kind":"memory","workspaces":{"/Users/alice/code/secret-project":{"associated_remote_urls":{"origin":"https://github.com/alice-corp/secret-project.git"},"latest_git_commit_hash":"3cd12a68","has_changes":false}}}`
+
+	got, changed := scrubCodexWorkspaces(raw)
+	if !changed {
+		t.Fatal("scrubCodexWorkspaces reported no change, want the workspace scrubbed")
+	}
+	for _, leaked := range []string{"alice", "secret-project", "github.com"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("scrubbed metadata %q still contains %q", got, leaked)
+		}
+	}
+
+	workspaces := gjson.Get(got, "workspaces")
+	if n := len(workspaces.Map()); n != 1 {
+		t.Fatalf("workspace entry count = %d, want 1 (shape must be preserved)", n)
+	}
+	for path, entry := range workspaces.Map() {
+		if !strings.HasPrefix(path, "/workspace/") {
+			t.Fatalf("workspace key = %q, want a derived placeholder path", path)
+		}
+		if entry.Get("associated_remote_urls").Exists() {
+			t.Fatalf("associated_remote_urls survived in %q", entry.Raw)
+		}
+		// 非身份字段原样保留，避免改变 metadata 形状。
+		if entry.Get("latest_git_commit_hash").String() != "3cd12a68" {
+			t.Fatalf("latest_git_commit_hash = %q, want it preserved", entry.Get("latest_git_commit_hash").String())
+		}
+		if entry.Get("has_changes").Bool() {
+			t.Fatal("has_changes = true, want the client value preserved")
+		}
+	}
+
+	// 同一路径恒定映射到同一占位符，不同路径互不相同。
+	repeat, _ := scrubCodexWorkspaces(raw)
+	if repeat != got {
+		t.Fatalf("scrub is not deterministic: %q vs %q", repeat, got)
+	}
+	if placeholderWorkspacePath("/Users/alice/a") == placeholderWorkspacePath("/Users/alice/b") {
+		t.Fatal("distinct workspace paths collapsed to the same placeholder")
+	}
+
+	// 抹除必须幂等：重试链路可能把改写过的载荷再送进来一次。
+	if again, changedAgain := scrubCodexWorkspaces(got); changedAgain || again != got {
+		t.Fatalf("second scrub changed the payload again: %q -> %q", got, again)
+	}
+
+	// 没有 workspaces 的 metadata 不受影响。
+	if _, changed := scrubCodexWorkspaces(`{"session_id":"s"}`); changed {
+		t.Fatal("metadata without workspaces was modified")
+	}
+}
+
+// TestCodexFingerprintLeavesNoOriginalIdentifierOutbound 是 issue #536 要求的一致性
+// 回归：用真实抓包的请求形态跑完整条改写链，断言出站头里不再残留任何一个原始标识。
+// 将来协议新增身份字段导致遗漏时，这条会先失败。
+func TestCodexFingerprintLeavesNoOriginalIdentifierOutbound(t *testing.T) {
+	const (
+		clientSessionUUID = "01a00e75-8856-7542-89bf-35812620690f"
+		clientInstallUUID = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
+		workspacePath     = "/Users/kyx/code_project/codex2api"
+		remoteURL         = "https://github.com/james-6-23/codex2api.git"
+	)
+	rawMetadata := `{"installation_id":"` + clientInstallUUID + `","session_id":"` + clientSessionUUID +
+		`","thread_id":"` + clientSessionUUID + `","turn_id":"01a00e76-15fb-7940-91a0-e201c45f502a","window_id":"` +
+		clientSessionUUID + `:0","request_kind":"turn","sandbox":"none","workspaces":{"` + workspacePath +
+		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"latest_git_commit_hash":"3cd12a68"}},"turn_started_at_unix_ms":1786949015072}`
+
+	// 复刻真实 CLI 的下游头集合。
+	downstream := http.Header{}
+	downstream.Set("X-Codex-Turn-Metadata", rawMetadata)
+	downstream.Set("Session-Id", clientSessionUUID)
+	downstream.Set("Thread-Id", clientSessionUUID)
+	downstream.Set("X-Client-Request-Id", clientSessionUUID)
+	downstream.Set("X-Codex-Window-Id", clientSessionUUID+":0")
+
+	// 复刻网关的白名单透传结果（见 codexAllowedForwardHeaders）。
+	outbound := http.Header{}
+	outbound.Set("X-Codex-Turn-Metadata", rawMetadata)
+	outbound.Set("X-Client-Request-Id", clientSessionUUID)
+
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	ApplyCodexFingerprintHeaders(outbound, account, downstream)
+	body := ApplyCodexFingerprintToBody(
+		[]byte(`{"client_metadata":{"x-codex-installation-id":"`+clientInstallUUID+`","session_id":"`+clientSessionUUID+
+			`","thread_id":"`+clientSessionUUID+`","x-codex-window-id":"`+clientSessionUUID+`:0"}}`),
+		account, downstream,
+	)
+
+	var outboundDump strings.Builder
+	for name, values := range outbound {
+		for _, value := range values {
+			outboundDump.WriteString(name + ": " + value + "\n")
+		}
+	}
+	outboundDump.Write(body)
+
+	// turn_id 不在此列：它是逐轮随机值，不标识设备或会话，重写只会引入不一致。
+	for _, leaked := range []string{clientSessionUUID, clientInstallUUID, workspacePath, remoteURL, "james-6-23"} {
+		if strings.Contains(outboundDump.String(), leaked) {
+			t.Fatalf("original identifier %q survived into the outbound request:\n%s", leaked, outboundDump.String())
+		}
+	}
+}
+
+// TestApplyCodexRequestHeadersConvergesForwardedClientRequestID 走真实的出站头组装
+// 顺序（白名单透传 → 指纹收敛 → 账号自定义头），而不是单独调收敛函数。
+// issue #536 的 bug 正出在这个顺序上：X-Client-Request-Id 先被白名单原样透传，
+// 收敛若不接手，原始线程标识就直达上游。
+func TestApplyCodexRequestHeadersConvergesForwardedClientRequestID(t *testing.T) {
+	const (
+		clientUUID    = "01a00e75-8856-7542-89bf-35812620690f"
+		installUUID   = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
+		workspacePath = "/Users/kyx/code_project/codex2api"
+		remoteURL     = "https://github.com/james-6-23/codex2api.git"
+	)
+	rawMetadata := `{"installation_id":"` + installUUID + `","session_id":"` + clientUUID +
+		`","thread_id":"` + clientUUID + `","window_id":"` + clientUUID +
+		`:0","request_kind":"turn","workspaces":{"` + workspacePath +
+		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"has_changes":false}}}`
+
+	downstream := http.Header{}
+	downstream.Set("X-Codex-Turn-Metadata", rawMetadata)
+	downstream.Set("Session-Id", clientUUID)
+	downstream.Set("Thread-Id", clientUUID)
+	downstream.Set("X-Client-Request-Id", clientUUID)
+	downstream.Set("X-Codex-Window-Id", clientUUID+":0")
+	downstream.Set("Originator", "codex-tui")
+
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest: %v", err)
+	}
+	applyCodexRequestHeaders(req, account, "access-token", "upstream-cache-key", "api-key-1", nil, downstream)
+
+	ids := resolveCodexFingerprintIDs(account, downstream)
+	if got := req.Header.Get("X-Client-Request-Id"); got != ids.threadID {
+		t.Fatalf("X-Client-Request-Id = %q, want converged thread id %q", got, ids.threadID)
+	}
+	// Session_id 仍归 resolveUpstreamSessionID 管，收敛不得介入。
+	if got := req.Header.Get("Session_id"); got != "upstream-cache-key" {
+		t.Fatalf("Session_id = %q, want the cache key untouched", got)
+	}
+	// 下游没发 installation 头，出站也不该有。
+	if got := req.Header.Get("X-Codex-Installation-Id"); got != "" {
+		t.Fatalf("X-Codex-Installation-Id = %q, want unset", got)
+	}
+
+	var dump strings.Builder
+	for name, values := range req.Header {
+		for _, value := range values {
+			dump.WriteString(name + ": " + value + "\n")
+		}
+	}
+	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "james-6-23"} {
+		if strings.Contains(dump.String(), leaked) {
+			t.Fatalf("original identifier %q survived the real header pipeline:\n%s", leaked, dump.String())
+		}
 	}
 }

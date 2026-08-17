@@ -24,15 +24,19 @@ import (
 //
 // 明确不改写的部分：
 //   - 出站 Session_id 头：由 resolveUpstreamSessionID 独立决定（默认隔离模式下每请求
-//     随机），收敛不介入，否则会改变 prompt cache 隔离语义。
+//     随机），收敛不介入，否则会改变 prompt cache 隔离语义。注意它与 metadata 里的
+//     session_id 是两套独立身份，开启收敛后两者取值不同属预期。
 //   - turn_id / turn_started_at_unix_ms：客户端逐轮随机值，不标识设备或会话；
 //     重算反而会让头与体、turn_id 与其时间戳彼此不一致，本身就是特征。
 //   - 客户端未携带的字段：只改写已存在的键，绝不新增，避免改变 metadata 的形状。
+//     该规则同样适用于请求头——出站只覆盖下游确实发过的标识头，不凭空补发。
 
 const (
-	codexTurnMetadataHeader   = "X-Codex-Turn-Metadata"
-	codexInstallationIDHeader = "X-Codex-Installation-Id"
-	codexWindowIDHeader       = "X-Codex-Window-Id"
+	codexTurnMetadataHeader    = "X-Codex-Turn-Metadata"
+	codexInstallationIDHeader  = "X-Codex-Installation-Id"
+	codexWindowIDHeader        = "X-Codex-Window-Id"
+	codexClientRequestIDHeader = "X-Client-Request-Id"
+	codexThreadIDHeader        = "Thread-Id"
 )
 
 // codexFingerprintIDs 是一次请求的收敛目标值。全部字段都由「账号 + 下游请求头」
@@ -161,14 +165,81 @@ func ApplyCodexFingerprintHeaders(outbound http.Header, account *auth.Account, d
 		}
 	}
 
-	// 仅对确有 Codex 引擎特征的下游请求补发标识头。
+	// X-Client-Request-Id 按白名单原样透传（codexAllowedForwardHeaders）。实测真实
+	// 客户端把它取成与自身 thread_id 相同的值，因此不处理就等于把下游用户的原始
+	// 线程标识直接送到上游，与已收敛的 metadata 各说各话。只在它确实复用了客户端
+	// 自报的会话/线程标识时改写；取值本就与身份无关时保持原样。
+	if converged := convergedClientRequestID(outbound.Get(codexClientRequestIDHeader), ids, downstreamHeaders); converged != "" {
+		outbound.Set(codexClientRequestIDHeader, converged)
+	}
+
+	// 仅对确有 Codex 引擎特征的下游请求处理标识头。
 	if !EvaluateEngineFingerprint(downstreamHeaders, nil, nil) {
 		return
 	}
-	outbound.Set(codexInstallationIDHeader, ids.installationID)
-	if ids.windowID != "" {
-		outbound.Set(codexWindowIDHeader, ids.windowID)
+	// 只覆盖下游确实发过的标识头。实测真实 Codex CLI 只发 x-codex-window-id，
+	// 从不发 x-codex-installation-id（installation_id 只存在于 turn metadata JSON 里）：
+	// 无条件补发等于给请求添一个真实客户端不会有的头，与收敛目标相反。
+	overrideExistingHeader(outbound, downstreamHeaders, codexInstallationIDHeader, ids.installationID)
+	overrideExistingHeader(outbound, downstreamHeaders, codexWindowIDHeader, ids.windowID)
+}
+
+// overrideExistingHeader 仅在下游确实发过该头时，用收敛值覆盖出站取值。
+// 判定读下游头而非出站头：这两个标识头都不在 codexAllowedForwardHeaders 里，
+// 下游即使发了，到这一步出站请求上也没有。
+func overrideExistingHeader(outbound, downstreamHeaders http.Header, name, value string) {
+	if value == "" || downstreamHeaders == nil {
+		return
 	}
+	if strings.TrimSpace(downstreamHeaders.Get(name)) == "" {
+		return
+	}
+	outbound.Set(name, value)
+}
+
+// convergedClientRequestID 在 X-Client-Request-Id 复用了客户端自报身份时返回对应的
+// 收敛值，否则返回空串表示不改写。device 档没有会话级收敛值，恒不改写。
+func convergedClientRequestID(current string, ids *codexFingerprintIDs, downstreamHeaders http.Header) string {
+	current = strings.TrimSpace(current)
+	if current == "" || ids == nil || ids.threadID == "" {
+		return ""
+	}
+	clientSessionID, clientThreadID := extractClientCodexIdentity(downstreamHeaders)
+	switch {
+	case clientThreadID != "" && current == clientThreadID:
+		return ids.threadID
+	case clientSessionID != "" && current == clientSessionID:
+		return ids.sessionID
+	default:
+		return ""
+	}
+}
+
+// extractClientCodexIdentity 取下游自报的原始会话/线程标识，用于判断别的头是否
+// 重复携带了同一个值。与 extractClientCodexSessionID 分开实现：后者是收敛值的派生
+// 输入，改动它会让既有账号已经稳定的 thread_id 发生漂移。
+func extractClientCodexIdentity(headers http.Header) (sessionID, threadID string) {
+	if headers == nil {
+		return "", ""
+	}
+	for _, name := range []string{"Session-Id", "Session_id"} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			sessionID = value
+			break
+		}
+	}
+	threadID = strings.TrimSpace(headers.Get(codexThreadIDHeader))
+	raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader))
+	if raw == "" || !gjson.Valid(raw) {
+		return sessionID, threadID
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(gjson.Get(raw, "session_id").String())
+	}
+	if threadID == "" {
+		threadID = strings.TrimSpace(gjson.Get(raw, "thread_id").String())
+	}
+	return sessionID, threadID
 }
 
 // ApplyCodexFingerprintToBody 收敛请求体 client_metadata 中的设备指纹。
@@ -234,7 +305,88 @@ func rewriteCodexTurnMetadataJSON(raw string, ids *codexFingerprintIDs) (string,
 		raw = updated
 		changed = true
 	}
+	if scrubbed, ok := scrubCodexWorkspaces(raw); ok {
+		raw = scrubbed
+		changed = true
+	}
 	return raw, changed
+}
+
+// scrubCodexWorkspaces 抹掉 turn metadata 里的工作区身份。
+//
+// workspaces 以本地绝对路径为键（含系统用户名），条目里带 git remote URL 和 commit
+// hash。多人共享一个账号时，这些字段会把每个下游用户的身份原样送到上游——同一个
+// installation_id 下面挂着一堆互不相干的仓库地址和用户名目录，既是隐私泄漏，也让
+// 前面几项标识的收敛失去意义。
+//
+// 处理方式是收敛而非删除：路径键换成按原值派生的占位符（条目数与互异性都保留，
+// 不改变 metadata 形状），remote URL 整体移除。其余字段原样保留。
+func scrubCodexWorkspaces(raw string) (string, bool) {
+	workspaces := gjson.Get(raw, "workspaces")
+	if !workspaces.IsObject() {
+		return raw, false
+	}
+
+	rebuilt := "{}"
+	changed := false
+	failed := false
+	workspaces.ForEach(func(key, value gjson.Result) bool {
+		entry := value.Raw
+		if gjson.Get(entry, "associated_remote_urls").Exists() {
+			if updated, err := sjson.Delete(entry, "associated_remote_urls"); err == nil {
+				entry = updated
+				changed = true
+			}
+		}
+		originalPath := key.String()
+		placeholder := originalPath
+		// 已是占位符就保持原样：重试链路可能把改写过的载荷再送进来一次，
+		// 二次哈希会让同一工作区在不同尝试间漂移。
+		if !isPlaceholderWorkspacePath(originalPath) {
+			placeholder = placeholderWorkspacePath(originalPath)
+			changed = true
+		}
+		updated, err := sjson.SetRaw(rebuilt, placeholder, entry)
+		if err != nil {
+			failed = true
+			return false
+		}
+		rebuilt = updated
+		return true
+	})
+	if failed || !changed {
+		return raw, false
+	}
+
+	updated, err := sjson.SetRaw(raw, "workspaces", rebuilt)
+	if err != nil {
+		return raw, false
+	}
+	return updated, true
+}
+
+// placeholderWorkspacePath 把本地路径映射成稳定占位符：同一路径恒定得到同一占位符，
+// 不同路径互不相同，且不携带用户名或项目名。返回值不含 sjson 的路径元字符
+// （. * ?），可直接作为 sjson 路径使用。
+func placeholderWorkspacePath(original string) string {
+	sum := sha256.Sum256([]byte("codex2api:workspace-path:v1:" + original))
+	return workspacePlaceholderPrefix + fmt.Sprintf("%x", sum[:4])
+}
+
+const workspacePlaceholderPrefix = "/workspace/"
+
+// isPlaceholderWorkspacePath 判断路径是否已经是本函数产出的占位符，用于让抹除保持幂等。
+func isPlaceholderWorkspacePath(path string) bool {
+	suffix, ok := strings.CutPrefix(path, workspacePlaceholderPrefix)
+	if !ok || len(suffix) != 8 {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // setExistingJSONString 只在目标路径已存在时替换其值，避免给客户端未携带该字段的
