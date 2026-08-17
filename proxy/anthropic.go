@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,6 +9,24 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
+
+var anthropicJSONNull = json.RawMessage("null")
+
+const anthropicStreamPingEveryNDeltas = 40
+
+func anthropicStopReason(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func anthropicStopReasonValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
 
 // ==================== Anthropic Messages API 类型定义 ====================
 
@@ -47,17 +66,22 @@ type anthropicMessage struct {
 
 // anthropicContentBlock 统一内容块（text/thinking/tool_use/tool_result/image）
 type anthropicContentBlock struct {
-	Type      string                `json:"type"`
-	Text      string                `json:"text,omitempty"`
-	Thinking  string                `json:"thinking,omitempty"`
-	Signature string                `json:"signature,omitempty"`
-	Source    *anthropicImageSource `json:"source,omitempty"`
-	ID        string                `json:"id,omitempty"`
-	Name      string                `json:"name,omitempty"`
-	Input     json.RawMessage       `json:"input,omitempty"`
-	ToolUseID string                `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage       `json:"content,omitempty"`
-	IsError   bool                  `json:"is_error,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text,omitempty"`
+	Thinking     string                 `json:"thinking,omitempty"`
+	Signature    string                 `json:"signature,omitempty"`
+	Source       *anthropicImageSource  `json:"source,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        json.RawMessage        `json:"input,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      json.RawMessage        `json:"content,omitempty"`
+	IsError      bool                   `json:"is_error,omitempty"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type,omitempty"`
 }
 
 func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
@@ -117,8 +141,9 @@ type anthropicResponse struct {
 	Role         string                  `json:"role"`
 	Content      []anthropicContentBlock `json:"content"`
 	Model        string                  `json:"model"`
-	StopReason   string                  `json:"stop_reason"`
+	StopReason   *string                 `json:"stop_reason"`
 	StopSequence *string                 `json:"stop_sequence"`
+	StopDetails  json.RawMessage         `json:"stop_details"`
 	Usage        anthropicUsage          `json:"usage"`
 }
 
@@ -141,12 +166,14 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicDelta struct {
-	Type        string `json:"type,omitempty"`
-	Text        string `json:"text,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
-	Thinking    string `json:"thinking,omitempty"`
-	Signature   string `json:"signature,omitempty"`
-	StopReason  string `json:"stop_reason,omitempty"`
+	Type         string          `json:"type,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	PartialJSON  string          `json:"partial_json,omitempty"`
+	Thinking     string          `json:"thinking,omitempty"`
+	Signature    string          `json:"signature,omitempty"`
+	StopReason   *string         `json:"stop_reason,omitempty"`
+	StopSequence json.RawMessage `json:"stop_sequence,omitempty"`
+	StopDetails  json.RawMessage `json:"stop_details,omitempty"`
 }
 
 // ==================== 模型映射 ====================
@@ -305,8 +332,11 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 		return nil, originalModel, err
 	}
 
-	// 构建 input 数组
+	// Grok 吃自动前缀缓存，system 必须按块拆开；Codex 仍拼成一条 developer。
 	input := buildCodexInput(req.System, req.Messages)
+	if preserveControls {
+		input = buildGrokInput(req.System, req.Messages)
+	}
 
 	// 构建输出 map（对齐 PrepareResponsesBody 的字段处理）
 	out := map[string]any{
@@ -316,13 +346,22 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 		"include": []string{"reasoning.encrypted_content"},
 		"input":   input,
 	}
+	if preserveControls {
+		// Official Grok CLI include list: encrypted reasoning plus no_inline_citations.
+		out["include"] = []string{"reasoning.encrypted_content", "no_inline_citations"}
+	}
 
 	// 注意：不设置 max_output_tokens，上游 Codex 不支持该字段
 
 	// reasoning effort: align Claude Code /v1/messages with the Responses reasoning shape.
+	// Grok official CLI uses summary=detailed; Codex rejects anything but auto.
+	summary := "auto"
+	if preserveControls {
+		summary = "detailed"
+	}
 	out["reasoning"] = map[string]any{
 		"effort":  resolveReasoningEffort(req.OutputConfig, codexModel),
-		"summary": "auto",
+		"summary": summary,
 	}
 
 	if shouldUseCodexPriorityForAnthropicSpeed(req.Speed) {
@@ -475,21 +514,21 @@ func validateAnthropicToolReferences(messages []anthropicMessage) error {
 	return nil
 }
 
-// buildCodexInput 将 Anthropic system + messages 转换为 Codex input 数组
-func buildCodexInput(system json.RawMessage, messages []anthropicMessage) []any {
-	var input []any
-
-	// system prompt → developer message
-	if sysText := parseAnthropicSystem(system); sysText != "" {
-		input = append(input, map[string]any{
-			"type": "message",
-			"role": "developer",
-			"content": []any{
-				map[string]any{"type": "input_text", "text": sysText},
-			},
-		})
+func grokDeveloperMessage(text string) map[string]any {
+	return map[string]any{
+		"type": "message",
+		"role": "developer",
+		"content": []any{
+			map[string]any{"type": "input_text", "text": text},
+		},
 	}
+}
 
+func anthropicSystemBlockCached(block anthropicContentBlock) bool {
+	return block.CacheControl != nil && strings.TrimSpace(block.CacheControl.Type) != ""
+}
+
+func appendTranslatedMessages(input []any, messages []anthropicMessage) []any {
 	for _, msg := range messages {
 		blocks := parseAnthropicContent(msg.Content)
 		switch msg.Role {
@@ -502,28 +541,93 @@ func buildCodexInput(system json.RawMessage, messages []anthropicMessage) []any 
 	return input
 }
 
+// buildCodexInput 将 Anthropic system + messages 转换为 Codex input 数组
+func buildCodexInput(system json.RawMessage, messages []anthropicMessage) []any {
+	var input []any
+	if sysText := parseAnthropicSystem(system); sysText != "" {
+		input = append(input, grokDeveloperMessage(sysText))
+	}
+	return appendTranslatedMessages(input, messages)
+}
+
+// buildGrokInput 把 system 按块拆成多条 developer 消息：带 cache_control
+// 的静态块在前、动态块在后。Grok /v1/responses 没有 cache_control 字段，
+// 只靠 input 前缀自动缓存，拼成一条文本会让动态尾巴把整段前缀打穿。
+func buildGrokInput(system json.RawMessage, messages []anthropicMessage) []any {
+	return appendTranslatedMessages(appendGrokSystemInput(nil, system), messages)
+}
+
+func appendGrokSystemInput(input []any, system json.RawMessage) []any {
+	var cached, uncached []string
+	for _, block := range parseAnthropicSystemBlocks(system) {
+		if block.Type != "text" || block.Text == "" {
+			continue
+		}
+		if anthropicSystemBlockCached(block) {
+			cached = append(cached, block.Text)
+			continue
+		}
+		uncached = append(uncached, block.Text)
+	}
+	for _, text := range cached {
+		input = append(input, grokDeveloperMessage(text))
+	}
+	for _, text := range uncached {
+		input = append(input, grokDeveloperMessage(text))
+	}
+	return input
+}
+
 // parseAnthropicSystem 解析 system 字段（string 或 []block）
 func parseAnthropicSystem(raw json.RawMessage) string {
-	if len(raw) == 0 || string(raw) == "null" {
-		return ""
+	var parts []string
+	for _, block := range parseAnthropicSystemBlocks(raw) {
+		if block.Type == "text" && block.Text != "" {
+			parts = append(parts, block.Text)
+		}
 	}
-	// 尝试纯字符串
+	return strings.Join(parts, "\n\n")
+}
+
+func parseAnthropicSystemBlocks(raw json.RawMessage) []anthropicContentBlock {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s
+		if s == "" {
+			return nil
+		}
+		return []anthropicContentBlock{{Type: "text", Text: s}}
 	}
-	// 尝试块数组
 	var blocks []anthropicContentBlock
 	if json.Unmarshal(raw, &blocks) == nil {
-		var parts []string
-		for _, b := range blocks {
-			if b.Type == "text" && b.Text != "" {
-				parts = append(parts, b.Text)
-			}
-		}
-		return strings.Join(parts, "\n\n")
+		return blocks
 	}
-	return ""
+	return nil
+}
+
+// stableAnthropicSystemSeed 只取带 cache_control 的静态 system 文本，
+// 避免 Claude Code 每轮刷新的 git/date 块把 Grok session 种子打漂。
+func stableAnthropicSystemSeed(raw []byte) string {
+	blocks := parseAnthropicSystemBlocks(raw)
+	if len(blocks) == 0 {
+		return strings.TrimSpace(string(raw))
+	}
+	var cached, all []string
+	for _, block := range blocks {
+		if block.Type != "text" || block.Text == "" {
+			continue
+		}
+		all = append(all, block.Text)
+		if anthropicSystemBlockCached(block) {
+			cached = append(cached, block.Text)
+		}
+	}
+	if len(cached) > 0 {
+		return strings.Join(cached, "\n\n")
+	}
+	return strings.Join(all, "\n\n")
 }
 
 // parseAnthropicContent 解析 message content（string 或 []block）
@@ -800,6 +904,8 @@ type anthropicStreamTranslator struct {
 	inputTokens            int
 	outputTokens           int
 	cachedTokens           int
+	pingAfterStartSent     bool
+	deltasSincePing        int
 }
 
 // newAnthropicStreamTranslator 创建流式翻译器
@@ -857,13 +963,45 @@ func (t *anthropicStreamTranslator) handleCreated() []anthropicStreamEvent {
 	return []anthropicStreamEvent{{
 		Type: "message_start",
 		Message: &anthropicResponse{
-			ID:    t.responseID,
-			Type:  "message",
-			Role:  "assistant",
-			Model: t.model,
-			Usage: anthropicUsage{},
+			ID:      t.responseID,
+			Type:    "message",
+			Role:    "assistant",
+			Content: []anthropicContentBlock{},
+			Model:   t.model,
+			Usage:   anthropicUsage{},
 		},
 	}}
+}
+
+func (t *anthropicStreamTranslator) startContentBlock(block anthropicContentBlock) []anthropicStreamEvent {
+	idx := t.contentBlockIndex
+	t.contentBlockIndex++
+	t.contentBlockOpen = true
+	events := []anthropicStreamEvent{{
+		Type:         "content_block_start",
+		Index:        &idx,
+		ContentBlock: &block,
+	}}
+	if !t.pingAfterStartSent {
+		t.pingAfterStartSent = true
+		events = append(events, anthropicStreamEvent{Type: "ping"})
+	}
+	return events
+}
+
+func (t *anthropicStreamTranslator) contentBlockDelta(delta anthropicDelta) []anthropicStreamEvent {
+	idx := t.contentBlockIndex - 1
+	events := []anthropicStreamEvent{{
+		Type:  "content_block_delta",
+		Index: &idx,
+		Delta: &delta,
+	}}
+	t.deltasSincePing++
+	if t.deltasSincePing >= anthropicStreamPingEveryNDeltas {
+		t.deltasSincePing = 0
+		events = append(events, anthropicStreamEvent{Type: "ping"})
+	}
+	return events
 }
 
 // handleOutputItemAdded 处理新的输出项（reasoning/message/function_call）
@@ -881,18 +1019,11 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 	case "reasoning":
 		// 关闭当前块
 		events = append(events, t.closeCurrentBlock()...)
-		idx := t.contentBlockIndex
-		t.contentBlockIndex++
-		t.contentBlockOpen = true
 		t.currentBlockType = "thinking"
-		events = append(events, anthropicStreamEvent{
-			Type:  "content_block_start",
-			Index: &idx,
-			ContentBlock: &anthropicContentBlock{
-				Type:     "thinking",
-				Thinking: "",
-			},
-		})
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type:     "thinking",
+			Thinking: "",
+		})...)
 
 	case "function_call", "custom_tool_call":
 		events = append(events, t.closeCurrentBlock()...)
@@ -901,23 +1032,16 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 			callID = fromCodexCallID(gjson.GetBytes(data, "item.id").String())
 		}
 		name := gjson.GetBytes(data, "item.name").String()
-		idx := t.contentBlockIndex
-		t.contentBlockIndex++
-		t.contentBlockOpen = true
 		t.currentBlockType = "tool_use"
 		t.currentToolUseID = callID
 		t.currentToolUseName = name
 		t.hasToolUse = true
-		events = append(events, anthropicStreamEvent{
-			Type:  "content_block_start",
-			Index: &idx,
-			ContentBlock: &anthropicContentBlock{
-				Type:  "tool_use",
-				ID:    callID,
-				Name:  name,
-				Input: json.RawMessage("{}"),
-			},
-		})
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type:  "tool_use",
+			ID:    callID,
+			Name:  name,
+			Input: json.RawMessage("{}"),
+		})...)
 
 	case "message":
 		// text block 延迟到第一个 delta 时打开
@@ -943,29 +1067,17 @@ func (t *anthropicStreamTranslator) handleTextDelta(data []byte) []anthropicStre
 	// 懒开 text block
 	if !t.contentBlockOpen || t.currentBlockType != "text" {
 		events = append(events, t.closeCurrentBlock()...)
-		idx := t.contentBlockIndex
-		t.contentBlockIndex++
-		t.contentBlockOpen = true
 		t.currentBlockType = "text"
-		events = append(events, anthropicStreamEvent{
-			Type:  "content_block_start",
-			Index: &idx,
-			ContentBlock: &anthropicContentBlock{
-				Type: "text",
-				Text: "",
-			},
-		})
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type: "text",
+			Text: "",
+		})...)
 	}
 
-	idx := t.contentBlockIndex - 1
-	events = append(events, anthropicStreamEvent{
-		Type:  "content_block_delta",
-		Index: &idx,
-		Delta: &anthropicDelta{
-			Type: "text_delta",
-			Text: delta,
-		},
-	})
+	events = append(events, t.contentBlockDelta(anthropicDelta{
+		Type: "text_delta",
+		Text: delta,
+	})...)
 	return events
 }
 
@@ -984,43 +1096,33 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 	// 确保 thinking block 已打开
 	if !t.contentBlockOpen || t.currentBlockType != "thinking" {
 		events = append(events, t.closeCurrentBlock()...)
-		idx := t.contentBlockIndex
-		t.contentBlockIndex++
-		t.contentBlockOpen = true
 		t.currentBlockType = "thinking"
-		events = append(events, anthropicStreamEvent{
-			Type:  "content_block_start",
-			Index: &idx,
-			ContentBlock: &anthropicContentBlock{
-				Type:     "thinking",
-				Thinking: "",
-			},
-		})
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type:     "thinking",
+			Thinking: "",
+		})...)
 	}
 
-	idx := t.contentBlockIndex - 1
-	events = append(events, anthropicStreamEvent{
-		Type:  "content_block_delta",
-		Index: &idx,
-		Delta: &anthropicDelta{
-			Type:     "thinking_delta",
-			Thinking: delta,
-		},
-	})
+	events = append(events, t.contentBlockDelta(anthropicDelta{
+		Type:     "thinking_delta",
+		Thinking: delta,
+	})...)
 	return events
 }
 
-// handleToolInputDelta 缓冲工具调用参数增量。
-// 不直接转发为 input_json_delta：上游模型偶尔会塞入空可选字段（如 gpt-5.5
-// 给 Read 工具加 "pages":""），逐片透传后下游会看到污染后的入参。统一在
-// closeCurrentBlock 时整段清洗后一次性下发。
+// handleToolInputDelta 按官方 Anthropic 形状把 arguments 碎片转成
+// input_json_delta。空可选字段的清洗留到非流式聚合（compactAnthropicContent /
+// buildAnthropicResponseFromCompleted），避免把整段 JSON 攒完再一次吐给 Claude Code。
 func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropicStreamEvent {
 	delta := gjson.GetBytes(data, "delta").String()
 	if delta == "" {
 		return nil
 	}
 	t.currentToolInputBuffer.WriteString(delta)
-	return nil
+	return t.contentBlockDelta(anthropicDelta{
+		Type:        "input_json_delta",
+		PartialJSON: delta,
+	})
 }
 
 // handleContentDone 处理内容完成（文本/推理块）
@@ -1041,15 +1143,10 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 	if t.contentBlockOpen && t.currentBlockType == "thinking" &&
 		gjson.GetBytes(data, "item.type").String() == "reasoning" {
 		if sig := gjson.GetBytes(data, "item.encrypted_content").String(); sig != "" {
-			idx := t.contentBlockIndex - 1
-			events := []anthropicStreamEvent{{
-				Type:  "content_block_delta",
-				Index: &idx,
-				Delta: &anthropicDelta{
-					Type:      "signature_delta",
-					Signature: sig,
-				},
-			}}
+			events := t.contentBlockDelta(anthropicDelta{
+				Type:      "signature_delta",
+				Signature: sig,
+			})
 			return append(events, t.closeCurrentBlock()...)
 		}
 	}
@@ -1093,8 +1190,9 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 	events = append(events, anthropicStreamEvent{
 		Type: "message_delta",
 		Delta: &anthropicDelta{
-			Type:       "message_delta",
-			StopReason: stopReason,
+			StopReason:   anthropicStopReason(stopReason),
+			StopSequence: anthropicJSONNull,
+			StopDetails:  anthropicJSONNull,
 		},
 		Usage: &anthropicUsage{
 			InputTokens:          t.inputTokens,
@@ -1117,8 +1215,9 @@ func (t *anthropicStreamTranslator) handleFailed() []anthropicStreamEvent {
 	events = append(events, anthropicStreamEvent{
 		Type: "message_delta",
 		Delta: &anthropicDelta{
-			Type:       "message_delta",
-			StopReason: "end_turn",
+			StopReason:   anthropicStopReason("end_turn"),
+			StopSequence: anthropicJSONNull,
+			StopDetails:  anthropicJSONNull,
 		},
 		Usage: &anthropicUsage{},
 	})
@@ -1127,36 +1226,19 @@ func (t *anthropicStreamTranslator) handleFailed() []anthropicStreamEvent {
 }
 
 // closeCurrentBlock 关闭当前打开的 content block。
-// 关闭 tool_use 块时会先把累积的 arguments JSON 整段清洗（删除空字符串/null
-// 的可选字段），再作为单次 input_json_delta 下发。
+// tool_use 的 arguments 已在 handleToolInputDelta 按碎片下发，这里只关块。
 func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	if !t.contentBlockOpen {
 		return nil
 	}
 	t.contentBlockOpen = false
 	idx := t.contentBlockIndex - 1
+	t.currentToolInputBuffer.Reset()
 
-	var events []anthropicStreamEvent
-	if t.currentBlockType == "tool_use" && t.currentToolInputBuffer.Len() > 0 {
-		cleaned := sanitizeToolInputJSON(t.currentToolUseName, t.currentToolInputBuffer.String())
-		if cleaned != "" {
-			events = append(events, anthropicStreamEvent{
-				Type:  "content_block_delta",
-				Index: &idx,
-				Delta: &anthropicDelta{
-					Type:        "input_json_delta",
-					PartialJSON: cleaned,
-				},
-			})
-		}
-		t.currentToolInputBuffer.Reset()
-	}
-
-	events = append(events, anthropicStreamEvent{
+	return []anthropicStreamEvent{{
 		Type:  "content_block_stop",
 		Index: &idx,
-	})
-	return events
+	}}
 }
 
 // anthropicEventToSSE 将 Anthropic 事件序列化为 SSE 格式
@@ -1213,10 +1295,19 @@ func (a *anthropicResponseAccumulator) apply(events []anthropicStreamEvent) {
 			case "signature_delta":
 				a.content[*evt.Index].Signature += evt.Delta.Signature
 			case "input_json_delta":
-				a.content[*evt.Index].Input = json.RawMessage(evt.Delta.PartialJSON)
+				prev := a.content[*evt.Index].Input
+				fragment := []byte(evt.Delta.PartialJSON)
+				if len(prev) == 0 || bytes.Equal(bytes.TrimSpace(prev), []byte("{}")) {
+					a.content[*evt.Index].Input = json.RawMessage(fragment)
+				} else {
+					merged := make([]byte, 0, len(prev)+len(fragment))
+					merged = append(merged, prev...)
+					merged = append(merged, fragment...)
+					a.content[*evt.Index].Input = merged
+				}
 			}
 		case "message_delta":
-			if evt.Delta != nil && evt.Delta.StopReason != "" {
+			if evt.Delta != nil && evt.Delta.StopReason != nil {
 				a.response.StopReason = evt.Delta.StopReason
 			}
 			if evt.Usage != nil {
@@ -1240,11 +1331,11 @@ func (a *anthropicResponseAccumulator) build(completedData []byte) *anthropicRes
 	if len(resp.Content) == 0 && len(fallback.Content) > 0 {
 		return fallback
 	}
-	if resp.StopReason == "" {
+	if anthropicStopReasonValue(resp.StopReason) == "" {
 		resp.StopReason = fallback.StopReason
 	}
-	if resp.StopReason == "" {
-		resp.StopReason = "end_turn"
+	if anthropicStopReasonValue(resp.StopReason) == "" {
+		resp.StopReason = anthropicStopReason("end_turn")
 	}
 	if resp.Usage == (anthropicUsage{}) {
 		resp.Usage = fallback.Usage
@@ -1266,7 +1357,9 @@ func compactAnthropicContent(content []anthropicContentBlock) []anthropicContent
 				continue
 			}
 		case "tool_use":
-			if block.Input == nil || !json.Valid(block.Input) {
+			if cleaned := sanitizeToolInputJSON(block.Name, string(block.Input)); cleaned != "" {
+				block.Input = json.RawMessage(cleaned)
+			} else if block.Input == nil || !json.Valid(block.Input) {
 				block.Input = json.RawMessage("{}")
 			}
 		default:
@@ -1282,10 +1375,11 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 	responseID := "msg_" + uuid.New().String()[:24]
 
 	resp := &anthropicResponse{
-		ID:    responseID,
-		Type:  "message",
-		Role:  "assistant",
-		Model: model,
+		ID:      responseID,
+		Type:    "message",
+		Role:    "assistant",
+		Content: []anthropicContentBlock{},
+		Model:   model,
 	}
 
 	// 提取 output 数组
@@ -1371,15 +1465,15 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 	case "incomplete":
 		reason := gjson.GetBytes(completedData, "response.incomplete_details.reason").String()
 		if reason == "max_output_tokens" {
-			resp.StopReason = "max_tokens"
+			resp.StopReason = anthropicStopReason("max_tokens")
 		} else {
-			resp.StopReason = "end_turn"
+			resp.StopReason = anthropicStopReason("end_turn")
 		}
 	default:
 		if lastBlockIsToolUse {
-			resp.StopReason = "tool_use"
+			resp.StopReason = anthropicStopReason("tool_use")
 		} else {
-			resp.StopReason = "end_turn"
+			resp.StopReason = anthropicStopReason("end_turn")
 		}
 	}
 

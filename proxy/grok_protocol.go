@@ -75,9 +75,10 @@ func routeHeaders(raw map[string]string) http.Header {
 	return result
 }
 
-// ResolveGrokUpstreamRoute uses a fresh native capability first, then the
-// catalog apiBackend. Missing catalogs use Responses for the conservative
-// built-in model set so existing OAuth/API-key accounts stay usable until sync.
+// ResolveGrokUpstreamRoute uses the catalog apiBackend. A fresh same-protocol
+// probe only marks Native passthrough; it cannot override a different catalog
+// backend. Missing catalogs use Responses for the conservative built-in model
+// set so existing OAuth/API-key accounts stay usable until sync.
 func ResolveGrokUpstreamRoute(account *auth.Account, model string, inbound GrokProtocol, now time.Time) GrokUpstreamRoute {
 	baseURL, _ := account.GrokCredentials()
 	resolved := GrokUpstreamRoute{
@@ -1242,13 +1243,13 @@ func ExecuteGrokNativeProtocolProbeAtOriginWithHeaders(ctx context.Context, acco
 	if err != nil {
 		return nil, ErrInternalError("创建 Grok 探针请求失败", err)
 	}
-	applyGrokRequestHeaders(req, account, bearer, nil)
+	applyGrokRequestHeaders(req, account, bearer, nil, nil)
 	for name, values := range routeHeaders(extraHeaders) {
 		for _, value := range values {
 			req.Header.Set(name, value)
 		}
 	}
-	applyGrokRequestHeaders(req, account, bearer, nil)
+	applyGrokRequestHeaders(req, account, bearer, nil, nil)
 	req.Header.Set("Accept-Encoding", "gzip, br, deflate")
 	req.Header.Set("x-grok-turn-idx", "1")
 	if model != "" {
@@ -1446,7 +1447,11 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 		if reqErr != nil {
 			return nil, ErrInternalError("创建请求失败", reqErr)
 		}
-		applyGrokRequestHeaders(req, account, bearer, headers)
+		conversationBody := inboundBody
+		if len(conversationBody) == 0 {
+			conversationBody = responsesBody
+		}
+		applyGrokRequestHeaders(req, account, bearer, headers, conversationBody)
 		if clientVersion != "" {
 			req.Header.Set("x-grok-client-version", clientVersion)
 		}
@@ -1456,7 +1461,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 			}
 		}
 		// Credential/security headers always win over model metadata.
-		applyGrokRequestHeaders(req, account, bearer, headers)
+		applyGrokRequestHeaders(req, account, bearer, headers, conversationBody)
 		if clientVersion != "" {
 			req.Header.Set("x-grok-client-version", clientVersion)
 		}
