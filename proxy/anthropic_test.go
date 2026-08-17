@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/auth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -169,6 +170,71 @@ func TestTranslateAnthropicToCodexStillJoinsSystemBlocks(t *testing.T) {
 	}
 	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); text != "static\n\ndynamic" {
 		t.Fatalf("joined system = %q; body=%s", text, got)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokDowngradesFollowUpReasoning(t *testing.T) {
+	prev := currentGrokFollowUpEffortConfig()
+	t.Cleanup(func() { SetGrokFollowUpEffortConfig(prev) })
+	SetGrokFollowUpEffortConfig(auth.GrokFollowUpEffortConfig{Enabled: true, ToolEffort: "medium", SmallEffort: "low"})
+
+	first := []byte(`{
+		"model":"grok-4.6",
+		"output_config":{"effort":"high"},
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":"分析项目"}]
+	}`)
+	got, _, err := TranslateAnthropicToResponsesForGrok(first, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "high" || gjson.GetBytes(got, "reasoning.summary").String() != "detailed" {
+		t.Fatalf("first turn should stay high+detailed; body=%s", got)
+	}
+
+	follow := []byte(`{
+		"model":"grok-4.6",
+		"output_config":{"effort":"high"},
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"user","content":"分析项目"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(follow, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "medium" || gjson.GetBytes(got, "reasoning.summary").String() != "auto" {
+		t.Fatalf("tool_result follow-up should be medium+auto; body=%s", got)
+	}
+
+	small := []byte(`{"model":"grok-4.6","system":"short","messages":[{"role":"user","content":"取个标题"}]}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(small, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "low" || gjson.GetBytes(got, "reasoning.summary").String() != "auto" {
+		t.Fatalf("small no-tools request should be low+auto; body=%s", got)
+	}
+
+	lowClient := []byte(`{"model":"grok-4.6","output_config":{"effort":"low"},"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"分析项目"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(lowClient, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "low" {
+		t.Fatalf("explicit lower effort must not be raised; body=%s", got)
+	}
+
+	SetGrokFollowUpEffortConfig(auth.GrokFollowUpEffortConfig{Enabled: false, ToolEffort: "medium", SmallEffort: "low"})
+	got, _, err = TranslateAnthropicToResponsesForGrok(follow, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "high" || gjson.GetBytes(got, "reasoning.summary").String() != "detailed" {
+		t.Fatalf("disabled follow-up policy should keep high+detailed; body=%s", got)
 	}
 }
 

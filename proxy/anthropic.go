@@ -354,14 +354,15 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 
 	// 注意：不设置 max_output_tokens，上游 Codex 不支持该字段
 
-	// reasoning effort: align Claude Code /v1/messages with the Responses reasoning shape.
-	// Grok official CLI uses summary=detailed; Codex rejects anything but auto.
+	// reasoning: Codex 固定 summary=auto。Grok 首轮保持 high+detailed，
+	// 工具续轮和无工具小请求降一档，避免每轮都付满思考。
+	effort := resolveReasoningEffort(req.OutputConfig, codexModel)
 	summary := "auto"
 	if preserveControls {
-		summary = "detailed"
+		effort, summary = resolveGrokReasoningControls(req, rawJSON, codexModel)
 	}
 	out["reasoning"] = map[string]any{
-		"effort":  resolveReasoningEffort(req.OutputConfig, codexModel),
+		"effort":  effort,
 		"summary": summary,
 	}
 
@@ -830,6 +831,64 @@ func resolveReasoningEffort(outputConfig *anthropicOutputConfig, model string) s
 		return normalizeReasoningEffortForModel(outputConfig.Effort, model)
 	}
 	return "high"
+}
+
+const grokSmallNoToolsBodyLimit = 12 << 10
+
+func anthropicMessagesHaveToolResult(messages []anthropicMessage) bool {
+	for _, message := range messages {
+		for _, block := range parseAnthropicContent(message.Content) {
+			if block.Type == "tool_result" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func anthropicMessagesHaveAssistant(messages []anthropicMessage) bool {
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
+func capReasoningEffort(effort, cap string) string {
+	rank := map[string]int{
+		"minimal": 0,
+		"low":     1,
+		"medium":  2,
+		"high":    3,
+		"xhigh":   4,
+		"max":     4,
+	}
+	if rank[strings.ToLower(strings.TrimSpace(effort))] > rank[strings.ToLower(strings.TrimSpace(cap))] {
+		return cap
+	}
+	return effort
+}
+
+// resolveGrokReasoningControls 按轮次降思考：
+//   - 带 tool_result 的续轮：Claude Code 已经选定工具，Grok 只需填参数/读结果，medium+auto
+//   - 无 tools、无 assistant、体很小：并行小请求（标题/摘要/侧问），low+auto
+//   - 其余首轮提问：保持 high+detailed
+//
+// 客户端显式写了更低的 effort 时不往上抬。
+func resolveGrokReasoningControls(req anthropicRequest, rawJSON []byte, model string) (effort, summary string) {
+	effort = resolveReasoningEffort(req.OutputConfig, model)
+	policy := currentGrokFollowUpEffortConfig()
+	if !policy.Enabled {
+		return effort, "detailed"
+	}
+	if anthropicMessagesHaveToolResult(req.Messages) {
+		return capReasoningEffort(effort, policy.ToolEffort), "auto"
+	}
+	if len(req.Tools) == 0 && !anthropicMessagesHaveAssistant(req.Messages) && len(rawJSON) <= grokSmallNoToolsBodyLimit {
+		return capReasoningEffort(effort, policy.SmallEffort), "auto"
+	}
+	return effort, "detailed"
 }
 
 func convertAnthropicToolsForGrok(tools []anthropicTool, orderKey string) []any {

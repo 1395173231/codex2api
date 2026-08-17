@@ -1374,6 +1374,9 @@ export interface SystemSettings {
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
   grok_max_rate_limit_retries?: number
+  grok_follow_up_effort_enabled?: boolean
+  grok_follow_up_tool_effort?: string
+  grok_follow_up_small_effort?: string
   grok_oauth_client_id?: string
   /** 环境变量 GROK_OAUTH_CLIENT_ID 是否正压着上面的设置（只读，后端下发）。 */
   grok_oauth_client_id_env_override?: boolean

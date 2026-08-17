@@ -84,6 +84,7 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 	inbound := []byte(`{
 		"model":"claude-alias","max_tokens":91,"messages":[{"role":"user","content":"hello"}],
 		"temperature":0.4,"top_p":0.7,"stop_sequences":["END"],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}}
 	}`)
 	body, err := prepareRoutedGrokProtocolBody(route, GrokProtocolMessages, inbound, []byte(`{"model":"mapped-grok"}`))
