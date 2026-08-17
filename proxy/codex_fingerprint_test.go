@@ -582,13 +582,16 @@ func TestConvergedClientRequestIDFollowsClientIdentity(t *testing.T) {
 // 路径含系统用户名、associated_remote_urls 含仓库归属，多人共享账号时这些会把每个
 // 下游用户的身份原样送到上游。
 func TestScrubCodexWorkspacesRemovesWorkspaceIdentity(t *testing.T) {
-	const raw = `{"request_kind":"memory","workspaces":{"/Users/alice/code/secret-project":{"associated_remote_urls":{"origin":"https://github.com/alice-corp/secret-project.git"},"latest_git_commit_hash":"3cd12a68","has_changes":false}}}`
+	// commit hash 用真实长度的值：它是全局唯一的仓库标记，公开仓库可反查到归属，
+	// 与 remote URL 泄漏的是同一份身份。
+	const originalCommit = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
+	const raw = `{"request_kind":"memory","workspaces":{"/Users/alice/code/secret-project":{"associated_remote_urls":{"origin":"https://github.com/alice-corp/secret-project.git"},"latest_git_commit_hash":"` + originalCommit + `","has_changes":false}}}`
 
-	got, changed := scrubCodexWorkspaces(raw)
+	got, changed := scrubCodexWorkspaces(raw, 42)
 	if !changed {
 		t.Fatal("scrubCodexWorkspaces reported no change, want the workspace scrubbed")
 	}
-	for _, leaked := range []string{"alice", "secret-project", "github.com"} {
+	for _, leaked := range []string{"alice", "secret-project", "github.com", originalCommit} {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("scrubbed metadata %q still contains %q", got, leaked)
 		}
@@ -605,9 +608,9 @@ func TestScrubCodexWorkspacesRemovesWorkspaceIdentity(t *testing.T) {
 		if entry.Get("associated_remote_urls").Exists() {
 			t.Fatalf("associated_remote_urls survived in %q", entry.Raw)
 		}
-		// 非身份字段原样保留，避免改变 metadata 形状。
-		if entry.Get("latest_git_commit_hash").String() != "3cd12a68" {
-			t.Fatalf("latest_git_commit_hash = %q, want it preserved", entry.Get("latest_git_commit_hash").String())
+		// 形状保持：字段仍在，且仍是等长的十六进制串。
+		if replaced := entry.Get("latest_git_commit_hash").String(); len(replaced) != len(originalCommit) {
+			t.Fatalf("latest_git_commit_hash = %q, want a same-length derived placeholder", replaced)
 		}
 		if entry.Get("has_changes").Bool() {
 			t.Fatal("has_changes = true, want the client value preserved")
@@ -615,21 +618,31 @@ func TestScrubCodexWorkspacesRemovesWorkspaceIdentity(t *testing.T) {
 	}
 
 	// 同一路径恒定映射到同一占位符，不同路径互不相同。
-	repeat, _ := scrubCodexWorkspaces(raw)
+	repeat, _ := scrubCodexWorkspaces(raw, 42)
 	if repeat != got {
 		t.Fatalf("scrub is not deterministic: %q vs %q", repeat, got)
 	}
-	if placeholderWorkspacePath("/Users/alice/a") == placeholderWorkspacePath("/Users/alice/b") {
+	if placeholderWorkspacePath(42, "/Users/alice/a") == placeholderWorkspacePath(42, "/Users/alice/b") {
 		t.Fatal("distinct workspace paths collapsed to the same placeholder")
 	}
 
+	// 账号维度隔离：同一路径在不同账号下必须派生出不同占位符，否则上游可以把
+	// 同一个下游用户跨账号关联起来。
+	if placeholderWorkspacePath(42, "/Users/alice/a") == placeholderWorkspacePath(43, "/Users/alice/a") {
+		t.Fatal("same path produced the same placeholder across accounts")
+	}
+	otherAccount, _ := scrubCodexWorkspaces(raw, 43)
+	if otherAccount == got {
+		t.Fatal("scrub result is identical across accounts, want account-scoped derivation")
+	}
+
 	// 抹除必须幂等：重试链路可能把改写过的载荷再送进来一次。
-	if again, changedAgain := scrubCodexWorkspaces(got); changedAgain || again != got {
+	if again, changedAgain := scrubCodexWorkspaces(got, 42); changedAgain || again != got {
 		t.Fatalf("second scrub changed the payload again: %q -> %q", got, again)
 	}
 
 	// 没有 workspaces 的 metadata 不受影响。
-	if _, changed := scrubCodexWorkspaces(`{"session_id":"s"}`); changed {
+	if _, changed := scrubCodexWorkspaces(`{"session_id":"s"}`, 42); changed {
 		t.Fatal("metadata without workspaces was modified")
 	}
 }
@@ -643,11 +656,12 @@ func TestCodexFingerprintLeavesNoOriginalIdentifierOutbound(t *testing.T) {
 		clientInstallUUID = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
 		workspacePath     = "/Users/kyx/code_project/codex2api"
 		remoteURL         = "https://github.com/james-6-23/codex2api.git"
+		commitHash        = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
 	)
 	rawMetadata := `{"installation_id":"` + clientInstallUUID + `","session_id":"` + clientSessionUUID +
 		`","thread_id":"` + clientSessionUUID + `","turn_id":"01a00e76-15fb-7940-91a0-e201c45f502a","window_id":"` +
 		clientSessionUUID + `:0","request_kind":"turn","sandbox":"none","workspaces":{"` + workspacePath +
-		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"latest_git_commit_hash":"3cd12a68"}},"turn_started_at_unix_ms":1786949015072}`
+		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"latest_git_commit_hash":"` + commitHash + `"}},"turn_started_at_unix_ms":1786949015072}`
 
 	// 复刻真实 CLI 的下游头集合。
 	downstream := http.Header{}
@@ -679,7 +693,7 @@ func TestCodexFingerprintLeavesNoOriginalIdentifierOutbound(t *testing.T) {
 	outboundDump.Write(body)
 
 	// turn_id 不在此列：它是逐轮随机值，不标识设备或会话，重写只会引入不一致。
-	for _, leaked := range []string{clientSessionUUID, clientInstallUUID, workspacePath, remoteURL, "james-6-23"} {
+	for _, leaked := range []string{clientSessionUUID, clientInstallUUID, workspacePath, remoteURL, "james-6-23", commitHash} {
 		if strings.Contains(outboundDump.String(), leaked) {
 			t.Fatalf("original identifier %q survived into the outbound request:\n%s", leaked, outboundDump.String())
 		}

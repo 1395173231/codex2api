@@ -561,11 +561,12 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 		installUUID   = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
 		workspacePath = "/Users/kyx/code_project/codex2api"
 		remoteURL     = "https://github.com/james-6-23/codex2api.git"
+		commitHash    = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
 	)
 	rawMetadata := `{"installation_id":"` + installUUID + `","session_id":"` + clientUUID +
 		`","thread_id":"` + clientUUID + `","window_id":"` + clientUUID +
 		`:0","request_kind":"turn","workspaces":{"` + workspacePath +
-		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"has_changes":false}}}`
+		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"latest_git_commit_hash":"` + commitHash + `","has_changes":false}}}`
 
 	// 复刻真实 codex-tui 的握手头集合（见 wss://chatgpt.com/backend-api/codex/responses）。
 	ginHeaders := http.Header{}
@@ -603,7 +604,7 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 			dump.WriteString(name + ": " + value + "\n")
 		}
 	}
-	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "james-6-23"} {
+	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "james-6-23", commitHash} {
 		if strings.Contains(dump.String(), leaked) {
 			t.Fatalf("original identifier %q survived the websocket handshake headers:\n%s", leaked, dump.String())
 		}

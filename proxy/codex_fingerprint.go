@@ -44,6 +44,7 @@ const (
 // 不需要跨函数传递即可保证一致。
 type codexFingerprintIDs struct {
 	mode           string
+	accountID      int64
 	installationID string
 	sessionID      string
 	threadID       string
@@ -83,6 +84,7 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 
 	ids := &codexFingerprintIDs{
 		mode:           mode,
+		accountID:      accountID,
 		installationID: resolveConvergedInstallationID(account, accountID),
 	}
 	if ids.installationID == "" {
@@ -305,7 +307,7 @@ func rewriteCodexTurnMetadataJSON(raw string, ids *codexFingerprintIDs) (string,
 		raw = updated
 		changed = true
 	}
-	if scrubbed, ok := scrubCodexWorkspaces(raw); ok {
+	if scrubbed, ok := scrubCodexWorkspaces(raw, ids.accountID); ok {
 		raw = scrubbed
 		changed = true
 	}
@@ -320,8 +322,14 @@ func rewriteCodexTurnMetadataJSON(raw string, ids *codexFingerprintIDs) (string,
 // 前面几项标识的收敛失去意义。
 //
 // 处理方式是收敛而非删除：路径键换成按原值派生的占位符（条目数与互异性都保留，
-// 不改变 metadata 形状），remote URL 整体移除。其余字段原样保留。
-func scrubCodexWorkspaces(raw string) (string, bool) {
+// 不改变 metadata 形状），remote URL 整体移除，commit hash 换成派生占位值——
+// commit hash 是全局唯一的仓库标记，公开仓库可直接反查到归属，留着它等于换个
+// 字段泄漏 remote URL 同样的身份。
+//
+// 所有派生值都带 accountID：否则同一个下游用户的同一路径在不同账号下会得到相同
+// 占位符，上游据此就能把两个账号关联到同一个人。这也与本文件其它收敛值的种子
+// 惯例一致（见 resolveConvergedInstallationID）。
+func scrubCodexWorkspaces(raw string, accountID int64) (string, bool) {
 	workspaces := gjson.Get(raw, "workspaces")
 	if !workspaces.IsObject() {
 		return raw, false
@@ -343,8 +351,19 @@ func scrubCodexWorkspaces(raw string) (string, bool) {
 		// 已是占位符就保持原样：重试链路可能把改写过的载荷再送进来一次，
 		// 二次哈希会让同一工作区在不同尝试间漂移。
 		if !isPlaceholderWorkspacePath(originalPath) {
-			placeholder = placeholderWorkspacePath(originalPath)
+			placeholder = placeholderWorkspacePath(accountID, originalPath)
 			changed = true
+		}
+		// commit hash 的占位值从「已派生的占位路径」导出，而不是从原哈希导出：
+		// 二次处理时路径已是占位符、导出结果不变，幂等性随之成立，同时不同工作区
+		// 仍得到互不相同的哈希。
+		if hash := gjson.Get(entry, "latest_git_commit_hash"); hash.Type == gjson.String && hash.String() != "" {
+			if replacement := placeholderCommitHash(accountID, placeholder); replacement != hash.String() {
+				if updated, err := sjson.Set(entry, "latest_git_commit_hash", replacement); err == nil {
+					entry = updated
+					changed = true
+				}
+			}
 		}
 		updated, err := sjson.SetRaw(rebuilt, placeholder, entry)
 		if err != nil {
@@ -368,17 +387,29 @@ func scrubCodexWorkspaces(raw string) (string, bool) {
 // placeholderWorkspacePath 把本地路径映射成稳定占位符：同一路径恒定得到同一占位符，
 // 不同路径互不相同，且不携带用户名或项目名。返回值不含 sjson 的路径元字符
 // （. * ?），可直接作为 sjson 路径使用。
-func placeholderWorkspacePath(original string) string {
-	sum := sha256.Sum256([]byte("codex2api:workspace-path:v1:" + original))
-	return workspacePlaceholderPrefix + fmt.Sprintf("%x", sum[:4])
+func placeholderWorkspacePath(accountID int64, original string) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-path:v2:%d:%s", accountID, original))
+	return workspacePlaceholderPrefix + fmt.Sprintf("%x", sum[:workspacePlaceholderDigestBytes])
 }
 
-const workspacePlaceholderPrefix = "/workspace/"
+// placeholderCommitHash 派生一个与真实 commit hash 等长（40 位十六进制）的占位值，
+// 保持字段形状不变。种子取占位路径而非原哈希，见调用点说明。
+func placeholderCommitHash(accountID int64, placeholderPath string) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-commit:v1:%d:%s", accountID, placeholderPath))
+	return fmt.Sprintf("%x", sum[:20])
+}
+
+const (
+	workspacePlaceholderPrefix = "/workspace/"
+	// 32 bit 对低熵的本地路径来说太窄——既可能撞键把两个工作区并成一个，
+	// 也便于用候选路径表反查。64 bit 无额外代价。
+	workspacePlaceholderDigestBytes = 8
+)
 
 // isPlaceholderWorkspacePath 判断路径是否已经是本函数产出的占位符，用于让抹除保持幂等。
 func isPlaceholderWorkspacePath(path string) bool {
 	suffix, ok := strings.CutPrefix(path, workspacePlaceholderPrefix)
-	if !ok || len(suffix) != 8 {
+	if !ok || len(suffix) != workspacePlaceholderDigestBytes*2 {
 		return false
 	}
 	for _, r := range suffix {
