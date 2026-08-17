@@ -37,6 +37,35 @@ func TestDefaultReviewPromptIsProviderNeutralAndTreatsInputAsData(t *testing.T) 
 	}
 }
 
+func TestReviewHTTPStatusErrorSummarizesHTMLWithoutLeakingPage(t *testing.T) {
+	error := (&reviewHTTPStatusError{
+		status: 502, contentType: "text/html; charset=UTF-8",
+		summary: summarizeReviewHTTPBody("text/html", []byte("<html>proxy failure details</html>")),
+	}).Error()
+	if !strings.Contains(error, "status 502") || !strings.Contains(error, "HTML error page") {
+		t.Fatalf("error = %q, want status and HTML guidance", error)
+	}
+	if strings.Contains(error, "proxy failure details") {
+		t.Fatalf("error leaked upstream HTML body: %q", error)
+	}
+}
+
+func TestReviewTextReportsHTMLUpstreamErrorsBriefly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html><title>fanrenapi.com | 502: Bad gateway</title></html>"))
+	}))
+	defer server.Close()
+	client := ReviewClient{HTTPClient: server.Client()}
+	_, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled: true, APIKey: "test-key", BaseURL: server.URL, Model: "omni-moderation-latest", TimeoutSeconds: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "HTML error page") || strings.Contains(err.Error(), "fanrenapi.com") {
+		t.Fatalf("unexpected upstream error: %v", err)
+	}
+}
+
 func TestShouldReviewVerdictScopes(t *testing.T) {
 	base := ReviewConfig{Enabled: true, APIKey: "test-key", BaseURL: "https://review.example"}
 	tests := []struct {

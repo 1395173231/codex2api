@@ -1939,6 +1939,23 @@ export interface PromptReviewAPIKeysResponse {
   count: number
 }
 
+export interface PromptReviewProfile {
+  id: string
+  name: string
+  base_url: string
+  model: string
+  request_mode: string
+  timeout_seconds: number
+  key_count: number
+  active: boolean
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface PromptReviewProfilesResponse {
+  profiles: PromptReviewProfile[]
+}
+
 export interface PromptReviewTestResponse {
   ok: boolean
   endpoint: string
