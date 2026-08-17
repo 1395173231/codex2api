@@ -60,6 +60,7 @@ type Handler struct {
 	apiKeyGate   *apiKeyConcurrencyLimiter
 	scopeUsageMu sync.Mutex
 	scopeUsage   *apiKeyScopeUsageTracker
+	liveStore    *liveCallStore
 }
 
 const (
@@ -982,7 +983,7 @@ func noAvailableAnthropicAccountMessage(model string) string {
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
-	return &Handler{
+	handler := &Handler{
 		store:      store,
 		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
 		db:         db,
@@ -990,6 +991,8 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 		deviceCfg:  deviceCfg,
 		apiKeyGate: newAPIKeyConcurrencyLimiter(),
 	}
+	handler.liveStore = newLiveCallStore(handler)
+	return handler
 }
 
 // SetRuntimeCache wires Redis/Memory runtime cache for hot auth metadata.
@@ -2333,6 +2336,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.GET("/models", h.listModelsOrManifest)
 	// Codex CLI web_search = "live" 的 standalone 联网搜索端点 (issue #359)
 	v1.POST("/alpha/search", h.CodexAlphaSearchHandler)
+	v1.POST("/live", h.LiveCreate)
+	v1.GET("/live/:call_id", h.LiveSideband)
 
 	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
 	r.POST("/chat/completions", auth, h.ChatCompletions)
@@ -2352,6 +2357,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/responses/input_tokens", auth, h.ResponsesInputTokens)
 	r.GET("/models", auth, h.listModelsOrManifest)
 	r.POST("/alpha/search", auth, h.CodexAlphaSearchHandler)
+	r.POST("/live", auth, h.LiveCreate)
+	r.GET("/live/:call_id", auth, h.LiveSideband)
 
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(auth)
@@ -2359,6 +2366,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	codexDirect.GET("/responses", h.ResponsesWebSocket)
 	codexDirect.GET("/models", h.CodexModelsManifestHandler)
 	codexDirect.POST("/alpha/search", h.CodexAlphaSearchHandler)
+	codexDirect.POST("/realtime/calls", h.LiveCreate)
 	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
 		subpath := strings.TrimSpace(c.Param("subpath"))
 		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
@@ -2367,6 +2375,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		}
 		h.Responses(c)
 	})
+	codexDirect.GET("/:call_id", h.LiveSideband)
 }
 
 // APIKeyAuthMiddleware exposes the standard /v1 API key authentication middleware

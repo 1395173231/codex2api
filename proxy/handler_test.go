@@ -183,6 +183,9 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/backend-api/codex/responses",
 		"/backend-api/codex/responses/*subpath",
+		"/v1/live",
+		"/live",
+		"/backend-api/codex/realtime/calls",
 	} {
 		if !postRoutes[path] {
 			t.Fatalf("expected POST route %s to be registered; routes=%v", path, postRoutes)
@@ -191,9 +194,12 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/v1/responses",
 		"/v1/realtime",
+		"/v1/live/:call_id",
 		"/responses",
 		"/realtime",
+		"/live/:call_id",
 		"/backend-api/codex/responses",
+		"/backend-api/codex/:call_id",
 	} {
 		if !getRoutes[path] {
 			t.Fatalf("expected GET route %s to be registered; routes=%v", path, getRoutes)

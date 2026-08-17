@@ -4017,6 +4017,8 @@
         "strip": "Removes the image_generation / image_gen tool declarations (top-level, Responses Lite, and matching tool_choice) and forwards the request as a plain text request. Other tools (shell, function, apply_patch, MCP, web search) are kept. Use this when the upstream group/plan does not support image generation but should still serve text and code.",
         "block": "Requests that touch image generation (gpt-image-* models, /v1/images endpoints, or an image_generation tool/intent) return 403."
       },
+      "allowLive": "Allow ChatGPT Live",
+      "allowLiveHint": "Off by default. When enabled, this key can call /v1/live and Codex realtime/calls, which occupy long-lived concurrency. Linux/Docker cannot generate DeviceCheck; without a client attestation the upstream may reject the call.",
       "rpm": "Requests per minute",
       "rpmSuffix": "/min",
       "rpd": "Requests per day",
