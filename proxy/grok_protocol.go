@@ -1442,6 +1442,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 			preflight.Body = clampGrokReasoningEffort(body)
 		}
 	}
+	logGrokPrefixFingerprint(preflight.Body, preflight.TurnIndex, preflight.Model)
 	send := func(payload []byte, clientVersion string) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, route.Endpoint, bytes.NewReader(payload))
 		if reqErr != nil {

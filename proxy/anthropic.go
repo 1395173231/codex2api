@@ -126,10 +126,11 @@ type anthropicImageSource struct {
 }
 
 type anthropicTool struct {
-	Type        string          `json:"type,omitempty"`
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Type         string                 `json:"type,omitempty"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description,omitempty"`
+	InputSchema  json.RawMessage        `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // ==================== Anthropic 响应类型 ====================
@@ -370,9 +371,14 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 		}
 	}
 
-	// tools
+	// tools。Grok 前缀缓存会吃整表工具定义；按会话记住首次顺序，
+	// 中途新出现的工具只追加在表尾，且不把 cache_control 传给上游。
 	if len(req.Tools) > 0 {
-		out["tools"] = convertAnthropicTools(req.Tools)
+		if preserveControls {
+			out["tools"] = convertAnthropicToolsForGrok(req.Tools, grokToolOrderKey(rawJSON))
+		} else {
+			out["tools"] = convertAnthropicTools(req.Tools)
+		}
 	}
 
 	// tool_choice
@@ -824,6 +830,10 @@ func resolveReasoningEffort(outputConfig *anthropicOutputConfig, model string) s
 		return normalizeReasoningEffortForModel(outputConfig.Effort, model)
 	}
 	return "high"
+}
+
+func convertAnthropicToolsForGrok(tools []anthropicTool, orderKey string) []any {
+	return stabilizeGrokToolOrder(orderKey, convertAnthropicTools(tools))
 }
 
 // convertAnthropicTools 将 Anthropic 工具格式转为 Codex 格式

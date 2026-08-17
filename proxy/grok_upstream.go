@@ -222,6 +222,7 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 	preflight := prepareGrokUpstreamBody(requestBody)
 	requestBody = preflight.Body
 	nsAliases := preflight.Aliases
+	logGrokPrefixFingerprint(requestBody, preflight.TurnIndex, preflight.Model)
 
 	endpoint := grokResponsesEndpoint(baseURL)
 	turnIdx := preflight.TurnIndex
