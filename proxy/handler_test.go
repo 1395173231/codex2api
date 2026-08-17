@@ -3164,6 +3164,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 	if !isCodexModelUnsupportedError(unsupported) {
 		t.Fatal("应识别模型不支持错误")
 	}
+	unknownProvider := []byte(`{"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}`)
+	if !isCodexModelUnsupportedError(unknownProvider) {
+		t.Fatal("应识别中转上游缺少模型提供商错误")
+	}
 	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
 		t.Fatal("普通 invalid_request 不应命中")
 	}
@@ -3176,6 +3180,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 		t.Fatal("模型不支持的 400 应可换号重试")
 	}
 	general, rate = 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unknownProvider, &general, &rate, 2, 1) {
+		t.Fatal("中转上游缺少模型提供商的 400 应可换号重试")
+	}
+	general, rate = 0, 0
 	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
 		t.Fatal("普通 400 不应重试")
 	}
@@ -3185,6 +3193,10 @@ func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
 	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
 	if !responseFailedRetryable(payload) {
 		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	unknownProvider := []byte(`{"type":"response.failed","response":{"status_code":400,"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}}`)
+	if !responseFailedRetryable(unknownProvider) {
+		t.Fatal("中转上游缺少模型提供商的 response.failed 应视为可换号重试")
 	}
 	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
 	if responseFailedRetryable(plain) {

@@ -5883,6 +5883,9 @@ func isCodexModelUnsupportedError(body []byte) bool {
 		if strings.Contains(lower, "model is not supported when using codex") {
 			return true
 		}
+		if strings.Contains(lower, "unknown provider for model") {
+			return true
+		}
 	}
 	return false
 }
