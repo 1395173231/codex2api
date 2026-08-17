@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.8.2 - 2026-08-18
+
+### Features
+
+- **Claude Code on Grok can drop follow-up reasoning effort without touching the first user turn.** A settings switch (`follow_up_effort_enabled`, default off) keeps the client's or default effort for the opening question, then caps tool-result follow-ups and tiny no-tools requests at operator-chosen `low`/`medium`/`high` (defaults medium / low). A client value that is already lower is left alone. grok-4.6 still has `xhigh`; grok-4.5 tops out at `high`.
+- **Grok tool tables keep their first-seen order, and Claude system prefixes stay split so Grok can reuse the static cache.** Claude Code often reorders tools or inserts MCP tools mid-session, which punched through Grok's prefix cache. The gateway now remembers the first-seen tool order per conversation — keyed by the static system text plus the first user turn, not the tool list itself — and only appends new names. `cache_control` is stripped from tools forwarded to Grok. System blocks that carry `cache_control` stay as separate developer messages instead of being concatenated, so the static CLAUDE.md prefix can be reused while the dynamic git-dirty tail changes.
+
+### Fixes
+
+- **Claude Code stays on catalog Responses, so grok-4.6 no longer 400s on `tool_result` roles.** A fresh Messages capability probe used to override the catalog `apiBackend`. grok-4.6's Responses path does not accept Anthropic `tool_result` roles; catalog now wins, downstream SSE stays Claude-shaped, and same-protocol non-native routes still force upstream streaming so the canonical SSE pipeline can consume them.
+- **`unknown provider for model` is treated as an account/model mismatch and rotated (PR #539 by @dundunge).** Relay 400s of the form `unknown provider for model gpt-5.6-sol` were passed through because the detector only recognized official Codex wording. HTTP and `response.failed` paths now reuse the existing model-unsupported cooldown and account-rotation retry; ordinary 400s stay unretried.
+- **Streaming Codex Remote Compact no longer pins to official OAuth accounts (#540, reported by @wxxsfxyzm).** Newer Codex clients send Remote Compact as `POST /responses` + `stream=true` + `compaction_trigger`. The old body-signal path excluded working OpenAI Responses relays whenever any official account was still in the pool, so a relay-only (or official-but-wrong-model) deployment returned an immediate 503. Streaming Remote Compact now uses the ordinary `/responses` scheduler; non-streaming body-signal compact still lifts to the dedicated compact path.
+
 ## v2.8.1 - 2026-08-17
 
 ### Features
