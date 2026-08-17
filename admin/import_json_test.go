@@ -1061,6 +1061,84 @@ func TestAddAccountRTRefreshUsesImportProbeGate(t *testing.T) {
 	}
 }
 
+func TestImportedATAndRTWarmupsReserveCapacityAtHighProbeSetting(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 64,
+	})
+	store.SetUsageProbeConcurrency(64)
+	t.Cleanup(store.Stop)
+
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var finished atomic.Int64
+	work := func() {
+		n := current.Add(1)
+		for {
+			previous := maxConcurrent.Load()
+			if n <= previous || maxConcurrent.CompareAndSwap(previous, n) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+		current.Add(-1)
+		finished.Add(1)
+	}
+
+	handler := &Handler{
+		store: store,
+		importLoadSnapshot: func() importRuntimeLoadSnapshot {
+			return importRuntimeLoadSnapshot{RPM: 1000, DBMaxOpen: 100}
+		},
+		refreshAccount: func(_ context.Context, id int64) error {
+			work()
+			account := store.FindByID(id)
+			if account == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			account.Mu().Lock()
+			account.AccessToken = fmt.Sprintf("refreshed-at-%d", id)
+			account.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			work()
+			return nil
+		},
+	}
+
+	accounts := make([]*auth.Account, 0, 8)
+	for id := int64(1); id <= 8; id++ {
+		account := &auth.Account{DBID: id, RefreshToken: fmt.Sprintf("rt-%d", id)}
+		if id <= 4 {
+			account.AccessToken = fmt.Sprintf("at-%d", id)
+		}
+		accounts = append(accounts, account)
+	}
+	handler.commitImportedRuntimeAccounts(accounts, "test_import", false)
+
+	// 4 个 AT 各探测一次；4 个 RT 各刷新并探测一次。
+	const wantFinished = 12
+	deadline := time.Now().Add(3 * time.Second)
+	for finished.Load() < wantFinished {
+		if time.Now().After(deadline) {
+			t.Fatalf("finished warmup operations = %d, want %d", finished.Load(), wantFinished)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 等待一个完整 worker 周期，确保 RT 刷新内部没有偷偷多跑一次 probe。
+	time.Sleep(100 * time.Millisecond)
+	if got := finished.Load(); got != wantFinished {
+		t.Fatalf("finished warmup operations = %d, want exactly %d (RT refresh probed twice)", got, wantFinished)
+	}
+	const wantHighLoadConcurrency = 4
+	if got := maxConcurrent.Load(); got > wantHighLoadConcurrency {
+		t.Fatalf("max concurrent import warmups = %d, want <= %d", got, wantHighLoadConcurrency)
+	}
+	if got := handler.importProbeConcurrency(); got != wantHighLoadConcurrency {
+		t.Fatalf("import probe concurrency = %d, want %d at high load", got, wantHighLoadConcurrency)
+	}
+}
+
 func newMultipartJSONRequest(t *testing.T, filename string, content string) *http.Request {
 	t.Helper()
 
@@ -1953,8 +2031,166 @@ func TestParseImportJSONTokensStreamRejectsBrokenJSON(t *testing.T) {
 	}
 }
 
-// 导入采样并发闸:同一时刻在途采样任务数不超过闸容量。用一个会阻塞的
-// probe 探测函数占满槽位,断言超出的任务在前面释放前拿不到槽。
+func TestAdaptiveImportLimitsUseHysteresisAndDatabasePressure(t *testing.T) {
+	snapshot := importRuntimeLoadSnapshot{DBMaxOpen: 100}
+	now := time.Unix(1_800_000_000, 0)
+	h := &Handler{
+		importLoadSnapshot: func() importRuntimeLoadSnapshot { return snapshot },
+		importLoadNow:      func() time.Time { return now },
+	}
+
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("low-load limits = %+v, want db=12 probe=8", got)
+	}
+	snapshot.RPM = 200
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("medium-load limits = %+v, want db=8 probe=6", got)
+	}
+	// 介于升档(180)和降档(120)阈值之间时保持中档，避免抖动。
+	snapshot.RPM = 150
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("hysteresis limits = %+v, want medium tier", got)
+	}
+	snapshot.RPM = 100
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("recovered limits = %+v, want low tier", got)
+	}
+	snapshot.RPM = 700
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("high-load limits = %+v, want db=4 probe=4", got)
+	}
+	// 高档每次最多降一档。
+	snapshot.RPM = 0
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("early recovery limits = %+v, want high tier during hold", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("first recovery limits = %+v, want medium tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("second recovery limits = %+v, want low tier", got)
+	}
+	snapshot.DBWaitCount++
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("DB-wait limits = %+v, want immediate high tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("DB-wait backoff limits = %+v, want latched high tier", got)
+	}
+}
+
+func TestAdaptiveImportLimitsReserveDatabasePoolCapacity(t *testing.T) {
+	h := &Handler{importLoadSnapshot: func() importRuntimeLoadSnapshot {
+		return importRuntimeLoadSnapshot{DBMaxOpen: 8}
+	}}
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 2, probe: 8}) {
+		t.Fatalf("small-pool limits = %+v, want db=2 probe=8", got)
+	}
+}
+
+func TestAdaptiveImportLimitsReactToLongRunningRequests(t *testing.T) {
+	snapshot := importRuntimeLoadSnapshot{Active: 64, DBMaxOpen: 100}
+	now := time.Unix(1_800_000_000, 0)
+	h := &Handler{
+		importLoadSnapshot: func() importRuntimeLoadSnapshot { return snapshot },
+		importLoadNow:      func() time.Time { return now },
+	}
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("high-active limits = %+v, want db=4 probe=4", got)
+	}
+	snapshot.Active = 0
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("first active recovery limits = %+v, want medium tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("second active recovery limits = %+v, want low tier", got)
+	}
+}
+
+func TestAdaptiveImportDBLimiterShrinksWhileImportIsRunning(t *testing.T) {
+	var rpm atomic.Int64
+	h := &Handler{importLoadSnapshot: func() importRuntimeLoadSnapshot {
+		return importRuntimeLoadSnapshot{RPM: rpm.Load(), DBMaxOpen: 100}
+	}}
+	limiter := &adaptiveImportDBLimiter{handler: h}
+	for i := 0; i < 12; i++ {
+		if !limiter.acquire(context.Background()) {
+			t.Fatalf("low-load permit %d was not acquired", i+1)
+		}
+	}
+	if got := limiter.active.Load(); got != 12 {
+		t.Fatalf("low-load active permits = %d, want 12", got)
+	}
+
+	rpm.Store(1000)
+	blockedCtx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	if limiter.acquire(blockedCtx) {
+		cancel()
+		t.Fatal("high-load limiter granted a 13th permit")
+	}
+	cancel()
+	for i := 0; i < 8; i++ {
+		limiter.release()
+	}
+	blockedCtx, cancel = context.WithTimeout(context.Background(), 75*time.Millisecond)
+	if limiter.acquire(blockedCtx) {
+		cancel()
+		t.Fatal("high-load limiter exceeded four active permits")
+	}
+	cancel()
+
+	limiter.release()
+	if !limiter.acquire(context.Background()) {
+		t.Fatal("high-load limiter did not refill the fourth permit")
+	}
+	for limiter.active.Load() > 0 {
+		limiter.release()
+	}
+}
+
+func TestRunImportProbeTaskUsesEightWorkersAtLowLoad(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, UsageProbeConcurrency: 64})
+	store.SetUsageProbeConcurrency(64)
+	t.Cleanup(store.Stop)
+	h := &Handler{
+		store: store,
+		importLoadSnapshot: func() importRuntimeLoadSnapshot {
+			return importRuntimeLoadSnapshot{DBMaxOpen: 100}
+		},
+	}
+
+	const n = 8
+	started := make(chan struct{}, n)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		h.runImportProbeTask(func(context.Context) {
+			defer wg.Done()
+			started <- struct{}{}
+			<-release
+		})
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatalf("only %d/%d low-load probe workers started", i, n)
+		}
+	}
+	close(release)
+	wg.Wait()
+}
+
+// 导入采样 worker pool:同一时刻在途任务数不超过容量，超出的任务只进队列，
+// 不会各自创建一个阻塞 goroutine。
 func TestRunImportProbeTaskConcurrencyGate(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
 	store.SetUsageProbeConcurrency(2)
@@ -1980,11 +2216,19 @@ func TestRunImportProbeTaskConcurrencyGate(t *testing.T) {
 			atomic.AddInt32(&inFlight, -1)
 		})
 	}
-	// 给 goroutine 时间进入信号量;闸容量 2,峰值不应超过 2。
+	// 给两个 worker 时间拿到任务；其余四个应该仍是普通队列元素。
 	time.Sleep(150 * time.Millisecond)
 	if peak := atomic.LoadInt32(&maxSeen); peak > 2 {
 		close(release)
 		t.Fatalf("in-flight peak = %d, want ≤ 2 (gate leaked)", peak)
+	}
+	h.importProbeQueueMu.Lock()
+	workers := h.importProbeWorkers
+	queued := len(h.importProbeQueue)
+	h.importProbeQueueMu.Unlock()
+	if workers != 2 || queued != n-workers {
+		close(release)
+		t.Fatalf("workers/queued = %d/%d, want 2/%d", workers, queued, n-workers)
 	}
 	close(release)
 	wg.Wait()

@@ -3031,6 +3031,7 @@ type Store struct {
 	promptRiskTrustPolicies            map[string]database.PromptRiskTrustPolicy
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
+	usageProbeCompletion               func()
 	usageProbeBatch                    atomic.Bool
 	recoveryProbeBatch                 atomic.Bool
 	autoCleanUnauthorized              atomic.Bool
@@ -7279,8 +7280,8 @@ func (s *Store) AddAccounts(accounts []*Account) {
 			s.accountsByID[acc.DBID] = acc
 		}
 	}
-	for _, acc := range added {
-		s.fastSchedulerUpdate(acc)
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		scheduler.UpdateMany(added)
 	}
 }
 
@@ -9077,6 +9078,25 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbe = fn
 }
 
+// SetUsageProbeCompletionFunc registers a callback invoked after a batch usage
+// probe has fully completed. It lets read-model caches refresh only after all
+// per-account state and persistence writes are visible.
+func (s *Store) SetUsageProbeCompletionFunc(fn func()) {
+	s.usageProbeMu.Lock()
+	defer s.usageProbeMu.Unlock()
+	s.usageProbeCompletion = fn
+}
+
+func (s *Store) finishUsageProbeBatch() {
+	s.usageProbeBatch.Store(false)
+	s.usageProbeMu.RLock()
+	onComplete := s.usageProbeCompletion
+	s.usageProbeMu.RUnlock()
+	if onComplete != nil {
+		onComplete()
+	}
+}
+
 // TriggerUsageProbeForAccountAsync immediately probes one account without
 // waiting for the periodic max-age sweep. ProbeUsageSnapshot sees the account
 // in a limited state and starts with WHAM as the zero-cost source of truth.
@@ -9158,7 +9178,7 @@ func (s *Store) TriggerUsageProbeAsync() {
 	}
 
 	if !s.startDBBackgroundTask(func(ctx context.Context) {
-		defer s.usageProbeBatch.Store(false)
+		defer s.finishUsageProbeBatch()
 		s.parallelProbeUsage(ctx)
 	}) {
 		s.usageProbeBatch.Store(false)
@@ -9512,7 +9532,7 @@ func (s *Store) TriggerUsageProbeForceAsync() {
 	}
 
 	if !s.startDBBackgroundTask(func(ctx context.Context) {
-		defer s.usageProbeBatch.Store(false)
+		defer s.finishUsageProbeBatch()
 		s.parallelProbeUsageWith(ctx, 0)
 	}) {
 		s.usageProbeBatch.Store(false)

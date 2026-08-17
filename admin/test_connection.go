@@ -96,6 +96,12 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		isTransient = true
 	}
 
+	// 连接测试虽是 SSE GET，却会写入未授权、错误、限流或恢复状态。等流结束后
+	// 再失效列表/分析快照，避免账号页继续把已判定的 401 账号显示为“未采样”。
+	if !isTransient {
+		defer h.invalidateAccountSnapshotCaches()
+	}
+
 	isOpenAIResponsesAccount := account.IsRelayStyle()
 	// Agent Identity 无 AT，凭私钥动态签名，跳过 AT 预检（请求走 Codex 执行器动态签名）。
 	if !isOpenAIResponsesAccount && !account.IsCodexAgentIdentity() && account.GetAccessToken() == "" {

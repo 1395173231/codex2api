@@ -18,10 +18,8 @@ import { api } from '../api'
 import { getErrorMessage } from '../utils/error'
 import type { AccountQuotaAnalysis } from '../types'
 
-type QuotaWindow = '5h' | '7d'
-
 interface AccountQuotaDistributionChartProps {
-  analysis: Record<QuotaWindow, AccountQuotaAnalysis>
+  analysis: Record<'5h' | '7d', AccountQuotaAnalysis>
   className?: string
   compact?: boolean
   onRefreshAnalysis?: () => Promise<void> | void
@@ -36,8 +34,6 @@ interface DistributionBucket {
   bucketPercent: number
   fill: string
 }
-
-const quotaWindows: QuotaWindow[] = ['5h', '7d']
 
 const quotaBuckets = [
   { key: '0-10', min: 0, max: 10, fill: 'hsl(var(--success))' },
@@ -77,7 +73,6 @@ export default function AccountQuotaDistributionChart({
   onProbeError,
 }: AccountQuotaDistributionChartProps) {
   const { t } = useTranslation()
-  const [windowKey, setWindowKey] = useState<QuotaWindow>('7d')
   const [probing, setProbing] = useState(false)
   const sampledRef = useRef(0)
   const pollTimerRef = useRef<number | null>(null)
@@ -149,7 +144,7 @@ export default function AccountQuotaDistributionChart({
   }
 
   const distribution = useMemo(() => {
-    const source = analysis[windowKey]
+    const source = analysis['7d']
     const buckets: DistributionBucket[] = source.buckets.map((bucket, index) => ({
       key: quotaBuckets[index]?.key ?? `${bucket.min}-${bucket.max}`,
       label: `${bucket.min}-${bucket.max}%`,
@@ -169,7 +164,7 @@ export default function AccountQuotaDistributionChart({
       exhausted: source.exhausted,
       averageUsed: source.average_used,
     }
-  }, [analysis, windowKey])
+  }, [analysis])
 
   sampledRef.current = distribution.sampled
   const samplePercent = distribution.total > 0
@@ -204,22 +199,6 @@ export default function AccountQuotaDistributionChart({
               <RefreshCw className={`size-3.5 ${probing ? 'animate-spin' : ''}`} />
               <span>{probing ? t('accounts.quotaDistributionRefreshing') : t('accounts.quotaDistributionRefresh')}</span>
             </button>
-            <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
-              {quotaWindows.map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setWindowKey(key)}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
-                    windowKey === key
-                      ? 'border border-border bg-background text-foreground shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  {key}
-                </button>
-              ))}
-            </div>
           </div>
         </div>
 
@@ -322,7 +301,7 @@ export default function AccountQuotaDistributionChart({
           </div>
         </div>
 
-        {samplePercent < 100 && (
+        {distribution.total > 0 && samplePercent < 100 && (
           <div className={`${compact ? 'mt-3' : 'mt-4'} shrink-0 rounded-lg border border-border bg-muted/20 px-3 py-2`}>
             <div className="mb-1.5 flex items-center justify-between gap-3 text-[11px] font-medium">
               <span className={probing ? 'text-sky-600 dark:text-sky-300' : 'text-muted-foreground'}>

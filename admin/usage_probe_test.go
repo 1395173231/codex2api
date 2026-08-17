@@ -132,6 +132,36 @@ func TestProbeUsageSnapshotWhamUnauthorizedDoesNotBanWhenFallbackUnavailable(t *
 	}
 }
 
+func TestProbeUsageSnapshotRevokedTokenBansWithoutResponsesFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"token_revoked","message":"Encountered invalidated oauth token for user, failing request"},"status":401}`))
+	}))
+	defer server.Close()
+	restore := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restore()
+
+	store := auth.NewStore(nil, nil, nil)
+	store.SetUsageProbeResponsesFallbackEnabled(false)
+	account := &auth.Account{DBID: 2, AccessToken: "revoked-token", Status: auth.StatusReady}
+	store.AddAccount(account)
+
+	h := &Handler{store: store}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() error = %v, want revoked token handled as terminal account state", err)
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	account.Mu().RLock()
+	errorMessage := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMessage, "token_revoked") {
+		t.Fatalf("ErrorMsg = %q, want token_revoked detail", errorMessage)
+	}
+}
+
 // wham 429 的既有行为不受影响：只上报失败，不封号、不归类为 unauthorized。
 func TestProbeUsageSnapshotWhamRateLimitedKeepsAccountUsable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
