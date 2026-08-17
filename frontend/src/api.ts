@@ -1123,6 +1123,23 @@ export const api = {
     request<PromptReviewAPIKeysResponse>('/prompt-filter/review/keys'),
   deletePromptReviewAPIKey: (keyID: string) =>
     request<PromptReviewAPIKeysResponse>(`/prompt-filter/review/keys/${encodeURIComponent(keyID)}`, { method: 'DELETE' }),
+  listPromptReviewProfiles: () =>
+    request<import('./types').PromptReviewProfilesResponse>('/prompt-filter/review/profiles'),
+  savePromptReviewProfile: (data: {
+    id?: string
+    name: string
+    base_url: string
+    model: string
+    request_mode: string
+    api_key?: string
+    adapter_json: string
+    timeout_seconds: number
+  }) =>
+    request<import('./types').PromptReviewProfile>('/prompt-filter/review/profiles', { method: 'POST', body: JSON.stringify(data) }),
+  activatePromptReviewProfile: (id: string) =>
+    request<import('./types').PromptReviewProfile>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' }),
+  deletePromptReviewProfile: (id: string) =>
+    request<{ ok: boolean }>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>

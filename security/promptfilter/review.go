@@ -434,11 +434,63 @@ type reviewModelResponseError struct {
 }
 
 type reviewHTTPStatusError struct {
-	status int
+	status      int
+	contentType string
+	summary     string
 }
 
 func (e *reviewHTTPStatusError) Error() string {
-	return fmt.Sprintf("review request failed with status %d", e.status)
+	message := fmt.Sprintf("review request failed with status %d", e.status)
+	if e.contentType != "" {
+		message += " (" + e.contentType + ")"
+	}
+	if e.summary != "" {
+		message += ": " + e.summary
+	}
+	return message
+}
+
+func summarizeReviewHTTPBody(contentType string, body []byte) string {
+	if strings.Contains(strings.ToLower(contentType), "text/html") {
+		return "upstream returned an HTML error page; check the Base URL, proxy route, and provider endpoint"
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "upstream returned an empty error body"
+	}
+	var decoded struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &decoded) == nil {
+		parts := make([]string, 0, 2)
+		if decoded.Error.Message != "" {
+			parts = append(parts, decoded.Error.Message)
+		}
+		if decoded.Error.Code != "" {
+			parts = append(parts, "code="+decoded.Error.Code)
+		}
+		if decoded.Message != "" && len(parts) == 0 {
+			parts = append(parts, decoded.Message)
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "; ")
+		}
+	}
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, trimmed)
+	if len([]rune(clean)) > 240 {
+		clean = string([]rune(clean)[:240]) + "…"
+	}
+	return clean
 }
 
 type reviewKeyCooldown struct {
@@ -806,15 +858,18 @@ func (c ReviewClient) reviewOnce(ctx context.Context, endpoint, apiKey string, p
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, true, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), &reviewHTTPStatusError{status: resp.StatusCode}
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReviewResponseBytes+1))
 	if err != nil {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, err
 	}
 	if len(body) > maxReviewResponseBytes {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, fmt.Errorf("review response exceeds %d bytes", maxReviewResponseBytes)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), &reviewHTTPStatusError{
+			status: resp.StatusCode, contentType: contentType, summary: summarizeReviewHTTPBody(contentType, body),
+		}
 	}
 	var outcome ReviewOutcome
 	if cfg.Adapter.RequestMode == ReviewRequestModeChatCompletions {

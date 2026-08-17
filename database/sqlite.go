@@ -442,6 +442,19 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			review_latency_ms INTEGER NULL,
 			full_text TEXT DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS prompt_review_profiles (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			base_url TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			request_mode TEXT NOT NULL DEFAULT 'moderations',
+			adapter_json TEXT NOT NULL DEFAULT '{}',
+			api_keys TEXT NOT NULL DEFAULT '',
+			timeout_seconds INTEGER NOT NULL DEFAULT 10,
+			active INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 		`DROP TABLE IF EXISTS prompt_filter_secrets;`,
 	}
 	for _, stmt := range statements {
