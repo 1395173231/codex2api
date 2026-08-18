@@ -170,7 +170,14 @@
     "editTitle": "编辑 Grok 账号",
     "editSaved": "Grok 账号已更新",
     "modelsQuickAdd": "常用模型",
-    "editModelsEmptyHint": "未声明模型：仅 grok 渠道 Key 可调用；要让 auto 渠道 Key 也能用，请在此声明 grok 模型（如 grok-4.6）。",
+    "editModelsEmptyHint": "未设置显式白名单：调度使用该账号的可见模型目录；首次同步目录前使用保守的 Grok 默认模型集。",
+    "modelMapping": "GPT 兼容模型别名",
+    "modelMappingHint": "把客户端请求的模型名映射到该账号的 Grok 模型。推荐使用 gpt-5.4 这类精确别名，也支持 * 通配；目标模型仍须在账号目录中可见并符合显式白名单。",
+    "modelMappingFromPlaceholder": "客户端模型，例如 gpt-5.4",
+    "modelMappingToPlaceholder": "Grok 目标，例如 grok-4.5",
+    "modelMappingAdd": "添加映射",
+    "modelMappingRemove": "删除映射",
+    "modelMappingInvalid": "每条映射都必须成对填写，且源模型不能重复。",
     "productUsage": "{{product}} 使用",
     "payAsYouGo": "按量付费",
     "paygDisabled": "未启用",
@@ -4077,7 +4084,7 @@
       "upstreamChannelHint": {
         "auto": "不限渠道：请求按模型路由到 Codex 或 Grok 账号。",
         "codex": "该 Key 只调度 Codex 账号，不会使用 Grok 账号。",
-        "grok": "该 Key 只调度 Grok 账号；请求模型直接透传，账号未声明模型列表时放行全部模型。"
+        "grok": "该 Key 只调度 Grok 账号；先应用账号模型映射，再要求目标位于可见目录或保守默认集，显式模型列表只会进一步收窄。"
       },
       "upstreamChannelAutoTab": "自动",
       "sectionScope": "分组 / 账号预算",

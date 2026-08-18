@@ -105,6 +105,12 @@ import {
   isLargePoolSortDisabled,
   resolveDisabledAccountSorts,
 } from "../lib/accountListSort";
+import {
+  emptyModelMappingEntries,
+  parseModelMappingEntries,
+  serializeModelMappingEntries,
+  type ModelMappingEntry,
+} from "../lib/modelMapping";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
@@ -1122,9 +1128,11 @@ function GrokAccounts({
   const [editForm, setEditForm] = useState<{
     models: string[];
     base_url: string;
-    model_mapping: string;
     proxy_url: string;
-  }>({ models: [], base_url: "", model_mapping: "", proxy_url: "" });
+  }>({ models: [], base_url: "", proxy_url: "" });
+  const [editModelMappingEntries, setEditModelMappingEntries] = useState<
+    ModelMappingEntry[]
+  >(emptyModelMappingEntries);
   const [editModelDraft, setEditModelDraft] = useState("");
   const [editSubmitting, setEditSubmitting] = useState(false);
 
@@ -1133,9 +1141,12 @@ function GrokAccounts({
     setEditForm({
       models: account.models ?? [],
       base_url: account.base_url ?? "",
-      model_mapping: account.model_mapping ?? "",
       proxy_url: account.proxy_url ?? "",
     });
+    const parsedMapping = parseModelMappingEntries(account.model_mapping ?? "");
+    setEditModelMappingEntries(
+      parsedMapping.ok ? parsedMapping.entries : emptyModelMappingEntries(),
+    );
     setEditModelDraft("");
   };
 
@@ -1167,6 +1178,23 @@ function GrokAccounts({
   const editRemoveModel = (model: string) =>
     setEditForm((f) => ({ ...f, models: f.models.filter((m) => m !== model) }));
 
+  const updateEditModelMapping = (
+    index: number,
+    field: keyof ModelMappingEntry,
+    value: string,
+  ) =>
+    setEditModelMappingEntries((entries) =>
+      entries.map((entry, entryIndex) =>
+        entryIndex === index ? { ...entry, [field]: value } : entry,
+      ),
+    );
+
+  const removeEditModelMapping = (index: number) =>
+    setEditModelMappingEntries((entries) => {
+      const next = entries.filter((_, entryIndex) => entryIndex !== index);
+      return next.length > 0 ? next : emptyModelMappingEntries();
+    });
+
   const editFillCommonModels = () =>
     setEditForm((f) => ({
       ...f,
@@ -1175,6 +1203,11 @@ function GrokAccounts({
 
   const handleSaveEdit = async () => {
     if (!editAccount) return;
+    const modelMapping = serializeModelMappingEntries(editModelMappingEntries);
+    if (!modelMapping.ok) {
+      showToast(t("grok.modelMappingInvalid"), "error");
+      return;
+    }
     setEditSubmitting(true);
     try {
       const isApiKey = editAccount.grok_auth_kind === "api_key";
@@ -1185,7 +1218,7 @@ function GrokAccounts({
         // OAuth 端点固定官方 cli-chat-proxy，Base URL 字段已隐藏；提交空值交
         // 后端规整为默认，避免持久化用户已看不到的自定义值。
         base_url: isApiKey ? editForm.base_url.trim() : "",
-        model_mapping: editForm.model_mapping.trim(),
+        model_mapping: modelMapping.value,
         proxy_url: editForm.proxy_url.trim(),
       });
       showToast(t("grok.editSaved"));
@@ -3620,6 +3653,68 @@ function GrokAccounts({
                   ))}
                 </div>
               )}
+            </div>
+
+            <div>
+              <label className="mb-2 block text-sm font-medium text-muted-foreground">
+                {t("grok.modelMapping")}
+              </label>
+              <div className="space-y-2">
+                {editModelMappingEntries.map((entry, index) => (
+                  <div
+                    key={index}
+                    className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                  >
+                    <Input
+                      placeholder={t("grok.modelMappingFromPlaceholder")}
+                      value={entry.from}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        updateEditModelMapping(index, "from", event.target.value)
+                      }
+                    />
+                    <Input
+                      placeholder={t("grok.modelMappingToPlaceholder")}
+                      value={entry.to}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        updateEditModelMapping(index, "to", event.target.value)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="h-10 w-10"
+                      onClick={() => removeEditModelMapping(index)}
+                      disabled={
+                        editModelMappingEntries.length === 1 &&
+                        !entry.from.trim() &&
+                        !entry.to.trim()
+                      }
+                      title={t("grok.modelMappingRemove")}
+                      aria-label={t("grok.modelMappingRemove")}
+                    >
+                      <X className="size-4" />
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setEditModelMappingEntries((entries) => [
+                      ...entries,
+                      { from: "", to: "" },
+                    ])
+                  }
+                >
+                  <Plus className="size-3.5" />
+                  {t("grok.modelMappingAdd")}
+                </Button>
+              </div>
+              <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                {t("grok.modelMappingHint")}
+              </p>
             </div>
 
             {/* OAuth 账号端点固定为官方 cli-chat-proxy，不显示 Base URL；
