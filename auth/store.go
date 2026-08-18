@@ -3080,7 +3080,6 @@ type Store struct {
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler            atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled     atomic.Bool
-	dispatchReconcileMu      sync.Mutex
 	dispatchReconcileStateMu sync.Mutex
 	dispatchReconcileDone    chan struct{}
 	dispatchReconciledAt     int64
@@ -4998,19 +4997,17 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	now := time.Now()
-	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && now.Sub(time.Unix(0, last)) < dispatchStateReconcileInterval {
-		return false, nil
-	}
 
-	// A miss can be observed by many requests at once. Never queue request
-	// goroutines behind a full database reconciliation; one caller is enough
-	// and the async trigger below coalesces the rest.
-	if !s.dispatchReconcileMu.TryLock() {
+	done, owner := s.beginDispatchStateReconcile()
+	if !owner {
 		return false, nil
 	}
-	defer s.dispatchReconcileMu.Unlock()
-	now = time.Now()
+	defer s.finishDispatchStateReconcile(done)
+	return s.reconcileDispatchState(ctx)
+}
+
+func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
+	now := time.Now()
 	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && now.Sub(time.Unix(0, last)) < dispatchStateReconcileInterval {
 		return false, nil
 	}
@@ -5111,6 +5108,27 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 	return changed, nil
 }
 
+func (s *Store) beginDispatchStateReconcile() (chan struct{}, bool) {
+	s.dispatchReconcileStateMu.Lock()
+	defer s.dispatchReconcileStateMu.Unlock()
+	if s.dispatchReconcileDone != nil {
+		return s.dispatchReconcileDone, false
+	}
+	done := make(chan struct{})
+	s.dispatchReconcileDone = done
+	return done, true
+}
+
+func (s *Store) finishDispatchStateReconcile(done chan struct{}) {
+	s.dispatchReconcileStateMu.Lock()
+	defer s.dispatchReconcileStateMu.Unlock()
+	if s.dispatchReconcileDone != done {
+		return
+	}
+	s.dispatchReconcileDone = nil
+	close(done)
+}
+
 // TriggerDispatchStateReconcileAsync refreshes the in-memory dispatch
 // projection without putting the request path on the database scan. A miss
 // can fan out across many requests during an upstream outage, so this is
@@ -5120,29 +5138,15 @@ func (s *Store) TriggerDispatchStateReconcileAsync() <-chan struct{} {
 		return nil
 	}
 
-	s.dispatchReconcileStateMu.Lock()
-	if s.dispatchReconcileDone != nil {
-		done := s.dispatchReconcileDone
-		s.dispatchReconcileStateMu.Unlock()
+	done, owner := s.beginDispatchStateReconcile()
+	if !owner {
 		return done
 	}
-	done := make(chan struct{})
-	s.dispatchReconcileDone = done
-	s.dispatchReconcileStateMu.Unlock()
-
-	finish := func() {
-		s.dispatchReconcileStateMu.Lock()
-		if s.dispatchReconcileDone == done {
-			s.dispatchReconcileDone = nil
-			close(done)
-		}
-		s.dispatchReconcileStateMu.Unlock()
-	}
 	if !s.startDBBackgroundTask(func(parent context.Context) {
-		defer finish()
+		defer s.finishDispatchStateReconcile(done)
 		ctx, cancel := context.WithTimeout(parent, dispatchStateReconcileTimeout)
 		defer cancel()
-		if changed, err := s.ReconcileDispatchState(ctx); err != nil {
+		if changed, err := s.reconcileDispatchState(ctx); err != nil {
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("异步调度状态重建失败: %v", err)
 			}
@@ -5150,7 +5154,7 @@ func (s *Store) TriggerDispatchStateReconcileAsync() <-chan struct{} {
 			log.Printf("异步调度状态重建完成")
 		}
 	}) {
-		finish()
+		s.finishDispatchStateReconcile(done)
 	}
 	return done
 }

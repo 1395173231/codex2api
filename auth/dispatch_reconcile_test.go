@@ -111,8 +111,11 @@ func TestReconcileDispatchStateDoesNotQueueBehindAnotherRun(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1})
-	store.dispatchReconcileMu.Lock()
-	defer store.dispatchReconcileMu.Unlock()
+	done, owner := store.beginDispatchStateReconcile()
+	if !owner {
+		t.Fatal("beginDispatchStateReconcile() owner = false, want true")
+	}
+	defer store.finishDispatchStateReconcile(done)
 
 	started := time.Now()
 	changed, err := store.ReconcileDispatchState(ctx)
@@ -124,5 +127,68 @@ func TestReconcileDispatchStateDoesNotQueueBehindAnotherRun(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("ReconcileDispatchState queued behind another run for %s", elapsed)
+	}
+}
+
+func TestAsyncReconcileCoalescesOntoActiveRunCompletion(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "dispatch-reconcile-interleaving.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store := NewStore(db, nil, &database.SystemSettings{
+		MaxConcurrency:       1,
+		FastSchedulerEnabled: true,
+	})
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("Store.Init: %v", err)
+	}
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "interleaved-endpoint", map[string]interface{}{
+		"upstream_type": UpstreamOpenAIResponses,
+		"base_url":      "https://healthy.example",
+		"api_key":       "sk-interleaved",
+		"models":        []string{"gpt-5.6"},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+
+	activeDone, owner := store.beginDispatchStateReconcile()
+	if !owner {
+		t.Fatal("beginDispatchStateReconcile() owner = false, want true")
+	}
+	asyncDone := store.TriggerDispatchStateReconcileAsync()
+	if asyncDone != activeDone {
+		t.Fatal("async trigger did not coalesce onto the active reconciliation")
+	}
+	select {
+	case <-asyncDone:
+		t.Fatal("active reconciliation completion closed before the active run finished")
+	default:
+	}
+
+	changed, err := store.reconcileDispatchState(ctx)
+	if err != nil {
+		t.Fatalf("reconcileDispatchState: %v", err)
+	}
+	if !changed {
+		t.Fatal("reconcileDispatchState reported no change for a newly added account")
+	}
+	store.finishDispatchStateReconcile(activeDone)
+	select {
+	case <-asyncDone:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced completion did not close after the active run finished")
+	}
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil after the active reconciliation completed")
+	}
+	defer store.Release(got)
+	if got.ID() != accountID {
+		t.Fatalf("Next() = account %d, want newly added account %d", got.ID(), accountID)
 	}
 }
