@@ -14735,7 +14735,7 @@ function UsageCell({
     }
   }, [account.id, onRefreshed, refreshing, showToast, t]);
 
-  const refreshButton = (
+  const refreshButton = account.openai_responses_api ? null : (
     <button
       type="button"
       onClick={handleRefresh}
