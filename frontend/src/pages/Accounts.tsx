@@ -14703,6 +14703,7 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
           label: row.key === "unknown" ? t("accounts.unknownModel") : row.key,
           count: row.count,
           percent: row.percent,
+          avgFirstTokenMs: detail.model_avg_first_token_ms?.[row.key],
           successRate:
             typeof success === "number" && row.count > 0
               ? (success / row.count) * 100

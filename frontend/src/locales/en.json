@@ -579,6 +579,7 @@
     "todayModelEmpty": "No model breakdown for today",
     "todayModelSuccessRate": "Success rate",
     "todayModelSuccessRateShort": "success {{rate}}",
+    "todayModelAvgFirstToken": "Avg. first-token duration",
     "todayModelTooltipAria": "Today {{count}} requests. Hover for model breakdown",
     "todayStats": "Today",
     "todayStatsHint": "Requests, tokens and cost through this gateway since midnight (server time). Click to sort by today's requests, then tokens and cost.",

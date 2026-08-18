@@ -1551,12 +1551,13 @@ type modelCooldownResponse struct {
 }
 
 type accountUsageWindow struct {
-	Requests           int64            `json:"requests"`
-	Tokens             int64            `json:"tokens"`
-	AccountBilled      float64          `json:"account_billed"`
-	UserBilled         float64          `json:"user_billed"`
-	ModelCounts        map[string]int64 `json:"model_counts,omitempty"`
-	ModelSuccessCounts map[string]int64 `json:"model_success_counts,omitempty"`
+	Requests             int64              `json:"requests"`
+	Tokens               int64              `json:"tokens"`
+	AccountBilled        float64            `json:"account_billed"`
+	UserBilled           float64            `json:"user_billed"`
+	ModelCounts          map[string]int64   `json:"model_counts,omitempty"`
+	ModelSuccessCounts   map[string]int64   `json:"model_success_counts,omitempty"`
+	ModelAvgFirstTokenMs map[string]float64 `json:"model_avg_first_token_ms,omitempty"`
 }
 
 func accountEmailDomain(email string) string {

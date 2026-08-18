@@ -37,6 +37,7 @@ export interface AccountUsageWindow {
   user_billed?: number
   model_counts?: Record<string, number>
   model_success_counts?: Record<string, number>
+  model_avg_first_token_ms?: Record<string, number>
 }
 
 export interface GrokProductUsage {
