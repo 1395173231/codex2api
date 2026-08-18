@@ -125,10 +125,15 @@ func TestExecuteGrokProtocolRequestBridgesResponsesToolsThroughChat(t *testing.T
 	}))
 	defer server.Close()
 
-	account := &auth.Account{UpstreamType: auth.UpstreamGrok, APIKey: "test", BaseURL: server.URL + "/v1"}
+	account := &auth.Account{
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "test",
+		BaseURL:      server.URL + "/v1",
+		ModelMapping: `{"gpt-5.5":"grok-4.5"}`,
+	}
 	account.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-4.5", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolChatCompletions}}})
 	body := []byte(`{
-		"model":"grok-4.5","stream":true,
+		"model":"gpt-5.5","stream":true,
 		"tools":[
 			{"type":"custom","name":"run_patch","description":"synthetic custom tool"},
 			{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read_file","description":"synthetic namespace function","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]},
@@ -139,7 +144,12 @@ func TestExecuteGrokProtocolRequestBridgesResponsesToolsThroughChat(t *testing.T
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"use the tools"}]}
 		]
 	}`)
-	resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolResponses, nil, body, "", nil)
+	handler := NewHandler(nil, nil, nil, nil)
+	mappedBody, mappedModel, mapped := handler.applyAccountModelMappingToBody(body, account)
+	if !mapped || mappedModel != "grok-4.5" {
+		t.Fatalf("mapped model = %q, applied=%t", mappedModel, mapped)
+	}
+	resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolResponses, body, mappedBody, "", nil)
 	if err != nil {
 		t.Fatalf("ExecuteGrokProtocolRequest: %v", err)
 	}
@@ -153,6 +163,9 @@ func TestExecuteGrokProtocolRequestBridgesResponsesToolsThroughChat(t *testing.T
 	}
 	if got := gjson.GetBytes(captured, "tools.#").Int(); got != 4 {
 		t.Fatalf("converted tool count = %d, want 4; body=%s", got, captured)
+	}
+	if got := gjson.GetBytes(captured, "model").String(); got != "grok-4.5" {
+		t.Fatalf("mapped upstream model = %q, want grok-4.5; body=%s", got, captured)
 	}
 
 	events := grokResponseSSEEvents(stream)

@@ -334,7 +334,7 @@ func requestUpstreamChannel(c *gin.Context) string {
 }
 
 // applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
-// grok 渠道换成 Grok 专属过滤（账号未声明模型时直接透传请求模型，不再要求声明）；
+// grok 渠道换成 Grok 专属过滤（账号未声明模型时按可见目录或保守默认集准入）；
 // codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
 func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
 	switch requestUpstreamChannel(c) {
@@ -352,7 +352,7 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 }
 
 // grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
-// 账号声明了 Models 白名单则要求命中（mapping 先行），未声明则放行全部模型。
+// mapping 先行，再按账号可见目录准入；显式 Models 白名单只会进一步收窄。
 func grokChannelAccountFilter(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {

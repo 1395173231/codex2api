@@ -451,6 +451,22 @@ data: [DONE]
 
 池内存在 Grok 账号时会一并列出其文本模型（如 `grok-4.6`）与媒体模型（`grok-imagine-*`）。媒体模型与账号的文本模型白名单相互独立：白名单只声明文本模型不会关闭媒体能力；白名单里显式写了 `grok-imagine` 条目时以声明为准收窄。
 
+#### Grok 的 GPT 兼容别名
+
+Grok 账号编辑页支持账号级模型映射，可让只请求 GPT 模型名的客户端改走 Grok。例如：
+
+```json
+{
+  "gpt-5.5": "grok-4.5",
+  "gpt-5.4": "grok-4.5",
+  "gpt-5.3-codex": "grok-4.5"
+}
+```
+
+推荐逐个配置精确别名，不要默认使用 `gpt-*`，以免把未来的专用或媒体模型也纳入映射。别名目标必须存在于该 Grok 账号的可见模型目录中；显式 `models` 白名单会进一步收窄目标，隐藏或目录外模型不会因映射重新开放。账号尚未同步目录且未声明白名单时，仅使用保守的 Grok 默认模型集。满足这些条件的精确别名会出现在该 API Key 的 `GET /v1/models` 结果中。
+
+映射适用于普通 HTTP `POST /v1/responses`、`POST /v1/chat/completions` 和 `POST /v1/messages`。Responses WebSocket 与 `/v1/responses/compact` 不会路由到 Grok。Codex 客户端的 function、namespace、custom、deferred `additional_tools` 和 `tool_search` 可经现有协议桥接；Web Search、File Search、Code Interpreter、Shell、MCP、图片生成等托管工具仍取决于具体 Grok 上游及协议能力，不能仅靠模型别名获得 OpenAI 后端的等价能力。
+
 ### 6. Health Check
 
 **端点:** `GET /health`
@@ -710,7 +726,7 @@ data: [DONE]
 
 #### POST /api/admin/accounts/grok/batch-models
 
-批量替换 Grok 账号的模型白名单。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空白名单（未声明，仅 grok 渠道 Key 可调度）。
+批量替换 Grok 账号的模型白名单。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空显式白名单，之后按账号可见目录或首次同步前的保守默认模型集准入。
 
 **请求:**
 
@@ -724,7 +740,7 @@ data: [DONE]
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
 | ids | integer[] | 是 | 要更新的 Grok 账号 ID |
-| models | string[] | 否 | 替换后的模型白名单；省略或空数组表示清空声明 |
+| models | string[] | 否 | 替换后的模型白名单；省略或空数组表示清空显式白名单并恢复目录/默认集准入 |
 
 **响应:**
 
