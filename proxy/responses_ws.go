@@ -383,8 +383,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	preserveContinuationBinding := func() bool {
 		return continuationPinned || (hasPreviousResponse && !continuationDegraded)
 	}
+	// 续链 id 上游已经明确不认识时，turn-state 钉号不能再挡住降级：
+	// 钉死只约束「别换号」，不该把 previous_response_not_found 原样甩给
+	// Codex CLI（它几乎每轮都带回 x-codex-turn-state，#541）。
 	canDegradeContinuation := func() bool {
-		return !continuationPinned && hasPreviousResponse && !continuationDegraded
+		return hasPreviousResponse && !continuationDegraded
 	}
 	var wsHTTPFallback websocketHTTPFallbackState
 	var lastUpstreamCancel context.CancelFunc
@@ -577,7 +580,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 			// 上游认不出续链 id：账号本身是好的，别记失败也别排除它，
 			// 降级成自包含请求后原地重试一次（issue #400）。
-			if !continuationPinned && hasPreviousResponse && !continuationDegraded && isPreviousResponseNotFoundBody(errBody) {
+			if canDegradeContinuation() && isPreviousResponseNotFoundBody(errBody) {
 				degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1)
 				SyncCodexUsageState(h.store, account, resp)
 				h.store.Release(account)
@@ -657,8 +660,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		allowContinuationDegrade := canDegradeContinuation()
 		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
 			var continuationErr *responsesWSContinuationNotFoundError
-			if !continuationPinned && errors.As(err, &continuationErr) {
+			if canDegradeContinuation() && errors.As(err, &continuationErr) {
 				// 账号已在流内释放，未记失败也未解绑：剥离续链 id 后原地再试一次。
+				// turn-state 钉号同样走这条路：上游已经说找不到 id，换号无益，剥 id 才能继续。
 				degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1)
 				continue
 			}
@@ -740,6 +744,12 @@ func (h *Handler) streamResponsesWSUpstream(
 	var usage *UsageInfo
 	var actualServiceTier string
 	ttftRecorded := false
+	// contentTokenSeen 用严格判定（与 first_token_mode 无关）。loose 模式下
+	// codex.rate_limits / metadata 会置位 ttftRecorded；本机 2004 还开了
+	// preflight passthrough，这两帧会先写出并置位 wroteAnyBody。若用它们做
+	// 「首包前」判断，previous_response_not_found 降级在真实上游上永远进不去（#541）。
+	contentTokenSeen := false
+	preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 	gotTerminal := false
 	deltaCharCount := 0
 	var readErr error
@@ -801,6 +811,9 @@ func (h *Handler) streamResponsesWSUpstream(
 			firstTokenMs = int(time.Since(start).Milliseconds())
 			ttftRecorded = true
 		}
+		if !contentTokenSeen && isFirstTokenResult(parsed) {
+			contentTokenSeen = true
+		}
 		if eventType == "response.output_text.delta" {
 			deltaCharCount += len(parsed.Get("delta").String())
 		}
@@ -828,9 +841,9 @@ func (h *Handler) streamResponsesWSUpstream(
 			// previous_response_not_found 的先导 error 帧同样缓冲：它按 invalid_request
 			// 分类不属于可重试帧，立即写出会置位 wroteAnyBody，随后的 response.failed
 			// 就进不了下面的续链降级分支。
-			shouldDefer := !ttftRecorded && !gotTerminal &&
-				(isPreContentLifecycleEvent(eventType) || isRetryableUpstreamErrorFrame(eventType, data) ||
-					(allowContinuationDegrade && eventType == "error" && isPreviousResponseNotFoundBody(data)))
+			shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
+				(!contentTokenSeen && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data)) ||
+				(allowContinuationDegrade && !contentTokenSeen && !gotTerminal && eventType == "error" && isPreviousResponseNotFoundBody(data))
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
 				pendingFirstTokenBytes += len(clientData)
@@ -845,14 +858,15 @@ func (h *Handler) streamResponsesWSUpstream(
 				// 不把失败帧下发给客户端：丢弃尚未发送的前导缓冲并提前结束读取，
 				// 让外层循环透明换到健康账号重试，避免客户端反复 Reconnecting。
 				// 已经向客户端写过内容（wroteAnyBody / 已记录首 token）则照常透传。
-				if (silentRetryEnabled || hideUpstreamErrors) && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
+				if (silentRetryEnabled || hideUpstreamErrors) && eventType == "response.failed" && !contentTokenSeen && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
 					return false
 				}
 				// 续链 id 上游认不出：换号重试没用（换了还是找不到），但剥离续链 id
-				// 后同一账号就能继续。丢弃缓冲交回外层降级重试，别把 400 甩给客户端。
-				if allowContinuationDegrade && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody &&
+				// 后同一账号就能继续。前置元数据（rate_limits / metadata）即使已经
+				// 写出也不算内容，不能挡住降级——真实 ChatGPT WS 几乎总会先推这两帧。
+				if allowContinuationDegrade && eventType == "response.failed" && !contentTokenSeen &&
 					isPreviousResponseNotFoundBody(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
@@ -864,7 +878,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				// 语义返回 error 帧 + 非正常 close code(与 SSE 路径返回 4xx 对齐)。
 				// 可重试的失败不在此拦截:silent retry 开启时由上面的分支换号重试,
 				// 关闭时按既有约定原样透传失败帧。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) &&
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) &&
 					!responseFailedRetryable(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
@@ -907,7 +921,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 
 	// 续链 id 失效且首包前拦下：账号无过错，不记失败也不解绑，交回外层降级重试。
-	if continuationNotFound && !wroteAnyBody && writeErr == nil && c.Request.Context().Err() == nil {
+	if continuationNotFound && !contentTokenSeen && writeErr == nil && c.Request.Context().Err() == nil {
 		ttftGuard.Stop()
 		resp.Body.Close()
 		h.store.Release(account)

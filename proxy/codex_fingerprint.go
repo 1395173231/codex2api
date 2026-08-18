@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -54,8 +57,9 @@ type codexFingerprintIDs struct {
 // deriveStableCodexUUID 从种子确定性派生一个 UUIDv4 格式的字符串：同一种子恒定返回
 // 同一值，跨进程重启也不变，因此无需落库。
 //
-// 这里没有复用 uuid.NewSHA1（本仓库其它确定性 ID 的做法），因为那会产出 v5 UUID，
-// 版本位与真实客户端的 v4 标识不同，本身可被识别。
+// 仅用于 installation_id：抓包实证真实客户端的 installation 标识是 v4，session/thread/
+// window 则是 v7（见 deriveStableCodexUUIDv7）。这里没有复用 uuid.NewSHA1（本仓库其它
+// 确定性 ID 的做法），因为那会产出 v5 UUID，版本位与真实 v4 不同，本身可被识别。
 func deriveStableCodexUUID(seed string) string {
 	sum := sha256.Sum256([]byte(seed))
 	var u uuid.UUID
@@ -65,10 +69,61 @@ func deriveStableCodexUUID(seed string) string {
 	return u.String()
 }
 
+// deriveStableCodexUUIDv7 从种子确定性派生一个 UUIDv7 格式的字符串：前 48 bit 是毫秒
+// 时间戳（big-endian，按 RFC 9562），其余 74 bit 取种子哈希。同一 (种子, 时间戳) 恒定
+// 返回同值，跨进程重启也不变，无需落库。
+//
+// 用于 session / thread / window：抓包实证真实客户端的这三个标识是 UUIDv7，时间戳位
+// 解出的时刻与抓包时刻仅差数秒。之前一律写死 v4 有两处可识别特征——版本 nibble 与真实
+// 不符；更关键的是 v4 无时间序，上游若按 UUID 排序（主键索引 / 日志），一个 v4 会因其
+// 伪随机的"时间戳位"落到与真实会话完全无关的位置、跳到序列顶部或底部（见 #536 评论）。
+// installation_id 真实是 v4，仍走 deriveStableCodexUUID。
+func deriveStableCodexUUIDv7(seed string, unixMilli int64) string {
+	sum := sha256.Sum256([]byte(seed))
+	var u uuid.UUID
+	copy(u[:], sum[:16])
+	ms := uint64(unixMilli)
+	u[0] = byte(ms >> 40)
+	u[1] = byte(ms >> 32)
+	u[2] = byte(ms >> 24)
+	u[3] = byte(ms >> 16)
+	u[4] = byte(ms >> 8)
+	u[5] = byte(ms)
+	u[6] = (u[6] & 0x0f) | 0x70 // version 7
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return u.String()
+}
+
+const (
+	// codexIdentityFallbackEpochMilli 是账号加入时间不可用时的时间戳基准，取一个固定
+	// 的近期时刻（2025-01-01Z），确保派生的 v7 时间戳落在合理区间而不是 1970。
+	codexIdentityFallbackEpochMilli int64 = 1_735_689_600_000
+	// codexIdentitySpreadMilli 是会话时间戳相对基准的散布窗口（30 天）：让同账号的
+	// session / thread / window 及不同线程的 v7 时间戳互不相同，又不至于漂移到远离
+	// 账号存在期。真实客户端每个会话都会新建一批时间戳相近但互异的标识。
+	codexIdentitySpreadMilli int64 = 30 * 24 * 60 * 60 * 1000
+)
+
+// codexIdentityUnixMilli 为账号的收敛身份 UUID 派生一个确定性毫秒时间戳，用作 v7 的
+// 时间戳位。以账号加入时间为基准（随新账号自然前移，避免所有收敛值挤在同一固定时刻），
+// 叠加一个由种子派生的有界偏移，使 session / thread / window 及不同线程的时间戳互不
+// 相同而仍聚集在账号存在期附近。全程只依赖账号加入时间和种子，不引入 time.Now，因此
+// 保持"同种子恒定、无需落库"的性质。
+func codexIdentityUnixMilli(account *auth.Account, seed string) int64 {
+	base := atomic.LoadInt64(&account.AddedAt) / int64(time.Millisecond)
+	if base <= 0 {
+		base = codexIdentityFallbackEpochMilli
+	}
+	sum := sha256.Sum256([]byte("codex2api:codex-identity-ts:v1:" + seed))
+	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
+	return base + offset
+}
+
 // resolveCodexFingerprintIDs 按账号配置推导收敛目标值，off 档或账号缺失时返回 nil。
 //
-// downstreamHeaders 是下游客户端的原始请求头，用于取客户端真实会话标识来派生
-// thread_id —— 这样每个真实 Codex 会话在上游对应一个独立线程，而不是全部压成一条。
+// downstreamHeaders 是下游客户端的原始请求头，用于取客户端真实会话/线程标识来派生
+// thread_id。session 档：同一客户端会话一条线程；会话与线程不同（子代理）时按真实
+// thread 再拆一条，避免 X-Client-Request-Id 塌缩后 previous_response_id 找不到。
 func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.Header) *codexFingerprintIDs {
 	if account == nil {
 		return nil
@@ -94,11 +149,25 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 		return ids
 	}
 
-	ids.sessionID = deriveStableCodexUUID(fmt.Sprintf("codex2api:codex-session-id:v1:%d", accountID))
+	sessionSeed := fmt.Sprintf("codex2api:codex-session-id:v1:%d", accountID)
+	ids.sessionID = deriveStableCodexUUIDv7(sessionSeed, codexIdentityUnixMilli(account, sessionSeed))
 	ids.threadID = ids.sessionID
 	if mode == auth.CodexFingerprintModeSession {
-		if clientSessionID := extractClientCodexSessionID(downstreamHeaders); clientSessionID != "" {
-			ids.threadID = deriveStableCodexUUID(fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientSessionID))
+		clientSessionID, clientThreadID := extractClientCodexIdentity(downstreamHeaders)
+		var threadSeed string
+		switch {
+		case clientThreadID != "" && clientSessionID != "" && clientThreadID != clientSessionID:
+			// 子代理 / 多窗口：真实 thread 与 session 不同。仍按会话派生会把
+			// 多条线程收成一条，X-Client-Request-Id（实测恒等于 thread-id）
+			// 跟着塌缩后，上游按线程查找 previous_response_id 就会 400（#541）。
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v2:%d:%s", accountID, clientThreadID)
+		case clientSessionID != "":
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientSessionID)
+		case clientThreadID != "":
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientThreadID)
+		}
+		if threadSeed != "" {
+			ids.threadID = deriveStableCodexUUIDv7(threadSeed, codexIdentityUnixMilli(account, threadSeed))
 		}
 	}
 	ids.windowID = ids.threadID + ":0"

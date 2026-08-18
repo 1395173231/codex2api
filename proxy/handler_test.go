@@ -649,11 +649,34 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 				}
 			},
 		},
+		{
+			// 真实 ChatGPT WS 几乎总会先推 rate_limits / metadata。本机 2004 还开了
+			// loose + preflight passthrough，这两帧会先落到客户端。降级不能被它们挡住。
+			name: "in-stream response.failed after preflight",
+			rejected: func() *http.Response {
+				sse := "data: {\"type\":\"codex.rate_limits\",\"plan_type\":\"plus\"}\n\n" +
+					"data: {\"type\":\"codex.response.metadata\",\"headers\":{\"x-codex-turn-state\":\"turn\"}}\n\n" +
+					"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp_stale' not found.\"}}}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(sse)),
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
+			if tc.name == "in-stream response.failed after preflight" {
+				prev := CurrentRuntimeSettings()
+				next := prev
+				next.FirstTokenMode = FirstTokenModeLoose
+				next.CodexPreflightSSEPassthrough = true
+				ApplyRuntimeSettings(next)
+				t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+			}
 
 			previousExec := WebsocketExecuteFunc
 			t.Cleanup(func() {
@@ -703,10 +726,7 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 			}
 
 			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			_, event, err := conn.ReadMessage()
-			if err != nil {
-				t.Fatalf("read event: %v", err)
-			}
+			event := readResponsesWSTerminalEvent(t, conn)
 			if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
 				t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
 			}
