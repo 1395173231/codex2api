@@ -4,34 +4,21 @@ import type { TFunction } from "i18next";
 import { cn } from "@/lib/utils";
 import type { AccountRow } from "../types";
 import { formatBeijingTime } from "../utils/time";
+import {
+  isDisabledAccountOverlayAccount,
+  resolveAccountOverlayKind,
+} from "../lib/accountStateOverlay";
+import type { AccountOverlayKind } from "../lib/accountStateOverlay";
 
-export type AccountOverlayKind = "disabled" | "overload";
-
-export function resolveAccountOverlayKind(
-  account: AccountRow,
-): AccountOverlayKind | null {
-  if (account.enabled === false) return "disabled";
-  if (account.status === "overload_paused") return "overload";
-  return null;
-}
-
-export function accountStateSurfaceClass(
-  account: AccountRow,
-  extraWhenActive = "",
-): string {
-  return resolveAccountOverlayKind(account)
-    ? ` account-state-surface${extraWhenActive}`
-    : "";
-}
-
-export function disabledAccountSurfaceClass(
-  account: AccountRow,
-  extraWhenActive = "",
-): string {
-  return account.enabled === false
-    ? ` account-state-surface${extraWhenActive}`
-    : "";
-}
+export {
+  accountStateSurfaceClass,
+  accountStateTableRowClass,
+  disabledAccountSurfaceClass,
+  disabledAccountTableRowClass,
+  isDisabledAccountOverlayAccount,
+  resolveAccountOverlayKind,
+} from "../lib/accountStateOverlay";
+export type { AccountOverlayKind } from "../lib/accountStateOverlay";
 
 function formatCountdownRemaining(untilMs: number, nowMs: number): string {
   const diff = Math.max(0, untilMs - nowMs);
@@ -72,6 +59,7 @@ export function AccountStateOverlay({
   kind,
   label,
   compact = false,
+  markerOnly = false,
   countdownUntil,
   resumingLabel,
   recoverLabel,
@@ -81,6 +69,7 @@ export function AccountStateOverlay({
   kind: AccountOverlayKind;
   label: string;
   compact?: boolean;
+  markerOnly?: boolean;
   countdownUntil?: string;
   resumingLabel?: string;
   recoverLabel?: string;
@@ -107,15 +96,27 @@ export function AccountStateOverlay({
   return (
     <div
       className={cn(
-        "account-state-overlay pointer-events-none absolute inset-0 z-10 overflow-hidden rounded-[inherit]",
+        "account-state-overlay pointer-events-none",
+        markerOnly
+          ? "account-state-overlay--marker-only w-full"
+          : "absolute inset-0 z-10 overflow-hidden rounded-[inherit]",
         isOverload
           ? "account-state-overlay--overload"
           : "account-state-overlay--disabled",
       )}
-      aria-hidden={!isOverload}
+      aria-hidden={markerOnly ? undefined : false}
     >
-      <div className="account-state-overlay__scrim absolute inset-0" />
-      <div className="account-state-overlay__mark absolute inset-0 flex items-center justify-center px-3">
+      {markerOnly ? null : (
+        <div className="account-state-overlay__scrim absolute inset-0" />
+      )}
+      <div
+        className={cn(
+          "account-state-overlay__mark flex items-center justify-center",
+          markerOnly
+            ? "account-state-overlay__mark--inline min-h-6 w-full"
+            : "absolute inset-0 px-3",
+        )}
+      >
         {isOverload && !compact ? (
           <div className="flex min-w-[188px] flex-col items-center gap-2 rounded-2xl border border-orange-300/60 bg-card/95 px-4 py-3 text-orange-800 shadow-[0_1px_2px_hsl(24_80%_20%/0.06),0_10px_28px_hsl(24_80%_20%/0.08)] backdrop-blur-md dark:border-orange-400/25 dark:text-orange-100 dark:shadow-[0_1px_2px_rgb(0_0_0/0.24),0_10px_28px_rgb(0_0_0/0.2)]">
             <div className="flex items-center gap-1.5">
@@ -153,7 +154,7 @@ export function AccountStateOverlay({
         ) : (
           <span
             className={cn(
-              "inline-flex items-center rounded-full border bg-card/95 shadow-[0_1px_2px_hsl(222_40%_11%/0.06),0_8px_24px_hsl(222_40%_11%/0.06)] backdrop-blur-md dark:shadow-[0_1px_2px_rgb(0_0_0/0.24),0_8px_24px_rgb(0_0_0/0.18)]",
+              "inline-flex max-w-full flex-wrap items-center justify-center rounded-full border bg-card/95 shadow-[0_1px_2px_hsl(222_40%_11%/0.06),0_8px_24px_hsl(222_40%_11%/0.06)] backdrop-blur-md dark:shadow-[0_1px_2px_rgb(0_0_0/0.24),0_8px_24px_rgb(0_0_0/0.18)]",
               compact && isOverload
                 ? "gap-2 py-1.5 pl-2 pr-2.5"
                 : compact
@@ -181,7 +182,7 @@ export function AccountStateOverlay({
             </span>
             <span
               className={cn(
-                "font-medium tracking-[0.04em]",
+                "whitespace-nowrap font-medium tracking-[0.04em]",
                 compact && isOverload ? "text-sm" : compact ? "text-[11px]" : "text-xs",
               )}
             >
@@ -190,7 +191,7 @@ export function AccountStateOverlay({
             {countdownText ? (
               <span
                 className={cn(
-                  "font-mono font-semibold tabular-nums tracking-wide",
+                  "whitespace-nowrap font-mono font-semibold tabular-nums tracking-wide",
                   compact && isOverload ? "text-sm" : compact ? "text-[11px]" : "text-xs",
                 )}
                 title={countdownUntil ? formatBeijingTime(countdownUntil) : undefined}
@@ -204,7 +205,7 @@ export function AccountStateOverlay({
                 disabled={busy}
                 onClick={(event) => void handleRecover(event)}
                 className={cn(
-                  "pointer-events-auto inline-flex items-center rounded-full bg-orange-600 font-medium text-white shadow-sm transition-colors hover:bg-orange-500 disabled:cursor-wait disabled:opacity-70 dark:bg-orange-500 dark:hover:bg-orange-400",
+                  "pointer-events-auto inline-flex items-center whitespace-nowrap rounded-full bg-orange-600 font-medium text-white shadow-sm transition-colors hover:bg-orange-500 disabled:cursor-wait disabled:opacity-70 dark:bg-orange-500 dark:hover:bg-orange-400",
                   compact ? "gap-1.5 px-2.5 py-1 text-xs" : "gap-1 px-2 py-0.5 text-[11px]",
                 )}
               >
@@ -228,6 +229,7 @@ export function renderAccountStateOverlay(
   t: TFunction,
   options: {
     compact?: boolean;
+    markerOnly?: boolean;
     onRecover?: () => void | Promise<void>;
   } = {},
 ) {
@@ -237,6 +239,7 @@ export function renderAccountStateOverlay(
     <AccountStateOverlay
       kind={kind}
       compact={options.compact}
+      markerOnly={options.markerOnly}
       label={
         kind === "disabled"
           ? t("accounts.disabledOverlay")
@@ -256,13 +259,14 @@ export function renderAccountStateOverlay(
 export function renderDisabledAccountOverlay(
   account: AccountRow,
   t: TFunction,
-  options: { compact?: boolean } = {},
+  options: { compact?: boolean; markerOnly?: boolean } = {},
 ) {
-  if (account.enabled !== false) return null;
+  if (!isDisabledAccountOverlayAccount(account)) return null;
   return (
     <AccountStateOverlay
       kind="disabled"
       compact={options.compact}
+      markerOnly={options.markerOnly}
       label={t("accounts.disabledOverlay")}
     />
   );
