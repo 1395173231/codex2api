@@ -2,10 +2,18 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
   push:
     branches:
       - main
       - codex/**
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
 
 permissions:
   contents: read
@@ -17,12 +25,13 @@ concurrency:
 jobs:
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -31,6 +40,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test
 
       - name: Typecheck frontend
         working-directory: frontend
@@ -44,12 +57,13 @@ jobs:
 
   golangci-lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -64,12 +78,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -77,21 +92,37 @@ jobs:
         run: mkdir -p frontend/dist && touch frontend/dist/placeholder
 
       - name: Run Go tests
-        run: go test ./...
+        run: go test -count=1 -timeout 8m ./...
 
   test-race:
+    name: test-race (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: admin
+          - name: database
+          - name: proxy
+          - name: promptfilter
+          - name: rest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Create frontend dist placeholder
         run: mkdir -p frontend/dist && touch frontend/dist/placeholder
 
+      # 重包各占一台 2 核 runner,避免 admin/database/proxy/promptfilter 互相抢核。
       - name: Run Go tests with race detector
-        run: go test -race -timeout 25m ./...
+        run: |
+          set -euo pipefail
+          packages="$(bash .github/scripts/go-race-packages.sh '${{ matrix.name }}')"
+          # shellcheck disable=SC2086
+          go test -race -count=1 -timeout 12m $packages
