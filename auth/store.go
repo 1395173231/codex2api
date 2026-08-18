@@ -1236,16 +1236,19 @@ func (a *Account) IsAvailable() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
+	return a.isAvailableLocked(time.Now())
+}
+
+func (a *Account) isAvailableLocked(now time.Time) bool {
 	if a.Status == StatusError {
 		return false
 	}
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
-	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		return false
 	}
-	now := time.Now()
 	// IgnoreUsageLimitStatus only protects an already active continuation;
 	// fresh sessions remain fenced by the latest local usage observation.
 	if a.usageWindowBlocksFreshDispatchLocked(now) {
@@ -9789,6 +9792,41 @@ func (s *Store) AvailableCount() int {
 		}
 	}
 	return count
+}
+
+// HealthCountsNonBlocking returns best-effort account counts without waiting on
+// hot request-path locks. It is intended for liveness endpoints.
+func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bool) {
+	if s == nil {
+		return 0, 0, true
+	}
+	if !s.mu.TryRLock() {
+		return -1, -1, false
+	}
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	complete = true
+	total = len(accounts)
+	now := time.Now()
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		if atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+			continue
+		}
+		if !acc.mu.TryRLock() {
+			complete = false
+			continue
+		}
+		if acc.isAvailableLocked(now) {
+			available++
+		}
+		acc.mu.RUnlock()
+	}
+	return available, total, complete
 }
 
 // Accounts 返回所有账号（用于统计）
