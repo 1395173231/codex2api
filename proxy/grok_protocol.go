@@ -1412,6 +1412,17 @@ func prepareRoutedGrokProtocolRequest(route GrokUpstreamRoute, inbound GrokProto
 		if route.Native {
 			// 仅 native 路由按线格式直通返回(forwardGrokNativeResponse),
 			// 可以完整保留 stream=false。
+			//
+			// 但直通的是"传输形态",不是"请求内容":Codex 专有工具形态
+			// (custom / namespace / tool_search / additional_tools)与被丢弃的
+			// 顶层字段仍必须经 preflight 降级,否则原样发给 Grok 会 400。
+			// 统一跑 preflight 还让同一会话在 native 与非 native 之间切换时
+			// 请求体形态保持一致,不打断上游的静态前缀缓存。
+			// 实测 preflight 成本 0.06~1.9ms(6KB~544KB 请求体),相对 Grok
+			// 秒级首字可忽略。
+			if route.Protocol == GrokProtocolResponses {
+				return prepareGrokUpstreamBody(body), nil
+			}
 			return grokPreflightResult{Body: body, TurnIndex: 1, Model: gjson.GetBytes(body, "model").String()}, nil
 		}
 		// 非 native 的同协议路由不会直通:响应必须经 adaptGrokProtocolResponse
