@@ -7997,6 +7997,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		AllowLive:              in.AllowLive,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
 	}
@@ -8322,6 +8323,9 @@ type settingsResponse struct {
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             int    `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
@@ -8474,6 +8478,9 @@ type updateSettingsReq struct {
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             *int     `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           *bool    `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              *string  `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             *string  `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   *string  `json:"grok_oauth_client_id"`
 	MaxRetries                          *int     `json:"max_retries"`
 	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
@@ -8991,8 +8998,8 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
-// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试配置编码成 grok_config JSON 落库。
-func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string) string {
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig) string {
 	mode := strings.TrimSpace(affinityMode)
 	switch mode {
 	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
@@ -9008,12 +9015,16 @@ func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinut
 	if maxRateLimitRetries < 0 {
 		maxRateLimitRetries = 0
 	}
+	followUp = auth.NormalizeGrokFollowUpEffortConfig(followUp)
 	b, err := json.Marshal(map[string]any{
-		"affinity_mode":          mode,
-		"probe_enabled":          probeEnabled,
-		"probe_interval_minutes": probeIntervalMinutes,
-		"max_rate_limit_retries": maxRateLimitRetries,
-		"oauth_client_id":        auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"affinity_mode":            mode,
+		"probe_enabled":            probeEnabled,
+		"probe_interval_minutes":   probeIntervalMinutes,
+		"max_rate_limit_retries":   maxRateLimitRetries,
+		"oauth_client_id":          auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"follow_up_effort_enabled": followUp.Enabled,
+		"follow_up_tool_effort":    followUp.ToolEffort,
+		"follow_up_small_effort":   followUp.SmallEffort,
 	})
 	if err != nil {
 		return `{"affinity_mode":"strict"}`
@@ -9205,6 +9216,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
 		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
 		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
@@ -10018,6 +10032,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: grok_max_rate_limit_retries = %d", h.store.GrokMaxRateLimitRetries())
 	}
 
+	if req.GrokFollowUpEffortEnabled != nil || req.GrokFollowUpToolEffort != nil || req.GrokFollowUpSmallEffort != nil {
+		cfg := h.store.GrokFollowUpEffortConfig()
+		if req.GrokFollowUpEffortEnabled != nil {
+			cfg.Enabled = *req.GrokFollowUpEffortEnabled
+		}
+		if req.GrokFollowUpToolEffort != nil {
+			cfg.ToolEffort = *req.GrokFollowUpToolEffort
+		}
+		if req.GrokFollowUpSmallEffort != nil {
+			cfg.SmallEffort = *req.GrokFollowUpSmallEffort
+		}
+		h.store.SetGrokFollowUpEffortConfig(cfg)
+		proxy.SetGrokFollowUpEffortConfig(h.store.GrokFollowUpEffortConfig())
+		log.Printf("设置已更新: grok_follow_up_effort enabled=%v tool=%s small=%s", cfg.Enabled, cfg.ToolEffort, cfg.SmallEffort)
+	}
+
 	// client_id 会拼进授权 URL 与 token 表单，含空白/控制字符或超长的直接拒绝，
 	// 而不是静默归一化成空——那样用户会以为存上了，实际仍在用默认值。
 	if req.GrokOAuthClientID != nil {
@@ -10561,7 +10591,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageConfig:                  imgConfigJSON,
 		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
-		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID()),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig()),
 		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
@@ -10762,6 +10792,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),

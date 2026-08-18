@@ -84,6 +84,7 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 	inbound := []byte(`{
 		"model":"claude-alias","max_tokens":91,"messages":[{"role":"user","content":"hello"}],
 		"temperature":0.4,"top_p":0.7,"stop_sequences":["END"],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}}
 	}`)
 	body, err := prepareRoutedGrokProtocolBody(route, GrokProtocolMessages, inbound, []byte(`{"model":"mapped-grok"}`))
@@ -98,6 +99,9 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 		"stop.0":            "END",
 		"text.format.type":  "json_schema",
 		"reasoning.effort":  "high",
+		"reasoning.summary": "detailed",
+		"include.0":         "reasoning.encrypted_content",
+		"include.1":         "no_inline_citations",
 	}
 	for path, want := range checks {
 		if got := gjson.GetBytes(body, path).String(); got != want {
@@ -111,16 +115,51 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 	}
 }
 
-func TestResolveGrokRouteFreshCapabilityOverridesCatalog(t *testing.T) {
+func TestResolveGrokRouteKeepsCatalogResponsesWhenMessagesProbeIsFresh(t *testing.T) {
 	now := time.Now()
 	account := &auth.Account{UpstreamType: auth.UpstreamGrok, AccessToken: "at", BaseURL: "https://default.example/v1"}
 	account.SetGrokRoutingState(auth.GrokRoutingState{
-		Models:       []auth.GrokModelRoute{{ModelID: "grok-4.5", APIBackend: auth.GrokProtocolResponses}},
+		Models:       []auth.GrokModelRoute{{ModelID: "grok-4.5", BaseURL: "https://default.example/v1", APIBackend: auth.GrokProtocolResponses}},
 		Capabilities: []auth.GrokProtocolCapability{{ModelID: "grok-4.5", Origin: "https://default.example/v1", Protocol: auth.GrokProtocolMessages, Status: auth.GrokCapabilityOK, ExpiresAt: now.Add(time.Hour)}},
 	})
 	route := ResolveGrokUpstreamRoute(account, "grok-4.5", GrokProtocolMessages, now)
-	if route.Protocol != GrokProtocolMessages || !route.Native || route.Endpoint != "https://default.example/v1/messages" {
-		t.Fatalf("route = %#v", route)
+	if route.Protocol != GrokProtocolResponses || route.Native || route.Endpoint != "https://default.example/v1/responses" {
+		t.Fatalf("Claude Code Messages inbound must stay on catalog Responses: %#v", route)
+	}
+}
+
+func TestExecuteGrokProtocolRequestReusesConversationHeaders(t *testing.T) {
+	var sessions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		sessions = append(sessions, r.Header.Get("x-grok-session-id"))
+		if r.Header.Get("x-grok-session-id") == "" || r.Header.Get("x-grok-session-id") != r.Header.Get("x-grok-conv-id") {
+			t.Fatalf("session=%q conv=%q", r.Header.Get("x-grok-session-id"), r.Header.Get("x-grok-conv-id"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+	}))
+	defer server.Close()
+
+	account := &auth.Account{UpstreamType: auth.UpstreamGrok, AccessToken: "at", BaseURL: server.URL + "/v1"}
+	account.SetGrokRoutingState(auth.GrokRoutingState{
+		Models: []auth.GrokModelRoute{{ModelID: "grok-4.6", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolResponses}},
+	})
+	turn1 := []byte(`{"model":"grok-4.6","system":"rules","messages":[{"role":"user","content":"分析项目"}]}`)
+	turn2 := []byte(`{"model":"grok-4.6","system":"rules","messages":[{"role":"user","content":"分析项目"},{"role":"assistant","content":"ok"},{"role":"user","content":"继续"}]}`)
+	stub := []byte(`{"model":"grok-4.6"}`)
+	for _, inbound := range [][]byte{turn1, turn2} {
+		resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolMessages, inbound, stub, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if len(sessions) != 2 || sessions[0] == "" || sessions[0] != sessions[1] {
+		t.Fatalf("session headers = %#v", sessions)
 	}
 }
 
@@ -187,7 +226,7 @@ func TestExecuteGrokProtocolRequestNativePreservesInboundBody(t *testing.T) {
 	account := &auth.Account{UpstreamType: auth.UpstreamGrok, APIKey: "xai", BaseURL: server.URL + "/v1", CredentialGeneration: 1}
 	account.SetGrokRoutingState(auth.GrokRoutingState{
 		CredentialGeneration: 1,
-		Models:               []auth.GrokModelRoute{{ModelID: "mapped-model", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolResponses}},
+		Models:               []auth.GrokModelRoute{{ModelID: "mapped-model", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolChatCompletions}},
 		Capabilities:         []auth.GrokProtocolCapability{{ModelID: "mapped-model", Origin: server.URL + "/v1", Protocol: auth.GrokProtocolChatCompletions, Status: auth.GrokCapabilityOK, ExpiresAt: now.Add(time.Hour)}},
 	})
 	inbound := []byte(`{"model":"client-alias","messages":[{"role":"user","content":"hi"}],"stream":false,"future_standard_field":{"keep":true}}`)

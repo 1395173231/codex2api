@@ -122,7 +122,7 @@ func normalizeGrokFunctionTool(tool map[string]any, name string) map[string]any 
 	for _, key := range []string{
 		"inputSchema", "input_schema", "deferLoading", "defer_loading",
 		"allowedCallers", "allowed_callers", "outputSchema", "output_schema",
-		"metadata", "x_provider",
+		"metadata", "x_provider", "cache_control", "cacheControl",
 	} {
 		delete(converted, key)
 	}

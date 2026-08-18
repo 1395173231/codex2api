@@ -265,7 +265,7 @@ func doGrokMediaRequest(ctx context.Context, account *auth.Account, profile grok
 		return nil, ErrInternalError("创建请求失败", err)
 	}
 	_, bearer := account.GrokCredentials()
-	applyGrokRequestHeaders(req, account, bearer, downstreamHeaders)
+	applyGrokRequestHeaders(req, account, bearer, downstreamHeaders, nil)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip, br, deflate")
 	if len(body) == 0 {
@@ -304,6 +304,7 @@ func stripGrokCLIIdentityHeaders(header http.Header) {
 		"x-xai-token-auth", "x-authenticateresponse", "x-compaction-at",
 		"x-grok-agent-id", "x-grok-session-id", "x-grok-conv-id", "x-grok-req-id",
 		"x-grok-turn-idx", "x-grok-model-override", "x-userid", "x-grok-user-id",
+		"x-grok-doom-loop-check", "x-compactions-remaining",
 	} {
 		header.Del(key)
 	}

@@ -247,6 +247,14 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 			delete(records, key)
 		}
 	}
+	if row.Limits.AllowLive {
+		for _, id := range liveModelAliases {
+			if liveModelExplicitlyDenied(id, row.Limits.ModelDeny) {
+				continue
+			}
+			addScopedModel(records, id, modelBackingCodex, time.Time{}, true)
+		}
+	}
 	return records
 }
 

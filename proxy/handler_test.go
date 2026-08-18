@@ -183,6 +183,9 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/backend-api/codex/responses",
 		"/backend-api/codex/responses/*subpath",
+		"/v1/live",
+		"/live",
+		"/backend-api/codex/realtime/calls",
 	} {
 		if !postRoutes[path] {
 			t.Fatalf("expected POST route %s to be registered; routes=%v", path, postRoutes)
@@ -191,9 +194,12 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/v1/responses",
 		"/v1/realtime",
+		"/v1/live/:call_id",
 		"/responses",
 		"/realtime",
+		"/live/:call_id",
 		"/backend-api/codex/responses",
+		"/backend-api/codex/:call_id",
 	} {
 		if !getRoutes[path] {
 			t.Fatalf("expected GET route %s to be registered; routes=%v", path, getRoutes)
@@ -3158,6 +3164,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 	if !isCodexModelUnsupportedError(unsupported) {
 		t.Fatal("应识别模型不支持错误")
 	}
+	unknownProvider := []byte(`{"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}`)
+	if !isCodexModelUnsupportedError(unknownProvider) {
+		t.Fatal("应识别中转上游缺少模型提供商错误")
+	}
 	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
 		t.Fatal("普通 invalid_request 不应命中")
 	}
@@ -3170,6 +3180,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 		t.Fatal("模型不支持的 400 应可换号重试")
 	}
 	general, rate = 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unknownProvider, &general, &rate, 2, 1) {
+		t.Fatal("中转上游缺少模型提供商的 400 应可换号重试")
+	}
+	general, rate = 0, 0
 	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
 		t.Fatal("普通 400 不应重试")
 	}
@@ -3179,6 +3193,10 @@ func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
 	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
 	if !responseFailedRetryable(payload) {
 		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	unknownProvider := []byte(`{"type":"response.failed","response":{"status_code":400,"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}}`)
+	if !responseFailedRetryable(unknownProvider) {
+		t.Fatal("中转上游缺少模型提供商的 response.failed 应视为可换号重试")
 	}
 	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
 	if responseFailedRetryable(plain) {
@@ -5215,7 +5233,123 @@ func TestResponsesRelaySuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	}
 }
 
-// 池中还有可用官方账号时,body-signal 请求被钉在官方账号上(不落中转)。
+// issue #540：纯 OpenAI Responses 中转池收到 Codex 新版 Remote Compact
+// （/responses + stream + compaction_trigger）时，必须按普通 /responses 选中该中转，
+// 不能在选号阶段直接 503。
+func TestResponses_NativeRemoteCompactionV2UsesRelayOnlyPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_issue_540","status":"completed","output":[{"type":"compaction_summary","summary":"compacted"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if !requestBodyHasCompactionTrigger(seenBody) {
+		t.Fatalf("upstream body lost compaction_trigger: %s", seenBody)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-5.6-sol" {
+		t.Fatalf("upstream model = %q, want gpt-5.6-sol; body=%s", model, seenBody)
+	}
+}
+
+// issue #540：池里还有可用官方账号时，不能把流式 Remote Compact 钉死在官方账号上。
+// 官方号若因模型白名单选不上，必须回落到能打 /responses 的中转，而不是立刻 503。
+func TestResponses_NativeRemoteCompactionV2FallsBackToRelayWhenOfficialCannotServe(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_issue_540_fallback","status":"completed","output":[{"type":"compaction_summary","summary":"compacted"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:        2,
+		AccessToken: "at-codex",
+		Models:      []string{"gpt-5.4"},
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[{"type":"compaction_trigger"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after falling back to relay; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+}
+
+// excludeRelayAccountsFilter / storeHasAvailableCodexAccount 仍供其它路径复用；
+// 流式 Remote Compact 不再用它们把请求钉死在官方账号上（issue #540）。
 func TestBodySignalCompactFilters(t *testing.T) {
 	relay := &auth.Account{
 		DBID:         1,
