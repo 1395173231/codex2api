@@ -1236,16 +1236,19 @@ func (a *Account) IsAvailable() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
+	return a.isAvailableLocked(time.Now())
+}
+
+func (a *Account) isAvailableLocked(now time.Time) bool {
 	if a.Status == StatusError {
 		return false
 	}
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
-	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		return false
 	}
-	now := time.Now()
 	// IgnoreUsageLimitStatus only protects an already active continuation;
 	// fresh sessions remain fenced by the latest local usage observation.
 	if a.usageWindowBlocksFreshDispatchLocked(now) {
@@ -3075,10 +3078,11 @@ type Store struct {
 	proxyRoundRobin      uint64              // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
-	fastScheduler        atomic.Pointer[FastScheduler]
-	fastSchedulerEnabled atomic.Bool
-	dispatchReconcileMu  sync.Mutex
-	dispatchReconciledAt int64
+	fastScheduler            atomic.Pointer[FastScheduler]
+	fastSchedulerEnabled     atomic.Bool
+	dispatchReconcileStateMu sync.Mutex
+	dispatchReconcileDone    chan struct{}
+	dispatchReconciledAt     int64
 
 	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
 	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
@@ -4959,7 +4963,14 @@ func (s *Store) LoadAccountByID(ctx context.Context, dbID int64) error {
 	return nil
 }
 
-const dispatchStateReconcileInterval = time.Second
+const (
+	dispatchStateReconcileInterval = time.Second
+	// dispatchStateReconcileTimeout bounds the detached background scan. This
+	// is the only runtime path that reloads cross-process account changes, so
+	// the bound must comfortably exceed a full-pool scan on a slow database —
+	// a scan that always times out would starve cross-process pickup forever.
+	dispatchStateReconcileTimeout = 30 * time.Second
+)
 
 func openAIResponsesRuntimeConfigDiffers(acc *Account, row *database.AccountRow) bool {
 	if acc == nil || row == nil ||
@@ -4990,14 +5001,17 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	now := time.Now()
-	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && now.Sub(time.Unix(0, last)) < dispatchStateReconcileInterval {
+
+	done, owner := s.beginDispatchStateReconcile()
+	if !owner {
 		return false, nil
 	}
+	defer s.finishDispatchStateReconcile(done)
+	return s.reconcileDispatchState(ctx)
+}
 
-	s.dispatchReconcileMu.Lock()
-	defer s.dispatchReconcileMu.Unlock()
-	now = time.Now()
+func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
+	now := time.Now()
 	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && now.Sub(time.Unix(0, last)) < dispatchStateReconcileInterval {
 		return false, nil
 	}
@@ -5011,11 +5025,15 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("reconcile account groups: %w", err)
 	}
-	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow)
-	if cooldownRows, cooldownErr := s.db.ListActiveModelCooldowns(ctx); cooldownErr == nil {
-		for _, cooldown := range cooldownRows {
-			modelCooldowns[cooldown.AccountID] = append(modelCooldowns[cooldown.AccountID], cooldown)
-		}
+	cooldownRows, cooldownErr := s.db.ListActiveModelCooldowns(ctx)
+	if cooldownErr != nil {
+		// Proceeding with an empty map would let newly discovered accounts
+		// enter dispatch without their persisted model cooldowns.
+		return false, fmt.Errorf("reconcile model cooldowns: %w", cooldownErr)
+	}
+	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow, len(cooldownRows))
+	for _, cooldown := range cooldownRows {
+		modelCooldowns[cooldown.AccountID] = append(modelCooldowns[cooldown.AccountID], cooldown)
 	}
 
 	changed := false
@@ -5096,6 +5114,66 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+func (s *Store) beginDispatchStateReconcile() (chan struct{}, bool) {
+	s.dispatchReconcileStateMu.Lock()
+	defer s.dispatchReconcileStateMu.Unlock()
+	if s.dispatchReconcileDone != nil {
+		return s.dispatchReconcileDone, false
+	}
+	done := make(chan struct{})
+	s.dispatchReconcileDone = done
+	return done, true
+}
+
+func (s *Store) finishDispatchStateReconcile(done chan struct{}) {
+	s.dispatchReconcileStateMu.Lock()
+	defer s.dispatchReconcileStateMu.Unlock()
+	if s.dispatchReconcileDone != done {
+		return
+	}
+	s.dispatchReconcileDone = nil
+	close(done)
+}
+
+// TriggerDispatchStateReconcileAsync refreshes the in-memory dispatch
+// projection without putting the request path on the database scan. A miss
+// can fan out across many requests during an upstream outage, so this is
+// deliberately single-flight and bounded by a short timeout.
+func (s *Store) TriggerDispatchStateReconcileAsync() <-chan struct{} {
+	if s == nil || s.db == nil {
+		return nil
+	}
+
+	done, owner := s.beginDispatchStateReconcile()
+	if !owner {
+		return done
+	}
+	// Inside the throttle window a fresh run would be a guaranteed no-op:
+	// return nil so callers skip their grace wait instead of receiving an
+	// instantly-closed channel, and no throwaway goroutine is spawned. The
+	// check sits after ownership acquisition so callers racing an in-flight
+	// run still coalesce onto its completion channel above.
+	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && time.Since(time.Unix(0, last)) < dispatchStateReconcileInterval {
+		s.finishDispatchStateReconcile(done)
+		return nil
+	}
+	if !s.startDBBackgroundTask(func(parent context.Context) {
+		defer s.finishDispatchStateReconcile(done)
+		ctx, cancel := context.WithTimeout(parent, dispatchStateReconcileTimeout)
+		defer cancel()
+		if changed, err := s.reconcileDispatchState(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("异步调度状态重建失败: %v", err)
+			}
+		} else if changed {
+			log.Printf("异步调度状态重建完成")
+		}
+	}) {
+		s.finishDispatchStateReconcile(done)
+	}
+	return done
 }
 
 // StartBackgroundRefresh 启动后台定期刷新
@@ -5504,28 +5582,31 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 
 	acc.mu.RLock()
 	defer acc.mu.RUnlock()
-	now := time.Now()
-	if acc.Status == StatusError {
+	return acc.lazySelectableLocked(time.Now())
+}
+
+func (a *Account) lazySelectableLocked(now time.Time) bool {
+	if a.Status == StatusError {
 		return false
 	}
-	if acc.healthTierLocked() == HealthTierBanned {
+	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
-	if acc.usageWindowBlocksFreshDispatchLocked(now) {
+	if a.usageWindowBlocksFreshDispatchLocked(now) {
 		return false
 	}
-	if acc.Status == StatusCooldown && now.Before(acc.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		return false
 	}
-	if acc.quotaAutoPausedLocked(now) {
+	if a.quotaAutoPausedLocked(now) {
 		return false
 	}
-	if acc.isRelayStyleLocked() {
+	if a.isRelayStyleLocked() {
 		return true
 	}
-	return strings.TrimSpace(acc.AccessToken) != "" ||
-		strings.TrimSpace(acc.RefreshToken) != "" ||
-		strings.TrimSpace(acc.SessionToken) != ""
+	return strings.TrimSpace(a.AccessToken) != "" ||
+		strings.TrimSpace(a.RefreshToken) != "" ||
+		strings.TrimSpace(a.SessionToken) != ""
 }
 
 func (s *Store) ensureLazyDispatchReady(acc *Account) bool {
@@ -9735,6 +9816,45 @@ func (s *Store) AvailableCount() int {
 		}
 	}
 	return count
+}
+
+// HealthCountsNonBlocking returns best-effort account counts without waiting on
+// hot request-path locks. It is intended for liveness endpoints.
+func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bool) {
+	if s == nil {
+		return 0, 0, true
+	}
+	if !s.mu.TryRLock() {
+		return -1, -1, false
+	}
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	complete = true
+	total = len(accounts)
+	now := time.Now()
+	lazy := s.GetLazyMode()
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		if atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+			continue
+		}
+		if !acc.mu.TryRLock() {
+			complete = false
+			continue
+		}
+		// Mirror AvailableCount: lazy mode accepts refresh/session-token-only
+		// accounts that hydrate on demand, otherwise a healthy lazy pool would
+		// report zero available.
+		if (lazy && acc.lazySelectableLocked(now)) || (!lazy && acc.isAvailableLocked(now)) {
+			available++
+		}
+		acc.mu.RUnlock()
+	}
+	return available, total, complete
 }
 
 // Accounts 返回所有账号（用于统计）
