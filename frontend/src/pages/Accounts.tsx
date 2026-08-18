@@ -14514,9 +14514,11 @@ function UsageBar({
 function UsageWindowStat({
   label,
   detail,
+  apiAccount = false,
 }: {
   label: string;
   detail?: AccountRow["usage_5h_detail"];
+  apiAccount?: boolean;
 }) {
   const { t } = useTranslation();
   if (!detail || !hasUsageWindowDetail(detail)) return null;
@@ -14540,14 +14542,30 @@ function UsageWindowStat({
         </span>
       </div>
       {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[34px]">
+        <div
+          className={cn(
+            "pl-[34px] text-[10px]",
+            apiAccount
+              ? "flex flex-col items-start gap-0.5 font-medium"
+              : "flex items-center gap-1.5 text-muted-foreground/80",
+          )}
+        >
           {accountBilledText && (
-            <span>
+            <span
+              className={cn(
+                apiAccount &&
+                  "text-emerald-700 dark:text-emerald-400",
+              )}
+            >
               {t("accounts.accountBilledLabel")}: ${accountBilledText}
             </span>
           )}
           {userBilledText && (
-            <span>
+            <span
+              className={cn(
+                apiAccount && "text-sky-700 dark:text-sky-400",
+              )}
+            >
               {t("accounts.userBilledLabel")}: ${userBilledText}
             </span>
           )}
@@ -14780,7 +14798,11 @@ function UsageCell({
               detail={account.usage_5h_detail}
             />
           ) : (
-            <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
+            <UsageWindowStat
+              label="5h"
+              detail={account.usage_5h_detail}
+              apiAccount={account.openai_responses_api}
+            />
           )}
           {has7d ? (
             <UsageBar
@@ -14790,7 +14812,11 @@ function UsageCell({
               detail={account.usage_7d_detail}
             />
           ) : (
-            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+            <UsageWindowStat
+              label={longWindowLabel}
+              detail={account.usage_7d_detail}
+              apiAccount={account.openai_responses_api}
+            />
           )}
         </div>
         {refreshButton}
@@ -14810,7 +14836,11 @@ function UsageCell({
               detail={account.usage_7d_detail}
             />
           ) : (
-            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+            <UsageWindowStat
+              label={longWindowLabel}
+              detail={account.usage_7d_detail}
+              apiAccount={account.openai_responses_api}
+            />
           )}
         </div>
         {refreshButton}
