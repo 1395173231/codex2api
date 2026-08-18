@@ -78,3 +78,20 @@ jobs:
 
       - name: Run Go tests
         run: go test ./...
+
+  test-race:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Create frontend dist placeholder
+        run: mkdir -p frontend/dist && touch frontend/dist/placeholder
+
+      - name: Run Go tests with race detector
+        run: go test -race -timeout 25m ./...
