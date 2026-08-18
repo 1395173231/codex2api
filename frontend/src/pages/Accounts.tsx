@@ -47,6 +47,7 @@ import type {
   AccountOperationSelector,
   AccountPageStatsItem,
   AccountLiveStateResponse,
+  OpenAIResponsesBalanceResponse,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -200,6 +201,57 @@ const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 // multipart 边界与其它表单字段),避免单个请求体触发后端上限。
 const IMPORT_MAX_FILE_BYTES = 200 * 1024 * 1024;
 const IMPORT_BATCH_MAX_BYTES = 150 * 1024 * 1024;
+const API_BALANCE_CACHE_TTL_MS = 60_000;
+const API_BALANCE_ERROR_CACHE_TTL_MS = 15_000;
+
+type APIBalanceLoadState = {
+  loading: boolean;
+  data?: OpenAIResponsesBalanceResponse;
+  error?: string;
+};
+
+const apiBalanceCache = new Map<
+  number,
+  { expiresAt: number; state: APIBalanceLoadState }
+>();
+const apiBalanceInflight = new Map<number, Promise<APIBalanceLoadState>>();
+
+function invalidateAPIAccountBalance(accountId: number) {
+  apiBalanceCache.delete(accountId);
+}
+
+function loadAPIAccountBalance(
+  accountId: number,
+  force = false,
+): Promise<APIBalanceLoadState> {
+  if (force) invalidateAPIAccountBalance(accountId);
+  const cached = apiBalanceCache.get(accountId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return Promise.resolve(cached.state);
+  }
+  const inflight = apiBalanceInflight.get(accountId);
+  if (inflight) return inflight;
+
+  const promise = api
+    .getOpenAIResponsesBalance(accountId)
+    .then<APIBalanceLoadState>((data) => ({ loading: false, data }))
+    .catch<APIBalanceLoadState>((error) => ({
+      loading: false,
+      error: getErrorMessage(error),
+    }))
+    .then((state) => {
+      apiBalanceCache.set(accountId, {
+        expiresAt:
+          Date.now() +
+          (state.data ? API_BALANCE_CACHE_TTL_MS : API_BALANCE_ERROR_CACHE_TTL_MS),
+        state,
+      });
+      return state;
+    })
+    .finally(() => apiBalanceInflight.delete(accountId));
+  apiBalanceInflight.set(accountId, promise);
+  return promise;
+}
 
 const formatMB = (bytes: number): string =>
   `${Math.round(bytes / (1024 * 1024))}MB`;
@@ -1681,6 +1733,7 @@ export default function Accounts() {
       name: "",
       base_url: "https://api.openai.com",
       api_key: "",
+      balance_query_url: "",
       models: [],
       codex_client_metadata_mode: "auto",
       proxy_url: "",
@@ -1767,6 +1820,7 @@ export default function Accounts() {
     useState<AddOpenAIResponsesAccountRequest>({
       base_url: "https://api.openai.com",
       api_key: "",
+      balance_query_url: "",
       models: [],
       codex_client_metadata_mode: "auto",
       proxy_url: "",
@@ -3356,6 +3410,7 @@ export default function Accounts() {
       setOpenAIForm({
         base_url: "https://api.openai.com",
         api_key: "",
+        balance_query_url: "",
         models: [],
         codex_client_metadata_mode: "auto",
         proxy_url: "",
@@ -3435,6 +3490,7 @@ export default function Accounts() {
         model_mapping: parsedModelMapping.value,
         custom_headers: parsedCustomHeaders.value,
       });
+      invalidateAPIAccountBalance(editingAccount.id);
       showToast(t("accounts.openaiAccountSaveSuccess"));
       await reload();
       closeSchedulerEditor(true);
@@ -5176,6 +5232,7 @@ export default function Accounts() {
       name: account.name ?? "",
       base_url: account.base_url || "https://api.openai.com",
       api_key: "",
+      balance_query_url: account.balance_query_url ?? "",
       models: account.models ?? [],
       codex_client_metadata_mode:
         account.codex_client_metadata_mode ?? "auto",
@@ -5230,6 +5287,7 @@ export default function Accounts() {
       name: "",
       base_url: "https://api.openai.com",
       api_key: "",
+      balance_query_url: "",
       models: [],
       codex_client_metadata_mode: "auto",
       proxy_url: "",
@@ -7485,6 +7543,24 @@ export default function Accounts() {
                 </div>
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.apiBalanceQueryUrl")}
+                  </label>
+                  <Input
+                    placeholder="/v1/usage"
+                    value={openAIForm.balance_query_url ?? ""}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        balance_query_url: event.target.value,
+                      }))
+                    }
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.apiBalanceQueryUrlHint")}
+                  </p>
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
                     {t("accounts.codexClientMetadataMode")}
                   </label>
                   <Select
@@ -8562,6 +8638,24 @@ export default function Accounts() {
                             }))
                           }
                         />
+                      </div>
+                      <div>
+                        <label className="block mb-2 text-xs font-semibold text-muted-foreground">
+                          {t("accounts.apiBalanceQueryUrl")}
+                        </label>
+                        <Input
+                          placeholder="/v1/usage"
+                          value={editOpenAIForm.balance_query_url ?? ""}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditOpenAIForm((form) => ({
+                              ...form,
+                              balance_query_url: event.target.value,
+                            }))
+                          }
+                        />
+                        <p className="mt-1.5 text-xs text-muted-foreground">
+                          {t("accounts.apiBalanceQueryUrlHint")}
+                        </p>
                       </div>
                       <div>
                         <label className="block mb-2 text-xs font-semibold text-muted-foreground">
@@ -14729,6 +14823,77 @@ function UsageCell({
 // 再转下去只会让用户以为一直在加载。
 const OFFICIAL_PENDING_SPIN_TIMEOUT_MS = 100_000;
 
+function formatAPIAccountBalance(data: OpenAIResponsesBalanceResponse): string {
+  if (data.unlimited) return "∞";
+  const unit = data.unit.trim().toUpperCase();
+  if (unit === "USD" || unit === "$") return formatOfficialUSD(data.balance);
+  if (unit === "CNY" || unit === "RMB" || unit === "¥") {
+    return `¥${data.balance.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  }
+  const value = data.balance.toLocaleString(undefined, {
+    maximumFractionDigits: 4,
+  });
+  return unit && unit !== "QUOTA" ? `${value} ${data.unit}` : `${value} quota`;
+}
+
+function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
+  const { t } = useTranslation();
+  const cached = apiBalanceCache.get(accountId);
+  const [state, setState] = useState<APIBalanceLoadState>(() =>
+    cached && cached.expiresAt > Date.now()
+      ? cached.state
+      : { loading: true },
+  );
+
+  const refresh = useCallback((force = false) => {
+    setState({ loading: true });
+    void loadAPIAccountBalance(accountId, force).then(setState);
+  }, [accountId]);
+
+  useEffect(() => {
+    let active = true;
+    void loadAPIAccountBalance(accountId).then((next) => {
+      if (active) setState(next);
+    });
+    return () => {
+      active = false;
+    };
+  }, [accountId]);
+
+  const title = state.data
+    ? t("accounts.apiBalanceTooltip", {
+        source: state.data.source,
+        time: formatRelativeTime(state.data.queried_at),
+      })
+    : state.error
+      ? t("accounts.apiBalanceFailed", { error: state.error })
+      : t("accounts.apiBalanceLoading");
+
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        refresh(true);
+      }}
+      className={cn(
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-mono text-[11px] tabular-nums ring-1 ring-inset transition-colors",
+        state.error
+          ? "bg-red-500/10 text-red-700/70 ring-red-500/20 hover:bg-red-500/20 dark:text-red-400/70"
+          : "bg-emerald-500/10 text-emerald-700 ring-emerald-500/20 hover:bg-emerald-500/20 dark:text-emerald-400",
+      )}
+      title={title}
+    >
+      {state.loading ? (
+        <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+      ) : (
+        <Wallet className="size-3 shrink-0" aria-hidden />
+      )}
+      {t("accounts.apiBalanceLabel")}: {state.data ? formatAPIAccountBalance(state.data) : "—"}
+    </button>
+  );
+}
+
 // 成本列并排两套账,颜色区分口径:
 // 上行(石板色)是网关自己的日志算出来的,只含经由本网关转发的请求;
 // 下行(琥珀色)是 OpenAI 官方结算数,还包含用户直接用官方客户端的消耗。
@@ -14746,6 +14911,7 @@ function BilledCell({
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
   const showOfficial =
     isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
+  const showAPIBalance = account.openai_responses_api === true;
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
   // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
@@ -14772,7 +14938,7 @@ function BilledCell({
     (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
     !!account.reset_5h_at;
   const visibleH5 = has5hWindow ? h5 : null;
-  if (visibleH5 === null && d7 === null && !showOfficial) {
+  if (visibleH5 === null && d7 === null && !showOfficial && !showAPIBalance) {
     return <span className="text-[12px] text-muted-foreground">-</span>;
   }
   const longLabel = formatLongUsageWindowLabel(account);
@@ -14789,6 +14955,7 @@ function BilledCell({
     : `${t("accounts.billedOfficialHint")}\n${t("accounts.billedOfficialOpen")}`;
   return (
     <div className="flex flex-col items-start gap-1">
+      {showAPIBalance && <APIAccountBalanceBadge accountId={account.id} />}
       {(visibleH5 !== null || d7 !== null) && (
         <span
           className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:text-slate-300"

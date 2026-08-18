@@ -11,6 +11,7 @@ import type {
   AgentIdentityBatchImportResponse,
   AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  OpenAIResponsesBalanceResponse,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
   BatchUpdateGrokModelsRequest,
@@ -590,6 +591,8 @@ export const api = {
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getOpenAIResponsesBalance: (id: number, signal?: AbortSignal) =>
+    request<OpenAIResponsesBalanceResponse>(`/accounts/${id}/openai-responses/balance`, { signal }),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>

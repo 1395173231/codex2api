@@ -1020,6 +1020,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
+	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
 	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
@@ -1460,6 +1461,7 @@ type accountResponse struct {
 	GrokRateLimit                 *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota                 *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
 	BaseURL                       string                      `json:"base_url,omitempty"`
+	BalanceQueryURL               string                      `json:"balance_query_url,omitempty"`
 	Models                        []string                    `json:"models,omitempty"`
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
@@ -3566,6 +3568,7 @@ type addOpenAIResponsesAccountReq struct {
 	Name                    string            `json:"name"`
 	BaseURL                 string            `json:"base_url"`
 	APIKey                  string            `json:"api_key"`
+	BalanceQueryURL         string            `json:"balance_query_url"`
 	Models                  []string          `json:"models"`
 	ModelMapping            string            `json:"model_mapping"`
 	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
@@ -3592,6 +3595,11 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
 	req.APIKey = strings.TrimSpace(req.APIKey)
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	balanceQueryURL, err := normalizeOpenAIResponsesBalanceQueryURL(req.BalanceQueryURL)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -3661,14 +3669,15 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		name = "openai-responses"
 	}
 	credentials := map[string]interface{}{
-		"upstream_type":              auth.UpstreamOpenAIResponses,
-		"base_url":                   baseURL,
-		"api_key":                    req.APIKey,
-		"models":                     models,
-		"model_mapping":              modelMapping,
-		"codex_client_metadata_mode": codexClientMetadataMode,
-		"plan_type":                  "api",
-		"email":                      baseURL,
+		"upstream_type":                          auth.UpstreamOpenAIResponses,
+		"base_url":                               baseURL,
+		"api_key":                                req.APIKey,
+		openAIResponsesBalanceQueryURLCredential: balanceQueryURL,
+		"models":                                 models,
+		"model_mapping":                          modelMapping,
+		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"plan_type":                              "api",
+		"email":                                  baseURL,
 	}
 	if len(customHeaders) > 0 {
 		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
@@ -3805,6 +3814,11 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	balanceQueryURL, err := normalizeOpenAIResponsesBalanceQueryURL(req.BalanceQueryURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	models := auth.NormalizeOpenAIResponsesModels(req.Models)
 	if len(models) == 0 {
 		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
@@ -3856,14 +3870,15 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 
 	credentials := map[string]interface{}{
-		"upstream_type":              auth.UpstreamOpenAIResponses,
-		"base_url":                   baseURL,
-		"models":                     models,
-		"model_mapping":              modelMapping,
-		"codex_client_metadata_mode": codexClientMetadataMode,
-		"plan_type":                  "api",
-		"email":                      baseURL,
-		"custom_headers":             cloneCustomHeaders(customHeaders),
+		"upstream_type":                          auth.UpstreamOpenAIResponses,
+		"base_url":                               baseURL,
+		openAIResponsesBalanceQueryURLCredential: balanceQueryURL,
+		"models":                                 models,
+		"model_mapping":                          modelMapping,
+		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"plan_type":                              "api",
+		"email":                                  baseURL,
+		"custom_headers":                         cloneCustomHeaders(customHeaders),
 	}
 	if req.APIKey != "" {
 		credentials["api_key"] = req.APIKey
