@@ -14735,14 +14735,17 @@ function UsageCell({
     }
   }, [account.id, onRefreshed, refreshing, showToast, t]);
 
-  const refreshButton = account.openai_responses_api ? null : (
+  const refreshButton = (
     <button
       type="button"
       onClick={handleRefresh}
       disabled={refreshing}
       title={t("accounts.refreshUsage")}
       aria-label={t("accounts.refreshUsage")}
-      className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+      className={cn(
+        "shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50",
+        account.openai_responses_api && "mr-6",
+      )}
     >
       <RefreshCw className={`size-3 ${refreshing ? "animate-spin" : ""}`} />
     </button>
