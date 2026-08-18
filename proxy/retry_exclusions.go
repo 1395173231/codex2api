@@ -182,6 +182,7 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 		if account != nil {
 			return account, stickyProxyURL
 		}
+		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
 		if preserveBinding {
 			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
 		} else {
@@ -190,10 +191,30 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 		if account != nil {
 			return account, stickyProxyURL
 		}
-		if changed, err := h.store.ReconcileDispatchState(ctx); err != nil {
-			log.Printf("调度 miss 后同步数据库账号状态失败: %v", err)
-		} else if changed {
-			continue
+		// If the scheduler had no candidates and returned immediately, give
+		// the shared background reconciliation a small bounded grace period.
+		// Requests never queue behind the database scan itself.
+		if reconcileDone != nil {
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-reconcileDone:
+				if preserveBinding {
+					account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
+				} else {
+					account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+				}
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if account != nil {
+				return account, stickyProxyURL
+			}
 		}
 		if !exclusions.ResetSoft() {
 			return nil, ""

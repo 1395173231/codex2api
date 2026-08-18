@@ -3075,10 +3075,12 @@ type Store struct {
 	proxyRoundRobin      uint64              // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
-	fastScheduler        atomic.Pointer[FastScheduler]
-	fastSchedulerEnabled atomic.Bool
-	dispatchReconcileMu  sync.Mutex
-	dispatchReconciledAt int64
+	fastScheduler            atomic.Pointer[FastScheduler]
+	fastSchedulerEnabled     atomic.Bool
+	dispatchReconcileMu      sync.Mutex
+	dispatchReconcileStateMu sync.Mutex
+	dispatchReconcileDone    chan struct{}
+	dispatchReconciledAt     int64
 
 	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
 	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
@@ -4959,7 +4961,10 @@ func (s *Store) LoadAccountByID(ctx context.Context, dbID int64) error {
 	return nil
 }
 
-const dispatchStateReconcileInterval = time.Second
+const (
+	dispatchStateReconcileInterval = time.Second
+	dispatchStateReconcileTimeout  = 5 * time.Second
+)
 
 func openAIResponsesRuntimeConfigDiffers(acc *Account, row *database.AccountRow) bool {
 	if acc == nil || row == nil ||
@@ -4995,7 +5000,12 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	s.dispatchReconcileMu.Lock()
+	// A miss can be observed by many requests at once. Never queue request
+	// goroutines behind a full database reconciliation; one caller is enough
+	// and the async trigger below coalesces the rest.
+	if !s.dispatchReconcileMu.TryLock() {
+		return false, nil
+	}
 	defer s.dispatchReconcileMu.Unlock()
 	now = time.Now()
 	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && now.Sub(time.Unix(0, last)) < dispatchStateReconcileInterval {
@@ -5096,6 +5106,50 @@ func (s *Store) ReconcileDispatchState(ctx context.Context) (bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+// TriggerDispatchStateReconcileAsync refreshes the in-memory dispatch
+// projection without putting the request path on the database scan. A miss
+// can fan out across many requests during an upstream outage, so this is
+// deliberately single-flight and bounded by a short timeout.
+func (s *Store) TriggerDispatchStateReconcileAsync() <-chan struct{} {
+	if s == nil || s.db == nil {
+		return nil
+	}
+
+	s.dispatchReconcileStateMu.Lock()
+	if s.dispatchReconcileDone != nil {
+		done := s.dispatchReconcileDone
+		s.dispatchReconcileStateMu.Unlock()
+		return done
+	}
+	done := make(chan struct{})
+	s.dispatchReconcileDone = done
+	s.dispatchReconcileStateMu.Unlock()
+
+	finish := func() {
+		s.dispatchReconcileStateMu.Lock()
+		if s.dispatchReconcileDone == done {
+			s.dispatchReconcileDone = nil
+			close(done)
+		}
+		s.dispatchReconcileStateMu.Unlock()
+	}
+	if !s.startDBBackgroundTask(func(parent context.Context) {
+		defer finish()
+		ctx, cancel := context.WithTimeout(parent, dispatchStateReconcileTimeout)
+		defer cancel()
+		if changed, err := s.ReconcileDispatchState(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("异步调度状态重建失败: %v", err)
+			}
+		} else if changed {
+			log.Printf("异步调度状态重建完成")
+		}
+	}) {
+		finish()
+	}
+	return done
 }
 
 // StartBackgroundRefresh 启动后台定期刷新
