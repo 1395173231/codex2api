@@ -2175,6 +2175,87 @@ func TestPrepareResponsesBody_PassesThroughCompactV2Items(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_MovesCompactionTriggerToFinalInputItem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[
+			{"type":"message","role":"user","content":"compact this"},
+			{"type":"compaction_trigger"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("input length = %d, want 3; body=%s", len(input), got)
+	}
+	if gotType := input[1].Get("type").String(); gotType == "compaction_trigger" {
+		t.Fatalf("compaction_trigger must not remain before the final item; body=%s", got)
+	}
+	if gotType := input[2].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBody_MovesCompactionTriggerToFinalInputItem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"compaction_trigger"},
+			{"type":"context_compaction","encrypted_content":"opaque"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("input length = %d, want 3; body=%s", len(input), got)
+	}
+	if gotType := input[0].Get("type").String(); gotType != "context_compaction" {
+		t.Fatalf("input[0].type = %q, want context_compaction; body=%s", gotType, got)
+	}
+	if gotType := input[2].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+}
+
+func TestPrepareResponsesBody_CachedHistoryStillKeepsCompactionTriggerFinal(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"previous_response_id":"resp_previous",
+		"input":[
+			{"type":"compaction_trigger"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+	cached := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"user","content":"earlier question"}`),
+		json.RawMessage(`{"type":"function_call","call_id":"call_1","name":"run","arguments":"{}"}`),
+	}
+
+	got, expanded := prepareResponsesBodyWithOptions(raw, responsesBodyPrepareOptions{
+		forceStoreFalse:        true,
+		expandPreviousResponse: true,
+		cachedResponseItems:    cached,
+	})
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 4 {
+		t.Fatalf("input length = %d, want 4; body=%s", len(input), got)
+	}
+	if gotType := input[len(input)-1].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+	if expandedType := gjson.Get(expanded, "#(type==\"compaction_trigger\").type").String(); expandedType != "compaction_trigger" {
+		t.Fatalf("expanded cache input lost compaction_trigger: %s", expanded)
+	}
+	if gotType := gjson.Get(expanded, "3.type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("expanded final input type = %q, want compaction_trigger; expanded=%s", gotType, expanded)
+	}
+}
+
 func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
