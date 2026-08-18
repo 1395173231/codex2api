@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/lib/pq"
 )
 
 // accountRequestCountBreakdownMaxIDs 是错误码/成功模型拆分的 ID 上限。
@@ -26,7 +24,7 @@ func (db *DB) appendAccountIDFilter(args *[]interface{}, ids []int64) string {
 		}
 		return "account_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
-	*args = append(*args, pq.Array(ids))
+	*args = append(*args, postgresInt8Array(ids))
 	return fmt.Sprintf("account_id = ANY($%d)", len(*args))
 }
 

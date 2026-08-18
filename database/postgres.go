@@ -18,7 +18,8 @@ import (
 
 	"github.com/codex2api/internal/openaiidentity"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -352,9 +353,8 @@ type usageLogEntry struct {
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
 func New(driver string, dsn string, schema ...string) (*DB, error) {
 	driver = normalizeDriver(driver)
-	driverName := driver
+	driverName := sqlOpenDriverName(driver)
 	if driver == "sqlite" {
-		driverName = "sqlite"
 		dsn = sqliteConnectDSN(dsn)
 	}
 
@@ -419,7 +419,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		// search_path 已通过 DSN 的 options=-c search_path=... 在所有连接启动时设置；
 		// 这里仅做一次幂等的 CREATE SCHEMA + SET 兜底，便于首次部署时自动建好 schema。
 		if pgSchema != "" {
-			quoted := pq.QuoteIdentifier(pgSchema)
+			quoted := quotePostgresIdent(pgSchema)
 			if _, err := conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
 				return nil, fmt.Errorf("创建数据库 schema 失败: %w", err)
 			}
@@ -540,12 +540,12 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 		return nil
 	}
 	if exists && !valid {
-		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+pq.QuoteIdentifier(indexName)); err != nil {
+		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+quotePostgresIdent(indexName)); err != nil {
 			return fmt.Errorf("清理无效索引 %s 失败: %w", indexName, err)
 		}
 	}
 	// CONCURRENTLY 不能在事务块内执行；单条 ExecContext 走 autocommit，满足要求。
-	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+pq.QuoteIdentifier(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+quotePostgresIdent(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
 		return fmt.Errorf("在线创建索引 %s 失败: %w", indexName, err)
 	}
 	log.Printf("usage_logs 代际索引 %s 已就绪", indexName)
@@ -4105,11 +4105,11 @@ func isUsageLogDataError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var pqErr *pq.Error
-	if !errors.As(err, &pqErr) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	switch pqErr.Code.Class() {
+	switch pgErr.Code[:2] {
 	case "22", "23":
 		return true
 	}
