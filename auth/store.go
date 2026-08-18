@@ -4965,7 +4965,11 @@ func (s *Store) LoadAccountByID(ctx context.Context, dbID int64) error {
 
 const (
 	dispatchStateReconcileInterval = time.Second
-	dispatchStateReconcileTimeout  = 5 * time.Second
+	// dispatchStateReconcileTimeout bounds the detached background scan. This
+	// is the only runtime path that reloads cross-process account changes, so
+	// the bound must comfortably exceed a full-pool scan on a slow database —
+	// a scan that always times out would starve cross-process pickup forever.
+	dispatchStateReconcileTimeout = 30 * time.Second
 )
 
 func openAIResponsesRuntimeConfigDiffers(acc *Account, row *database.AccountRow) bool {
@@ -5021,11 +5025,15 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("reconcile account groups: %w", err)
 	}
-	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow)
-	if cooldownRows, cooldownErr := s.db.ListActiveModelCooldowns(ctx); cooldownErr == nil {
-		for _, cooldown := range cooldownRows {
-			modelCooldowns[cooldown.AccountID] = append(modelCooldowns[cooldown.AccountID], cooldown)
-		}
+	cooldownRows, cooldownErr := s.db.ListActiveModelCooldowns(ctx)
+	if cooldownErr != nil {
+		// Proceeding with an empty map would let newly discovered accounts
+		// enter dispatch without their persisted model cooldowns.
+		return false, fmt.Errorf("reconcile model cooldowns: %w", cooldownErr)
+	}
+	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow, len(cooldownRows))
+	for _, cooldown := range cooldownRows {
+		modelCooldowns[cooldown.AccountID] = append(modelCooldowns[cooldown.AccountID], cooldown)
 	}
 
 	changed := false
@@ -5141,6 +5149,15 @@ func (s *Store) TriggerDispatchStateReconcileAsync() <-chan struct{} {
 	done, owner := s.beginDispatchStateReconcile()
 	if !owner {
 		return done
+	}
+	// Inside the throttle window a fresh run would be a guaranteed no-op:
+	// return nil so callers skip their grace wait instead of receiving an
+	// instantly-closed channel, and no throwaway goroutine is spawned. The
+	// check sits after ownership acquisition so callers racing an in-flight
+	// run still coalesce onto its completion channel above.
+	if last := atomic.LoadInt64(&s.dispatchReconciledAt); last > 0 && time.Since(time.Unix(0, last)) < dispatchStateReconcileInterval {
+		s.finishDispatchStateReconcile(done)
+		return nil
 	}
 	if !s.startDBBackgroundTask(func(parent context.Context) {
 		defer s.finishDispatchStateReconcile(done)
@@ -5565,28 +5582,31 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 
 	acc.mu.RLock()
 	defer acc.mu.RUnlock()
-	now := time.Now()
-	if acc.Status == StatusError {
+	return acc.lazySelectableLocked(time.Now())
+}
+
+func (a *Account) lazySelectableLocked(now time.Time) bool {
+	if a.Status == StatusError {
 		return false
 	}
-	if acc.healthTierLocked() == HealthTierBanned {
+	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
-	if acc.usageWindowBlocksFreshDispatchLocked(now) {
+	if a.usageWindowBlocksFreshDispatchLocked(now) {
 		return false
 	}
-	if acc.Status == StatusCooldown && now.Before(acc.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		return false
 	}
-	if acc.quotaAutoPausedLocked(now) {
+	if a.quotaAutoPausedLocked(now) {
 		return false
 	}
-	if acc.isRelayStyleLocked() {
+	if a.isRelayStyleLocked() {
 		return true
 	}
-	return strings.TrimSpace(acc.AccessToken) != "" ||
-		strings.TrimSpace(acc.RefreshToken) != "" ||
-		strings.TrimSpace(acc.SessionToken) != ""
+	return strings.TrimSpace(a.AccessToken) != "" ||
+		strings.TrimSpace(a.RefreshToken) != "" ||
+		strings.TrimSpace(a.SessionToken) != ""
 }
 
 func (s *Store) ensureLazyDispatchReady(acc *Account) bool {
@@ -9814,6 +9834,7 @@ func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bo
 	complete = true
 	total = len(accounts)
 	now := time.Now()
+	lazy := s.GetLazyMode()
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
@@ -9825,7 +9846,10 @@ func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bo
 			complete = false
 			continue
 		}
-		if acc.isAvailableLocked(now) {
+		// Mirror AvailableCount: lazy mode accepts refresh/session-token-only
+		// accounts that hydrate on demand, otherwise a healthy lazy pool would
+		// report zero available.
+		if (lazy && acc.lazySelectableLocked(now)) || (!lazy && acc.isAvailableLocked(now)) {
 			available++
 		}
 		acc.mu.RUnlock()

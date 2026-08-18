@@ -192,3 +192,35 @@ func TestAsyncReconcileCoalescesOntoActiveRunCompletion(t *testing.T) {
 		t.Fatalf("Next() = account %d, want newly added account %d", got.ID(), accountID)
 	}
 }
+
+func TestTriggerDispatchStateReconcileAsyncThrottledReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "dispatch-reconcile-throttle.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1})
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("Store.Init: %v", err)
+	}
+
+	if _, err := store.ReconcileDispatchState(ctx); err != nil {
+		t.Fatalf("ReconcileDispatchState: %v", err)
+	}
+
+	// Inside the throttle window a new run would be a guaranteed no-op, so the
+	// trigger must return nil instead of an instantly-closed channel — callers
+	// use nil to skip their grace wait entirely.
+	if done := store.TriggerDispatchStateReconcileAsync(); done != nil {
+		t.Fatal("TriggerDispatchStateReconcileAsync() inside throttle window != nil")
+	}
+
+	// The throttled trigger must release ownership so a later run can start.
+	done, owner := store.beginDispatchStateReconcile()
+	if !owner {
+		t.Fatal("beginDispatchStateReconcile() after throttled trigger: ownership not released")
+	}
+	store.finishDispatchStateReconcile(done)
+}

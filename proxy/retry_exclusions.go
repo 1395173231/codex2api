@@ -166,10 +166,22 @@ func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityK
 	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true)
 }
 
+// reconcileGraceWait bounds how long a missed request waits for the shared
+// background reconciliation. Waiting on the single-flight done channel never
+// queues work behind the database scan; it only spends this request's own
+// latency budget, so it can afford to cover a realistic full-pool scan.
+const reconcileGraceWait = 2 * time.Second
+
+// maxReconcileReentries caps how many completed reconciliations a single
+// request may ride back into the selection loop, so continuous cross-process
+// churn cannot pin a request in the loop beyond its context lifetime.
+const maxReconcileReentries = 3
+
 func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
+	reconcileReentries := 0
 	for {
 		exclude := exclusions.ForSelection()
 		var account *auth.Account
@@ -191,18 +203,24 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 		if account != nil {
 			return account, stickyProxyURL
 		}
-		// If the scheduler had no candidates and returned immediately, give
-		// the shared background reconciliation a small bounded grace period.
-		// Requests never queue behind the database scan itself.
-		if reconcileDone != nil {
-			timer := time.NewTimer(250 * time.Millisecond)
+		if reconcileDone == nil {
+			// The pre-wait trigger may have been throttled; after a long wait
+			// the in-memory state can be stale again, so give the post-wait
+			// moment one more chance to own or join a reconciliation.
+			reconcileDone = h.store.TriggerDispatchStateReconcileAsync()
+		}
+		// If the scheduler had no candidates and returned immediately, wait a
+		// bounded grace period for the shared background reconciliation, then
+		// re-enter the full selection loop (including the availability wait)
+		// so a repaired pool restores the old queueing semantics instead of
+		// granting a single immediate re-check. Requests never queue behind
+		// the database scan itself.
+		if reconcileDone != nil && reconcileReentries < maxReconcileReentries && ctx.Err() == nil {
+			timer := time.NewTimer(reconcileGraceWait)
+			reconciled := false
 			select {
 			case <-reconcileDone:
-				if preserveBinding {
-					account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
-				} else {
-					account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
-				}
+				reconciled = true
 			case <-timer.C:
 			case <-ctx.Done():
 			}
@@ -212,9 +230,13 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 				default:
 				}
 			}
-			if account != nil {
-				return account, stickyProxyURL
+			if reconciled && ctx.Err() == nil {
+				reconcileReentries++
+				continue
 			}
+		}
+		if ctx.Err() != nil {
+			return nil, ""
 		}
 		if !exclusions.ResetSoft() {
 			return nil, ""
