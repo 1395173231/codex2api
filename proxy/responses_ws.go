@@ -820,15 +820,18 @@ func (h *Handler) streamResponsesWSUpstream(
 		if image, ok := extractImageFromOutputItemDone(data, model); ok {
 			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 		}
-		if eventType == "response.completed" {
+		if isResponsesSuccessTerminalEvent(eventType) {
 			usage = extractUsageFromResult(parsed.Get("response.usage"))
-			if options != nil && options.onResponseCompleted != nil {
-				options.onResponseCompleted(append([]byte(nil), data...))
-			}
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+			if eventType == "response.completed" {
+				if options != nil && options.onResponseCompleted != nil {
+					options.onResponseCompleted(append([]byte(nil), data...))
+				}
+				// 截断态不入缓存：它不是完整回合，展开后会把半截输出当历史。
+				cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+			}
 			gotTerminal = true
 		}
 		if eventType == "response.failed" {
@@ -848,7 +851,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
 				pendingFirstTokenBytes += len(clientData)
 				if pendingFirstTokenBytes <= 1024*1024 {
-					return eventType != "response.completed" && eventType != "response.failed"
+					return !isResponsesTerminalEvent(eventType)
 				}
 				if !flushPendingFirstTokenMessages() {
 					return false
@@ -903,7 +906,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				}
 			}
 		}
-		return eventType != "response.completed" && eventType != "response.failed"
+		return !isResponsesTerminalEvent(eventType)
 	})
 	if writeErr == nil && outputBuffer != nil {
 		remaining, err := outputBuffer.Flush()

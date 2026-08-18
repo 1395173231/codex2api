@@ -703,10 +703,10 @@ func grokNativeTerminalEvent(protocol GrokProtocol, payload []byte) (terminal bo
 		}
 		return false, false
 	default:
-		switch root.Get("type").String() {
-		case "response.completed":
+		switch eventType := root.Get("type").String(); {
+		case isResponsesSuccessTerminalEvent(eventType):
 			return true, false
-		case "response.failed", "error":
+		case eventType == "response.failed", eventType == "error":
 			return true, true
 		}
 		return false, false
@@ -2567,6 +2567,33 @@ func shouldWriteStreamBreakEvent(gotTerminal, wroteAnyBody bool, ctxErr, writeEr
 	return !gotTerminal && wroteAnyBody && ctxErr == nil && writeErr == nil
 }
 
+// isResponsesSuccessTerminalEvent 判断事件是否为 Responses 的正常终态。
+// response.incomplete 与 response.completed 同为正常终态：上游按
+// max_output_tokens 截断时只发前者，且照样带完整 output 与 usage。漏认它会
+// 让收尾逻辑把正常截断当断流——合成假的 response.failed / overloaded_error、
+// 丢弃真实 usage 改用估算、并按断流惩罚账号。
+func isResponsesSuccessTerminalEvent(eventType string) bool {
+	return eventType == "response.completed" || eventType == "response.incomplete"
+}
+
+// isResponsesTerminalEvent 覆盖 Responses 的全部终态（正常/截断/失败），
+// 供 SSE 读取循环判定"读到这里就可以收工"。
+func isResponsesTerminalEvent(eventType string) bool {
+	return isResponsesSuccessTerminalEvent(eventType) || eventType == "response.failed"
+}
+
+// responsesIncompleteFinishReason 把 Responses 的截断原因映射成 Chat 的
+// finish_reason；非截断终态返回空串表示"沿用推导值"。
+func responsesIncompleteFinishReason(eventType, reason string) string {
+	if eventType != "response.incomplete" {
+		return ""
+	}
+	if reason == "content_filter" {
+		return "content_filter"
+	}
+	return "length"
+}
+
 // isRetryableStatus 检查是否可重试的上游状态码。
 // 403 也视为可重试：Codex 上游 403 全是账号侧问题（payment_required /
 // deactivated_workspace / codex_access_restricted 等 OAuth/套餐/工作区维度），
@@ -3327,7 +3354,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
-					if eventType == "response.completed" {
+					if isResponsesSuccessTerminalEvent(eventType) {
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
 							actualServiceTier = tier
@@ -3376,7 +3403,7 @@ func (h *Handler) Responses(c *gin.Context) {
 							wroteAnyBody = true
 						}
 					}
-					return eventType != "response.completed" && eventType != "response.failed"
+					return !isResponsesTerminalEvent(eventType)
 				})
 				// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 				// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
@@ -3846,13 +3873,16 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				// 提取 usage + service_tier
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+					if eventType == "response.completed" {
+						// 缓存响应上下文，供后续 previous_response_id 展开使用。
+						// 截断态不入缓存：它不是完整回合，展开后会把半截输出当历史。
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -3903,7 +3933,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						wroteAnyBody = true
 					}
 				}
-				return eventType != "response.completed" && eventType != "response.failed"
+				return !isResponsesTerminalEvent(eventType)
 			}
 
 			// 思考截断自动续想（默认关闭）：开启时用折叠状态机包裹 forward，
@@ -4030,13 +4060,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+					if eventType == "response.completed" {
+						// 截断态不入缓存，理由同流式分支。
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -5412,7 +5444,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -5447,7 +5479,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						wroteAnyBody = true
 					}
 					if shouldDefer && !wrote {
-						return eventType != "response.completed" && eventType != "response.failed"
+						return !isResponsesTerminalEvent(eventType)
 					}
 				}
 				if !clientGone && done {
@@ -5506,6 +5538,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var fullContent strings.Builder
 			var fullReasoning strings.Builder
 			var toolCalls []ToolCallResult
+			var finishReasonOverride string
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -5524,11 +5557,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullReasoning.WriteString(parsed.Get("delta").String())
 				case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
-				case "response.completed":
+				case "response.completed", "response.incomplete":
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					finishReasonOverride = responsesIncompleteFinishReason(eventType,
+						parsed.Get("response.incomplete_details.reason").String())
 					// 从 response.output 提取 function_call 项
 					toolCalls = ExtractToolCallsFromOutput(data)
 					gotTerminal = true
@@ -5541,7 +5576,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+			compactResult = BuildCompactResponseWithFinishReason(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage, finishReasonOverride)
 		}
 
 		// 断流检测 + token 估算
