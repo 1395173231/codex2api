@@ -2220,6 +2220,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	if err != nil {
 		return rawBody, expandedInputRaw
 	}
+	result = normalizeCompactionTriggerFinal(result, false)
+	if requestBodyHasCompactionTrigger(result) {
+		expandedInputRaw = gjson.GetBytes(result, "input").Raw
+	}
 	return result, expandedInputRaw
 }
 
@@ -2269,6 +2273,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	if err != nil {
 		return rawBody
 	}
+	result = normalizeCompactionTriggerFinal(result, false)
 	return result
 }
 
