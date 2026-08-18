@@ -175,7 +175,9 @@ import RequestCountPills, {
 import { buildModelCountBreakdown } from "../lib/requestErrorStatus";
 import {
   accountStateSurfaceClass,
+  accountStateTableRowClass,
   renderAccountStateOverlay,
+  resolveAccountOverlayKind,
 } from "../components/AccountStateOverlay";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
@@ -979,6 +981,13 @@ const AccountTableRow = memo(function AccountTableRow({
   t: ReturnType<typeof useTranslation>["t"];
   actions: AccountRowActions;
 }) {
+  const tableOverlayKind = resolveAccountOverlayKind(account);
+  const tableOverlay = renderAccountStateOverlay(account, t, {
+    compact: true,
+    markerOnly: true,
+    onRecover: () => actions.resetStatus(account),
+  });
+
   return (
                           <TableRow
                             key={account.id}
@@ -989,11 +998,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                 : selected
                                   ? "bg-primary/5"
                                   : ""
-                            }${
-                              // 禁用 / 过载暂停用独立遮罩层淡化内容，徽章保持清晰。relative 让遮罩以整行为定位基准。
-                              // 不用 grayscale / 行级 opacity：filter 会破坏定位包含块，opacity 会把徽章一起冲淡。
-                              accountStateSurfaceClass(account, " relative")
-                            }`}
+                            }${accountStateTableRowClass(account)}`}
                             onClick={(event) => {
                               const target = event.target as HTMLElement | null;
                               if (
@@ -1007,17 +1012,38 @@ const AccountTableRow = memo(function AccountTableRow({
                             }}
                           >
                             <TableCell>
-                              {renderAccountStateOverlay(account, t, {
-                                compact: true,
-                                onRecover: () => actions.resetStatus(account),
-                              })}
-                              <input
-                                type="checkbox"
-                                className="size-4 cursor-pointer accent-primary"
-                                checked={selected}
-                                onChange={() => actions.toggleSelect(account.id)}
-                                onClick={(event) => event.stopPropagation()}
-                              />
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="checkbox"
+                                  className="size-4 cursor-pointer accent-primary"
+                                  checked={selected}
+                                  onChange={() => actions.toggleSelect(account.id)}
+                                  onClick={(event) => event.stopPropagation()}
+                                />
+                                {!visibleColumns.status && tableOverlayKind ? (
+                                  <span className="sr-only">
+                                    {tableOverlayKind === "disabled"
+                                      ? t("accounts.disabledOverlay")
+                                      : t("accounts.overloadOverlay")}
+                                  </span>
+                                ) : null}
+                                {!visibleColumns.status &&
+                                tableOverlayKind === "overload" ? (
+                                  <button
+                                    type="button"
+                                    className="inline-flex size-7 items-center justify-center rounded-md text-orange-700 transition-colors hover:bg-orange-500/10 dark:text-orange-300"
+                                    title={t("accounts.overloadRecover")}
+                                    aria-label={t("accounts.overloadRecover")}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      void actions.resetStatus(account);
+                                    }}
+                                  >
+                                    <RotateCcw className="size-3.5" />
+                                  </button>
+                                ) : null}
+                              </div>
                             </TableCell>
                             {visibleColumns.sequence && (
                               <TableCell
@@ -1219,66 +1245,68 @@ const AccountTableRow = memo(function AccountTableRow({
                               </TableCell>
                             )}
                             {visibleColumns.status && (
-                              <TableCell>
-                                <div
-                                  className="min-w-[168px] max-w-[240px] space-y-1.5"
-                                  title={[
-                                    t("accounts.healthSummary", {
-                                      health: formatHealthTier(
-                                        account.health_tier,
-                                        t,
-                                      ),
-                                      score: Math.round(
-                                        getDispatchScore(account),
-                                      ),
-                                      concurrency:
-                                        account.dynamic_concurrency_limit ?? "-",
-                                    }),
-                                    account.status === "error" &&
-                                    account.error_message
-                                      ? account.error_message
-                                      : "",
-                                    (account.model_cooldowns?.length ?? 0) > 0
-                                      ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
-                                      : "",
-                                  ]
-                                    .filter(Boolean)
-                                    .join("\n")}
-                                >
-                                  <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                                    <StatusBadge
-                                      status={getAccountStatusBadgeStatus(account)}
-                                      detail={
-                                        account.status === "overload_paused"
-                                          ? undefined
-                                          : getAccountRateLimitWindow(account) ??
-                                            undefined
-                                      }
-                                      errorMessage={account.error_message}
-                                    />
-                                    <UsingCreditsBadge account={account} />
-                                    {account.status !== "overload_paused" && (
-                                      <AccountStatusCountdown account={account} />
-                                    )}
-                                    {(account.active_requests ?? 0) > 0 && (
-                                      <span
-                                        className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                                        title={t("accounts.activeRequestsTooltip", {
-                                          count: account.active_requests ?? 0,
-                                        })}
-                                      >
+                              <TableCell data-account-state-cell="status">
+                                {tableOverlay ?? (
+                                  <div
+                                    className="min-w-[168px] max-w-[240px] space-y-1.5"
+                                    title={[
+                                      t("accounts.healthSummary", {
+                                        health: formatHealthTier(
+                                          account.health_tier,
+                                          t,
+                                        ),
+                                        score: Math.round(
+                                          getDispatchScore(account),
+                                        ),
+                                        concurrency:
+                                          account.dynamic_concurrency_limit ?? "-",
+                                      }),
+                                      account.status === "error" &&
+                                      account.error_message
+                                        ? account.error_message
+                                        : "",
+                                      (account.model_cooldowns?.length ?? 0) > 0
+                                        ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
+                                        : "",
+                                    ]
+                                      .filter(Boolean)
+                                      .join("\n")}
+                                  >
+                                    <div className="flex min-h-6 flex-wrap items-center gap-1.5">
+                                      <StatusBadge
+                                        status={getAccountStatusBadgeStatus(account)}
+                                        detail={
+                                          account.status === "overload_paused"
+                                            ? undefined
+                                            : getAccountRateLimitWindow(account) ??
+                                              undefined
+                                        }
+                                        errorMessage={account.error_message}
+                                      />
+                                      <UsingCreditsBadge account={account} />
+                                      {account.status !== "overload_paused" && (
+                                        <AccountStatusCountdown account={account} />
+                                      )}
+                                      {(account.active_requests ?? 0) > 0 && (
                                         <span
-                                          className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                                          aria-hidden
-                                        />
-                                        {account.active_requests}
-                                      </span>
-                                    )}
+                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                                          title={t("accounts.activeRequestsTooltip", {
+                                            count: account.active_requests ?? 0,
+                                          })}
+                                        >
+                                          <span
+                                            className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                                            aria-hidden
+                                          />
+                                          {account.active_requests}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <AccountHealthBar
+                                      buckets={healthBuckets}
+                                    />
                                   </div>
-                                  <AccountHealthBar
-                                    buckets={healthBuckets}
-                                  />
-                                </div>
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.today && (
@@ -13192,7 +13220,10 @@ function AccountMobileCard({
                   })}
                 </div>
               </div>
-              <div className="shrink-0">
+              <div
+                className="shrink-0"
+                aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+              >
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <StatusBadge
                     status={getAccountStatusBadgeStatus(account)}
@@ -13481,7 +13512,10 @@ function AccountMobileCard({
                 )}
               </div>
               {(!visibleColumns || visibleColumns.status) && (
-                <div className="flex min-w-[112px] shrink-0 flex-col items-end">
+                <div
+                  className="flex min-w-[112px] shrink-0 flex-col items-end"
+                  aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+                >
                   <StatusBadge
                     status={getAccountStatusBadgeStatus(account)}
                     detail={

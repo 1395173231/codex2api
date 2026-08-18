@@ -53,6 +53,7 @@ import AccountDetailSheet from "../components/AccountDetailSheet";
 import RequestCountPills from "../components/RequestCountPills";
 import {
   disabledAccountSurfaceClass,
+  disabledAccountTableRowClass,
   renderDisabledAccountOverlay,
 } from "../components/AccountStateOverlay";
 import AccountGroupFilterSelect, {
@@ -4137,13 +4138,17 @@ function GrokAccountTableRow({
   const models = account.models ?? [];
   const host = shortHost(account.base_url);
   const label = accountLabel(account);
+  const tableOverlay = renderDisabledAccountOverlay(account, t, {
+    compact: true,
+    markerOnly: true,
+  });
 
   return (
     <TableRow
       className={cn(
         "cursor-pointer",
         detailOpen ? "bg-primary/8" : selected && "bg-primary/5",
-        disabledAccountSurfaceClass(account, " relative"),
+        disabledAccountTableRowClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -4158,7 +4163,6 @@ function GrokAccountTableRow({
       }}
     >
       <TableCell className="w-9">
-        {renderDisabledAccountOverlay(account, t, { compact: true })}
         <input
           type="checkbox"
           className="size-4 cursor-pointer rounded border-border accent-primary"
@@ -4233,23 +4237,25 @@ function GrokAccountTableRow({
       <TableCell className="text-center">
         <GrokPlanBadge account={account} />
       </TableCell>
-      <TableCell>
-        <div className="space-y-1.5">
-          <StatusBadge
-            status={disabled ? "paused" : (account.status ?? "unknown")}
-            errorMessage={account.error_message}
-          />
-          {(account.active_requests ?? 0) > 0 && (
-            <span
-              className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-              title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
-            >
-              <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
-              {account.active_requests}
-            </span>
-          )}
-          <AccountHealthBar buckets={healthBuckets} />
-        </div>
+      <TableCell data-account-state-cell="status">
+        {tableOverlay ?? (
+          <div className="space-y-1.5">
+            <StatusBadge
+              status={disabled ? "paused" : (account.status ?? "unknown")}
+              errorMessage={account.error_message}
+            />
+            {(account.active_requests ?? 0) > 0 && (
+              <span
+                className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
+              >
+                <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
+                {account.active_requests}
+              </span>
+            )}
+            <AccountHealthBar buckets={healthBuckets} />
+          </div>
+        )}
       </TableCell>
       <TableCell>
         <RequestCountPills account={account} compact />
