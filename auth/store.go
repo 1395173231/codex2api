@@ -3007,6 +3007,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
 	mu                                 sync.RWMutex
+	accountMutationMu                  sync.Mutex // serializes account-set and scheduler mutations without nesting their locks
 	accounts                           []*Account
 	accountsByID                       map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
 	globalProxy                        string
@@ -5511,8 +5512,6 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 	}
 
 	for attempts := 0; attempts < 16; attempts++ {
-		s.mu.RLock()
-
 		var best *Account
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
@@ -5521,7 +5520,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		var bestLimit int64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-		for _, acc := range s.accounts {
+		for _, acc := range s.Accounts() {
 			if exclude != nil && exclude[acc.DBID] {
 				continue
 			}
@@ -5557,8 +5556,6 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				best = acc
 			}
 		}
-		s.mu.RUnlock()
-
 		if best == nil {
 			return nil
 		}
@@ -5679,8 +5676,6 @@ func (s *Store) acquireLazyCandidate(acc *Account, maxConcurrency int64) bool {
 
 func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	for attempts := 0; attempts < 16; attempts++ {
-		s.mu.RLock()
-
 		var best *Account
 		var metadataRefreshCandidate *Account
 		bestSchedulerPriority := minSchedulerPriority - 1
@@ -5689,7 +5684,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		var bestLoad int64 = math.MaxInt64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-		for _, acc := range s.accounts {
+		for _, acc := range s.Accounts() {
 			if exclude != nil && exclude[acc.DBID] {
 				continue
 			}
@@ -5731,8 +5726,6 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				best = acc
 			}
 		}
-		s.mu.RUnlock()
-
 		if best == nil {
 			if metadataRefreshCandidate != nil && s.ensureLazyDispatchReady(metadataRefreshCandidate) {
 				continue
@@ -6018,9 +6011,9 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 	}
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-	s.mu.RLock()
-	candidates := make([]affinityCandidate, 0, len(s.accounts))
-	for _, acc := range s.accounts {
+	accounts := s.Accounts()
+	candidates := make([]affinityCandidate, 0, len(accounts))
+	for _, acc := range accounts {
 		if exclude != nil && exclude[acc.DBID] {
 			continue
 		}
@@ -6050,7 +6043,6 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 			weight:            hasher.Sum64(),
 		})
 	}
-	s.mu.RUnlock()
 
 	if len(candidates) == 0 {
 		return nil
@@ -6287,10 +6279,7 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 	filter = s.withUsableEgressFilter(filter)
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, acc := range s.accounts {
+	for _, acc := range s.Accounts() {
 		if acc == nil {
 			continue
 		}
@@ -7337,8 +7326,13 @@ func (s *Store) AddAccounts(accounts []*Account) {
 		return
 	}
 
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
+
 	now := time.Now().UnixNano()
 	added := make([]*Account, 0, len(accounts))
+	ignoreUsageLimit := s.IgnoreUsageLimitStatus()
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
@@ -7347,6 +7341,12 @@ func (s *Store) AddAccounts(accounts []*Account) {
 		if atomic.LoadInt64(&acc.AddedAt) == 0 {
 			atomic.StoreInt64(&acc.AddedAt, now)
 		}
+		acc.mu.Lock()
+		acc.grokRuntimeSink = s
+		acc.recomputeEffectiveIgnoreUsageLimitStatus(ignoreUsageLimit)
+		acc.recomputeEffectiveGroupBaseConcurrency(s)
+		acc.recomputeSchedulerLocked(maxConcurrency)
+		acc.mu.Unlock()
 		added = append(added, acc)
 	}
 	if len(added) == 0 {
@@ -7354,18 +7354,6 @@ func (s *Store) AddAccounts(accounts []*Account) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ignoreUsageLimit := s.IgnoreUsageLimitStatus()
-	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-	for _, acc := range added {
-		acc.mu.Lock()
-		acc.grokRuntimeSink = s
-		acc.recomputeEffectiveIgnoreUsageLimitStatus(ignoreUsageLimit)
-		acc.recomputeEffectiveGroupBaseConcurrency(s)
-		acc.recomputeSchedulerLocked(maxConcurrency)
-		acc.mu.Unlock()
-	}
 	s.accounts = append(s.accounts, added...)
 	if s.accountsByID == nil {
 		s.rebuildAccountIndex()
@@ -7374,6 +7362,8 @@ func (s *Store) AddAccounts(accounts []*Account) {
 			s.accountsByID[acc.DBID] = acc
 		}
 	}
+	s.mu.Unlock()
+
 	if scheduler := s.getFastScheduler(); scheduler != nil {
 		scheduler.UpdateMany(added)
 	}
@@ -7381,20 +7371,28 @@ func (s *Store) AddAccounts(accounts []*Account) {
 
 // RemoveAccount 从内存池移除账号
 func (s *Store) RemoveAccount(dbID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
 
+	removed := false
+	s.mu.Lock()
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			s.rebuildAccountIndex()
-			s.fastSchedulerRemove(dbID)
-			// 清理 RefreshScheduler 中可能残留的任务
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(dbID)
-			}
-			return
+			removed = true
+			break
 		}
+	}
+	s.mu.Unlock()
+	if !removed {
+		return
+	}
+
+	s.fastSchedulerRemove(dbID)
+	// 清理 RefreshScheduler 中可能残留的任务
+	if scheduler := s.GetRefreshScheduler(); scheduler != nil {
+		scheduler.CancelTask(dbID)
 	}
 }
 
@@ -9548,19 +9546,20 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		return
 	}
 
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
+
 	removeSet := make(map[int64]struct{}, len(dbIDs))
 	for _, id := range dbIDs {
 		removeSet[id] = struct{}{}
 	}
 
+	removedIDs := make([]int64, 0, len(removeSet))
 	s.mu.Lock()
 	kept := s.accounts[:0]
 	for _, acc := range s.accounts {
 		if _, remove := removeSet[acc.DBID]; remove {
-			s.fastSchedulerRemove(acc.DBID)
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(acc.DBID)
-			}
+			removedIDs = append(removedIDs, acc.DBID)
 		} else {
 			kept = append(kept, acc)
 		}
@@ -9568,6 +9567,14 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 	s.accounts = kept
 	s.rebuildAccountIndex()
 	s.mu.Unlock()
+
+	refreshScheduler := s.GetRefreshScheduler()
+	for _, dbID := range removedIDs {
+		s.fastSchedulerRemove(dbID)
+		if refreshScheduler != nil {
+			refreshScheduler.CancelTask(dbID)
+		}
+	}
 }
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {
