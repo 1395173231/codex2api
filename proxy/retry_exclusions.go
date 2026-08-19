@@ -3,15 +3,20 @@ package proxy
 import (
 	"context"
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/google/uuid"
 )
 
 type retryAccountExclusions struct {
-	hard map[int64]bool
-	soft map[int64]bool
+	hard        map[int64]bool
+	soft        map[int64]bool
+	transient   map[int64]bool
+	recoverable map[int64]bool
 }
 
 // websocketHTTPFallbackState carries the already-acquired account lease across
@@ -107,8 +112,10 @@ func (s *websocketHTTPFallbackState) LogHTTPAttemptCompletion(endpoint string, a
 
 func newRetryAccountExclusions() *retryAccountExclusions {
 	return &retryAccountExclusions{
-		hard: make(map[int64]bool),
-		soft: make(map[int64]bool),
+		hard:        make(map[int64]bool),
+		soft:        make(map[int64]bool),
+		transient:   make(map[int64]bool),
+		recoverable: make(map[int64]bool),
 	}
 }
 
@@ -118,6 +125,153 @@ func (r *retryAccountExclusions) MarkHard(accountID int64) {
 	}
 	r.hard[accountID] = true
 	delete(r.soft, accountID)
+	delete(r.transient, accountID)
+	delete(r.recoverable, accountID)
+}
+
+// MarkTransient excludes an account for the current pass through the pool.
+// Unlike a hard exclusion, it may be cleared after every candidate has seen a
+// recoverable transport, overload, or rate-limit failure in continuous mode.
+func (r *retryAccountExclusions) MarkTransient(accountID int64) {
+	if r == nil || accountID == 0 {
+		return
+	}
+	if r.hard[accountID] {
+		return
+	}
+	delete(r.soft, accountID)
+	r.transient[accountID] = true
+	r.recoverable[accountID] = true
+}
+
+func (r *retryAccountExclusions) MarkTransportFailure(accountID int64, retryLimit int, policies ...database.ContinuousRetryPolicy) {
+	r.MarkRequestFailure(accountID, nil, retryLimit, policies...)
+}
+
+// MarkRequestFailure classifies a status-bearing or plain transport error for
+// account selection. Keeping the original error matters for WebSocket
+// handshake failures and exact error-code selectors: the retry budget may have
+// been promoted to unlimited by the policy even though the legacy transport
+// classifier only sees a generic dial error.
+func (r *retryAccountExclusions) MarkRequestFailure(accountID int64, err error, retryLimit int, policies ...database.ContinuousRetryPolicy) {
+	policy := continuousRetryPolicyForCall(policies)
+	if _, _, statusBearing := continuousRetryHTTPErrorDetails(err); statusBearing {
+		if continuousRetryRequestErrorSelected(policy, err) {
+			r.MarkTransient(accountID)
+			return
+		}
+		r.MarkHard(accountID)
+		return
+	}
+	if policy.MatchesTransport("transport") || (err != nil && policy.MatchesTransport(err.Error())) {
+		r.MarkTransient(accountID)
+		return
+	}
+	if retryLimit == -1 {
+		r.MarkTransient(accountID)
+		return
+	}
+	r.MarkHard(accountID)
+}
+
+// MarkHTTPFailure keeps account-local and deterministic failures excluded for
+// the lifetime of the request, while allowing genuinely recoverable failures
+// to participate in another pool cycle when continuous retry is enabled.
+func (r *retryAccountExclusions) MarkHTTPFailure(accountID int64, statusCode int, body []byte, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) {
+	policy := continuousRetryPolicyForCall(policies)
+	if continuousRetryHTTPSelected(policy, statusCode, body) {
+		r.MarkTransient(accountID)
+		return
+	}
+	retryLimit := generalLimit
+	if statusCode == http.StatusTooManyRequests {
+		retryLimit = rateLimit
+	}
+	if retryLimit == -1 && isTransientRetryHTTPFailure(statusCode, body) {
+		r.MarkTransient(accountID)
+		return
+	}
+	r.MarkHard(accountID)
+}
+
+func (r *retryAccountExclusions) MarkStreamFailure(accountID int64, outcome streamOutcome, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) {
+	r.MarkStreamFailureForEvent(accountID, outcome, "", generalLimit, rateLimit, policies...)
+}
+
+func (r *retryAccountExclusions) MarkStreamFailureForEvent(accountID int64, outcome streamOutcome, eventType string, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) {
+	if continuousRetryStreamSelected(outcome, outcome.failurePayload, eventType, policies...) {
+		r.MarkTransient(accountID)
+		return
+	}
+	failureKind := strings.ToLower(strings.TrimSpace(outcome.failureKind))
+	retryLimit := generalLimit
+	if outcome.logStatusCode == http.StatusTooManyRequests || strings.Contains(failureKind, "rate_limit") {
+		retryLimit = rateLimit
+	}
+	if retryLimit != -1 {
+		r.MarkHard(accountID)
+		return
+	}
+	if outcome.capacityShed {
+		r.MarkTransient(accountID)
+		return
+	}
+	switch failureKind {
+	case "transport", "timeout", "server", "rate_limited", "rate_limited_model", "model_capacity":
+		r.MarkTransient(accountID)
+		return
+	case "usage_limit", "usage_limited", "unauthorized", "forbidden", "deactivated_workspace", "payment_required_unknown", "version_required", "client", "cyber_policy":
+		r.MarkHard(accountID)
+		return
+	}
+	if isTransientRetryHTTPFailure(outcome.logStatusCode, nil) || outcome.logStatusCode == logStatusUpstreamStreamBreak {
+		r.MarkTransient(accountID)
+		return
+	}
+	r.MarkHard(accountID)
+}
+
+func isTransientRetryHTTPFailure(statusCode int, body []byte) bool {
+	if isPermanentQuotaFailure(body) {
+		return false
+	}
+	switch statusCode {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPermanentQuotaFailure(body []byte) bool {
+	if IsUsageLimitReachedError(body) {
+		return true
+	}
+	value := strings.ToLower(strings.Join([]string{
+		firstGJSONString(body, "error.code", "response.error.code", "response.status_details.error.code", "code"),
+		firstGJSONString(body, "error.type", "response.error.type", "response.status_details.error.type", "type"),
+		firstGJSONString(body, "error.message", "response.error.message", "response.status_details.error.message", "message"),
+	}, " "))
+	for _, marker := range []string{
+		"insufficient_quota",
+		"quota_exceeded",
+		"quota_exhausted",
+		"billing_hard_limit",
+		"billing_limit_reached",
+		"spend_limit",
+		"credit_balance",
+		"insufficient_balance",
+		"usage_limited",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *retryAccountExclusions) MarkSoftFirstTokenTimeout(accountID int64) {
@@ -130,7 +284,7 @@ func (r *retryAccountExclusions) MarkSoft(accountID int64) {
 	if r == nil || accountID == 0 {
 		return
 	}
-	if r.hard[accountID] {
+	if r.hard[accountID] || r.transient[accountID] {
 		return
 	}
 	r.soft[accountID] = true
@@ -144,18 +298,67 @@ func (r *retryAccountExclusions) ResetSoft() bool {
 	return true
 }
 
+func (r *retryAccountExclusions) ResetTransient() bool {
+	if r == nil || len(r.transient) == 0 {
+		return false
+	}
+	r.transient = make(map[int64]bool)
+	return true
+}
+
+func (r *retryAccountExclusions) CanContinueTransientCycle() bool {
+	return r != nil && len(r.recoverable) > 0
+}
+
 func (r *retryAccountExclusions) ForSelection() map[int64]bool {
-	if r == nil || (len(r.hard) == 0 && len(r.soft) == 0) {
+	if r == nil || (len(r.hard) == 0 && len(r.soft) == 0 && len(r.transient) == 0) {
 		return nil
 	}
-	exclude := make(map[int64]bool, len(r.hard)+len(r.soft))
+	exclude := make(map[int64]bool, len(r.hard)+len(r.soft)+len(r.transient))
 	for id := range r.hard {
 		exclude[id] = true
 	}
 	for id := range r.soft {
 		exclude[id] = true
 	}
+	for id := range r.transient {
+		exclude[id] = true
+	}
 	return exclude
+}
+
+// nextBoundedRetryAccount gives hard-capped image/media loops one additional
+// pool pass after every policy-selected transient candidate has been tried.
+// It never waits and never changes the caller's total-attempt cap.
+func nextBoundedRetryAccount(exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string)) (*auth.Account, string) {
+	if selectAccount == nil {
+		return nil, ""
+	}
+	account, proxyURL := selectAccount(exclusions.ForSelection())
+	if account != nil || !exclusions.ResetTransient() {
+		return account, proxyURL
+	}
+	return selectAccount(exclusions.ForSelection())
+}
+
+const continuousPoolRetryPollInterval = 5 * time.Second
+
+func waitForContinuousPoolRetry(ctx context.Context) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if ctx == nil {
+		time.Sleep(continuousPoolRetryPollInterval)
+		return true
+	}
+	timer := time.NewTimer(continuousPoolRetryPollInterval)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
@@ -239,7 +442,17 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 			return nil, ""
 		}
 		if !exclusions.ResetSoft() {
-			return nil, ""
+			if exclusions.ResetTransient() {
+				log.Printf("可恢复故障已遍历账号池，清空本轮暂态排除并进入下一轮重试")
+				continue
+			}
+			if !exclusions.CanContinueTransientCycle() {
+				return nil, ""
+			}
+			if !waitForContinuousPoolRetry(ctx) {
+				return nil, ""
+			}
+			continue
 		}
 		log.Printf("首字超时账号池已试完，清空本次请求软排除并进入下一轮重试")
 	}

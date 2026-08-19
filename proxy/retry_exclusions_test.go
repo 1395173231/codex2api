@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"log"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 )
 
 func TestRetryAccountExclusionsSoftResetPreservesHard(t *testing.T) {
@@ -43,6 +47,313 @@ func TestRetryAccountExclusionsHardOverridesSoft(t *testing.T) {
 	selection := exclusions.ForSelection()
 	if !selection[1] {
 		t.Fatalf("hard account missing from selection excludes: %#v", selection)
+	}
+}
+
+func TestRetryAccountExclusionsHardOverridesPriorTransient(t *testing.T) {
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkTransient(1)
+	exclusions.MarkHard(1)
+
+	if exclusions.ResetTransient() {
+		t.Fatal("hard override left a transient round entry")
+	}
+	if exclusions.CanContinueTransientCycle() {
+		t.Fatal("hard override left the account recoverable")
+	}
+	if selection := exclusions.ForSelection(); !selection[1] {
+		t.Fatalf("hard account missing after override: %#v", selection)
+	}
+}
+
+func TestRetryAccountExclusionsContinuousCycleOnlyClearsTransient(t *testing.T) {
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkTransient(1)
+	exclusions.MarkHard(2)
+	exclusions.MarkSoft(3)
+
+	if !exclusions.CanContinueTransientCycle() {
+		t.Fatal("continuous retry did not remember a transient failure")
+	}
+	if !exclusions.ResetTransient() {
+		t.Fatal("ResetTransient() = false, want true")
+	}
+	selection := exclusions.ForSelection()
+	if selection[1] {
+		t.Fatalf("transient account still excluded after reset: %#v", selection)
+	}
+	if !selection[2] || !selection[3] {
+		t.Fatalf("transient reset cleared hard or soft exclusions: %#v", selection)
+	}
+
+	finite := newRetryAccountExclusions()
+	finite.MarkTransportFailure(4, 2)
+	if finite.CanContinueTransientCycle() {
+		t.Fatal("finite retry budget enabled continuous pool cycling")
+	}
+}
+
+func TestNextBoundedRetryAccountResetsOnlyTransientRound(t *testing.T) {
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkTransient(1)
+
+	var selections []map[int64]bool
+	account, _ := nextBoundedRetryAccount(exclusions, func(exclude map[int64]bool) (*auth.Account, string) {
+		copyExclude := make(map[int64]bool, len(exclude))
+		for id, blocked := range exclude {
+			copyExclude[id] = blocked
+		}
+		selections = append(selections, copyExclude)
+		if exclude[1] {
+			return nil, ""
+		}
+		return &auth.Account{DBID: 1}, ""
+	})
+	if account == nil || account.ID() != 1 {
+		t.Fatalf("bounded retry account = %#v, want account 1 after transient reset", account)
+	}
+	if len(selections) != 2 || !selections[0][1] || selections[1][1] {
+		t.Fatalf("selection rounds = %#v, want transient exclusion then reset", selections)
+	}
+
+	hard := newRetryAccountExclusions()
+	hard.MarkHard(2)
+	calls := 0
+	account, _ = nextBoundedRetryAccount(hard, func(exclude map[int64]bool) (*auth.Account, string) {
+		calls++
+		return nil, ""
+	})
+	if account != nil || calls != 1 {
+		t.Fatalf("hard exclusion triggered an extra bounded pool pass: account=%#v calls=%d", account, calls)
+	}
+}
+
+func TestRetryAccountExclusionsRequestErrorUsesSelectedPolicy(t *testing.T) {
+	statusPolicy := database.ContinuousRetryPolicy{
+		Enabled:     true,
+		StatusCodes: []int{http.StatusForbidden},
+	}
+	exclusions := newRetryAccountExclusions()
+	handshakeErr := continuousRetryTestHTTPError{
+		status: http.StatusForbidden,
+		body:   []byte(`{"error":{"code":"account_forbidden"}}`),
+	}
+	exclusions.MarkRequestFailure(1, handshakeErr, 0, statusPolicy)
+	if !exclusions.CanContinueTransientCycle() {
+		t.Fatal("selected handshake status was marked permanently excluded")
+	}
+	if !exclusions.ResetTransient() {
+		t.Fatal("selected handshake status did not leave a transient exclusion")
+	}
+
+	transportOnly := database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryTransport},
+	}
+	unselected := newRetryAccountExclusions()
+	unselected.MarkRequestFailure(1, handshakeErr, 2, transportOnly)
+	if unselected.CanContinueTransientCycle() {
+		t.Fatal("transport category made an unselected handshake status recoverable")
+	}
+	if !unselected.ForSelection()[1] {
+		t.Fatal("unselected handshake status was not hard-excluded for the request")
+	}
+
+	codePolicy := database.ContinuousRetryPolicy{Enabled: true, ErrorCodes: []string{"temporarily_unavailable"}}
+	exclusions.MarkRequestFailure(2, errors.New("upstream temporarily_unavailable"), 0, codePolicy)
+	if !exclusions.CanContinueTransientCycle() {
+		t.Fatal("selected transport error code was marked permanently excluded")
+	}
+}
+
+func TestRetryAccountExclusionsHTTPFailureClassification(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		transient  bool
+	}{
+		{name: "429 rate limit", statusCode: http.StatusTooManyRequests, body: []byte(`{"error":{"code":"rate_limit_exceeded"}}`), transient: true},
+		{name: "502", statusCode: http.StatusBadGateway, transient: true},
+		{name: "503", statusCode: http.StatusServiceUnavailable, transient: true},
+		{name: "504", statusCode: http.StatusGatewayTimeout, transient: true},
+		{name: "usage limit wrapped as 500", statusCode: http.StatusInternalServerError, body: []byte(`{"error":{"type":"usage_limit_reached"}}`)},
+		{name: "insufficient quota", statusCode: http.StatusTooManyRequests, body: []byte(`{"error":{"code":"insufficient_quota"}}`)},
+		{name: "401", statusCode: http.StatusUnauthorized},
+		{name: "403", statusCode: http.StatusForbidden},
+		{name: "404", statusCode: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTransientRetryHTTPFailure(tt.statusCode, tt.body); got != tt.transient {
+				t.Fatalf("isTransientRetryHTTPFailure(%d) = %v, want %v", tt.statusCode, got, tt.transient)
+			}
+		})
+	}
+}
+
+func TestPermanentQuotaMarkersNeverEnterContinuousCycles(t *testing.T) {
+	for _, marker := range []string{
+		"insufficient_quota",
+		"quota_exceeded",
+		"quota_exhausted",
+		"billing_hard_limit",
+		"billing_limit_reached",
+		"spend_limit",
+		"credit_balance",
+		"insufficient_balance",
+		"usage_limited",
+	} {
+		t.Run(marker, func(t *testing.T) {
+			for _, field := range []string{"code", "message"} {
+				t.Run(field, func(t *testing.T) {
+					body := []byte(`{"error":{"` + field + `":"` + marker + `"}}`)
+					if !isPermanentQuotaFailure(body) {
+						t.Fatalf("quota marker %q in %s was not classified as permanent", marker, field)
+					}
+
+					httpExclusions := newRetryAccountExclusions()
+					httpExclusions.MarkHTTPFailure(1, http.StatusTooManyRequests, body, -1, -1)
+					if httpExclusions.CanContinueTransientCycle() || httpExclusions.ResetTransient() {
+						t.Fatalf("HTTP quota marker %q in %s entered a continuous retry cycle", marker, field)
+					}
+
+					payload := []byte(`{"type":"response.failed","response":{"error":{"` + field + `":"` + marker + `"}}}`)
+					outcome := classifyResponseFailedOutcome(payload)
+					if outcome.logStatusCode != http.StatusTooManyRequests || outcome.failureKind != "usage_limit" || !streamOutcomeUsesRateLimitBudget(outcome) {
+						t.Fatalf("stream quota outcome = %#v, want permanent usage-limit semantics", outcome)
+					}
+					streamExclusions := newRetryAccountExclusions()
+					streamExclusions.MarkStreamFailure(1, outcome, -1, -1)
+					if streamExclusions.CanContinueTransientCycle() || streamExclusions.ResetTransient() {
+						t.Fatalf("stream quota marker %q in %s entered a continuous retry cycle", marker, field)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestApplyResponseFailedDecisionKindPreservesMessageOnlyPermanentQuota(t *testing.T) {
+	decision := codex429Decision{Scope: rateLimitScopeModel, Reason: "rate_limited_model"}
+	for _, marker := range []string{
+		"insufficient_quota",
+		"billing_hard_limit",
+		"spend_limit",
+		"credit_balance",
+		"usage_limited",
+	} {
+		t.Run(marker, func(t *testing.T) {
+			payload := []byte(`{"type":"response.failed","response":{"error":{"message":"` + marker + `"}}}`)
+			outcome := classifyResponseFailedOutcome(payload)
+			outcome = applyResponseFailedDecisionKind(outcome, payload, decision)
+			if outcome.logStatusCode != http.StatusTooManyRequests || outcome.failureKind != "usage_limit" {
+				t.Fatalf("response.failed outcome for %q = %#v, want permanent usage-limit semantics", marker, outcome)
+			}
+
+			exclusions := newRetryAccountExclusions()
+			exclusions.MarkStreamFailure(1, outcome, -1, -1)
+			if exclusions.CanContinueTransientCycle() || exclusions.ResetTransient() {
+				t.Fatalf("response.failed quota marker %q entered a continuous retry cycle", marker)
+			}
+		})
+	}
+}
+
+func TestRetryAccountExclusionsUsesIndependentBudgets(t *testing.T) {
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkHTTPFailure(1, http.StatusServiceUnavailable, nil, -1, 1)
+	exclusions.MarkHTTPFailure(2, http.StatusTooManyRequests, []byte(`{"error":{"code":"rate_limit_exceeded"}}`), -1, 1)
+
+	if !exclusions.ResetTransient() {
+		t.Fatal("unlimited general failure was not marked transient")
+	}
+	selection := exclusions.ForSelection()
+	if selection[1] {
+		t.Fatalf("general transient account remained excluded: %#v", selection)
+	}
+	if !selection[2] {
+		t.Fatalf("finite 429 budget was pulled into the general unlimited cycle: %#v", selection)
+	}
+}
+
+func TestRetryAccountExclusionsStreamFailureClassification(t *testing.T) {
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkStreamFailure(1, streamOutcome{failureKind: "transport", logStatusCode: logStatusUpstreamStreamBreak}, -1, 0)
+	exclusions.MarkStreamFailure(2, streamOutcome{failureKind: "usage_limit", logStatusCode: http.StatusTooManyRequests}, -1, -1)
+
+	if !exclusions.ResetTransient() {
+		t.Fatal("transport stream failure was not marked transient")
+	}
+	selection := exclusions.ForSelection()
+	if selection[1] {
+		t.Fatalf("transport stream failure remained excluded: %#v", selection)
+	}
+	if !selection[2] {
+		t.Fatalf("usage-limit stream failure was cleared: %#v", selection)
+	}
+}
+
+func TestWaitForContinuousPoolRetryCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if waitForContinuousPoolRetry(ctx) {
+		t.Fatal("canceled pool wait returned true")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("canceled pool wait returned too slowly: %v", elapsed)
+	}
+}
+
+func TestNextRetryAccountStartsNewTransientCycle(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	account := &auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(account)
+	h := &Handler{store: store}
+
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkTransient(account.ID())
+	got, _ := h.nextRetryAccountForSession(context.Background(), "", 0, exclusions, nil)
+	if got != account {
+		t.Fatalf("next retry account = %p, want %p after transient cycle reset", got, account)
+	}
+	store.Release(got)
+}
+
+func TestNextRetryAccountDoesNotCyclePermanentFailures(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	account := &auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(account)
+	h := &Handler{store: store}
+
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkHard(account.ID())
+	start := time.Now()
+	got, _ := h.nextRetryAccountForSession(context.Background(), "", 0, exclusions, nil)
+	if got != nil {
+		store.Release(got)
+		t.Fatalf("permanently excluded account was selected: %d", got.ID())
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("permanent-only pool did not fail promptly: %v", elapsed)
+	}
+}
+
+func TestNextRetryAccountContinuousWaitHonorsCancellation(t *testing.T) {
+	h := &Handler{store: auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})}
+	exclusions := newRetryAccountExclusions()
+	exclusions.MarkTransient(99)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	got, _ := h.nextRetryAccountForSession(ctx, "", 0, exclusions, nil)
+	if got != nil {
+		t.Fatalf("empty pool returned account %d", got.ID())
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("continuous pool wait ignored cancellation: %v", elapsed)
 	}
 }
 

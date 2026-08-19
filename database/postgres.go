@@ -1349,6 +1349,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[]}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
@@ -2098,6 +2099,7 @@ type SystemSettings struct {
 	FastSchedulerEnabled               bool
 	MaxRetries                         int
 	MaxRateLimitRetries                int
+	ContinuousRetryPolicy              string // JSON: database.ContinuousRetryPolicy
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
@@ -2493,11 +2495,36 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if strings.TrimSpace(s.PayloadRules) == "" {
 		s.PayloadRules = "{}"
 	}
+	var continuousRetryRaw sql.NullString
+	if policyErr := db.conn.QueryRowContext(ctx, `SELECT COALESCE(continuous_retry_policy, '') FROM system_settings WHERE id = 1`).Scan(&continuousRetryRaw); policyErr == nil {
+		s.ContinuousRetryPolicy = continuousRetryRaw.String
+	} else if !errors.Is(policyErr, sql.ErrNoRows) {
+		return nil, policyErr
+	}
+	if strings.TrimSpace(s.ContinuousRetryPolicy) == "" {
+		s.ContinuousRetryPolicy = EncodeContinuousRetryPolicy(DefaultContinuousRetryPolicy())
+	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	return s, err
+}
+
+// UpdateContinuousRetryPolicy persists the opt-in retry selector separately
+// from the large legacy settings upsert. This keeps old callers that build a
+// partial SystemSettings snapshot from accidentally clearing the new policy.
+func (db *DB) UpdateContinuousRetryPolicy(ctx context.Context, policy ContinuousRetryPolicy) error {
+	if db == nil || db.conn == nil {
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO system_settings (id, continuous_retry_policy)
+		VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET
+			continuous_retry_policy = EXCLUDED.continuous_retry_policy
+	`, EncodeContinuousRetryPolicy(policy))
+	return err
 }
 
 // NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到四个已知
@@ -2729,7 +2756,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
+		s.FastSchedulerEnabled, NormalizeRetryLimit(s.MaxRetries), NormalizeRetryLimit(s.MaxRateLimitRetries), s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
 		s.UsageProbeConcurrency, s.UsageProbeResponsesFallbackEnabled,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
@@ -2917,8 +2944,9 @@ func NormalizeCodexWSStatelessSlots(slots int) int {
 	return slots
 }
 
-// normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
-func normalizeCodexWSSilentMaxRetries(retries int) int {
+// NormalizeRetryLimit 把公开的有限重试预算限制在 0-10。
+// 持续重试由独立策略控制；内部使用的 -1 哨兵不能通过设置接口持久化。
+func NormalizeRetryLimit(retries int) int {
 	if retries < 0 {
 		return 0
 	}
@@ -2926,6 +2954,11 @@ func normalizeCodexWSSilentMaxRetries(retries int) int {
 		return 10
 	}
 	return retries
+}
+
+// normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
+func normalizeCodexWSSilentMaxRetries(retries int) int {
+	return NormalizeRetryLimit(retries)
 }
 
 // UTLS 优雅关闭等待上限的边界（分钟，issue #446）。

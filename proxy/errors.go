@@ -24,25 +24,25 @@ const (
 
 const (
 	// Authentication errors
-	ErrorCodeMissingAPIKey     = "missing_api_key"
-	ErrorCodeInvalidAPIKey     = "invalid_api_key"
+	ErrorCodeMissingAPIKey = "missing_api_key"
+	ErrorCodeInvalidAPIKey = "invalid_api_key"
 
 	// Rate limiting errors
-	ErrorCodeRateLimited              = "rate_limited"
-	ErrorCodeAccountPoolUsageLimit   = "account_pool_usage_limit_reached"
+	ErrorCodeRateLimited           = "rate_limited"
+	ErrorCodeAccountPoolUsageLimit = "account_pool_usage_limit_reached"
 
 	// Upstream errors
-	ErrorCodeUpstreamError     = "upstream_error"
-	ErrorCodeUpstreamTimeout   = "upstream_timeout"
+	ErrorCodeUpstreamError       = "upstream_error"
+	ErrorCodeUpstreamTimeout     = "upstream_timeout"
 	ErrorCodeUpstreamStreamBreak = "upstream_stream_break"
 
 	// Server errors
 	ErrorCodeNoAvailableAccount = "no_available_account"
-	ErrorCodeInternalError     = "internal_error"
+	ErrorCodeInternalError      = "internal_error"
 
 	// Request errors
-	ErrorCodeBadRequest       = "bad_request"
-	ErrorCodeMissingModel     = "missing_model"
+	ErrorCodeBadRequest   = "bad_request"
+	ErrorCodeMissingModel = "missing_model"
 )
 
 // ==================== Error Struct ====================
@@ -84,6 +84,25 @@ func (e *Error) Unwrap() error {
 // StatusCode returns the HTTP status code for this error
 func (e *Error) StatusCode() int {
 	return e.HTTPStatus
+}
+
+// UpstreamStatusCode/UpstreamErrorBody expose the upstream dimensions needed
+// by opt-in retry selectors when an upstream failure arrives as an error
+// rather than a normal HTTP response (for example a WebSocket handshake).
+// They intentionally use distinct names so the existing StatusCode API stays
+// unchanged.
+func (e *Error) UpstreamStatusCode() int {
+	if e == nil || e.Type != ErrorTypeUpstreamError || e.HTTPStatus < 100 || e.HTTPStatus > 599 {
+		return 0
+	}
+	return e.HTTPStatus
+}
+
+func (e *Error) UpstreamErrorBody() []byte {
+	if e == nil || e.Type != ErrorTypeUpstreamError {
+		return nil
+	}
+	return []byte(fmt.Sprintf(`{"error":{"code":%q,"type":%q,"message":%q}}`, e.Code, e.Type, e.Message))
 }
 
 // ToGinH converts the error to a gin.H map for JSON response
@@ -162,10 +181,14 @@ func ErrUpstream(statusCode int, message string, cause error) *Error {
 		message = fmt.Sprintf("Upstream request failed (status %d)", statusCode)
 	}
 	return &Error{
-		Code:       ErrorCodeUpstreamError,
-		Message:    message,
-		Type:       ErrorTypeUpstreamError,
-		Retryable:  statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusInternalServerError,
+		Code:    ErrorCodeUpstreamError,
+		Message: message,
+		Type:    ErrorTypeUpstreamError,
+		Retryable: statusCode == http.StatusTooManyRequests ||
+			statusCode == http.StatusInternalServerError ||
+			statusCode == http.StatusBadGateway ||
+			statusCode == http.StatusServiceUnavailable ||
+			statusCode == http.StatusGatewayTimeout,
 		HTTPStatus: statusCode,
 		Cause:      cause,
 	}

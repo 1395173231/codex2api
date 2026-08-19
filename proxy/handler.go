@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -1587,6 +1588,15 @@ func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
+func accountIDOnlyFilter(accountID int64, inner auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || account.ID() != accountID {
+			return false
+		}
+		return inner == nil || inner(account)
+	}
+}
+
 func responseCachePreparationFailure(prepared responsesBodyPreparation) (status int, reason string, unavailable bool) {
 	if prepared.PreviousResponseID == "" || prepared.Bypassed || prepared.CacheLookup.Kind == responseCacheLookupHit {
 		return 0, "", false
@@ -1779,6 +1789,7 @@ type streamOutcome struct {
 	logStatusCode  int
 	failureKind    string
 	failureMessage string
+	failurePayload []byte // 原始 response.failed/error 帧，仅用于策略匹配，不向日志直接回显
 	penalize       bool
 	// capacityShed 标记这是一次上游容量降载（server_is_overloaded / slow_down）。
 	// penalize 仍为 true 以复用首包前帧缓冲/透明重试机制，但账号连击/健康度不因此
@@ -1842,8 +1853,23 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 
 func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	statusCode := responseFailedStatusCode(payload)
-	message := usageLogErrorMessage(statusCode, payload)
+	errorBody := responseFailedErrorBody(payload)
+	permanentQuota := isPermanentQuotaFailure(errorBody)
+	safetyPolicy := isExplicitUpstreamSafetyPolicy(payload)
 	cyberPolicy := isExplicitUpstreamCyberPolicy(payload)
+	if permanentQuota {
+		// Relays do not consistently include status_code on quota failures. Keep
+		// them on the independent 429 budget and permanently exclude the account
+		// from this request instead of admitting it to continuous 5xx cycles.
+		statusCode = http.StatusTooManyRequests
+	}
+	if safetyPolicy {
+		// Provider policy refusals are deterministic for this request. Some relays
+		// report them with a synthetic 500, which must not inherit the legacy
+		// finite 5xx retry path or penalize otherwise healthy accounts.
+		statusCode = http.StatusBadRequest
+	}
+	message := usageLogErrorMessage(statusCode, payload)
 	if cyberPolicy {
 		// Upstream response.failed events often omit status_code, whose generic
 		// fallback is 500. CYB is a deterministic request-policy rejection: expose
@@ -1854,9 +1880,14 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	if strings.TrimSpace(message) == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
 		message = "上游返回 response.failed"
 	}
-	kind := upstreamErrorKind(statusCode, payload, codex429Decision{})
+	kind := upstreamErrorKind(statusCode, errorBody, codex429Decision{})
+	if permanentQuota {
+		kind = "usage_limit"
+	}
 	if cyberPolicy {
 		kind = "cyber_policy"
+	} else if safetyPolicy {
+		kind = "safety_policy"
 	}
 	if kind == "" {
 		if statusCode >= 500 {
@@ -1866,12 +1897,13 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 		}
 	}
 	// 400 中"账号不支持该模型"属账号权益问题，冷却后换号重试有意义，视同可重试故障。
-	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(responseFailedErrorBody(payload))
+	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(errorBody)
 	return streamOutcome{
 		logStatusCode:  statusCode,
 		failureKind:    kind,
 		failureMessage: message,
-		penalize:       !cyberPolicy && (statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500 || modelUnsupported),
+		failurePayload: append([]byte(nil), payload...),
+		penalize:       !safetyPolicy && (statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500 || modelUnsupported),
 		capacityShed:   !capacityShedHandlingDisabled() && isCapacityShedPayload(payload),
 	}
 }
@@ -1949,11 +1981,20 @@ func responseFailedRetryable(payload []byte) bool {
 // server_is_overloaded/slow_down 按闭集判致命并直接终止会话。可重试类 error 帧
 // 必须与生命周期帧一样缓冲；不可重试类（content_policy/invalid_request 等）
 // 维持原样立即转发，保留上游错误细节。
-func isRetryableUpstreamErrorFrame(eventType string, payload []byte) bool {
+func isRetryableUpstreamErrorFrame(eventType string, payload []byte, policies ...database.ContinuousRetryPolicy) bool {
 	if strings.TrimSpace(eventType) != "error" {
 		return false
 	}
-	return responseFailedRetryable(payload)
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return false
+	}
+	// A continuous policy may deliberately select deterministic upstream error
+	// frames (for example an account-specific 403/404). Keep those frames
+	// buffered before the first token as well, otherwise the leading `error`
+	// event commits the downstream response before the following
+	// `response.failed` event can be retried transparently.
+	outcome := classifyResponseFailedOutcome(payload)
+	return continuousRetryStreamFailureSelected(outcome, payload, eventType, policies...)
 }
 
 // capacityShedRetryableClientCode 是把上游容量降载错误透传给下游时改写使用的
@@ -2030,8 +2071,25 @@ func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []b
 		return codex429Decision{}
 	}
 	body := responseFailedErrorBody(payload)
-	statusCode := responseFailedStatusCode(payload)
+	statusCode := classifyResponseFailedOutcome(payload).logStatusCode
 	return h.applyCooldownForModel(account, statusCode, body, resp, model)
+}
+
+// applyResponseFailedDecisionKind enriches a stream failure with the cooldown
+// reason without weakening a permanent quota classification. Relays sometimes
+// put markers such as insufficient_quota only in error.message; a generic 429
+// cooldown decision must not turn those hard failures back into a transient
+// rate_limited_model cycle.
+func applyResponseFailedDecisionKind(outcome streamOutcome, payload []byte, decision codex429Decision) streamOutcome {
+	body := responseFailedErrorBody(payload)
+	if isPermanentQuotaFailure(body) {
+		outcome.failureKind = "usage_limit"
+		return outcome
+	}
+	if decision.Reason != "" {
+		outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, body, decision)
+	}
+	return outcome
 }
 
 func responseFailedStatusCode(payload []byte) int {
@@ -2086,29 +2144,94 @@ func responseFailedStatusCode(payload []byte) int {
 }
 
 func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries int, wroteAnyBody bool, ctxErr, writeErr error) bool {
-	if attempt >= maxRetries {
-		return false
-	}
-	if !outcome.penalize {
-		return false
-	}
-	if wroteAnyBody || ctxErr != nil || writeErr != nil {
-		return false
-	}
-	return true
+	generalRetries := attempt
+	rateLimitRetries := attempt
+	return shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, maxRetries, wroteAnyBody, ctxErr, writeErr)
 }
 
 func shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType string, terminalFailurePayload []byte, ttftRecorded bool, wroteAnyBody bool, attempt int, maxRetries int, ctxErr, writeErr error) bool {
+	return shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(
+		eventType,
+		terminalFailurePayload,
+		ttftRecorded,
+		wroteAnyBody,
+		attempt,
+		attempt,
+		maxRetries,
+		maxRetries,
+		ctxErr,
+		writeErr,
+	)
+}
+
+func streamOutcomeUsesRateLimitBudget(outcome streamOutcome) bool {
+	failureKind := strings.ToLower(strings.TrimSpace(outcome.failureKind))
+	return outcome.logStatusCode == http.StatusTooManyRequests ||
+		strings.Contains(failureKind, "rate_limit") ||
+		strings.Contains(failureKind, "usage_limit")
+}
+
+func retryLimitForStreamOutcome(outcome streamOutcome, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) int {
+	generalLimit, rateLimit = continuousRetryLimitsForStream(outcome, outcome.failurePayload, "", generalLimit, rateLimit, policies...)
+	if streamOutcomeUsesRateLimitBudget(outcome) {
+		return rateLimit
+	}
+	return generalLimit
+}
+
+func retryStateForStreamOutcome(outcome streamOutcome, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) (int, int) {
+	return retryStateForStreamEvent(outcome, "", generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries, policies...)
+}
+
+func retryStateForStreamEvent(outcome streamOutcome, eventType string, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) (int, int) {
+	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForStream(outcome, outcome.failurePayload, eventType, maxGeneralRetries, maxRateLimitRetries, policies...)
+	if streamOutcomeUsesRateLimitBudget(outcome) {
+		return rateLimitRetries, maxRateLimitRetries
+	}
+	return generalRetries, maxGeneralRetries
+}
+
+func shouldTransparentRetryStreamWithBudgets(outcome streamOutcome, generalRetries, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, wroteAnyBody bool, ctxErr, writeErr error, policies ...database.ContinuousRetryPolicy) bool {
+	return shouldTransparentRetryStreamEventWithBudgets(outcome, "", generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries, wroteAnyBody, ctxErr, writeErr, policies...)
+}
+
+func shouldTransparentRetryStreamEventWithBudgets(outcome streamOutcome, eventType string, generalRetries, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, wroteAnyBody bool, ctxErr, writeErr error, policies ...database.ContinuousRetryPolicy) bool {
+	if wroteAnyBody || ctxErr != nil || writeErr != nil {
+		return false
+	}
+	if !outcome.penalize && !continuousRetryStreamSelected(outcome, outcome.failurePayload, eventType, policies...) {
+		return false
+	}
+	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForStream(outcome, outcome.failurePayload, eventType, maxGeneralRetries, maxRateLimitRetries, policies...)
+	retries := generalRetries
+	limit := maxGeneralRetries
+	if streamOutcomeUsesRateLimitBudget(outcome) {
+		retries = rateLimitRetries
+		limit = maxRateLimitRetries
+	}
+	if retries == nil || !retryBudgetAvailable(*retries, limit) {
+		return false
+	}
+	*retries++
+	return true
+}
+
+func shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType string, terminalFailurePayload []byte, ttftRecorded, wroteAnyBody bool, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries int, ctxErr, writeErr error, policies ...database.ContinuousRetryPolicy) bool {
 	if eventType != "response.failed" {
 		return false
 	}
 	if ttftRecorded || wroteAnyBody || ctxErr != nil || writeErr != nil {
 		return false
 	}
-	if attempt >= maxRetries {
+	outcome := classifyResponseFailedOutcome(terminalFailurePayload)
+	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForStream(outcome, terminalFailurePayload, eventType, maxGeneralRetries, maxRateLimitRetries, policies...)
+	if !outcome.penalize && !continuousRetryStreamSelected(outcome, terminalFailurePayload, eventType, policies...) {
 		return false
 	}
-	return responseFailedRetryable(terminalFailurePayload)
+	if streamOutcomeUsesRateLimitBudget(outcome) {
+		return retryBudgetAvailable(rateLimitRetries, maxRateLimitRetries)
+	}
+	return retryBudgetAvailable(generalRetries, maxGeneralRetries)
 }
 
 // shouldReturnHTTPErrorForResponseFailed 判断:流式请求在首 token 之前收到
@@ -2601,7 +2724,9 @@ func responsesIncompleteFinishReason(eventType, reason string) string {
 // 402 同理：deactivated_workspace（team 空间被封）等计费维度拒绝是纯账号侧
 // 问题，applyCooldownForModel 已把该账号标错隔离，换号重试即可成功。
 func isRetryableStatus(code int) bool {
-	return code == http.StatusServiceUnavailable ||
+	return code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout ||
 		code == http.StatusUnauthorized ||
 		code == http.StatusInternalServerError ||
 		code == http.StatusPaymentRequired ||
@@ -2609,9 +2734,14 @@ func isRetryableStatus(code int) bool {
 		code == http.StatusUpgradeRequired
 }
 
-func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) bool {
+	if isExplicitUpstreamSafetyPolicy(body) {
+		return false
+	}
+	policySelected := continuousRetryHTTPSelected(continuousRetryPolicyForCall(policies), statusCode, body)
+	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForHTTP(statusCode, body, maxGeneralRetries, maxRateLimitRetries, policies...)
 	if statusCode == http.StatusTooManyRequests {
-		if rateLimitRetries == nil || *rateLimitRetries >= maxRateLimitRetries {
+		if rateLimitRetries == nil || !retryBudgetAvailable(*rateLimitRetries, maxRateLimitRetries) {
 			return false
 		}
 		*rateLimitRetries++
@@ -2620,39 +2750,189 @@ func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rat
 	// 400 一般是请求内容问题不重试；唯独"账号不支持该模型"是账号权益问题，
 	// 该账号已被模型冷却排除，换号重试可成功（issue #408）。
 	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(body)
-	if !isRetryableStatus(statusCode) && !modelUnsupported {
+	if !isRetryableStatus(statusCode) && !modelUnsupported && !policySelected {
 		return false
 	}
-	if generalRetries == nil || *generalRetries >= maxGeneralRetries {
+	if generalRetries == nil || !retryBudgetAvailable(*generalRetries, maxGeneralRetries) {
 		return false
 	}
 	*generalRetries++
 	return true
 }
 
-func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int) bool {
-	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
+func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int, policies ...database.ContinuousRetryPolicy) bool {
+	if _, body, ok := continuousRetryHTTPErrorDetails(err); ok && isExplicitUpstreamSafetyPolicy(body) {
 		return false
 	}
-	if IsRetryableError(err) || classifyTransportFailure(err) != "" {
+	policy := continuousRetryPolicyForCall(policies)
+	selected := continuousRetryRequestErrorSelected(policy, err)
+	maxGeneralRetries = continuousRetryLimitForRequestError(err, maxGeneralRetries, policy)
+	if err == nil || generalRetries == nil || !retryBudgetAvailable(*generalRetries, maxGeneralRetries) {
+		return false
+	}
+	if isRetryableRequestError(err) || selected {
 		*generalRetries++
 		return true
 	}
 	return false
 }
 
-const transportRetryPolicySticky = "sticky"
+// isRetryableRequestError gives an explicit non-retryable structured error
+// precedence over the generic transport classifier. Executors use
+// ErrUpstream(0, ..., cause) for failures from http.Client.Do; those remain
+// retryable even though a status-less Error cannot set Retryable by status.
+func isRetryableRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var structured *Error
+	if errors.As(err, &structured) {
+		if structured.Retryable {
+			return true
+		}
+		return structured.Code == ErrorCodeUpstreamError && structured.HTTPStatus == 0 && structured.Cause != nil
+	}
+	return classifyTransportFailure(err) != ""
+}
 
-// waitBeforeRetry 在两次重试之间等待管理端配置的重试间隔(retry_interval_ms,0 = 立即重试)。
-// 等待期间客户端断开返回 false,调用方应放弃本次重试(issue #331)。
-func (h *Handler) waitBeforeRetry(ctx context.Context) bool {
+func isRetryableRequestErrorForContext(ctx context.Context, err error, policies ...database.ContinuousRetryPolicy) bool {
 	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
-	if h == nil || h.store == nil {
+	if _, body, ok := continuousRetryHTTPErrorDetails(err); ok && isExplicitUpstreamSafetyPolicy(body) {
+		return false
+	}
+	if isRetryableRequestError(err) {
 		return true
 	}
-	interval := time.Duration(h.store.GetRetryIntervalMS()) * time.Millisecond
+	return continuousRetryRequestErrorSelected(continuousRetryPolicyForCall(policies), err)
+}
+
+const transportRetryPolicySticky = "sticky"
+
+// retryBudgetAvailable reports whether another retry may be consumed. A limit
+// of -1 is the explicit unlimited sentinel; zero disables retries and positive
+// limits preserve the existing exact-count behavior.
+func retryBudgetAvailable(used, limit int) bool {
+	return limit == -1 || (limit > 0 && used < limit)
+}
+
+func retryLimitForHTTPStatus(statusCode, generalLimit, rateLimit int) int {
+	if statusCode == http.StatusTooManyRequests {
+		return rateLimit
+	}
+	return generalLimit
+}
+
+func retryStateForHTTPStatus(statusCode, generalRetries, rateLimitRetries, generalLimit, rateLimit int) (int, int) {
+	return retryStateForHTTPStatusWithBody(statusCode, nil, generalRetries, rateLimitRetries, generalLimit, rateLimit)
+}
+
+// retryStateForHTTPStatusWithBody mirrors retryStateForHTTPStatus while also
+// applying the selected continuous-retry policy. The body is needed when the
+// operator selected an exact upstream error code rather than a status/category;
+// without it the retry itself would be unlimited but the backoff/logging state
+// would still look finite and could hot-loop.
+func retryStateForHTTPStatusWithBody(statusCode int, body []byte, generalRetries, rateLimitRetries, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) (int, int) {
+	generalLimit, rateLimit = continuousRetryLimitsForHTTP(statusCode, body, generalLimit, rateLimit, policies...)
+	if statusCode == http.StatusTooManyRequests {
+		return rateLimitRetries, retryLimitForHTTPStatus(statusCode, generalLimit, rateLimit)
+	}
+	return generalRetries, retryLimitForHTTPStatus(statusCode, generalLimit, rateLimit)
+}
+
+func retryAttemptProgress(attempt, limit int) string {
+	if limit == -1 {
+		return fmt.Sprintf("%d/unlimited", attempt+1)
+	}
+	return fmt.Sprintf("%d/%d", attempt+1, limit+1)
+}
+
+const (
+	unlimitedRetryBackoffBase = 250 * time.Millisecond
+	unlimitedRetryBackoffMax  = 30 * time.Second
+)
+
+// unlimitedRetryBackoff is pure so its exponential and jitter boundaries can
+// be tested without sleeping. retryOrdinal is one-based. Jitter adds up to 50%
+// of the exponential floor, while the final delay remains capped.
+func unlimitedRetryBackoff(retryOrdinal int, jitterUnit float64) time.Duration {
+	if retryOrdinal < 1 {
+		retryOrdinal = 1
+	}
+	if jitterUnit < 0 {
+		jitterUnit = 0
+	} else if jitterUnit > 1 {
+		jitterUnit = 1
+	}
+
+	delay := unlimitedRetryBackoffBase
+	for i := 1; i < retryOrdinal && delay < unlimitedRetryBackoffMax; i++ {
+		if delay > unlimitedRetryBackoffMax/2 {
+			delay = unlimitedRetryBackoffMax
+			break
+		}
+		delay *= 2
+	}
+	jitter := time.Duration(float64(delay/2) * jitterUnit)
+	if delay >= unlimitedRetryBackoffMax-jitter {
+		return unlimitedRetryBackoffMax
+	}
+	return delay + jitter
+}
+
+// maxRetryAfterDelay bounds an upstream-controlled delay. Retry-After is still
+// treated as a minimum over the locally configured retry interval, but a bad
+// relay cannot park a request forever with an arbitrarily large value.
+const maxRetryAfterDelay = 5 * time.Minute
+
+// waitBeforeRetry 在两次重试之间等待管理端配置的重试间隔(retry_interval_ms,0 = 立即重试)。
+// 若上游响应带 Retry-After，则等待本地间隔和上游建议中的较大值。等待期间客户端
+// 断开返回 false,调用方应放弃本次重试(issue #331)。
+func (h *Handler) waitBeforeRetry(ctx context.Context, responses ...*http.Response) bool {
+	retryLimit := 0
+	if h != nil && h.store != nil {
+		retryLimit = h.store.GetMaxRetries()
+	}
+	return h.waitBeforeRetryWithBudget(ctx, 1, retryLimit, responses...)
+}
+
+func (h *Handler) waitBeforeRetryWithBudget(ctx context.Context, retryOrdinal, retryLimit int, responses ...*http.Response) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	interval := time.Duration(0)
+	if h != nil && h.store != nil {
+		interval = time.Duration(h.store.GetRetryIntervalMS()) * time.Millisecond
+	}
+	hasRetryAfter := false
+	for _, resp := range responses {
+		if resp == nil {
+			continue
+		}
+		rawRetryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
+		if rawRetryAfter == "" {
+			continue
+		}
+		retryAfter := parseRetryAfterHeader(rawRetryAfter)
+		if retryAfter > 0 {
+			hasRetryAfter = true
+		}
+		if retryAfter > maxRetryAfterDelay {
+			retryAfter = maxRetryAfterDelay
+		}
+		if retryAfter > interval {
+			interval = retryAfter
+		}
+	}
+	if retryLimit == -1 && !hasRetryAfter {
+		if backoff := unlimitedRetryBackoff(retryOrdinal, rand.Float64()); backoff > interval {
+			interval = backoff
+		}
+	}
 	if interval <= 0 {
 		return true
 	}
@@ -2721,6 +3001,12 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 		if decision.Reason != "" {
 			return decision.Reason
 		}
+		return "usage_limit"
+	}
+	// Relays sometimes expose permanent billing/quota markers only in the
+	// structured message field. A model-scoped cooldown decision must not turn
+	// those account-level failures back into a transient rate-limit cycle.
+	if isPermanentQuotaFailure(body) {
 		return "usage_limit"
 	}
 	switch statusCode {
@@ -2892,7 +3178,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
-	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	turnBoundAccountID, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	turnContinuationPinned := turnContinuation && turnHasBinding
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -2962,6 +3248,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+	}
+	if turnContinuationPinned {
+		// A turn-state continuation is upstream-account-owned. Pin the request to
+		// the account captured at ingress even if the local affinity TTL expires
+		// while continuous retry is waiting for that account to recover.
+		accountFilter = accountIDOnlyFilter(turnBoundAccountID, accountFilter)
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -3036,6 +3328,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
 		}
 		h.AcquireAPIKeyScopeConcurrency(c, account)
+		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -3124,7 +3417,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if wsHTTPFallback.ForceHTTP() {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 				}
-				retryable := IsRetryableError(reqErr) || kind != ""
+				retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
 				shouldRetry := false
 				if retryable {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
@@ -3132,20 +3425,20 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
 				// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
 				stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
-				if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
+				if retryable && shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !stickyRetry {
+				if retryable && !stickyRetry {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				}
 				if timedOut && shouldRetry {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %s, account %d): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
 					continue
 				}
-				if !timedOut && !stickyRetry {
-					retryExclusions.MarkHard(account.ID())
+				if retryable && !timedOut && !stickyRetry {
+					retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
 				}
 
 				if !retryable {
@@ -3156,9 +3449,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetry {
 					if stickyRetry {
-						log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d)", account.ID(), attempt+1, maxRetries+1)
+						log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %s)", account.ID(), retryAttemptProgress(attempt, maxRetries))
 					}
-					if !h.waitBeforeRetry(c.Request.Context()) {
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
 						return
 					}
 					continue
@@ -3203,7 +3496,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				retryExclusions.MarkHard(account.ID())
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries)
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
@@ -3212,7 +3505,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					AccountID: account.ID(), AttemptIndex: attempt + 1,
 				}))
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:              account.ID(),
@@ -3240,7 +3533,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
-					if !h.waitBeforeRetry(c.Request.Context()) {
+					retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 						return
 					}
 					continue
@@ -3255,11 +3549,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				totalDuration := int(time.Since(start).Milliseconds())
 				stopTTFTGuard()
 				resp.Body.Close()
-				if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+				if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
 					h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
-					retryExclusions.MarkHard(account.ID())
+					retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+					retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+						return
+					}
 					continue
 				}
 				if !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil {
@@ -3305,6 +3603,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			var usage *UsageInfo
 			var actualServiceTier string
 			ttftRecorded := false
+			// contentTokenSeen is deliberately strict and independent from the
+			// operator's TTFT mode. In loose mode, preflight metadata records TTFT
+			// without committing model output and must not close the transparent
+			// retry window.
+			contentTokenSeen := false
+			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			gotTerminal := false
 			deltaCharCount := 0
 			var readErr error
@@ -3351,6 +3655,9 @@ func (h *Handler) Responses(c *gin.Context) {
 						firstTokenMs = int(time.Since(start).Milliseconds())
 						ttftRecorded = true
 					}
+					if !contentTokenSeen && isFirstTokenResult(parsed) {
+						contentTokenSeen = true
+					}
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
@@ -3375,13 +3682,13 @@ func (h *Handler) Responses(c *gin.Context) {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
-					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr) {
 						pendingFirstTokenEvents.Reset()
 						return false
 					}
 					// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 					// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 流让中转层误计费。
-					if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+					if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) {
 						pendingFirstTokenEvents.Reset()
 						abortedForHTTPError = true
 						return false
@@ -3393,8 +3700,8 @@ func (h *Handler) Responses(c *gin.Context) {
 						// 可重试的 error 帧（上游降载先导帧）与生命周期帧一样缓冲：
 						// 立即写出会置位 wroteAnyBody，随后的 response.failed 就进不了
 						// 首包前静默换号分支。必须写出时改写降载码为客户端可重试码。
-						shouldDefer := !ttftRecorded && !gotTerminal &&
-							(isPreContentLifecycleEvent(eventType) || isRetryableUpstreamErrorFrame(eventType, data))
+						shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
+							(!contentTokenSeen && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data))
 						wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, sanitizeCapacityShedEventForClient(eventType, data), shouldDefer)
 						if err != nil {
 							writeErr = err
@@ -3448,9 +3755,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
-				if responseFailedDecision.Reason != "" {
-					outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
-				}
+				outcome = applyResponseFailedDecisionKind(outcome, terminalFailurePayload, responseFailedDecision)
 				// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				if !upstreamCyberPolicyLogged {
@@ -3466,7 +3771,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 			}
-			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel, EffectiveModel: attemptLogEffectiveModel,
 					StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
@@ -3474,7 +3779,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
 					ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 				}, promptPolicyIncidentID)
-				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %s, account %d): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -3484,9 +3789,16 @@ func (h *Handler) Responses(c *gin.Context) {
 				resp.Body.Close()
 				h.store.Release(account)
 				h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries)
+				if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
+					retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries) == -1 {
+					retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+				}
 				// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-				if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
-					return
+				if !isFirstTokenTimeoutOutcome(outcome) {
+					retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+						return
+					}
 				}
 				continue
 			}
@@ -3625,7 +3937,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
-			retryable := IsRetryableError(reqErr) || kind != ""
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
 			shouldRetry := false
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
@@ -3633,20 +3945,20 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
 			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
 			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
-			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
+			if retryable && shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if retryable && !stickyRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/responses): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/responses): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
-				retryExclusions.MarkHard(account.ID())
+			if retryable && !timedOut && !stickyRetry {
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
 			}
 
 			// 不可重试的结构化错误直接返回
@@ -3658,9 +3970,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
 				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/responses)", account.ID(), attempt+1, maxRetries+1)
+					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %s, /v1/responses)", account.ID(), retryAttemptProgress(attempt, maxRetries))
 				}
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
 					return
 				}
 				continue
@@ -3723,7 +4035,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 			}
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHard(account.ID())
+			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
@@ -3732,7 +4044,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -3760,7 +4072,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
@@ -3900,7 +4213,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
@@ -4108,9 +4421,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
-			if responseFailedDecision.Reason != "" {
-				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
-			}
+			outcome = applyResponseFailedDecisionKind(outcome, terminalFailurePayload, responseFailedDecision)
 			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			if !upstreamCyberPolicyLogged {
@@ -4134,7 +4445,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
-		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel, EffectiveModel: logEffectiveModel,
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
@@ -4142,7 +4453,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
 				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
-			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %s, account %d, /v1/responses): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -4152,9 +4463,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries)
+			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
+				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries) == -1 {
+				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+			}
 			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-			if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
-				return
+			if !isFirstTokenTimeoutOutcome(outcome) {
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 			}
 			continue
 		}
@@ -4422,7 +4740,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
 	invalidEncryptedContentRetried := false
 	relayContinuationAttempted := false
 
@@ -4430,20 +4748,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		var account *auth.Account
 		var stickyProxyURL string
 		if attempt == 0 && compactionAffinity.Known {
-			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter)
+			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
 		}
 		if account == nil {
-			if compactionAffinity.Known {
+			if compactionAffinity.Known && !retryExclusions.CanContinueTransientCycle() {
 				sendCompactionUpstreamUnavailable(c)
 				return
 			}
-			if continuationUnavailable && !relayContinuationAttempted {
+			if continuationUnavailable && !relayContinuationAttempted && !retryExclusions.CanContinueTransientCycle() {
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 					return
@@ -4451,7 +4769,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 			if account == nil {
 				if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -4499,20 +4817,26 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
-				if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+				retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+				if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				excludeAccounts[account.ID()] = true
+				if retryable {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+				}
 
-				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				if !retryable {
 					ErrorToGinResponse(c, reqErr)
 					return
 				}
 
 				log.Printf("OpenAI Responses compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
+						return
+					}
 					continue
 				}
 				ErrorToGinResponse(c, reqErr)
@@ -4547,14 +4871,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				excludeAccounts[account.ID()] = true
+				effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
 
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 					Transport: "http", StatusCode: resp.StatusCode, AccountID: account.ID(), AttemptIndex: attempt + 1,
 				}))
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:              account.ID(),
@@ -4580,7 +4905,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
-					if !h.waitBeforeRetry(c.Request.Context()) {
+					retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 						return
 					}
 					continue
@@ -4594,16 +4920,23 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			resp.Body.Close()
 			if readErr != nil {
 				totalDuration := int(time.Since(start).Milliseconds())
+				retryable := isRetryableRequestErrorForContext(c.Request.Context(), readErr)
 				kind := classifyTransportFailure(readErr)
 				if kind == "" {
 					kind = "transport"
 				}
-				h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+				if retryable && shouldPenalizeTransportKind(kind) {
+					h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+				}
 				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				excludeAccounts[account.ID()] = true
-
-				shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
+				if retryable {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					retryExclusions.MarkRequestFailure(account.ID(), readErr, maxRetries)
+				}
+				if !retryable && c.Request.Context().Err() != nil {
+					return
+				}
+				shouldRetry := retryable && shouldRetryRequestError(readErr, &generalRetries, maxRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -4628,6 +4961,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(`{"error":{"message":"Failed to read upstream response","type":"upstream_error","code":"upstream_read_error"}}`)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(readErr, maxRetries)) {
+						return
+					}
 					continue
 				}
 				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
@@ -4704,20 +5040,26 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			if retryable {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+			}
 
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
 
 			log.Printf("compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
+					return
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -4753,14 +5095,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
+			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: "http", StatusCode: resp.StatusCode, AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -4786,7 +5129,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
@@ -4808,17 +5152,24 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		resp.Body.Close()
 		if readErr != nil {
 			totalDuration := int(time.Since(start).Milliseconds())
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), readErr)
 			kind := classifyTransportFailure(readErr)
 			if kind == "" {
 				kind = "transport"
 			}
-			h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+			if retryable && shouldPenalizeTransportKind(kind) {
+				h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
-
-			shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
+			if retryable {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkRequestFailure(account.ID(), readErr, maxRetries)
+			}
+			if !retryable && c.Request.Context().Err() != nil {
+				return
+			}
+			shouldRetry := retryable && shouldRetryRequestError(readErr, &generalRetries, maxRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -4843,6 +5194,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = http.StatusBadGateway
 				lastBody = []byte(`{"error":{"message":"Failed to read upstream response","type":"upstream_error","code":"upstream_read_error"}}`)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(readErr, maxRetries)) {
+					return
+				}
 				continue
 			}
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
@@ -4853,10 +5207,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		// body-signal 兼容模式：SSE 内的 response.failed 终态按上游错误处理，
 		// 语义对齐传统 compact 链路的 HTTP 非 200 分支（含 encrypted_content 剥离重试）。
 		if compactViaResponses && len(compactFailedPayload) > 0 {
-			failStatus := responseFailedStatusCode(compactFailedPayload)
-			if isExplicitUpstreamCyberPolicy(compactFailedPayload) {
-				failStatus = http.StatusBadRequest
-			}
+			const eventType = "response.failed"
+			failureOutcome := classifyResponseFailedOutcome(compactFailedPayload)
+			failStatus := failureOutcome.logStatusCode
 			errBody := responseFailedErrorBody(compactFailedPayload)
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(failStatus, errBody) {
@@ -4878,20 +5231,44 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(failStatus); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			decision := h.applyResponseFailedCooldown(account, compactFailedPayload, resp, effectiveModel)
+			failureOutcome = applyResponseFailedDecisionKind(failureOutcome, compactFailedPayload, decision)
+			if failureOutcome.penalize {
+				h.reportStreamOutcomeFailure(account, failureOutcome, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
+			effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
+			continuousPolicy := CurrentRuntimeSettings().ContinuousRetryPolicy
+			selectedContinuousFailure := continuousRetryStreamSelected(failureOutcome, compactFailedPayload, eventType, continuousPolicy)
+			shouldRetry := false
+			if selectedContinuousFailure {
+				shouldRetry = shouldTransparentRetryStreamEventWithBudgets(
+					failureOutcome,
+					eventType,
+					&generalRetries,
+					&rateLimitRetries,
+					maxRetries,
+					effectiveRateLimitRetries,
+					false,
+					c.Request.Context().Err(),
+					nil,
+					continuousPolicy,
+				)
+			} else {
+				shouldRetry = shouldRetryHTTPStatus(failStatus, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousPolicy)
+			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			if selectedContinuousFailure {
+				retryExclusions.MarkStreamFailureForEvent(account.ID(), failureOutcome, eventType, maxRetries, effectiveRateLimitRetries, continuousPolicy)
+			} else {
+				retryExclusions.MarkHTTPFailure(account.ID(), failStatus, errBody, maxRetries, effectiveRateLimitRetries, continuousPolicy)
+			}
 
 			logUpstreamError("/v1/responses/compact", failStatus, logModel, account.ID(), errBody)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: "http", StatusCode: failStatus, AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyResponseFailedCooldown(account, compactFailedPayload, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(failStatus, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -4917,7 +5294,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = failStatus
 				lastBody = errBody
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				var retryOrdinal, retryLimit int
+				if selectedContinuousFailure {
+					retryOrdinal, retryLimit = retryStateForStreamEvent(failureOutcome, eventType, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousPolicy)
+				} else {
+					retryOrdinal, retryLimit = retryStateForHTTPStatusWithBody(failStatus, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousPolicy)
+				}
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
@@ -5114,6 +5497,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
+		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -5216,7 +5600,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
-			retryable := IsRetryableError(reqErr) || kind != ""
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
 			shouldRetry := false
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
@@ -5224,20 +5608,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
 			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
 			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
-			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
+			if retryable && shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if retryable && !stickyRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/chat/completions): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/chat/completions): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
-				retryExclusions.MarkHard(account.ID())
+			if retryable && !timedOut && !stickyRetry {
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
 			}
 
 			// 不可重试的结构化错误直接返回
@@ -5249,9 +5633,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
 				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/chat/completions)", account.ID(), attempt+1, maxRetries+1)
+					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %s, /v1/chat/completions)", account.ID(), retryAttemptProgress(attempt, maxRetries))
 				}
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
 					return
 				}
 				continue
@@ -5273,7 +5657,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHard(account.ID())
+			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
@@ -5282,7 +5666,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -5310,7 +5694,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				if !h.waitBeforeRetry(c.Request.Context()) {
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
@@ -5326,11 +5711,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			totalDuration := int(time.Since(start).Milliseconds())
 			ttftGuard.Stop()
 			resp.Body.Close()
-			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
 				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				retryExclusions.MarkHard(account.ID())
+				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 				continue
 			}
 			if !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil {
@@ -5375,6 +5764,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var usage *UsageInfo
 		var actualServiceTier string
 		ttftRecorded := false
+		// TTFT may use loose structural progress, but retry safety is based on
+		// actual content. Chat translation drops many structural events, so
+		// treating loose TTFT as output would strand a retryable failure even
+		// though no downstream bytes were written.
+		contentTokenSeen := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
 		var readErr error
@@ -5440,6 +5834,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				if !contentTokenSeen && isFirstTokenResult(parsed) {
+					contentTokenSeen = true
+				}
 				// 累计 delta 字符数（文本 + function call 参数）
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
@@ -5456,21 +5853,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenChunks.Reset()
 					return false
 				}
 
 				// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 				// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 + [DONE] 让中转层误计费。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) {
 					pendingFirstTokenChunks.Reset()
 					abortedForHTTPError = true
 					return false
 				}
 
 				if !clientGone && chunk != nil {
-					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+					shouldDefer := !contentTokenSeen && !gotTerminal && isPreContentLifecycleEvent(eventType)
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenChunks, chunk, shouldDefer)
 					if err != nil {
 						writeErr = err
@@ -5593,9 +5990,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
-			if responseFailedDecision.Reason != "" {
-				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
-			}
+			outcome = applyResponseFailedDecisionKind(outcome, terminalFailurePayload, responseFailedDecision)
 			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			if !upstreamCyberPolicyLogged {
@@ -5619,7 +6014,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
-		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel, EffectiveModel: attemptLogEffectiveModel,
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
@@ -5627,7 +6022,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
 				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
-			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %s, account %d, /v1/chat/completions): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -5637,9 +6032,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries)
+			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
+				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries) == -1 {
+				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+			}
 			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-			if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
-				return
+			if !isFirstTokenTimeoutOutcome(outcome) {
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 			}
 			continue
 		}

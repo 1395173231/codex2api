@@ -220,6 +220,7 @@ func TestNextForContinuationPreservesBoundedAffinity(t *testing.T) {
 
 	store.sessionMu.Lock()
 	binding := store.sessionBindings["conversation-1"]
+	binding.expiresAt = time.Now().Add(-time.Minute)
 	binding.boundAt = time.Now().Add(-defaultMaxAffinityDuration - time.Minute)
 	binding.requestCount = defaultMaxAffinityRequests
 	store.sessionBindings["conversation-1"] = binding

@@ -507,13 +507,15 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	exclude := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
 
 	for attempt := 0; attempt < maxGrokMediaAttempts; attempt++ {
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextGrokMediaAccount(c, apiKeyID, exclude, imageModel, identity)
+		account, stickyProxyURL := nextBoundedRetryAccount(retryExclusions, func(exclude map[int64]bool) (*auth.Account, string) {
+			return h.nextGrokMediaAccount(c, apiKeyID, exclude, imageModel, identity)
+		})
 		if account == nil {
 			if lastStatusCode > 0 && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -540,12 +542,22 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		}, c.Request.Header.Clone())
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			exclude[account.ID()] = true
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if !retryable {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+			shouldRetry := attempt+1 < maxGrokMediaAttempts && shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			if shouldRetry {
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -561,10 +573,10 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			exclude[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			decision := applyGrokMediaCooldown(h.store, account, resp.StatusCode, errBody, resp, result.Model)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, h.getMaxRateLimitRetries()))
+			effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, h.getMaxRateLimitRetries())
+			shouldRetry := attempt+1 < maxGrokMediaAttempts && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: inboundEndpoint, Model: logModel, EffectiveModel: logEffectiveModel,
 				StatusCode: resp.StatusCode, DurationMs: durationMs,
@@ -576,6 +588,11 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 				continue
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -588,7 +605,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		if readErr != nil || !gjson.ValidBytes(out) || imageCount <= 0 {
 			// 上游 200 但没有任何产物:按可疑失败换号重试。
 			h.store.Release(account)
-			exclude[account.ID()] = true
+			retryExclusions.MarkHard(account.ID())
 			errMsg := "upstream returned no image data"
 			if readErr != nil {
 				errMsg = readErr.Error()
@@ -791,13 +808,15 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	exclude := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
 
 	for attempt := 0; attempt < maxGrokMediaAttempts; attempt++ {
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextGrokMediaAccount(c, apiKeyID, exclude, model, identity)
+		account, stickyProxyURL := nextBoundedRetryAccount(retryExclusions, func(exclude map[int64]bool) (*auth.Account, string) {
+			return h.nextGrokMediaAccount(c, apiKeyID, exclude, model, identity)
+		})
 		if account == nil {
 			if lastStatusCode > 0 && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -824,12 +843,22 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 		}, c.Request.Header.Clone())
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			exclude[account.ID()] = true
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if !retryable {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+			shouldRetry := attempt+1 < maxGrokMediaAttempts && shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			if shouldRetry {
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -845,10 +874,10 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			exclude[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, model, account.ID(), errBody)
 			decision := applyGrokMediaCooldown(h.store, account, resp.StatusCode, errBody, resp, result.Model)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, h.getMaxRateLimitRetries()))
+			effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, h.getMaxRateLimitRetries())
+			shouldRetry := attempt+1 < maxGrokMediaAttempts && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: inboundEndpoint, Model: requestModel, EffectiveModel: logEffectiveModel,
 				StatusCode: resp.StatusCode, DurationMs: durationMs,
@@ -860,6 +889,11 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 				continue
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -874,7 +908,7 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 		}
 		if !validGrokVideoRequestID(requestID) {
 			h.store.Release(account)
-			exclude[account.ID()] = true
+			retryExclusions.MarkHard(account.ID())
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: inboundEndpoint, Model: requestModel, EffectiveModel: logEffectiveModel,
 				StatusCode: http.StatusBadGateway, DurationMs: durationMs,

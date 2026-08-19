@@ -161,8 +161,8 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 |------|------|--------|------|------|
 | `MaxConcurrency` | int | 2 | ≥1（无上限） | 单账号最大并发请求数 |
 | `GlobalRPM` | int | 0 | 0-∞ | 全局每分钟请求限制，0 表示不限 |
-| `MaxRetries` | int | 3 | 0-10 | 请求失败最大重试次数 |
-| `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
+| `MaxRetries` | int | 2 | 0-10 | 原有有限重试预算，覆盖传输错误及既有可重试的 5xx（含 500/502/503/504）；`0` 禁用该预算 |
+| `MaxRateLimitRetries` | int | 1 | 0-10 | 原有有限的 429 独立重试预算；`0` 禁用该预算 |
 | `RetryIntervalMS` | int | 0 | 0-30000 | 普通重试前等待的毫秒数；`0` 保持立即重试 |
 | `TransportRetryPolicy` | string | `rotate` | `rotate` / `sticky` | 传输错误重试时换号，或保留同一账号重试 |
 | `FastSchedulerEnabled` | bool | false | - | 启用快速调度器 |
@@ -171,11 +171,24 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `CodexWSKeepaliveIntervalSec` | int | 60 | 10-600 | WS 保活 Ping 间隔（秒），仅在 `CodexWSKeepaliveEnabled` 开启时生效 |
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
-| `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
+| `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 首包前静默重试上限；`0` 禁用该预算 |
 | `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）、`remaining_quota`（优先使用用量少的账号）或 `fill_first`（顺序耗尽：集中使用剩余额度最少的账号，耗尽/限流后切下一个） |
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
 
 调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
+
+`ContinuousRetryPolicy` 是默认关闭的独立持续重试策略，持久化为 JSON：
+
+```json
+{
+  "enabled": false,
+  "categories": ["transport", "http_429", "http_5xx", "stream_error"],
+  "status_codes": [],
+  "error_codes": []
+}
+```
+
+启用后，类别、精确 HTTP 状态码或精确上游错误代码任一命中即可持续重试；`http_4xx`、403、404、上下文错误以及“全部 `response.failed`”等宽泛或确定性故障需要管理员显式选择，501 则已由默认的 `http_5xx` 类别覆盖。默认的 `stream_error` 只匹配首包前的流读取/断开故障，不会把普通 `invalid_request` 类型的 `response.failed` 自动升级为无限重试。结构化安全策略拒绝始终立即停止，不能被通用类别或精确选择器覆盖。永久额度/余额错误不会被通用类别绕过；管理员只有明确选择对应额度错误代码时才能让它进入持续重试。持续模式只覆盖首包前且尚未向下游写正文的可安全重放请求；客户端取消、下游写入失败或 WebSocket 断开会结束等待。图片请求保留 5 次总尝试硬上限，Grok 图片/视频媒体请求保留 3 次总尝试硬上限，避免昂贵或可能产生副作用的媒体操作无限提交。
 
 ### 测试配置
 

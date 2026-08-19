@@ -1465,10 +1465,14 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "auto_clean_error": false,
   "proxy_pool_enabled": false,
   "fast_scheduler_enabled": false,
-  "max_retries": 3,
-  "max_rate_limit_retries": 2,
+  "max_retries": 2,
+  "max_rate_limit_retries": 1,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "continuous_retry_enabled": false,
+  "continuous_retry_categories": ["transport", "http_429", "http_5xx", "stream_error"],
+  "continuous_retry_status_codes": [],
+  "continuous_retry_error_codes": [],
   "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
@@ -1516,6 +1520,10 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 **响应:** 更新后的完整设置对象
 
 `codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
+
+`max_retries`、`max_rate_limit_retries` 与 `codex_ws_silent_max_retries` 是原有的有限重试预算，管理界面和 API 范围均为 `0` 到 `10`（`0` 禁用对应预算）。需要持续重试时使用独立的 `continuous_retry_enabled` 开关；它不会改变这些有限预算的含义。开关打开后，可在 `continuous_retry_categories` 选择 `transport`、`http_429`、`http_4xx`、`http_5xx`、`stream_error`、`response_failed`、`context_error`，并用 `continuous_retry_status_codes`（例如 `[403,404,501]`）或 `continuous_retry_error_codes`（例如 `["rate_limited","context_length_exceeded"]`）精确追加匹配。类别、状态码、错误代码任一命中即可进入持续重试；403、404、上下文错误及“全部 `response.failed`”默认不选中（501 已由默认的 `http_5xx` 类别覆盖）。默认的 `stream_error` 只匹配首包前的流读取/断开故障。结构化安全策略拒绝始终立即停止，不能被通用类别或精确选择器覆盖。永久额度/余额错误（如 `insufficient_quota`、`quota_exceeded`、`billing_hard_limit`、`billing_limit_reached`、`spend_limit`、`credit_balance`、`insufficient_balance`、`usage_limited`）不会因为通用类别进入无限循环；只有管理员明确选择对应额度错误代码时才会进入持续重试。
+
+`retry_interval_ms` 是本地等待下限；有效的上游 `Retry-After` 优先并限制在 5 分钟内。持续模式没有有效 `Retry-After` 时还会使用带抖动的指数退避，从 250ms 起步并在 30 秒封顶。流已经向下游写出内容后不会整段重放，以免重复文本或工具副作用。图片请求仍受 5 次总尝试上限约束，Grok 图片/视频媒体请求仍受 3 次总尝试上限约束，持续模式不会移除这些昂贵或带副作用操作的硬上限。客户端取消、下游写入失败或 WebSocket 已断开时等待会立即停止。
 
 Responses 上下文缓存字段使用原始字节数：
 

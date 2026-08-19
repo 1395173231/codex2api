@@ -2232,6 +2232,84 @@ func TestResponsesCompactOpenAIReadErrorRetryReturnsBadGateway(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactReadCancellationDoesNotPenalizeAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		UpdateRuntimeSettings(func(RuntimeSettings) RuntimeSettings { return previousRuntime })
+	})
+	UpdateRuntimeSettings(func(current RuntimeSettings) RuntimeSettings {
+		current.ContinuousRetryPolicy = database.ContinuousRetryPolicy{
+			Enabled:    true,
+			Categories: []string{database.ContinuousRetryCategoryTransport},
+		}
+		return current
+	})
+
+	responseStarted := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"partial"`))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		responseStarted <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	defer store.Stop()
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "test-direct-key",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+		Status:       auth.StatusReady,
+	}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, nil, nil)
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewBufferString(`{"model":"gpt-4.1-direct","input":"hello"}`)).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = req
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ResponsesCompact(ginContext)
+	}()
+	select {
+	case <-responseStarted:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("timed out waiting for compact response body")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compact handler did not stop after downstream cancellation")
+	}
+
+	if account.FailureStreak != 0 || account.LastFailureKind != "" {
+		t.Fatalf("downstream cancellation penalized account: streak=%d kind=%q", account.FailureStreak, account.LastFailureKind)
+	}
+	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+		t.Fatalf("ActiveRequests after cancellation = %d, want 0", got)
+	}
+}
+
 func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

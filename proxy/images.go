@@ -1441,7 +1441,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
 
 	// 仅在 response_format=url 且配置了云存储时启用：上传图片到对象存储、
 	// 登记进图库并返回预签名直链。否则 urlFor 为 nil，沿用 base64/data URL。
@@ -1456,10 +1456,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextImageAccount(c, apiKeyID, excludeAccounts, requestModel, sessionIdentity)
+		account, stickyProxyURL := nextBoundedRetryAccount(retryExclusions, func(exclude map[int64]bool) (*auth.Account, string) {
+			return h.nextImageAccount(c, apiKeyID, exclude, requestModel, sessionIdentity)
+		})
 		if account == nil {
 			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.applyScopeBudgetFilter(c, waitFilter))
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1486,16 +1488,22 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			shouldRetry := attempt+1 < maxImageAttempts && shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			if shouldRetry {
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -1510,14 +1518,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: upstreamPromptPolicyTransport(stream, false), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := attempt+1 < maxImageAttempts && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
 				Endpoint:               inboundEndpoint,
@@ -1537,6 +1544,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 				continue
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -1578,7 +1590,6 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				// double-write when the error is transient.
 				resp.Body.Close()
 				h.store.Release(account)
-				excludeAccounts[account.ID()] = true
 				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
 				// Always record the failed attempt so it appears in usage stats,
 				// matching the chat completions error path.
@@ -1591,6 +1602,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				if willRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
+					retryLimit := imageStreamRetryLimit(readErr, maxRetries)
+					if retryLimit == -1 {
+						retryExclusions.MarkTransient(account.ID())
+						if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit, resp) {
+							return
+						}
+					} else {
+						retryExclusions.MarkHard(account.ID())
+					}
 					continue
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
@@ -1606,9 +1626,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// transient (e.g. upstream model overload, network hiccup).
 			resp.Body.Close()
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
 			// Only retry when nothing has been written to the client yet.
-			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
+			willRetry := !c.Writer.Written() && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
 			// Always record the failed attempt so it appears in usage stats.
 			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
 			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
@@ -1619,6 +1638,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if willRetry {
 				lastStatusCode = statusCode
 				lastBody = []byte(readErr.Error())
+				retryLimit := imageStreamRetryLimit(readErr, maxRetries)
+				if retryLimit == -1 {
+					retryExclusions.MarkTransient(account.ID())
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit, resp) {
+						return
+					}
+				} else {
+					retryExclusions.MarkHard(account.ID())
+				}
 				continue
 			}
 			// Non-retryable -- deliver error response if nothing written yet.
@@ -1707,12 +1735,21 @@ func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, l
 // read error warrants retrying on a different account. Transient failures
 // (stream disconnects, upstream model errors) are retryable; permanent
 // failures (content policy, invalid request, quota exhausted) are not.
-func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int) bool {
-	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
+func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int, policies ...database.ContinuousRetryPolicy) bool {
+	if err == nil || generalRetries == nil {
 		return false
 	}
 	if attempt >= maxAttempts-1 {
 		return false
+	}
+	policy := continuousRetryPolicyForCall(policies)
+	if payload := imageResponseFailedPayload(err); len(payload) > 0 {
+		if isExplicitUpstreamSafetyPolicy(payload) {
+			return false
+		}
+		if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.MatchesErrorCodes(payload) {
+			return false
+		}
 	}
 	msg := strings.ToLower(err.Error())
 	// Never retry content policy or safety violations.
@@ -1724,9 +1761,35 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 			return false
 		}
 	}
+	maxGeneralRetries = imageStreamRetryLimit(err, maxGeneralRetries, policy)
+	if !retryBudgetAvailable(*generalRetries, maxGeneralRetries) {
+		return false
+	}
 	// Retry transient upstream issues.
 	*generalRetries++
 	return true
+}
+
+func imageStreamRetryLimit(err error, generalLimit int, policies ...database.ContinuousRetryPolicy) int {
+	policy := continuousRetryPolicyForCall(policies)
+	payload := imageResponseFailedPayload(err)
+	if len(payload) > 0 {
+		outcome := classifyResponseFailedOutcome(payload)
+		if continuousRetryStreamSelected(outcome, payload, "response.failed", policy) {
+			return -1
+		}
+		return generalLimit
+	}
+	outcome := streamOutcome{
+		logStatusCode:  logStatusUpstreamStreamBreak,
+		failureKind:    "transport",
+		failurePayload: []byte(err.Error()),
+		penalize:       true,
+	}
+	if continuousRetryStreamSelected(outcome, outcome.failurePayload, "", policy) {
+		return -1
+	}
+	return generalLimit
 }
 
 // imageUpscaleTimeout 是单张图超分(含并发闸排队)的耗时上限,对齐生图台。

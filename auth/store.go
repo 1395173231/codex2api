@@ -3111,10 +3111,11 @@ type Store struct {
 	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 
 	// 重试间隔与传输错误重试策略（issue #331）
-	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy atomic.Value // 传输错误重试策略: rotate / sticky
-	githubToken          atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
-	githubProxyURL       atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
+	retryIntervalMS       atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy  atomic.Value // 传输错误重试策略: rotate / sticky
+	continuousRetryPolicy atomic.Value // database.ContinuousRetryPolicy（默认关闭）
+	githubToken           atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
+	githubProxyURL        atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
 
 	// 新导入/新建 Codex 账号默认盖上的指纹收敛档位: off / device / session / full
 	codexFingerprintDefaultMode atomic.Value
@@ -3538,6 +3539,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			RecoveryProbeIntervalMinutes:       30,
 			LazyMode:                           false,
 			ProxyURL:                           "",
+			MaxRetries:                         2,
 			MaxRateLimitRetries:                1,
 			SchedulerMode:                      "round_robin",
 			CodexWSHideUpstreamErrors:          true,
@@ -3588,16 +3590,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
 	s.lazyMode.Store(settings.LazyMode)
-	retries := int64(settings.MaxRetries)
-	if retries <= 0 {
-		retries = 2 // 默认重试 2 次
-	}
-	atomic.StoreInt64(&s.maxRetries, retries)
-	rateLimitRetries := int64(settings.MaxRateLimitRetries)
-	if rateLimitRetries < 0 {
-		rateLimitRetries = 0
-	}
-	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
+	atomic.StoreInt64(&s.maxRetries, int64(database.NormalizeRetryLimit(settings.MaxRetries)))
+	atomic.StoreInt64(&s.maxRateLimitRetries, int64(database.NormalizeRetryLimit(settings.MaxRateLimitRetries)))
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	s.schedulerMode.Store(settings.SchedulerMode)
 	s.SetAffinityMode(settings.AffinityMode)
@@ -3659,6 +3653,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
+	continuousPolicy := database.ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
+	if strings.TrimSpace(settings.ContinuousRetryPolicy) == "" {
+		continuousPolicy = database.DefaultContinuousRetryPolicy()
+	}
+	s.continuousRetryPolicy.Store(continuousPolicy)
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(settings.CodexFingerprintDefaultMode))
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
@@ -3784,13 +3783,7 @@ func normalizeWSKeepaliveInterval(sec int) int64 {
 
 // normalizeWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
 func normalizeWSSilentMaxRetries(retries int) int64 {
-	if retries < 0 {
-		return 0
-	}
-	if retries > 10 {
-		return 10
-	}
-	return int64(retries)
+	return int64(database.NormalizeRetryLimit(retries))
 }
 
 // SetCodexForceWebsocket 设置"强制 Codex 上游走 WebSocket"开关（运行时热更新）。
@@ -5896,7 +5889,8 @@ func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclud
 //   - 绑定账号当前取不到（超并发/冷却/被本次请求排除）时返回 nil 而不是回退到
 //     别的账号。调用方据此决定是等它空出来，还是剥离续链 id 降级换号。
 //
-// 绑定本身不存在（新会话/绑定已 TTL 过期）时仍走完整挑号，与普通请求一致。
+// 绑定本身不存在时仍走完整挑号，与普通请求一致；TTL 过期只影响普通请求，
+// preserveBinding=true 的续链请求仍保留原账号。
 func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool) (*Account, string) {
 	if s == nil {
 		return nil, ""
@@ -5932,7 +5926,10 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if ok {
-		expired := !binding.expiresAt.After(now)
+		// Stateful continuations own opaque upstream state on this exact account.
+		// Once a request elects continuation scheduling, local affinity TTL expiry
+		// must not silently rotate it to a different account mid-request.
+		expired := !preserveBinding && !binding.expiresAt.After(now)
 		// bounded 模式下追加逃逸条件检查
 		escape := false
 		if mode == AffinityModeBounded && !preserveBinding {
@@ -6491,12 +6488,9 @@ func (s *Store) GetMaxConcurrency() int {
 	return int(atomic.LoadInt64(&s.maxConcurrency))
 }
 
-// SetMaxRetries 动态更新最大重试次数
+// SetMaxRetries 动态更新原有的有限重试次数（0-10）。
 func (s *Store) SetMaxRetries(n int) {
-	if n < 0 {
-		n = 0
-	}
-	atomic.StoreInt64(&s.maxRetries, int64(n))
+	atomic.StoreInt64(&s.maxRetries, int64(database.NormalizeRetryLimit(n)))
 }
 
 // GetMaxRetries 获取当前最大重试次数
@@ -6505,10 +6499,7 @@ func (s *Store) GetMaxRetries() int {
 }
 
 func (s *Store) SetMaxRateLimitRetries(n int) {
-	if n < 0 {
-		n = 0
-	}
-	atomic.StoreInt64(&s.maxRateLimitRetries, int64(n))
+	atomic.StoreInt64(&s.maxRateLimitRetries, int64(database.NormalizeRetryLimit(n)))
 }
 
 func (s *Store) GetMaxRateLimitRetries() int {
@@ -6559,6 +6550,25 @@ func (s *Store) GetTransportRetryPolicy() string {
 		return v
 	}
 	return "rotate"
+}
+
+// SetContinuousRetryPolicy 热更新上游错误持续重试策略。
+func (s *Store) SetContinuousRetryPolicy(policy database.ContinuousRetryPolicy) {
+	if s == nil {
+		return
+	}
+	s.continuousRetryPolicy.Store(database.NormalizeContinuousRetryPolicy(policy))
+}
+
+// GetContinuousRetryPolicy 返回当前上游错误持续重试策略的值快照。
+func (s *Store) GetContinuousRetryPolicy() database.ContinuousRetryPolicy {
+	if s == nil {
+		return database.DefaultContinuousRetryPolicy()
+	}
+	if value, ok := s.continuousRetryPolicy.Load().(database.ContinuousRetryPolicy); ok {
+		return database.NormalizeContinuousRetryPolicy(value)
+	}
+	return database.DefaultContinuousRetryPolicy()
 }
 
 // SetCodexFingerprintDefaultMode 动态更新新导入账号的默认指纹收敛档位。

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -32,6 +33,13 @@ func newDrainableUpstreamContext(clientCtx context.Context, drainTimeout time.Du
 	go func() {
 		select {
 		case <-clientCtx.Done():
+			// A Realtime response.cancel is scoped to a logical turn while the
+			// downstream WebSocket remains connected. Stop that turn immediately;
+			// the normal connection-close path still keeps its bounded usage drain.
+			if errors.Is(context.Cause(clientCtx), errRealtimeResponseCanceled) {
+				cancelUpstream()
+				return
+			}
 			timer := time.NewTimer(drainTimeout)
 			defer timer.Stop()
 			select {
