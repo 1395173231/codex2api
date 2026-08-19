@@ -8304,6 +8304,8 @@ type settingsResponse struct {
 	SchedulerMode                       string `json:"scheduler_mode"`
 	AffinityMode                        string `json:"affinity_mode"`
 	SessionAffinitySpread               bool   `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            bool   `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            int    `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    string `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
@@ -8459,6 +8461,8 @@ type updateSettingsReq struct {
 	SchedulerMode                       *string  `json:"scheduler_mode"`
 	AffinityMode                        *string  `json:"affinity_mode"`
 	SessionAffinitySpread               *bool    `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            *bool    `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            *int     `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    *string  `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
@@ -9197,6 +9201,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
@@ -9992,6 +9998,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetSessionAffinitySpread(*req.SessionAffinitySpread)
 		log.Printf("设置已更新: session_affinity_spread = %t", *req.SessionAffinitySpread)
 	}
+	if req.SessionSlotBufferSeconds != nil {
+		seconds := database.NormalizeSessionSlotBufferSeconds(*req.SessionSlotBufferSeconds)
+		h.store.SetSessionSlotBuffer(time.Duration(seconds) * time.Second)
+		log.Printf("设置已更新: session_slot_buffer_seconds = %d", seconds)
+	}
+	if req.SessionSlotBufferEnabled != nil {
+		h.store.SetSessionSlotBufferEnabled(*req.SessionSlotBufferEnabled)
+		log.Printf("设置已更新: session_slot_buffer_enabled = %t", *req.SessionSlotBufferEnabled)
+	}
 
 	if req.GrokAffinityMode != nil {
 		h.store.SetGrokAffinityMode(*req.GrokAffinityMode)
@@ -10528,6 +10543,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -10773,6 +10790,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),

@@ -34,7 +34,11 @@
     "modelCooldownSeconds": "基礎時長",
     "modelCooldownSecondsDesc": "範圍 1–1800 秒。",
     "modelCooldownBackoff": "指數退避",
-    "modelCooldownBackoffDesc": "僅自適應模式生效。"
+    "modelCooldownBackoffDesc": "僅自適應模式生效。",
+    "sessionSlotBuffer": "會話並發槽緩衝",
+    "sessionSlotBufferDesc": "成功請求結束後，為原會話短暫保留帳號並發槽；同一會話可立即取回，其他新會話不能搶佔。失敗和重試仍立即釋放，正在執行的請求不會中斷。預設關閉。",
+    "sessionSlotBufferSeconds": "緩衝時間（秒）",
+    "sessionSlotBufferSecondsDesc": "成功請求結束後保留槽位的時間，範圍 1–60 秒，預設 10 秒。儲存後立即生效，無需重啟。"
   },
   "promptFilter": {
     "views": {"profiles":"風險畫像","intelligence":"CY 學習審核"},

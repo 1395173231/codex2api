@@ -271,12 +271,17 @@ type Account struct {
 
 	// 高并发调度指标（原子操作，无需锁）
 	ActiveRequests int64 // 当前并发请求数
-	TotalRequests  int64 // 累计总请求数
-	LastUsedAt     int64 // 最后使用时间（UnixNano）
-	Disabled       int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
-	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
-	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
-	DispatchPaused int32 // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
+	// OccupiedRequests includes both active requests and short-lived slots
+	// reserved for the session that just completed a successful request.
+	// Admission uses this counter while admin-facing active concurrency keeps
+	// using ActiveRequests, so buffered slots never masquerade as live traffic.
+	OccupiedRequests int64
+	TotalRequests    int64 // 累计总请求数
+	LastUsedAt       int64 // 最后使用时间（UnixNano）
+	Disabled         int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
+	AddedAt          int64 // 加入号池的时间（UnixNano），用于过期清理
+	Locked           int32 // 原子标志，1 = 锁定，自动清理跳过此账号
+	DispatchPaused   int32 // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
 
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
@@ -3122,23 +3127,27 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
-	modelMapping          atomic.Value // 模型映射 JSON 字符串
-	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
-	payloadRules          atomic.Value // Payload 请求体重写规则 JSON 字符串
-	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
-	schedulerMode         atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first"
-	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
-	affinitySpreadEnabled atomic.Bool  // 新亲和键按 HRW 哈希散列选号(issue #484)
-	grokAffinityMode      atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
-	grokProbeEnabled      atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
-	grokProbeIntervalMin  atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
-	grokMaxRateLimitRetry atomic.Int64 // Grok 请求限流(429)专属换号重试上限（0=跟随全局）
-	grokFollowUpEffort    atomic.Value // GrokFollowUpEffortConfig
-	modelCooldownSettings atomic.Value // database.ModelCooldownSettings
-	promptFilterConfig    atomic.Value // promptFilterConfigState
-	sessionMu             sync.RWMutex
-	sessionBindings       map[string]sessionAffinity
+	allowRemoteMigration     atomic.Bool  // 是否允许远程迁移拉取账号
+	modelMapping             atomic.Value // 模型映射 JSON 字符串
+	codexModelMapping        atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules             atomic.Value // Payload 请求体重写规则 JSON 字符串
+	reasoningEffortModels    atomic.Value // 带思考强度的模型别名 JSON 数组
+	schedulerMode            atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first"
+	affinityMode             atomic.Value // string: "bounded" / "off" / "strict"
+	affinitySpreadEnabled    atomic.Bool  // 新亲和键按 HRW 哈希散列选号(issue #484)
+	grokAffinityMode         atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
+	grokProbeEnabled         atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
+	grokProbeIntervalMin     atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
+	grokMaxRateLimitRetry    atomic.Int64 // Grok 请求限流(429)专属换号重试上限（0=跟随全局）
+	grokFollowUpEffort       atomic.Value // GrokFollowUpEffortConfig
+	modelCooldownSettings    atomic.Value // database.ModelCooldownSettings
+	promptFilterConfig       atomic.Value // promptFilterConfigState
+	sessionMu                sync.RWMutex
+	sessionBindings          map[string]sessionAffinity
+	sessionSlotBufferEnabled atomic.Bool
+	sessionSlotBufferNS      atomic.Int64
+	sessionSlotSequence      uint64
+	sessionSlotReservations  map[int64]map[string][]uint64
 
 	globalAutoPause5hThreshold    float64  // protected by mu
 	globalAutoPause7dThreshold    float64  // protected by mu
@@ -3170,6 +3179,11 @@ type sessionAffinity struct {
 }
 
 const defaultSessionAffinityTTL = time.Hour
+
+const (
+	defaultSessionSlotBuffer = 10 * time.Second
+	maxSessionSlotBuffer     = 60 * time.Second
+)
 
 // maxSessionBindings 会话粘性表的软上限。超限时在 bind 路径全量清一轮过期项。
 const maxSessionBindings = 65536
@@ -3568,9 +3582,12 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		backgroundCancel:           backgroundCancel,
 		proxyPoolEnabled:           settings.ProxyPoolEnabled,
 		sessionBindings:            make(map[string]sessionAffinity),
+		sessionSlotReservations:    make(map[int64]map[string][]uint64),
 		promptFilterNewAPIBindings: make(map[int64]database.PromptFilterNewAPIBinding),
 		oauthRefreshLocks:          make(map[string]*oauthRefreshLocalLock),
 	}
+	s.sessionSlotBufferEnabled.Store(settings.SessionSlotBufferEnabled)
+	s.SetSessionSlotBuffer(time.Duration(database.NormalizeSessionSlotBufferSeconds(settings.SessionSlotBufferSeconds)) * time.Second)
 	if db != nil {
 		s.proxyPoolLoader = db.ListEnabledProxies
 		s.proxyInventoryLoader = db.ListProxies
@@ -5467,27 +5484,63 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 	if acc == nil || limit <= 0 {
 		return false
 	}
+	if !reserveOccupiedAccountSlot(acc, limit) {
+		return false
+	}
+	now := time.Now()
+	reservation := acc.reserveDispatchCount(now)
+	if !reservation.Allowed {
+		releaseOccupiedAccountSlot(acc)
+		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
+		return false
+	}
+	atomic.AddInt64(&acc.TotalRequests, 1)
+	atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
+	if reservation.HitLimit {
+		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
+	}
+	return true
+}
+
+func accountOccupiedRequests(acc *Account) int64 {
+	if acc == nil {
+		return 0
+	}
 	for {
-		current := atomic.LoadInt64(&acc.ActiveRequests)
-		if current >= limit {
+		active := atomic.LoadInt64(&acc.ActiveRequests)
+		occupied := atomic.LoadInt64(&acc.OccupiedRequests)
+		if occupied >= active {
+			return occupied
+		}
+		if atomic.CompareAndSwapInt64(&acc.OccupiedRequests, occupied, active) {
+			return active
+		}
+	}
+}
+
+func reserveOccupiedAccountSlot(acc *Account, limit int64) bool {
+	if acc == nil || limit <= 0 {
+		return false
+	}
+	for {
+		occupied := accountOccupiedRequests(acc)
+		if occupied >= limit {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
-			now := time.Now()
-			reservation := acc.reserveDispatchCount(now)
-			if !reservation.Allowed {
-				atomic.AddInt64(&acc.ActiveRequests, -1)
-				s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
-				return false
-			}
-			atomic.AddInt64(&acc.TotalRequests, 1)
-			atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
-			if reservation.HitLimit {
-				s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
-			}
+		if atomic.CompareAndSwapInt64(&acc.OccupiedRequests, occupied, occupied+1) {
+			atomic.AddInt64(&acc.ActiveRequests, 1)
 			return true
 		}
 	}
+}
+
+func releaseOccupiedAccountSlot(acc *Account) {
+	if acc == nil {
+		return
+	}
+	_ = accountOccupiedRequests(acc)
+	atomic.AddInt64(&acc.ActiveRequests, -1)
+	atomic.AddInt64(&acc.OccupiedRequests, -1)
 }
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
@@ -5535,7 +5588,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				continue
 			}
 
-			load := atomic.LoadInt64(&acc.ActiveRequests)
+			load := accountOccupiedRequests(acc)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
 			if limit <= 0 || load >= limit {
 				continue
@@ -5710,7 +5763,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				continue
 			}
 
-			load := atomic.LoadInt64(&acc.ActiveRequests)
+			load := accountOccupiedRequests(acc)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
 			if limit <= 0 || load >= limit {
 				continue
@@ -5925,7 +5978,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	if ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key), ""
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
 			ok = false
@@ -5947,7 +6000,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 
 		if expired || escape {
 			s.UnbindSessionAffinity(key, binding.accountID)
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding); acc != nil {
+		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
 			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
@@ -5963,7 +6016,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key), ""
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
 			return s.nextAccountForFreshAffinity(key, apiKeyID, exclude, filter), ""
@@ -5975,7 +6028,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 		if cacheMode == AffinityModeBounded && !preserveBinding && !s.affinityAccountStillHealthy(binding.accountID) {
 			// 不复用,落到完整挑号
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding); acc != nil {
+		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key); acc != nil {
 			s.sessionMu.Lock()
 			if s.sessionBindings == nil {
 				s.sessionBindings = make(map[string]sessionAffinity)
@@ -6033,7 +6086,7 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 		if filter != nil && !filter(acc) {
 			continue
 		}
-		load := atomic.LoadInt64(&acc.ActiveRequests)
+		load := accountOccupiedRequests(acc)
 		tier, _, _, limit := acc.schedulerSnapshot(maxConcurrency)
 		if limit <= 0 || load >= limit {
 			continue
@@ -6193,7 +6246,7 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 }
 
 func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.takeByIDMode(id, apiKeyID, exclude, filter, false)
+	return s.takeByIDMode(id, apiKeyID, exclude, filter, false, "")
 }
 
 // TakePreferredAccountWithFilter attempts to acquire one specific account
@@ -6204,11 +6257,11 @@ func (s *Store) TakePreferredAccountWithFilter(id int64, apiKeyID int64, exclude
 	return s.takeByIDExcluding(id, apiKeyID, exclude, filter)
 }
 
-func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.takeByIDMode(id, apiKeyID, exclude, filter, true)
+func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, sessionKey string) *Account {
+	return s.takeByIDMode(id, apiKeyID, exclude, filter, true, sessionKey)
 }
 
-func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool) *Account {
+func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool, sessionKey string) *Account {
 	if s == nil || id == 0 {
 		return nil
 	}
@@ -6247,6 +6300,9 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
 	if s.GetLazyMode() && !continuationEligible {
+		if s.tryReclaimSessionSlot(target, sessionKey, true) {
+			return target
+		}
 		if !s.acquireLazyCandidate(target, maxConcurrency) {
 			return nil
 		}
@@ -6262,6 +6318,9 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 	}
 	if !available || limit <= 0 {
 		return nil
+	}
+	if s.tryReclaimSessionSlot(target, sessionKey, true) {
+		return target
 	}
 	if !s.tryAcquireAccount(target, limit, true) {
 		return nil
@@ -6463,16 +6522,188 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 	}
 }
 
-// Release 释放账号（请求完成后调用，递减并发计数）
+// SetSessionSlotBuffer updates the grace period during which a successfully
+// completed request keeps its account slot reserved for the same session.
+// Values are clamped to 0..60 seconds; zero disables buffering.
+func (s *Store) SetSessionSlotBuffer(duration time.Duration) {
+	if s == nil {
+		return
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	if duration > maxSessionSlotBuffer {
+		duration = maxSessionSlotBuffer
+	}
+	s.sessionSlotBufferNS.Store(int64(duration))
+}
+
+func (s *Store) GetSessionSlotBuffer() time.Duration {
+	if s == nil {
+		return 0
+	}
+	return time.Duration(s.sessionSlotBufferNS.Load())
+}
+
+func (s *Store) SessionSlotBufferEnabled() bool {
+	return s != nil && s.sessionSlotBufferEnabled.Load()
+}
+
+// SetSessionSlotBufferEnabled hot-updates session slot buffering. Disabling it
+// also releases existing reservations immediately; live requests are untouched.
+func (s *Store) SetSessionSlotBufferEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.sessionSlotBufferEnabled.Store(enabled)
+	if enabled {
+		return
+	}
+
+	s.sessionMu.Lock()
+	releasedByAccount := make(map[int64]int64, len(s.sessionSlotReservations))
+	for accountID, bySession := range s.sessionSlotReservations {
+		for _, reservations := range bySession {
+			releasedByAccount[accountID] += int64(len(reservations))
+		}
+	}
+	s.sessionSlotReservations = make(map[int64]map[string][]uint64)
+	s.sessionMu.Unlock()
+
+	if len(releasedByAccount) == 0 {
+		return
+	}
+	s.mu.RLock()
+	for _, acc := range s.accounts {
+		if acc == nil || releasedByAccount[acc.DBID] == 0 {
+			continue
+		}
+		atomic.AddInt64(&acc.OccupiedRequests, -releasedByAccount[acc.DBID])
+	}
+	s.mu.RUnlock()
+}
+
+// ReleaseForSession converts a live slot into a short reservation owned by
+// sessionKey. The active count drops immediately, but admission still sees the
+// slot as occupied until the owner reclaims it or the grace period expires.
+func (s *Store) ReleaseForSession(acc *Account, sessionKey string) {
+	if s == nil || acc == nil {
+		return
+	}
+	sessionKey = strings.TrimSpace(sessionKey)
+	buffer := s.GetSessionSlotBuffer()
+	if sessionKey == "" || !s.SessionSlotBufferEnabled() || buffer <= 0 || s.GetAffinityMode() == AffinityModeOff {
+		s.Release(acc)
+		return
+	}
+
+	_ = accountOccupiedRequests(acc)
+	s.sessionMu.Lock()
+	if !s.SessionSlotBufferEnabled() {
+		s.sessionMu.Unlock()
+		s.Release(acc)
+		return
+	}
+	if s.sessionSlotReservations == nil {
+		s.sessionSlotReservations = make(map[int64]map[string][]uint64)
+	}
+	s.sessionSlotSequence++
+	reservationID := s.sessionSlotSequence
+	bySession := s.sessionSlotReservations[acc.DBID]
+	if bySession == nil {
+		bySession = make(map[string][]uint64)
+		s.sessionSlotReservations[acc.DBID] = bySession
+	}
+	bySession[sessionKey] = append(bySession[sessionKey], reservationID)
+	atomic.AddInt64(&acc.ActiveRequests, -1)
+	s.sessionMu.Unlock()
+
+	time.AfterFunc(buffer, func() {
+		s.expireSessionSlot(acc, sessionKey, reservationID)
+	})
+}
+
+func (s *Store) expireSessionSlot(acc *Account, sessionKey string, reservationID uint64) {
+	if s == nil || acc == nil {
+		return
+	}
+	released := false
+	s.sessionMu.Lock()
+	if bySession := s.sessionSlotReservations[acc.DBID]; bySession != nil {
+		reservations := bySession[sessionKey]
+		for i, id := range reservations {
+			if id != reservationID {
+				continue
+			}
+			reservations = append(reservations[:i], reservations[i+1:]...)
+			released = true
+			break
+		}
+		if len(reservations) == 0 {
+			delete(bySession, sessionKey)
+		} else {
+			bySession[sessionKey] = reservations
+		}
+		if len(bySession) == 0 {
+			delete(s.sessionSlotReservations, acc.DBID)
+		}
+	}
+	s.sessionMu.Unlock()
+	if released {
+		atomic.AddInt64(&acc.OccupiedRequests, -1)
+	}
+}
+
+func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSchedulerOnLimit bool) bool {
+	if s == nil || acc == nil || strings.TrimSpace(sessionKey) == "" || !s.SessionSlotBufferEnabled() || s.GetSessionSlotBuffer() <= 0 {
+		return false
+	}
+	sessionKey = strings.TrimSpace(sessionKey)
+
+	reclaimed := false
+	s.sessionMu.Lock()
+	if bySession := s.sessionSlotReservations[acc.DBID]; bySession != nil {
+		reservations := bySession[sessionKey]
+		if len(reservations) > 0 {
+			reservations = reservations[1:]
+			if len(reservations) == 0 {
+				delete(bySession, sessionKey)
+			} else {
+				bySession[sessionKey] = reservations
+			}
+			if len(bySession) == 0 {
+				delete(s.sessionSlotReservations, acc.DBID)
+			}
+			atomic.AddInt64(&acc.ActiveRequests, 1)
+			reclaimed = true
+		}
+	}
+	s.sessionMu.Unlock()
+	if !reclaimed {
+		return false
+	}
+
+	now := time.Now()
+	dispatchReservation := acc.reserveDispatchCount(now)
+	if !dispatchReservation.Allowed {
+		releaseOccupiedAccountSlot(acc)
+		s.markDispatchCountLimitCooldown(acc, dispatchReservation.ResetAt, updateSchedulerOnLimit)
+		return false
+	}
+	atomic.AddInt64(&acc.TotalRequests, 1)
+	atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
+	if dispatchReservation.HitLimit {
+		s.markDispatchCountLimitCooldown(acc, dispatchReservation.ResetAt, updateSchedulerOnLimit)
+	}
+	return true
+}
+
+// Release 立即释放账号；失败、重试和无会话请求继续使用这条路径。
 func (s *Store) Release(acc *Account) {
 	if acc == nil {
 		return
 	}
-	if scheduler := s.getFastScheduler(); scheduler != nil {
-		scheduler.Release(acc)
-		return
-	}
-	atomic.AddInt64(&acc.ActiveRequests, -1)
+	releaseOccupiedAccountSlot(acc)
 }
 
 // SetMaxConcurrency 动态更新每账号并发上限
