@@ -13,6 +13,9 @@ func TestContinuousRetryPolicyDefaultsAndNormalization(t *testing.T) {
 	if defaultPolicy.Enabled {
 		t.Fatal("continuous retry must be disabled by default")
 	}
+	if defaultPolicy.CatchAll {
+		t.Fatal("continuous retry catch-all must be disabled by default")
+	}
 	if len(defaultPolicy.Categories) == 0 {
 		t.Fatal("default policy should preserve the common transient categories")
 	}
@@ -36,6 +39,9 @@ func TestContinuousRetryPolicyDefaultsAndNormalization(t *testing.T) {
 	}
 	if strings.Join(got.ErrorCodes, ",") != "context_length_exceeded,rate_limited" {
 		t.Fatalf("normalized error codes = %v", got.ErrorCodes)
+	}
+	if disabled := NormalizeContinuousRetryPolicy(ContinuousRetryPolicy{CatchAll: true}); disabled.CatchAll {
+		t.Fatal("normalization retained catch-all behind a disabled master switch")
 	}
 }
 
@@ -74,18 +80,36 @@ func TestContinuousRetryPolicyMatchesStatusAndErrorCode(t *testing.T) {
 	if !fourXX.MatchesHTTP(429, nil) {
 		t.Error("http_4xx category should include 429")
 	}
+
+	catchAll := ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	for _, status := range []int{308, 418, 499, 520, 599, 600, 701} {
+		if !catchAll.MatchesHTTP(status, nil) {
+			t.Errorf("catch-all policy did not match HTTP status %d", status)
+		}
+	}
+	if catchAll.MatchesHTTP(200, nil) || catchAll.MatchesHTTP(204, nil) {
+		t.Error("catch-all policy selected a successful HTTP response")
+	}
+	if !catchAll.MatchesTransport("an unrecognized upstream failure") {
+		t.Error("catch-all policy did not match an unrecognized transport failure")
+	}
+	disabledCatchAll := ContinuousRetryPolicy{CatchAll: true}
+	if disabledCatchAll.MatchesHTTP(418, nil) || disabledCatchAll.MatchesTransport("upstream failed") {
+		t.Error("catch-all policy bypassed the disabled master switch")
+	}
 }
 
 func TestContinuousRetryPolicyEncodeParseRoundTrip(t *testing.T) {
 	want := ContinuousRetryPolicy{
 		Enabled:     true,
+		CatchAll:    true,
 		Categories:  []string{ContinuousRetryCategoryHTTP4xx},
 		StatusCodes: []int{403, 404},
 		ErrorCodes:  []string{"forbidden"},
 	}
 	raw := EncodeContinuousRetryPolicy(want)
 	got := ParseContinuousRetryPolicy(raw)
-	if got.Enabled != want.Enabled || strings.Join(got.Categories, ",") != strings.Join(want.Categories, ",") {
+	if got.Enabled != want.Enabled || got.CatchAll != want.CatchAll || strings.Join(got.Categories, ",") != strings.Join(want.Categories, ",") {
 		t.Fatalf("round-trip policy = %#v, raw=%s", got, raw)
 	}
 	if strings.Join(intsToStrings(got.StatusCodes), ",") != "403,404" || strings.Join(got.ErrorCodes, ",") != "forbidden" {
@@ -103,6 +127,7 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 	ctx := context.Background()
 	want := ContinuousRetryPolicy{
 		Enabled:     true,
+		CatchAll:    true,
 		Categories:  []string{ContinuousRetryCategoryHTTP4xx},
 		StatusCodes: []int{403, 404},
 		ErrorCodes:  []string{"forbidden"},
@@ -114,7 +139,7 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemSettings: %v", err)
 	}
-	if got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy); !got.Enabled || len(got.StatusCodes) != 2 || got.StatusCodes[0] != 403 || len(got.Categories) != 1 || got.Categories[0] != ContinuousRetryCategoryHTTP4xx {
+	if got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy); !got.Enabled || !got.CatchAll || len(got.StatusCodes) != 2 || got.StatusCodes[0] != 403 || len(got.Categories) != 1 || got.Categories[0] != ContinuousRetryCategoryHTTP4xx {
 		t.Fatalf("persisted policy = %#v", got)
 	}
 
@@ -127,7 +152,7 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemSettings after full write: %v", err)
 	}
-	if got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy); !got.Enabled || len(got.StatusCodes) != 2 {
+	if got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy); !got.Enabled || !got.CatchAll || len(got.StatusCodes) != 2 {
 		t.Fatalf("full settings write cleared policy = %#v", got)
 	}
 }

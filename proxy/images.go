@@ -1734,7 +1734,8 @@ func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, l
 // shouldRetryImageStreamError determines whether an image generation stream
 // read error warrants retrying on a different account. Transient failures
 // (stream disconnects, upstream model errors) are retryable; permanent
-// failures (content policy, invalid request, quota exhausted) are not.
+// failures stay bounded unless the operator selected them explicitly or used
+// catch-all; safety-policy failures always stop.
 func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int, policies ...database.ContinuousRetryPolicy) bool {
 	if err == nil || generalRetries == nil {
 		return false
@@ -1747,7 +1748,7 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 		if isExplicitUpstreamSafetyPolicy(payload) {
 			return false
 		}
-		if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.MatchesErrorCodes(payload) {
+		if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.CatchesAllUpstreamFailures() && !policy.MatchesErrorCodes(payload) {
 			return false
 		}
 	}

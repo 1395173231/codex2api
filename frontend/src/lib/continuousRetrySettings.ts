@@ -1,5 +1,17 @@
 const CONTINUOUS_RETRY_ERROR_CODE_PATTERN = /^[a-z0-9_.-]+$/
 
+export function buildContinuousRetryEnabledPatch(enabled: boolean) {
+  return enabled
+    ? { continuous_retry_enabled: true }
+    : { continuous_retry_enabled: false, continuous_retry_catch_all: false }
+}
+
+export function buildContinuousRetryCatchAllPatch(enabled: boolean) {
+  return enabled
+    ? { continuous_retry_enabled: true, continuous_retry_catch_all: true }
+    : { continuous_retry_catch_all: false }
+}
+
 export function parseContinuousRetryStatusCodes(raw: string): number[] {
   const values = raw
     .split(',')

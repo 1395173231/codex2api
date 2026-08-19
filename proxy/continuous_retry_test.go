@@ -63,9 +63,40 @@ func TestContinuousRetryHTTPSelectionSupportsContextCategory(t *testing.T) {
 	}
 }
 
+func TestContinuousRetryCatchAllSelectsUnknownUpstreamFailures(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+
+	for _, status := range []int{http.StatusTeapot, 499, 520, 599, 600, 701} {
+		general, rate := 0, 0
+		if !shouldRetryHTTPStatus(status, []byte(`{"error":{"code":"never_seen_before"}}`), &general, &rate, 0, 0, policy) {
+			t.Fatalf("catch-all policy did not retry unknown HTTP status %d", status)
+		}
+	}
+
+	quota := []byte(`{"error":{"code":"insufficient_quota"}}`)
+	if !continuousRetryHTTPSelected(policy, http.StatusTooManyRequests, quota) {
+		t.Fatal("catch-all policy did not explicitly override the permanent-quota guard")
+	}
+
+	unknownFrame := []byte(`{"type":"error","error":{"code":"future_upstream_failure"}}`)
+	outcome := classifyResponseFailedOutcome(unknownFrame)
+	if !continuousRetryStreamSelected(outcome, unknownFrame, "error", policy) {
+		t.Fatal("catch-all policy did not retry an unknown upstream error frame")
+	}
+
+	general, rate := 0, 0
+	if shouldTransparentRetryStreamWithBudgets(outcome, &general, &rate, 0, 0, true, nil, nil, policy) {
+		t.Fatal("catch-all policy replayed a failure after downstream output")
+	}
+	if shouldTransparentRetryStreamWithBudgets(outcome, &general, &rate, 0, 0, false, context.Canceled, nil, policy) {
+		t.Fatal("catch-all policy ignored downstream cancellation")
+	}
+}
+
 func TestContinuousRetryNeverSelectsStructuredSafetyRefusals(t *testing.T) {
 	policy := database.ContinuousRetryPolicy{
 		Enabled:     true,
+		CatchAll:    true,
 		Categories:  []string{database.ContinuousRetryCategoryHTTP4xx, database.ContinuousRetryCategoryHTTP5xx, database.ContinuousRetryCategoryResponseFailed},
 		StatusCodes: []int{http.StatusBadRequest, http.StatusInternalServerError},
 		ErrorCodes:  []string{"content_policy_violation"},
@@ -220,6 +251,13 @@ func TestContinuousRetryImageStreamSelectionHonorsPolicyAndSafety(t *testing.T) 
 	if !shouldRetryImageStreamError(quotaFailure, &general, 0, 0, maxImageAttempts, policy) {
 		t.Fatal("explicitly selected image quota code did not use the bounded continuous retry")
 	}
+	catchAll := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	if !shouldRetryImageStreamError(quotaFailure, &general, 0, 0, maxImageAttempts, catchAll) {
+		t.Fatal("catch-all did not select a permanent image quota failure")
+	}
+	if shouldRetryImageStreamError(quotaFailure, &general, 0, maxImageAttempts-1, maxImageAttempts, catchAll) {
+		t.Fatal("catch-all bypassed the image total-attempt cap")
+	}
 }
 
 func TestContinuousRetryErrorFrameUsesSelectedPolicyBeforeResponseFailed(t *testing.T) {
@@ -301,5 +339,57 @@ func TestContinuousRetryRequestErrorCanPromoteStructuredStatusFailure(t *testing
 	}
 	if isRetryableRequestErrorForContext(context.Background(), err) {
 		t.Fatal("structured 403 became retryable without an opt-in policy")
+	}
+}
+
+func TestContinuousRetryCatchAllSelectsOnlyStructuredStatuslessUpstreamErrors(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	upstreamErr := ErrUpstream(0, "upstream failed without a classified cause", nil)
+	if !isRetryableRequestErrorForContext(context.Background(), upstreamErr, policy) {
+		t.Fatal("catch-all did not select a statusless structured upstream error")
+	}
+	general := 0
+	if !shouldRetryRequestError(upstreamErr, &general, 0, policy) {
+		t.Fatal("catch-all did not override the finite budget for a statusless structured upstream error")
+	}
+	if isRetryableRequestErrorForContext(context.Background(), ErrBadRequest("invalid local request"), policy) {
+		t.Fatal("catch-all selected an internal bad-request error")
+	}
+	if isRetryableRequestErrorForContext(context.Background(), ErrInternalError("internal failure", nil), policy) {
+		t.Fatal("catch-all selected an internal server error")
+	}
+	safetyErr := &Error{
+		Code:    "cyber_policy",
+		Message: "blocked",
+		Type:    ErrorTypeUpstreamError,
+	}
+	if isRetryableRequestErrorForContext(context.Background(), safetyErr, policy) {
+		t.Fatal("catch-all selected a statusless structured safety refusal")
+	}
+	canceled := ErrUpstream(0, "upstream request canceled", context.Canceled)
+	if isRetryableRequestErrorForContext(context.Background(), canceled, policy) {
+		t.Fatal("catch-all selected a canceled upstream request")
+	}
+	deadline := ErrUpstream(0, "upstream request timed out", context.DeadlineExceeded)
+	general = 0
+	if !shouldRetryRequestError(deadline, &general, 0, policy) {
+		t.Fatal("catch-all did not select an upstream deadline while the downstream context remained active")
+	}
+	downstreamCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if isRetryableRequestErrorForContext(downstreamCtx, deadline, policy) {
+		t.Fatal("catch-all ignored a canceled downstream context")
+	}
+}
+
+func TestContinuousRetryCatchAllSelectsNonstandardHandshakeStatus(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	err := continuousRetryTestHTTPError{
+		status: 701,
+		body:   []byte(`{"error":{"code":"future_handshake_failure"}}`),
+	}
+	general := 0
+	if !shouldRetryRequestError(err, &general, 0, policy) {
+		t.Fatal("catch-all did not select a nonstandard upstream handshake status")
 	}
 }

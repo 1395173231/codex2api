@@ -8321,6 +8321,7 @@ type settingsResponse struct {
 	RetryIntervalMS                    int                              `json:"retry_interval_ms"`
 	TransportRetryPolicy               string                           `json:"transport_retry_policy"`
 	ContinuousRetryEnabled             bool                             `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll            bool                             `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories          []string                         `json:"continuous_retry_categories"`
 	ContinuousRetryStatusCodes         []int                            `json:"continuous_retry_status_codes"`
 	ContinuousRetryErrorCodes          []string                         `json:"continuous_retry_error_codes"`
@@ -8476,6 +8477,7 @@ type updateSettingsReq struct {
 	RetryIntervalMS                     *int      `json:"retry_interval_ms"`
 	TransportRetryPolicy                *string   `json:"transport_retry_policy"`
 	ContinuousRetryEnabled              *bool     `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll             *bool     `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories           *[]string `json:"continuous_retry_categories"`
 	ContinuousRetryStatusCodes          *[]int    `json:"continuous_retry_status_codes"`
 	ContinuousRetryErrorCodes           *[]string `json:"continuous_retry_error_codes"`
@@ -9220,6 +9222,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
 		ContinuousRetryEnabled:              h.store.GetContinuousRetryPolicy().Enabled,
+		ContinuousRetryCatchAll:             h.store.GetContinuousRetryPolicy().CatchAll,
 		ContinuousRetryCategories:           h.store.GetContinuousRetryPolicy().Categories,
 		ContinuousRetryStatusCodes:          h.store.GetContinuousRetryPolicy().StatusCodes,
 		ContinuousRetryErrorCodes:           h.store.GetContinuousRetryPolicy().ErrorCodes,
@@ -10088,9 +10091,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: transport_retry_policy = %s", v)
 	}
 
-	if req.ContinuousRetryEnabled != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil {
+	if req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil {
 		if req.ContinuousRetryEnabled != nil {
 			continuousRetryPolicy.Enabled = *req.ContinuousRetryEnabled
+		}
+		if req.ContinuousRetryCatchAll != nil {
+			continuousRetryPolicy.CatchAll = *req.ContinuousRetryCatchAll
 		}
 		if req.ContinuousRetryCategories != nil {
 			continuousRetryPolicy.Categories = append([]string(nil), (*req.ContinuousRetryCategories)...)
@@ -10103,7 +10109,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		continuousRetryPolicy = database.NormalizeContinuousRetryPolicy(continuousRetryPolicy)
 		continuousRetryChanged = true
-		log.Printf("设置已更新: continuous_retry enabled=%t categories=%d status_codes=%d error_codes=%d", continuousRetryPolicy.Enabled, len(continuousRetryPolicy.Categories), len(continuousRetryPolicy.StatusCodes), len(continuousRetryPolicy.ErrorCodes))
+		log.Printf("设置已更新: continuous_retry enabled=%t catch_all=%t categories=%d status_codes=%d error_codes=%d", continuousRetryPolicy.Enabled, continuousRetryPolicy.CatchAll, len(continuousRetryPolicy.Categories), len(continuousRetryPolicy.StatusCodes), len(continuousRetryPolicy.ErrorCodes))
 	}
 
 	if req.CodexFingerprintDefaultMode != nil {
@@ -10815,6 +10821,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
 		ContinuousRetryEnabled:              h.store.GetContinuousRetryPolicy().Enabled,
+		ContinuousRetryCatchAll:             h.store.GetContinuousRetryPolicy().CatchAll,
 		ContinuousRetryCategories:           h.store.GetContinuousRetryPolicy().Categories,
 		ContinuousRetryStatusCodes:          h.store.GetContinuousRetryPolicy().StatusCodes,
 		ContinuousRetryErrorCodes:           h.store.GetContinuousRetryPolicy().ErrorCodes,

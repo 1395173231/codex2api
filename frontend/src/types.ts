@@ -1387,6 +1387,7 @@ export interface SystemSettings {
   retry_interval_ms: number
   transport_retry_policy: string
   continuous_retry_enabled: boolean
+  continuous_retry_catch_all: boolean
   continuous_retry_categories: string[]
   continuous_retry_status_codes: number[]
   continuous_retry_error_codes: string[]

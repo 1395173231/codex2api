@@ -13,6 +13,8 @@ import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
+  buildContinuousRetryCatchAllPatch,
+  buildContinuousRetryEnabledPatch,
   parseContinuousRetryErrorCodes,
   parseContinuousRetryStatusCodes,
 } from '../lib/continuousRetrySettings'
@@ -1359,6 +1361,7 @@ export default function Settings() {
     retry_interval_ms: 0,
     transport_retry_policy: 'rotate',
     continuous_retry_enabled: false,
+    continuous_retry_catch_all: false,
     continuous_retry_categories: ['transport', 'http_429', 'http_5xx', 'stream_error'],
     continuous_retry_status_codes: [],
     continuous_retry_error_codes: [],
@@ -1439,6 +1442,7 @@ export default function Settings() {
   })
   const continuousRetryStatusCodesText = (settingsForm.continuous_retry_status_codes ?? []).join(',')
   const continuousRetryErrorCodesText = (settingsForm.continuous_retry_error_codes ?? []).join(',')
+  const continuousRetryFineControlsDisabled = !settingsForm.continuous_retry_enabled || settingsForm.continuous_retry_catch_all
   const [continuousRetryStatusCodesDraft, setContinuousRetryStatusCodesDraft] = useState(continuousRetryStatusCodesText)
   const [continuousRetryErrorCodesDraft, setContinuousRetryErrorCodesDraft] = useState(continuousRetryErrorCodesText)
   const lazyModeActive = settingsForm.lazy_mode
@@ -2276,10 +2280,25 @@ export default function Settings() {
                   >
                     <Switch
                       checked={settingsForm.continuous_retry_enabled}
-                      onCheckedChange={(checked) => autoSaveBooleanField('continuous_retry_enabled', checked)}
+                      onCheckedChange={(checked) => void autoSaveSettingsPatch(buildContinuousRetryEnabledPatch(checked))}
                     />
                   </SettingField>
-                  <div className={cn('grid gap-3 sm:grid-cols-2 lg:grid-cols-4', !settingsForm.continuous_retry_enabled && 'opacity-60')}>
+                  <SettingField
+                    label={t('settings.continuousRetryCatchAll')}
+                    description={t('settings.continuousRetryCatchAllDesc')}
+                    warning={t('settings.continuousRetryCatchAllWarning')}
+                    layout="switch"
+                    className={cn(
+                      'rounded-lg',
+                      settingsForm.continuous_retry_catch_all && 'border-amber-500/50 bg-amber-500/10 hover:border-amber-500/60',
+                    )}
+                  >
+                    <Switch
+                      checked={settingsForm.continuous_retry_catch_all}
+                      onCheckedChange={(checked) => void autoSaveSettingsPatch(buildContinuousRetryCatchAllPatch(checked))}
+                    />
+                  </SettingField>
+                  <div className={cn('grid gap-3 sm:grid-cols-2 lg:grid-cols-4', continuousRetryFineControlsDisabled && 'opacity-60')}>
                     {continuousRetryCategoryOptions.map((option) => (
                       <SettingField
                         key={option.value}
@@ -2289,7 +2308,7 @@ export default function Settings() {
                       >
                         <Switch
                           checked={(settingsForm.continuous_retry_categories ?? []).includes(option.value)}
-                          disabled={!settingsForm.continuous_retry_enabled}
+                          disabled={continuousRetryFineControlsDisabled}
                           onCheckedChange={(checked) => {
                             const current = settingsFormRef.current.continuous_retry_categories ?? []
                             const next = checked
@@ -2308,7 +2327,7 @@ export default function Settings() {
                     >
                       <Input
                         value={continuousRetryStatusCodesDraft}
-                        disabled={!settingsForm.continuous_retry_enabled}
+                        disabled={continuousRetryFineControlsDisabled}
                         placeholder="403,404,429,500,501,502,503,504"
                         onChange={(event) => setContinuousRetryStatusCodesDraft(event.target.value)}
                         onBlur={(event) => {
@@ -2324,7 +2343,7 @@ export default function Settings() {
                     >
                       <Input
                         value={continuousRetryErrorCodesDraft}
-                        disabled={!settingsForm.continuous_retry_enabled}
+                        disabled={continuousRetryFineControlsDisabled}
                         placeholder="rate_limited,context_length_exceeded"
                         onChange={(event) => setContinuousRetryErrorCodesDraft(event.target.value)}
                         onBlur={(event) => {

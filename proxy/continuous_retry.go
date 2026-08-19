@@ -22,8 +22,8 @@ func continuousRetryHTTPSelected(policy database.ContinuousRetryPolicy, status i
 	}
 	// A generic 429 category should not turn a permanent billing/quota failure
 	// into an endless account-rotation loop. An operator can still opt into that
-	// exact marker by selecting the corresponding error code explicitly.
-	if isPermanentQuotaFailure(body) && !policy.MatchesErrorCodes(body) {
+	// exact marker or deliberately enable the high-risk catch-all override.
+	if isPermanentQuotaFailure(body) && !policy.CatchesAllUpstreamFailures() && !policy.MatchesErrorCodes(body) {
 		return false
 	}
 	if policy.MatchesHTTP(status, body) {
@@ -49,7 +49,7 @@ func continuousRetryLimitsForHTTP(status int, body []byte, generalLimit, rateLim
 
 func continuousRetryLimitForRequestError(err error, generalLimit int, policies ...database.ContinuousRetryPolicy) int {
 	policy := continuousRetryPolicyForCall(policies)
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return generalLimit
 	}
 	if status, body, ok := continuousRetryHTTPErrorDetails(err); ok {
@@ -82,7 +82,7 @@ func continuousRetryHTTPErrorDetails(err error) (int, []byte, bool) {
 		return 0, nil, false
 	}
 	status := upstreamErr.UpstreamStatusCode()
-	if status < 100 || status > 599 {
+	if status < 100 || status > 999 {
 		return 0, nil, false
 	}
 	return status, upstreamErr.UpstreamErrorBody(), true
@@ -94,7 +94,13 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 	}
 	status, body, ok := continuousRetryHTTPErrorDetails(err)
 	if !ok {
-		return false
+		if !policy.CatchesAllUpstreamFailures() || errors.Is(err, context.Canceled) {
+			return false
+		}
+		var upstreamErr *Error
+		return errors.As(err, &upstreamErr) &&
+			upstreamErr.Type == ErrorTypeUpstreamError &&
+			!isExplicitUpstreamSafetyPolicy(upstreamErr.UpstreamErrorBody())
 	}
 	return continuousRetryHTTPSelected(policy, status, body)
 }
@@ -107,8 +113,11 @@ func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventT
 	if eventType == "" && strings.Contains(strings.ToLower(string(payload)), "response.failed") {
 		eventType = "response.failed"
 	}
-	if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.MatchesErrorCodes(payload) {
+	if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.CatchesAllUpstreamFailures() && !policy.MatchesErrorCodes(payload) {
 		return false
+	}
+	if policy.CatchesAllUpstreamFailures() {
+		return true
 	}
 	if continuousRetryHTTPSelected(policy, outcome.logStatusCode, payload) {
 		return true

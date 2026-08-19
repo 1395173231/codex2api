@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -360,6 +361,98 @@ func TestResponsesContinuousRetryCyclesSingleAccountAfter503(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"type":"response.completed"`) || strings.Contains(body, "temporarily unavailable") {
 		t.Fatalf("retry was not transparent: %s", body)
+	}
+}
+
+func TestResponsesContinuousRetryCatchAllRotatesAndRepeatsPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		UpdateRuntimeSettings(func(RuntimeSettings) RuntimeSettings { return previousRuntime })
+	})
+	UpdateRuntimeSettings(func(current RuntimeSettings) RuntimeSettings {
+		current.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+		current.CodexForceWebsocket = false
+		current.CodexWSSilentRetry = false
+		current.CodexWSSilentRetries = 0
+		return current
+	})
+
+	var requestMu sync.Mutex
+	var authorizationHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMu.Lock()
+		authorizationHeaders = append(authorizationHeaders, r.Header.Get("Authorization"))
+		attempt := len(authorizationHeaders)
+		requestMu.Unlock()
+
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTeapot)
+			_, _ = io.WriteString(w, `{"error":{"code":"future_unknown_failure","message":"must stay upstream"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempt == 2 {
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"future_stream_failure","message":"must stay upstream"}}}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_catch_all_recovered","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		TestConcurrency:     1,
+		TestModel:           "gpt-5.4",
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	t.Cleanup(store.Stop)
+	for _, account := range []struct {
+		id  int64
+		key string
+	}{
+		{id: 1, key: "catch-all-account-one"},
+		{id: 2, key: "catch-all-account-two"},
+	} {
+		store.AddAccount(&auth.Account{
+			DBID:         account.id,
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      upstream.URL,
+			APIKey:       account.key,
+			Models:       []string{"gpt-5.4"},
+			PlanType:     "api",
+		})
+	}
+	handler := NewHandler(store, nil, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-5.4","input":"hello","stream":true}`)).WithContext(requestCtx)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.Responses(ctx)
+
+	requestMu.Lock()
+	gotHeaders := append([]string(nil), authorizationHeaders...)
+	requestMu.Unlock()
+	if len(gotHeaders) != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (two unknown failures then success)", len(gotHeaders))
+	}
+	if gotHeaders[0] == "" || gotHeaders[0] == gotHeaders[1] {
+		t.Fatalf("catch-all did not rotate accounts before repeating the pool: first=%q second=%q", gotHeaders[0], gotHeaders[1])
+	}
+	if gotHeaders[2] != gotHeaders[0] && gotHeaders[2] != gotHeaders[1] {
+		t.Fatalf("third attempt did not reuse the exhausted account pool: headers=%q", gotHeaders)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("downstream status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"id":"resp_catch_all_recovered"`) || strings.Contains(body, "must stay upstream") {
+		t.Fatalf("catch-all retry was not transparent: %s", body)
 	}
 }
 

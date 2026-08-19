@@ -13,6 +13,7 @@ import (
 // without introducing an import cycle.
 type ContinuousRetryPolicy struct {
 	Enabled     bool     `json:"enabled"`
+	CatchAll    bool     `json:"catch_all"`
 	Categories  []string `json:"categories"`
 	StatusCodes []int    `json:"status_codes"`
 	ErrorCodes  []string `json:"error_codes"`
@@ -44,7 +45,8 @@ var continuousRetryCategories = map[string]struct{}{
 // selection in the admin UI.
 func DefaultContinuousRetryPolicy() ContinuousRetryPolicy {
 	return ContinuousRetryPolicy{
-		Enabled: false,
+		Enabled:  false,
+		CatchAll: false,
 		Categories: []string{
 			ContinuousRetryCategoryTransport,
 			ContinuousRetryCategoryHTTP429,
@@ -60,6 +62,9 @@ func DefaultContinuousRetryPolicy() ContinuousRetryPolicy {
 // exact status selectors to valid HTTP status codes. Empty values are retained
 // as empty slices so JSON responses stay stable and editable in the UI.
 func NormalizeContinuousRetryPolicy(policy ContinuousRetryPolicy) ContinuousRetryPolicy {
+	if !policy.Enabled {
+		policy.CatchAll = false
+	}
 	categorySet := make(map[string]struct{}, len(policy.Categories))
 	for _, raw := range policy.Categories {
 		category := strings.ToLower(strings.TrimSpace(raw))
@@ -136,9 +141,15 @@ func EncodeContinuousRetryPolicy(policy ContinuousRetryPolicy) string {
 	normalized := NormalizeContinuousRetryPolicy(policy)
 	raw, err := json.Marshal(normalized)
 	if err != nil {
-		return `{"enabled":false,"categories":[],"status_codes":[],"error_codes":[]}`
+		return `{"enabled":false,"catch_all":false,"categories":[],"status_codes":[],"error_codes":[]}`
 	}
 	return string(raw)
+}
+
+// CatchesAllUpstreamFailures reports whether the explicit catch-all override
+// is active. Enabled remains the master gate.
+func (p ContinuousRetryPolicy) CatchesAllUpstreamFailures() bool {
+	return p.Enabled && p.CatchAll
 }
 
 func (p ContinuousRetryPolicy) HasCategory(category string) bool {
@@ -173,6 +184,9 @@ func (p ContinuousRetryPolicy) HasStatusCode(status int) bool {
 func (p ContinuousRetryPolicy) MatchesHTTP(status int, body []byte) bool {
 	if !p.Enabled {
 		return false
+	}
+	if p.CatchAll && status > 0 && (status < 200 || status >= 300) {
+		return true
 	}
 	if p.HasStatusCode(status) || p.MatchesErrorCodes(body) {
 		return true
@@ -237,6 +251,9 @@ func isContinuousRetryCodeChar(value byte) bool {
 func (p ContinuousRetryPolicy) MatchesTransport(errText string) bool {
 	if !p.Enabled {
 		return false
+	}
+	if p.CatchAll {
+		return true
 	}
 	if p.HasCategory(ContinuousRetryCategoryTransport) {
 		return true

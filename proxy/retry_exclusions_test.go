@@ -166,6 +166,35 @@ func TestRetryAccountExclusionsRequestErrorUsesSelectedPolicy(t *testing.T) {
 	}
 }
 
+func TestRetryAccountExclusionsCatchAllKeepsUnknownFailuresInRotation(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	exclusions := newRetryAccountExclusions()
+	handshakeErr := continuousRetryTestHTTPError{
+		status: http.StatusTeapot,
+		body:   []byte(`{"error":{"code":"future_account_error"}}`),
+	}
+
+	exclusions.MarkRequestFailure(1, handshakeErr, 0, policy)
+	if !exclusions.CanContinueTransientCycle() || !exclusions.ResetTransient() {
+		t.Fatal("catch-all handshake failure was not kept in the recoverable account cycle")
+	}
+
+	exclusions.MarkHTTPFailure(2, 520, []byte(`{"error":{"code":"unknown_gateway_error"}}`), 0, 0, policy)
+	if !exclusions.CanContinueTransientCycle() || !exclusions.ResetTransient() {
+		t.Fatal("catch-all HTTP failure was not kept in the recoverable account cycle")
+	}
+
+	outcome := streamOutcome{
+		logStatusCode:  http.StatusBadRequest,
+		failureKind:    "future_stream_error",
+		failurePayload: []byte(`{"type":"error","error":{"code":"future_stream_error"}}`),
+	}
+	exclusions.MarkStreamFailureForEvent(3, outcome, "error", 0, 0, policy)
+	if !exclusions.CanContinueTransientCycle() || !exclusions.ResetTransient() {
+		t.Fatal("catch-all stream failure was not kept in the recoverable account cycle")
+	}
+}
+
 func TestRetryAccountExclusionsHTTPFailureClassification(t *testing.T) {
 	tests := []struct {
 		name       string

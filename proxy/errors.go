@@ -92,7 +92,7 @@ func (e *Error) StatusCode() int {
 // They intentionally use distinct names so the existing StatusCode API stays
 // unchanged.
 func (e *Error) UpstreamStatusCode() int {
-	if e == nil || e.Type != ErrorTypeUpstreamError || e.HTTPStatus < 100 || e.HTTPStatus > 599 {
+	if e == nil || e.Type != ErrorTypeUpstreamError || e.HTTPStatus < 100 || e.HTTPStatus > 999 {
 		return 0
 	}
 	return e.HTTPStatus
