@@ -1,13 +1,12 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/security"
@@ -35,139 +34,6 @@ const (
 	realtimeTextHistoryMaxBytes = 256 << 10
 )
 
-var errRealtimeResponseCanceled = errors.New("realtime response canceled")
-
-type realtimePendingResponse struct {
-	turn      int
-	cancel    context.CancelCauseFunc
-	canceled  bool
-	completed bool
-}
-
-// realtimeResponseController lets the connection's only reader cancel an
-// active response while the handler goroutine is blocked in an upstream retry.
-// Pending response.create turns are kept in wire order so a response.cancel
-// never leaks across the response that was active when the event arrived.
-type realtimeResponseController struct {
-	mu      sync.Mutex
-	pending []*realtimePendingResponse
-}
-
-func (controller *realtimeResponseController) observeInbound(message responsesWSInboundMessage) {
-	if controller == nil || (message.messageType != websocket.TextMessage && message.messageType != websocket.BinaryMessage) || !gjson.ValidBytes(message.payload) {
-		return
-	}
-	eventType := strings.TrimSpace(gjson.GetBytes(message.payload, "type").String())
-
-	var cancel context.CancelCauseFunc
-	controller.mu.Lock()
-	switch eventType {
-	case "response.create":
-		controller.pending = append(controller.pending, &realtimePendingResponse{turn: message.turn})
-	case "response.cancel":
-		if len(controller.pending) > 0 {
-			current := controller.pending[0]
-			// Keep a completed response at the head until finish removes it. A
-			// cancel received after its terminal event is a late no-op and must not
-			// skip ahead to a queued response.create.
-			if !current.completed {
-				current.canceled = true
-				cancel = current.cancel
-			}
-		}
-	}
-	controller.mu.Unlock()
-	if cancel != nil {
-		cancel(errRealtimeResponseCanceled)
-	}
-}
-
-func (controller *realtimeResponseController) begin(parent context.Context, turn int) (context.Context, func() bool) {
-	turnCtx, cancel := context.WithCancelCause(parent)
-	var current *realtimePendingResponse
-
-	controller.mu.Lock()
-	for _, pending := range controller.pending {
-		if pending.turn == turn {
-			current = pending
-			break
-		}
-	}
-	if current == nil {
-		current = &realtimePendingResponse{turn: turn}
-		insertAt := len(controller.pending)
-		for i, pending := range controller.pending {
-			if pending.turn > turn {
-				insertAt = i
-				break
-			}
-		}
-		controller.pending = append(controller.pending, nil)
-		copy(controller.pending[insertAt+1:], controller.pending[insertAt:])
-		controller.pending[insertAt] = current
-	}
-	current.cancel = cancel
-	alreadyCanceled := current.canceled
-	controller.mu.Unlock()
-
-	if alreadyCanceled {
-		cancel(errRealtimeResponseCanceled)
-	}
-	return turnCtx, func() bool {
-		return controller.finish(turn, cancel)
-	}
-}
-
-func (controller *realtimeResponseController) discard(turn int) {
-	controller.finish(turn, nil)
-}
-
-func (controller *realtimeResponseController) complete(turn int) {
-	if controller == nil {
-		return
-	}
-	controller.mu.Lock()
-	for _, pending := range controller.pending {
-		if pending.turn != turn {
-			continue
-		}
-		pending.completed = true
-		break
-	}
-	controller.mu.Unlock()
-}
-
-func (controller *realtimeResponseController) finish(turn int, fallbackCancel context.CancelCauseFunc) bool {
-	if controller == nil {
-		if fallbackCancel != nil {
-			fallbackCancel(context.Canceled)
-		}
-		return false
-	}
-
-	canceled := false
-	cancel := fallbackCancel
-	controller.mu.Lock()
-	for i, pending := range controller.pending {
-		if pending.turn != turn {
-			continue
-		}
-		canceled = pending.canceled
-		if pending.cancel != nil {
-			cancel = pending.cancel
-		}
-		copy(controller.pending[i:], controller.pending[i+1:])
-		controller.pending[len(controller.pending)-1] = nil
-		controller.pending = controller.pending[:len(controller.pending)-1]
-		break
-	}
-	controller.mu.Unlock()
-	if cancel != nil {
-		cancel(context.Canceled)
-	}
-	return canceled
-}
-
 // RealtimeWebSocket accepts standard Realtime text events from NewAPI and
 // translates each response.create turn into a Responses WebSocket turn.
 func (h *Handler) RealtimeWebSocket(c *gin.Context) {
@@ -190,6 +56,7 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	defer conn.Close()
 	conn.SetReadLimit(int64(security.MaxRequestBodySize))
 
 	state := realtimeTextSession{Model: strings.TrimSpace(c.Query("model"))}
@@ -200,45 +67,27 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 			"output_modalities": []string{"text"},
 		},
 	})); err != nil {
-		_ = conn.Close()
 		return
 	}
-	turns := &realtimeResponseController{}
-	requestCtx, messages, readPumpDone, cancel := startResponsesWSReadPump(c.Request.Context(), conn, turns.observeInbound)
-	c.Request = c.Request.WithContext(requestCtx)
-	defer func() {
-		cancel()
-		_ = conn.Close()
-		<-readPumpDone
-	}()
-
-	for {
-		var message responsesWSInboundMessage
-		var ok bool
-		select {
-		case message, ok = <-messages:
-		case <-requestCtx.Done():
+	for turn := 0; ; turn++ {
+		if turn == 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(responsesWSFirstMessageTimeout))
+		} else {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
 			return
 		}
-		if !ok {
-			return
-		}
-		message.releaseQueueBudget()
-		if message.err != nil || requestCtx.Err() != nil {
-			return
-		}
-		if message.messageType != websocket.TextMessage && message.messageType != websocket.BinaryMessage {
+		_ = conn.SetReadDeadline(time.Time{})
+		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
 			_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrCodeInvalidRequest, "unsupported websocket message type", api.ErrorTypeInvalidRequest))
 			continue
 		}
-		payload, forwardedEventID := stripNewAPIPolicyWebSocketEventID(message.payload)
-		responseCreate := strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.create"
+		payload, forwardedEventID := stripNewAPIPolicyWebSocketEventID(payload)
 
 		ack, forward, apiErr := normalizeRealtimeTextClientEvent(&state, payload)
 		if apiErr != nil {
-			if responseCreate {
-				turns.discard(message.turn)
-			}
 			_ = writeResponsesWSError(conn, apiErr)
 			continue
 		}
@@ -248,13 +97,10 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 			}
 		}
 		if len(forward) == 0 {
-			if responseCreate {
-				turns.discard(message.turn)
-			}
 			continue
 		}
 		if forwardedEventID == "" {
-			forwardedEventID = fmt.Sprintf("realtime:%d", message.turn)
+			forwardedEventID = fmt.Sprintf("realtime:%d", turn)
 		}
 		completed := false
 		var completedOutput []json.RawMessage
@@ -264,28 +110,14 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 			onResponseCompleted: func(data []byte) {
 				completed = true
 				completedOutput = realtimeResponseHistoryItems(data)
-				turns.complete(message.turn)
 			},
 		}
-		turnCtx, finishTurn := turns.begin(requestCtx, message.turn)
-		connectionRequest := c.Request
-		c.Request = connectionRequest.WithContext(turnCtx)
-		forwardErr := errResponsesWSClientGone
-		if turnCtx.Err() == nil {
-			forwardErr = h.forwardResponsesWebSocketTurn(c, conn, forward, forwardedEventID, options)
-		}
-		c.Request = connectionRequest
-		turnCanceled := finishTurn()
-		if turnCanceled && requestCtx.Err() == nil {
-			state.Items = nil
-			continue
-		}
-		if forwardErr != nil {
-			if errors.Is(forwardErr, errResponsesWSClientGone) {
+		if err := h.forwardResponsesWebSocketTurn(c, conn, forward, forwardedEventID, options); err != nil {
+			if errors.Is(err, errResponsesWSClientGone) {
 				return
 			}
 			var closeErr *responsesWSCloseError
-			if errors.As(forwardErr, &closeErr) {
+			if errors.As(err, &closeErr) {
 				closeResponsesWS(conn, closeErr.code, closeErr.reason)
 				return
 			}
@@ -371,11 +203,9 @@ func normalizeRealtimeTextClientEvent(state *realtimeTextSession, raw []byte) (a
 
 	case "response.cancel":
 		// Cancellation is a logical turn boundary even though the Responses
-		// compatibility transport does not forward this event upstream. The read
-		// pump has already signaled the active turn, so consuming the queued event
-		// only needs to clear pending input and keep the session alive.
+		// compatibility transport does not forward this event upstream.
 		state.Items = nil
-		return nil, nil, nil
+		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, fmt.Sprintf("realtime event %s is not supported by the Responses compatibility transport", eventType), api.ErrorTypeInvalidRequest)
 
 	case "conversation.item.delete", "conversation.item.truncate":
 		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, fmt.Sprintf("realtime event %s is not supported by the Responses compatibility transport", eventType), api.ErrorTypeInvalidRequest)
