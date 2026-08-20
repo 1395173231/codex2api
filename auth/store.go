@@ -5984,10 +5984,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if ok {
-		// Stateful continuations own opaque upstream state on this exact account.
-		// Once a request elects continuation scheduling, local affinity TTL expiry
-		// must not silently rotate it to a different account mid-request.
-		expired := !preserveBinding && !binding.expiresAt.After(now)
+		expired := !binding.expiresAt.After(now)
 		// bounded 模式下追加逃逸条件检查
 		escape := false
 		if mode == AffinityModeBounded && !preserveBinding {
