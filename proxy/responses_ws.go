@@ -403,7 +403,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	hasPreviousResponse := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
 	turnContinuation := codexWSTurnContinuationToken(rawBody) != ""
-	turnBoundAccountID, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	// 上下文压缩轮豁免首字超时看门狗（issue #381）：压缩首帧天然慢，超时换号无益。
@@ -461,10 +461,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
 	}
-	baseAccountFilter := accountFilter
-	if turnContinuation && turnHasBinding {
-		accountFilter = accountIDOnlyFilter(turnBoundAccountID, accountFilter)
-	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -502,7 +498,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	degradeContinuation := func(reason string, attempt int) {
 		continuationDegraded = true
 		continuationPinned = false
-		accountFilter = baseAccountFilter
 		codexBody = degradeResponsesWSContinuationBody(codexBody, respCacheOwner)
 		expandedInputRaw = responsesInputRaw(codexBody)
 		log.Printf("Responses WebSocket continuation degraded: %s, stripped previous_response_id and retried once (attempt %d)", reason, attempt)

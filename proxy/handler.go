@@ -1633,15 +1633,6 @@ func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
-func accountIDOnlyFilter(accountID int64, inner auth.AccountFilter) auth.AccountFilter {
-	return func(account *auth.Account) bool {
-		if account == nil || account.ID() != accountID {
-			return false
-		}
-		return inner == nil || inner(account)
-	}
-}
-
 func responseCachePreparationFailure(prepared responsesBodyPreparation) (status int, reason string, unavailable bool) {
 	if prepared.PreviousResponseID == "" || prepared.Bypassed || prepared.CacheLookup.Kind == responseCacheLookupHit {
 		return 0, "", false
@@ -3300,7 +3291,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
-	turnBoundAccountID, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	turnContinuationPinned := turnContinuation && turnHasBinding
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -3370,12 +3361,6 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
-	}
-	if turnContinuationPinned {
-		// A turn-state continuation is upstream-account-owned. Pin the request to
-		// the account captured at ingress even if the local affinity TTL expires
-		// while continuous retry is waiting for that account to recover.
-		accountFilter = accountIDOnlyFilter(turnBoundAccountID, accountFilter)
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
