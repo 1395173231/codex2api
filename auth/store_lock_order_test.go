@@ -206,7 +206,7 @@ func TestAccountFiltersRunOutsideStoreReadLock(t *testing.T) {
 		{
 			name: "lazy scheduler",
 			call: func(store *Store, filter AccountFilter) {
-				store.nextExcludingWithFilterLazy(0, nil, filter)
+				store.nextExcludingWithFilterLazy(0, nil, filter, DispatchPolicyStandard)
 			},
 		},
 		{
