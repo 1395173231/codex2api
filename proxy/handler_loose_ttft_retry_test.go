@@ -328,7 +328,7 @@ func TestRelayResponsesCatchAllDiscardsPartialAttemptWithoutTerminal(t *testing.
 	}
 }
 
-func TestResponsesWebSocketCatchAllHidesSafetyFailureAndRotates(t *testing.T) {
+func TestResponsesWebSocketCatchAllStopsAtExplicitCyberPolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	enableLooseResponseFailedContinuousRetry(t)
 	nextSettings := CurrentRuntimeSettings()
@@ -342,8 +342,7 @@ func TestResponsesWebSocketCatchAllHidesSafetyFailureAndRotates(t *testing.T) {
 		{
 			`{"type":"response.created","response":{"id":"resp_retry_1"}}`,
 			`{"type":"codex.rate_limits","plan_type":"plus"}`,
-			`{"type":"response.output_text.delta","delta":"failed-websocket-partial"}`,
-			`{"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"cyber_policy","message":"must stay upstream"}}}`,
+			`{"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"cyber_policy","message":"must stop this turn"}}}`,
 		},
 		{
 			`{"type":"response.created","response":{"id":"resp_retry_2"}}`,
@@ -382,15 +381,6 @@ func TestResponsesWebSocketCatchAllHidesSafetyFailureAndRotates(t *testing.T) {
 	t.Cleanup(store.Stop)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "pro", AccountID: "acct-2"})
-	filterConfig := promptfilter.DefaultConfig()
-	filterConfig.Enabled = true
-	filterConfig.Mode = promptfilter.ModeBlock
-	filterConfig.StrictTerminalEnabled = true
-	filterConfig.CustomPatterns = []promptfilter.PatternConfig{{
-		Name: "failed_attempt_output", Pattern: `failed-websocket-partial`, Weight: 100, Strict: true,
-	}}
-	filterConfig.Advanced.Output = promptfilter.OutputConfig{Enabled: true, BufferBytes: 512, OverlapBytes: 64, StrictOnly: true}
-	store.SetPromptFilterConfig(filterConfig)
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 
 	router := gin.New()
@@ -426,18 +416,20 @@ func TestResponsesWebSocketCatchAllHidesSafetyFailureAndRotates(t *testing.T) {
 		}
 	}
 
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2 after a pre-content safety failure; downstream=%s", got, downstream.String())
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 for explicit CYB hard stop; downstream=%s", got, downstream.String())
 	}
-	firstAccount, secondAccount := <-attemptAccounts, <-attemptAccounts
-	if firstAccount == secondAccount {
-		t.Fatalf("catch-all did not rotate accounts: first=%d second=%d", firstAccount, secondAccount)
+	<-attemptAccounts
+	select {
+	case accountID := <-attemptAccounts:
+		t.Fatalf("catch-all rotated to unexpected second account %d", accountID)
+	default:
 	}
-	if terminalType != "response.completed" {
-		t.Fatalf("terminal event = %q, want response.completed; downstream=%s", terminalType, downstream.String())
+	if terminalType != "response.failed" {
+		t.Fatalf("terminal event = %q, want response.failed; downstream=%s", terminalType, downstream.String())
 	}
-	if body := downstream.String(); !strings.Contains(body, "recovered-websocket") || strings.Contains(body, "failed-websocket-partial") || strings.Contains(body, "must stay upstream") || strings.Contains(body, "cyber_policy") || strings.Contains(body, "codex.rate_limits") {
-		t.Fatalf("Responses websocket retry was not transparent: %s", body)
+	if body := downstream.String(); !strings.Contains(body, "cyber_policy") || strings.Contains(body, "recovered-websocket") || strings.Contains(body, "response.completed") {
+		t.Fatalf("Responses websocket did not return the final CYB failure: %s", body)
 	}
 }
 

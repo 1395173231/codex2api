@@ -155,6 +155,10 @@ func (r *retryAccountExclusions) MarkTransportFailure(accountID int64, retryLimi
 // been promoted to unlimited by the policy even though the legacy transport
 // classifier only sees a generic dial error.
 func (r *retryAccountExclusions) MarkRequestFailure(accountID int64, err error, retryLimit int, policies ...database.ContinuousRetryPolicy) {
+	if isExplicitUpstreamCyberPolicyError(err) {
+		r.MarkHard(accountID)
+		return
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	if _, _, statusBearing := continuousRetryHTTPErrorDetails(err); statusBearing {
 		if continuousRetryRequestErrorSelected(policy, err) {
@@ -179,6 +183,10 @@ func (r *retryAccountExclusions) MarkRequestFailure(accountID int64, err error, 
 // the lifetime of the request, while allowing genuinely recoverable failures
 // to participate in another pool cycle when continuous retry is enabled.
 func (r *retryAccountExclusions) MarkHTTPFailure(accountID int64, statusCode int, body []byte, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) {
+	if isExplicitUpstreamCyberPolicy(body) {
+		r.MarkHard(accountID)
+		return
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	if continuousRetryHTTPSelected(policy, statusCode, body) {
 		r.MarkTransient(accountID)
@@ -200,11 +208,15 @@ func (r *retryAccountExclusions) MarkStreamFailure(accountID int64, outcome stre
 }
 
 func (r *retryAccountExclusions) MarkStreamFailureForEvent(accountID int64, outcome streamOutcome, eventType string, generalLimit, rateLimit int, policies ...database.ContinuousRetryPolicy) {
+	failureKind := strings.ToLower(strings.TrimSpace(outcome.failureKind))
+	if failureKind == "cyber_policy" || isExplicitUpstreamCyberPolicy(outcome.failurePayload) {
+		r.MarkHard(accountID)
+		return
+	}
 	if continuousRetryStreamSelected(outcome, outcome.failurePayload, eventType, policies...) {
 		r.MarkTransient(accountID)
 		return
 	}
-	failureKind := strings.ToLower(strings.TrimSpace(outcome.failureKind))
 	retryLimit := generalLimit
 	if outcome.logStatusCode == http.StatusTooManyRequests || strings.Contains(failureKind, "rate_limit") {
 		retryLimit = rateLimit

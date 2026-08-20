@@ -322,6 +322,9 @@ type grokMediaSendResult struct {
 // retries every such upstream failure; selective mode can match transport,
 // exact error-code, or context categories from the original body/error.
 func grokMediaInvalidSuccessSelected(policy database.ContinuousRetryPolicy, body []byte, readErr error) bool {
+	if isExplicitUpstreamCyberPolicy(body) || isExplicitUpstreamCyberPolicyError(readErr) {
+		return false
+	}
 	if readErr != nil {
 		return continuousRetryLimitForRequestError(readErr, 0, policy) == -1
 	}

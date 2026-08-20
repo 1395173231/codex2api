@@ -212,6 +212,57 @@ func TestRetryAccountExclusionsCatchAllKeepsUnknownFailuresInRotation(t *testing
 	}
 }
 
+func TestRetryAccountExclusionsCatchAllMarksExplicitCyberPolicyHard(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	body := []byte(`{"error":{"code":"cyber_policy"}}`)
+	streamPayload := []byte(`{"type":"response.failed","response":{"status_code":500,"error":{"code":"cyber_policy"}}}`)
+
+	tests := []struct {
+		name string
+		mark func(*retryAccountExclusions)
+	}{
+		{
+			name: "status-bearing request error",
+			mark: func(exclusions *retryAccountExclusions) {
+				exclusions.MarkRequestFailure(1, continuousRetryTestHTTPError{status: http.StatusForbidden, body: body}, -1, policy)
+			},
+		},
+		{
+			name: "statusless request error",
+			mark: func(exclusions *retryAccountExclusions) {
+				exclusions.MarkRequestFailure(1, &Error{Code: "cyber_policy", Message: "blocked", Type: ErrorTypeUpstreamError}, -1, policy)
+			},
+		},
+		{
+			name: "HTTP failure",
+			mark: func(exclusions *retryAccountExclusions) {
+				exclusions.MarkHTTPFailure(1, http.StatusInternalServerError, body, -1, -1, policy)
+			},
+		},
+		{
+			name: "stream failure",
+			mark: func(exclusions *retryAccountExclusions) {
+				outcome := classifyResponseFailedOutcome(streamPayload)
+				outcome.penalize = true
+				exclusions.MarkStreamFailureForEvent(1, outcome, "response.failed", -1, -1, policy)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exclusions := newRetryAccountExclusions()
+			tt.mark(exclusions)
+			if exclusions.CanContinueTransientCycle() || exclusions.ResetTransient() {
+				t.Fatal("explicit CYB remained eligible for another account-pool cycle")
+			}
+			if !exclusions.ForSelection()[1] {
+				t.Fatal("explicit CYB account was not hard-excluded")
+			}
+		})
+	}
+}
+
 func TestRetryAccountExclusionsHTTPFailureClassification(t *testing.T) {
 	tests := []struct {
 		name       string

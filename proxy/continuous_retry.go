@@ -56,6 +56,12 @@ func continuousRetryHTTPSelected(policy database.ContinuousRetryPolicy, status i
 	if !policy.Enabled {
 		return false
 	}
+	// 明确的上游 CYB 是请求级安全终态；即使开启 catch-all 也不能换号重放。
+	// An explicit upstream CYB is a request-level safety terminal and must not
+	// rotate accounts even when catch-all is enabled.
+	if isExplicitUpstreamCyberPolicy(body) {
+		return false
+	}
 	if isExplicitUpstreamSafetyPolicy(body) && !policy.CatchesAllUpstreamFailures() {
 		return false
 	}
@@ -89,6 +95,9 @@ func continuousRetryLimitsForHTTP(status int, body []byte, generalLimit, rateLim
 func continuousRetryLimitForRequestError(err error, generalLimit int, policies ...database.ContinuousRetryPolicy) int {
 	policy := continuousRetryPolicyForCall(policies)
 	if err == nil || errors.Is(err, context.Canceled) {
+		return generalLimit
+	}
+	if isExplicitUpstreamCyberPolicyError(err) {
 		return generalLimit
 	}
 	if status, body, ok := continuousRetryHTTPErrorDetails(err); ok {
@@ -127,8 +136,19 @@ func continuousRetryHTTPErrorDetails(err error) (int, []byte, bool) {
 	return status, upstreamErr.UpstreamErrorBody(), true
 }
 
+// isExplicitUpstreamCyberPolicyError also inspects statusless structured
+// upstream errors. Their status cannot participate in HTTP selection, but the
+// machine-readable CYB body must still retain hard-stop precedence.
+func isExplicitUpstreamCyberPolicyError(err error) bool {
+	var upstreamErr continuousRetryHTTPError
+	return errors.As(err, &upstreamErr) && isExplicitUpstreamCyberPolicy(upstreamErr.UpstreamErrorBody())
+}
+
 func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, err error) bool {
 	if !policy.Enabled || err == nil {
+		return false
+	}
+	if isExplicitUpstreamCyberPolicyError(err) {
 		return false
 	}
 	status, body, ok := continuousRetryHTTPErrorDetails(err)
@@ -150,6 +170,9 @@ func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventT
 	}
 	eventType = normalizedUpstreamSSEEventType(eventType, payload)
 	if !isActualUpstreamStreamFailure(outcome, eventType) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(outcome.failureKind), "cyber_policy") || isExplicitUpstreamCyberPolicy(payload) || isExplicitUpstreamCyberPolicy(outcome.failurePayload) {
 		return false
 	}
 	if isExplicitUpstreamSafetyPolicy(payload) && !policy.CatchesAllUpstreamFailures() {
@@ -245,6 +268,9 @@ func terminalUpstreamErrorPayload(payload []byte) []byte {
 // into account-scoped 4xx/context/error-frame failures whose legacy outcome is
 // not penalized.
 func continuousRetryStreamFailureSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
+	if isExplicitUpstreamCyberPolicy(payload) || isExplicitUpstreamCyberPolicy(outcome.failurePayload) || strings.EqualFold(strings.TrimSpace(outcome.failureKind), "cyber_policy") {
+		return false
+	}
 	return outcome.penalize || continuousRetryStreamSelected(outcome, payload, eventType, policies...)
 }
 
@@ -266,10 +292,10 @@ func isContextRetryError(payload []byte) bool {
 
 // isExplicitUpstreamSafetyPolicy identifies deterministic provider safety
 // refusals so selective policies do not accidentally turn a broad 4xx/5xx
-// category into an endless loop. The explicit catch-all override still selects
-// them, as promised by the high-risk super switch. Match structured machine
-// codes only so a harmless mention of "content policy" in an error message
-// cannot disable a genuinely recoverable selective retry.
+// category into an endless loop. Catch-all may still select non-CYB refusals,
+// while explicit cyber_policy always remains a hard stop. Match structured
+// machine codes only so a harmless mention of "content policy" in an error
+// message cannot disable a genuinely recoverable selective retry.
 func isExplicitUpstreamSafetyPolicy(payload []byte) bool {
 	if isExplicitUpstreamCyberPolicy(payload) {
 		return true

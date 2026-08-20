@@ -207,6 +207,71 @@ func TestContinuousRetryCatchAllSelectsStructuredUpstreamSafetyRefusals(t *testi
 	}
 }
 
+func TestContinuousRetryCatchAllNeverRetriesExplicitCyberPolicy(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	httpPayload := []byte(`{"error":{"code":"cyber_policy","message":"blocked"}}`)
+	if continuousRetryHTTPSelected(policy, http.StatusInternalServerError, httpPayload) {
+		t.Fatal("catch-all selected an explicit CYB HTTP failure")
+	}
+	general, rate := 0, 0
+	if shouldRetryHTTPStatus(http.StatusInternalServerError, httpPayload, &general, &rate, -1, -1, policy) {
+		t.Fatal("explicit CYB used an already-unlimited HTTP retry budget")
+	}
+
+	streamPayload := []byte(`{"type":"response.failed","response":{"status_code":500,"error":{"code":"cyber_policy"}}}`)
+	outcome := classifyResponseFailedOutcome(streamPayload)
+	outcome.penalize = true // A legacy retryable classification must not bypass the CYB stop.
+	if continuousRetryStreamSelected(outcome, streamPayload, "response.failed", policy) {
+		t.Fatal("catch-all selected an explicit CYB stream failure")
+	}
+	if continuousRetryStreamFailureSelected(outcome, streamPayload, "response.failed", policy) {
+		t.Fatal("legacy penalize classification bypassed the explicit CYB stream stop")
+	}
+	if shouldTransparentRetryStreamEventWithBudgets(outcome, "response.failed", &general, &rate, -1, -1, false, nil, nil, policy) {
+		t.Fatal("explicit CYB used an already-unlimited stream retry budget")
+	}
+	kindOnlyOutcome := streamOutcome{logStatusCode: http.StatusInternalServerError, failureKind: "cyber_policy", penalize: true}
+	if continuousRetryStreamSelected(kindOnlyOutcome, nil, "error", policy) || continuousRetryStreamFailureSelected(kindOnlyOutcome, nil, "error", policy) {
+		t.Fatal("catch-all selected a classified CYB stream outcome without a retained payload")
+	}
+
+	handshakeErr := continuousRetryTestHTTPError{status: http.StatusForbidden, body: httpPayload}
+	if continuousRetryRequestErrorSelected(policy, handshakeErr) || isRetryableRequestErrorForContext(context.Background(), handshakeErr, policy) {
+		t.Fatal("catch-all selected an explicit CYB handshake failure")
+	}
+	if limit := continuousRetryLimitForRequestError(handshakeErr, 2, policy); limit != 2 {
+		t.Fatalf("explicit CYB handshake retry limit = %d, want 2", limit)
+	}
+	if shouldRetryRequestError(handshakeErr, &general, -1, policy) {
+		t.Fatal("explicit CYB handshake used an already-unlimited retry budget")
+	}
+
+	statuslessErr := &Error{Code: "cyber_policy", Message: "blocked", Type: ErrorTypeUpstreamError, Retryable: true}
+	if continuousRetryRequestErrorSelected(policy, statuslessErr) || isRetryableRequestErrorForContext(context.Background(), statuslessErr, policy) {
+		t.Fatal("catch-all selected a statusless explicit CYB error")
+	}
+	if shouldRetryRequestError(statuslessErr, &general, -1, policy) {
+		t.Fatal("statusless explicit CYB used an already-unlimited retry budget")
+	}
+
+	imageFailure := newImageResponseFailedError(streamPayload)
+	if shouldRetryImageStreamError(imageFailure, &general, -1, 0, maxImageAttempts, policy) {
+		t.Fatal("catch-all selected an explicit CYB image stream failure")
+	}
+	if shouldRetryImageStreamError(statuslessErr, &general, -1, 0, maxImageAttempts, policy) {
+		t.Fatal("catch-all selected a statusless explicit CYB image failure")
+	}
+	if grokMediaInvalidSuccessSelected(policy, httpPayload, nil) {
+		t.Fatal("catch-all selected an explicit CYB Grok media error envelope")
+	}
+	if !grokMediaInvalidSuccessSelected(policy, []byte(`{"error":{"code":"future_media_failure"}}`), nil) {
+		t.Fatal("catch-all stopped selecting a non-CYB Grok media failure")
+	}
+	if general != 0 || rate != 0 {
+		t.Fatalf("explicit CYB consumed retry counters: general=%d rate=%d", general, rate)
+	}
+}
+
 func TestContinuousRetryNeverRetriesStructuredHandshakeSafetyRefusal(t *testing.T) {
 	policy := database.ContinuousRetryPolicy{
 		Enabled:     true,
@@ -552,8 +617,8 @@ func TestContinuousRetryCatchAllSelectsOnlyStructuredStatuslessUpstreamErrors(t 
 		Message: "blocked",
 		Type:    ErrorTypeUpstreamError,
 	}
-	if !isRetryableRequestErrorForContext(context.Background(), safetyErr, policy) {
-		t.Fatal("catch-all did not select a statusless structured upstream safety refusal")
+	if isRetryableRequestErrorForContext(context.Background(), safetyErr, policy) {
+		t.Fatal("catch-all selected a statusless explicit CYB refusal")
 	}
 	canceled := ErrUpstream(0, "upstream request canceled", context.Canceled)
 	if isRetryableRequestErrorForContext(context.Background(), canceled, policy) {

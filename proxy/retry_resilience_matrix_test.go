@@ -611,7 +611,7 @@ func TestContinuousRetryNonStreamingErrorEventCannotBeOverriddenByCompleted(t *t
 	}
 }
 
-func TestContinuousRetryCatchAllClearsPolicyHeadersBeforeHeartbeat(t *testing.T) {
+func TestContinuousRetryCatchAllStopsAtCYBAndRetainsPolicyDecision(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousRuntime := CurrentRuntimeSettings()
 	previousKeepaliveInterval := continuousRetryKeepaliveInterval
@@ -624,14 +624,14 @@ func TestContinuousRetryCatchAllClearsPolicyHeadersBeforeHeartbeat(t *testing.T)
 		current.CodexForceWebsocket = false
 		return current
 	})
-	continuousRetryKeepaliveInterval = time.Millisecond
+	continuousRetryKeepaliveInterval = time.Hour
 
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempt := calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		if attempt == 1 {
-			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"cyber_policy","message":"must stay upstream"}}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"cyber_policy","message":"must stop this turn"}}}`+"\n\n")
 			return
 		}
 		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"recovered-after-policy"}`+"\n\n")
@@ -639,11 +639,7 @@ func TestContinuousRetryCatchAllClearsPolicyHeadersBeforeHeartbeat(t *testing.T)
 	}))
 	t.Cleanup(upstream.Close)
 
-	cfg := promptGuardTestConfig()
-	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{{
-		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
-		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
-	}})
+	handler, _ := newPromptConversationLockTestHandler(t)
 	t.Cleanup(handler.store.Stop)
 	for id := int64(1); id <= 2; id++ {
 		handler.store.AddAccount(&auth.Account{
@@ -658,19 +654,15 @@ func TestContinuousRetryCatchAllClearsPolicyHeadersBeforeHeartbeat(t *testing.T)
 
 	handler.Responses(c)
 
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("upstream calls = %d, want policy failure then success; body=%s", got, recorder.Body.String())
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want one explicit CYB attempt; body=%s", got, recorder.Body.String())
 	}
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered-after-policy") || strings.Contains(recorder.Body.String(), "must stay upstream") {
-		t.Fatalf("policy retry was not transparent: status=%d body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest || strings.Contains(recorder.Body.String(), "recovered-after-policy") {
+		t.Fatalf("explicit CYB did not terminate the request: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	for name := range recorder.Result().Header {
-		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Codex2api-Policy-") {
-			t.Fatalf("heartbeat committed stale policy header %q", name)
-		}
-	}
-	if _, ok := newAPIUpstreamCyberPolicyDecision(c); ok {
-		t.Fatal("successful request retained the failed attempt's policy decision")
+	metadata, ok := newAPIUpstreamCyberPolicyDecision(c)
+	if !ok || !metadata.ConversationLocked {
+		t.Fatalf("explicit CYB decision = %+v delegated=%t", metadata, ok)
 	}
 }
 

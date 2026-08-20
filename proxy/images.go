@@ -1826,8 +1826,14 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 	if isImageStreamTerminalLocalError(err) {
 		return false
 	}
+	if isExplicitUpstreamCyberPolicyError(err) {
+		return false
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	if payload := imageResponseFailedPayload(err); len(payload) > 0 {
+		if isExplicitUpstreamCyberPolicy(payload) {
+			return false
+		}
 		if isExplicitUpstreamSafetyPolicy(payload) && !policy.CatchesAllUpstreamFailures() {
 			return false
 		}

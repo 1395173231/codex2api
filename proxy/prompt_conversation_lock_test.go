@@ -126,7 +126,7 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	}
 }
 
-func TestContinuousRetryCatchAllAuditsCYBWithoutLockingConversation(t *testing.T) {
+func TestContinuousRetryCatchAllRetainsCYBLockAndUserCooldown(t *testing.T) {
 	previousRuntime := CurrentRuntimeSettings()
 	t.Cleanup(func() { ApplyRuntimeSettings(previousRuntime) })
 	nextRuntime := previousRuntime
@@ -143,7 +143,7 @@ func TestContinuousRetryCatchAllAuditsCYBWithoutLockingConversation(t *testing.T
 
 	_, accepted := handler.logUpstreamCyberPolicy(c, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
 	metadata, delegated := newAPIUpstreamCyberPolicyDecision(c)
-	if !delegated || metadata.ConversationLocked {
+	if !delegated || !metadata.ConversationLocked {
 		t.Fatalf("catch-all CYB decision = %+v delegated=%t", metadata, delegated)
 	}
 	if !accepted {
@@ -154,8 +154,12 @@ func TestContinuousRetryCatchAllAuditsCYBWithoutLockingConversation(t *testing.T
 	if !verified || !ok {
 		t.Fatal("signed session identity was not available")
 	}
-	if _, err := db.GetActivePromptConversationLock(t.Context(), lockIdentity.LockKey); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("catch-all CYB persisted a conversation lock: %v", err)
+	if lock, err := db.GetActivePromptConversationLock(t.Context(), lockIdentity.LockKey); err != nil || lock.NewAPIUserID != "42" {
+		t.Fatalf("catch-all CYB conversation lock = %#v err=%v", lock, err)
+	}
+	cooldown, exact, err := db.GetActivePromptConversationRestriction(t.Context(), "", "gateway-a", "42", 24*time.Hour, 30*time.Minute)
+	if err != nil || exact || cooldown.NewAPIUserID != "42" {
+		t.Fatalf("catch-all CYB user cooldown = %#v exact=%t err=%v", cooldown, exact, err)
 	}
 }
 

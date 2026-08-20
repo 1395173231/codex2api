@@ -2286,7 +2286,7 @@ func shouldTransparentRetryStreamEventWithBudgets(outcome streamOutcome, eventTy
 	if wroteAnyBody || ctxErr != nil || writeErr != nil || outcome.logStatusCode == logStatusClientClosed {
 		return false
 	}
-	if !outcome.penalize && !continuousRetryStreamSelected(outcome, outcome.failurePayload, eventType, policies...) {
+	if !continuousRetryStreamFailureSelected(outcome, outcome.failurePayload, eventType, policies...) {
 		return false
 	}
 	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForStream(outcome, outcome.failurePayload, eventType, maxGeneralRetries, maxRateLimitRetries, policies...)
@@ -2312,7 +2312,7 @@ func shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType 
 	}
 	outcome := classifyResponseFailedOutcome(terminalFailurePayload)
 	maxGeneralRetries, maxRateLimitRetries = continuousRetryLimitsForStream(outcome, terminalFailurePayload, eventType, maxGeneralRetries, maxRateLimitRetries, policies...)
-	if !outcome.penalize && !continuousRetryStreamSelected(outcome, terminalFailurePayload, eventType, policies...) {
+	if !continuousRetryStreamFailureSelected(outcome, terminalFailurePayload, eventType, policies...) {
 		return false
 	}
 	if streamOutcomeUsesRateLimitBudget(outcome) {
@@ -2823,6 +2823,9 @@ func isRetryableStatus(code int) bool {
 
 func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) bool {
 	policy := continuousRetryPolicyForCall(policies)
+	if isExplicitUpstreamCyberPolicy(body) {
+		return false
+	}
 	if isExplicitUpstreamSafetyPolicy(body) && !policy.CatchesAllUpstreamFailures() {
 		return false
 	}
@@ -2850,6 +2853,9 @@ func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rat
 
 func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int, policies ...database.ContinuousRetryPolicy) bool {
 	policy := continuousRetryPolicyForCall(policies)
+	if isExplicitUpstreamCyberPolicyError(err) {
+		return false
+	}
 	if _, body, ok := continuousRetryHTTPErrorDetails(err); ok && isExplicitUpstreamSafetyPolicy(body) && !policy.CatchesAllUpstreamFailures() {
 		return false
 	}
@@ -2891,6 +2897,9 @@ func isRetryableRequestErrorForContext(ctx context.Context, err error, policies 
 		return false
 	}
 	policy := continuousRetryPolicyForCall(policies)
+	if isExplicitUpstreamCyberPolicyError(err) {
+		return false
+	}
 	if _, body, ok := continuousRetryHTTPErrorDetails(err); ok && isExplicitUpstreamSafetyPolicy(body) && !policy.CatchesAllUpstreamFailures() {
 		return false
 	}
