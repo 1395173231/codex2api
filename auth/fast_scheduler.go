@@ -243,7 +243,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			continue
 		}
 		tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
-		if !available || limit <= 0 {
+		if !acc.fastSchedulerKeepInPool(s.baseLimit, now, tier, limit, available) {
 			continue
 		}
 		if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
@@ -301,8 +301,7 @@ func (s *FastScheduler) updateLocked(acc *Account, now time.Time) {
 	}
 
 	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
-	schedulable := available && limit > 0 &&
-		(tier == HealthTierHealthy || tier == HealthTierWarm || tier == HealthTierRisky)
+	schedulable := acc.fastSchedulerKeepInPool(s.baseLimit, now, tier, limit, available)
 
 	pos, exists := s.positions[acc.DBID]
 	if !schedulable {
@@ -397,6 +396,11 @@ func (s *FastScheduler) AcquireExcluding(apiKeyID int64, exclude map[int64]bool)
 
 // AcquireExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
 func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	return s.AcquireExcludingWithDispatch(apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+// AcquireExcludingWithDispatch 按用量策略选号。spark 请求不看账号级 5h/7d。
+func (s *FastScheduler) AcquireExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
 	if s == nil {
 		return nil
 	}
@@ -453,7 +457,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 				if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
 					cursor = &zeroCursor
 				}
-				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter)
+				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter, policy)
 				if acc != nil {
 					return acc
 				}
@@ -472,7 +476,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 
 // scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
 // 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
-func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
+func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
 	rangeLen := rangeEnd - rangeStart
 	if rangeLen <= 0 {
@@ -496,11 +500,11 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if filter != nil && !filter(entry.acc) {
 			continue
 		}
-		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshotForPolicy(baseLimit, now, policy)
 		if tier != expectedTier {
 			// 健康层级变了，条目要换桶，桶边界随之变化，必须重新开始扫描。
 			s.removeLocked(entry.dbID)
-			if available && limit > 0 {
+			if entry.acc.fastSchedulerKeepInPool(baseLimit, now, tier, limit, available) {
 				s.insertLocked(entry.acc, now)
 			}
 			return nil, true
@@ -569,7 +573,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 	}
 
 	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
-	if !available || limit <= 0 {
+	if !acc.fastSchedulerKeepInPool(s.baseLimit, now, tier, limit, available) {
 		return
 	}
 	if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
@@ -622,6 +626,48 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 			index: idx,
 		}
 	}
+}
+
+func (a *Account) fastSchedulerKeepInPool(baseLimit int64, now time.Time, tier AccountHealthTier, limit int64, available bool) bool {
+	if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
+		return false
+	}
+	if available && limit > 0 {
+		return true
+	}
+	_, _, sparkLimit, _, sparkOK := a.fastSchedulerSnapshotForSpark(baseLimit, now)
+	return sparkOK && sparkLimit > 0
+}
+
+func (a *Account) fastSchedulerSnapshotForPolicy(baseLimit int64, now time.Time, policy DispatchPolicy) (AccountHealthTier, float64, int64, bool, bool) {
+	if policy == DispatchPolicySpark {
+		return a.fastSchedulerSnapshotForSpark(baseLimit, now)
+	}
+	return a.fastSchedulerSnapshot(baseLimit, now)
+}
+
+func (a *Account) fastSchedulerSnapshotForSpark(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	tier := a.healthTierLocked()
+	score := a.DispatchScore
+	proven := atomic.LoadInt64(&a.TotalRequests) > 10
+	if score == 0 && a.SchedulerScore != 0 {
+		score = a.SchedulerScore
+	}
+	if score == 0 && tier != HealthTierBanned && a.hasDispatchCredentialLocked() && a.Status != StatusError {
+		rawScore := 100.0
+		appliedBias := a.effectiveScoreBiasLocked(now, tier)
+		score = rawScore + float64(appliedBias)
+	}
+	baseConcurrencyEffective := a.BaseConcurrencyEffective
+	if baseConcurrencyEffective <= 0 {
+		baseConcurrencyEffective = a.effectiveBaseConcurrencyLocked(baseLimit)
+	}
+	limit := concurrencyLimitForTier(baseConcurrencyEffective, tier)
+	available := a.sparkDispatchEligibleLocked(now)
+	return tier, score, limit, proven, available
 }
 
 func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {

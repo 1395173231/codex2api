@@ -2020,12 +2020,15 @@
       "newapiIdentity": "Trusted NewAPI identity",
       "peopleProfiles": "People profiles",
       "allObjects": "All profile subjects",
+      "lockedProfiles": "Locked only",
+      "lockedProfilesHint": "Shows only live conversation locks and user cooldowns, newest lock first.",
       "peopleProfilesHint": "Shows identities traceable to a signed NewAPI user ID by default.",
       "nonPersonHint": "Sessions, keys, networks, and upstream accounts are environment subjects used for tracing; they are not people.",
       "conversationLock": {
         "title": "CYB conversation lock",
         "active": "Conversation locked",
         "description": "This session received an explicit upstream cyber_policy response. Rejected requests after the lock do not add strikes; an administrator may unlock it after confirming a false positive.",
+        "localDescription": "This session was locked by a high-confidence local terminal rule, not by upstream CYB. Review the original request and model-review result through the audit reference before unlocking.",
         "unlock": "Unlock conversation",
         "confirm": "Unlock this conversation? Its original context remains present, so do this only after confirming a false positive.",
         "unlocked": "Conversation unlocked",
@@ -2040,7 +2043,10 @@
         "lockedAt": "Locked at",
         "expiresAt": "Automatic release",
         "remaining": "Time remaining",
-        "reason": "Lock reason"
+        "reason": "Lock reason",
+        "auditReference": "Audit reference",
+        "decisionId": "Decision ID",
+        "openAudit": "Open original audit"
       },
       "trust": {
         "title": "Temporary adaptive trust",

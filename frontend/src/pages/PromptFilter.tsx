@@ -1,6 +1,6 @@
 import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { NavLink, useParams } from 'react-router-dom'
+import { NavLink, useParams, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Copy, FileText, Gauge, GitBranch, HelpCircle, Layers, ListChecks, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Users, Wand2, X } from 'lucide-react'
 import { AdminAPIError, api } from '../api'
@@ -90,6 +90,7 @@ type RiskProfileFilters = {
   accountId: string
   minScore: string
   q: string
+  lockedOnly: boolean
 }
 
 type RulePatternTestState = {
@@ -3703,12 +3704,15 @@ type PromptLogClearSection = 'incidents' | 'review' | 'local'
 function LogsView({ onPromptLogsChanged }: { onPromptLogsChanged: () => Promise<void> }) {
   const { t } = useTranslation()
   const { showToast } = useToast()
-  const [incidentDraftFilters, setIncidentDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [incidentFilters, setIncidentFilters] = useState<LogFilters>(emptyFilters)
-  const [reviewDraftFilters, setReviewDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [reviewFilters, setReviewFilters] = useState<LogFilters>(emptyFilters)
-  const [localDraftFilters, setLocalDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [localFilters, setLocalFilters] = useState<LogFilters>(emptyFilters)
+  const [searchParams] = useSearchParams()
+  const auditReference = searchParams.get('audit')?.trim() || ''
+  const initialLogFilters = () => ({ ...emptyFilters, q: auditReference })
+  const [incidentDraftFilters, setIncidentDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [incidentFilters, setIncidentFilters] = useState<LogFilters>(initialLogFilters)
+  const [reviewDraftFilters, setReviewDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [reviewFilters, setReviewFilters] = useState<LogFilters>(initialLogFilters)
+  const [localDraftFilters, setLocalDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [localFilters, setLocalFilters] = useState<LogFilters>(initialLogFilters)
   const [logPage, setLogPage] = useState(1)
   const [logPageSize, setLogPageSize] = usePersistedPageSize('prompt_filter_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [reviewPage, setReviewPage] = useState(1)
@@ -4076,6 +4080,7 @@ const emptyRiskProfileFilters: RiskProfileFilters = {
   accountId: '',
   minScore: '',
   q: '',
+  lockedOnly: false,
 }
 
 function RiskProfilesView() {
@@ -4105,6 +4110,7 @@ function RiskProfilesView() {
         accountId: filters.accountId,
         minScore: filters.minScore,
         q: filters.q,
+        lockedOnly: filters.lockedOnly,
       })
       setProfiles(result.profiles ?? [])
       setTotal(result.total ?? 0)
@@ -4152,13 +4158,16 @@ function RiskProfilesView() {
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/20 p-3">
-          <Button size="sm" variant={draftFilters.subjectType === 'newapi_user' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setPage(1) }}>
+          <Button size="sm" variant={!draftFilters.lockedOnly && draftFilters.subjectType === 'newapi_user' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: 'newapi_user', lockedOnly: false })); setFilters((current) => ({ ...current, subjectType: 'newapi_user', lockedOnly: false })); setPage(1) }}>
             <Users className="size-4" />{t('promptFilter.risk.peopleProfiles')}
           </Button>
-          <Button size="sm" variant={draftFilters.subjectType === '' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '' })); setFilters((current) => ({ ...current, subjectType: '' })); setPage(1) }}>
+          <Button size="sm" variant={!draftFilters.lockedOnly && draftFilters.subjectType === '' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '', lockedOnly: false })); setFilters((current) => ({ ...current, subjectType: '', lockedOnly: false })); setPage(1) }}>
             <Network className="size-4" />{t('promptFilter.risk.allObjects')}
           </Button>
-          <span className="text-xs leading-5 text-muted-foreground">{draftFilters.subjectType === 'newapi_user' ? t('promptFilter.risk.peopleProfilesHint') : t('promptFilter.risk.nonPersonHint')}</span>
+          <Button size="sm" variant={draftFilters.lockedOnly ? 'destructive' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '', lockedOnly: true })); setFilters((current) => ({ ...current, subjectType: '', lockedOnly: true })); setPage(1) }}>
+            <ShieldAlert className="size-4" />{t('promptFilter.risk.lockedProfiles')}
+          </Button>
+          <span className="text-xs leading-5 text-muted-foreground">{draftFilters.lockedOnly ? t('promptFilter.risk.lockedProfilesHint') : draftFilters.subjectType === 'newapi_user' ? t('promptFilter.risk.peopleProfilesHint') : t('promptFilter.risk.nonPersonHint')}</span>
         </div>
 
         <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(155px,1fr))] gap-3">
@@ -4324,6 +4333,8 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
   }
   const activeRestriction = item.conversation_lock
   const isUserCooldown = activeRestriction?.restriction_scope === 'user_cooldown' || item.subject_type === 'newapi_user'
+  const isLocalRestriction = !isUserCooldown && activeRestriction?.reason_code !== 'upstream_cyber_policy'
+  const auditReference = activeRestriction?.incident_id || activeRestriction?.request_id || activeRestriction?.decision_id?.replace(/^local-block:/, '') || ''
   return <>
     <Button size="sm" variant="outline" onClick={() => { setEventPage(1); setTrustEventPage(1); setOpen(true) }}>{t('promptFilter.cyberDetail')}</Button>
     <Dialog open={open} onOpenChange={setOpen}>
@@ -4333,10 +4344,11 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
           <div className="rounded-lg border border-[hsl(var(--warning))]/30 bg-[hsl(var(--warning-bg))] p-3 text-sm text-[hsl(var(--warning))]">{detail?.guardrail || t('promptFilter.risk.guardrail')}</div>
           {item.conversation_lock?.status === 'active' ? <div className="rounded-lg border border-destructive/35 bg-destructive/5 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
-              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownTitle' : 'promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownDescription' : 'promptFilter.risk.conversationLock.description')}</p></div>
+              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownTitle' : 'promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownDescription' : isLocalRestriction ? 'promptFilter.risk.conversationLock.localDescription' : 'promptFilter.risk.conversationLock.description')}</p></div>
               <Button size="sm" variant="destructive" disabled={unlockingConversation} onClick={() => void unlockConversation()}>{t(isUserCooldown ? 'promptFilter.risk.conversationLock.unlockUserCooldown' : 'promptFilter.risk.conversationLock.unlock')}</Button>
             </div>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.expiresAt')} value={item.conversation_lock.expires_at ? formatBeijingTime(item.conversation_lock.expires_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.remaining')} value={formatPromptRestrictionRemaining(item.conversation_lock.remaining_seconds)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={isUserCooldown ? 'user_cyber_cooldown' : 'conversation_cyber_locked'} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /></div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.expiresAt')} value={item.conversation_lock.expires_at ? formatBeijingTime(item.conversation_lock.expires_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.remaining')} value={formatPromptRestrictionRemaining(item.conversation_lock.remaining_seconds)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={isUserCooldown ? 'user_cyber_cooldown' : item.conversation_lock.reason_code || 'conversation_cyber_locked'} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.auditReference')} value={auditReference || '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.decisionId')} value={item.conversation_lock.decision_id || '-'} /></div>
+            {auditReference ? <div className="mt-3 flex flex-wrap items-center gap-2"><Button size="sm" variant="outline" asChild><NavLink to={`/prompt-filter/logs?audit=${encodeURIComponent(auditReference)}`}><Search className="size-3.5" />{t('promptFilter.risk.conversationLock.openAudit')}</NavLink></Button><span className="font-mono text-xs text-muted-foreground">{auditReference}</span></div> : null}
           </div> : null}
           <div className="rounded-lg border bg-muted/20 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">

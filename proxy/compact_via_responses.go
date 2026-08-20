@@ -55,7 +55,7 @@ func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
 		if triggerCount == 0 && !addIfMissing {
 			return body
 		}
-		if triggerCount == 1 && len(items) > 0 && isDirectCompactionTrigger(items[len(items)-1]) {
+		if triggerCount == 1 && len(items) > 0 && isCanonicalCompactionTrigger(items[len(items)-1]) {
 			return body
 		}
 
@@ -76,6 +76,16 @@ func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
 		}
 		normalized = append(normalized, trigger)
 		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return body
+		}
+		out, err := sjson.SetRawBytes(body, "input", encoded)
+		if err != nil {
+			return body
+		}
+		return out
+	case input.IsObject() && isDirectCompactionTrigger(input):
+		encoded, err := json.Marshal([]json.RawMessage{trigger})
 		if err != nil {
 			return body
 		}
@@ -121,6 +131,10 @@ func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
 func isDirectCompactionTrigger(item gjson.Result) bool {
 	return item.IsObject() &&
 		strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction_trigger")
+}
+
+func isCanonicalCompactionTrigger(item gjson.Result) bool {
+	return item.IsObject() && item.Get("type").String() == "compaction_trigger"
 }
 
 // collectCompactResponsesSSE 把 body-signal 压缩的上游 /responses SSE 流聚合成

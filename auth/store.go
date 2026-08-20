@@ -183,6 +183,11 @@ type Account struct {
 	Reset5hAt           time.Time // 5h 窗口重置时间
 	UsageUpdatedAt      time.Time // 7d 用量快照刷新时间
 	UsageUpdatedAt5h    time.Time // 5h 用量快照刷新时间
+	// Spark 是 Pro/Prolite 账号上独立于主 5h/7d 的用量窗口。
+	UsagePercentSpark      float64
+	UsagePercentSparkValid bool
+	ResetSparkAt           time.Time
+	UsageUpdatedAtSpark    time.Time
 
 	// RateLimitResetCredits 是 OpenAI 官方账号剩余的「主动重置次数」，来自
 	// /backend-api/wham/usage 响应的 rate_limit_reset_credits.available_count。
@@ -381,6 +386,9 @@ type AccountListRuntimeSnapshot struct {
 	UsagePercent5hValid     bool
 	UsagePercent7d          float64
 	UsagePercent7dValid     bool
+	UsagePercentSpark       float64
+	UsagePercentSparkValid  bool
+	ResetSparkAt            time.Time
 	HealthTier              string
 	DispatchScore           float64
 	LatencyPenalty          float64
@@ -1994,6 +2002,9 @@ func (a *Account) GetAccountListRuntimeSnapshot() AccountListRuntimeSnapshot {
 		UsagePercent5hValid:     a.UsagePercent5hValid,
 		UsagePercent7d:          a.UsagePercent7d,
 		UsagePercent7dValid:     a.UsagePercent7dValid,
+		UsagePercentSpark:       a.UsagePercentSpark,
+		UsagePercentSparkValid:  a.UsagePercentSparkValid,
+		ResetSparkAt:            a.ResetSparkAt,
 		HealthTier:              string(a.HealthTier),
 		DispatchScore:           a.DispatchScore,
 		LatencyPenalty:          a.schedulerBreakdownLocked(now).LatencyPenalty,
@@ -2326,6 +2337,10 @@ func (a *Account) ClearUsageCache() {
 	a.Reset5hAt = time.Time{}
 	a.UsageUpdatedAt = time.Time{}
 	a.UsageUpdatedAt5h = time.Time{}
+	a.UsagePercentSpark = 0
+	a.UsagePercentSparkValid = false
+	a.ResetSparkAt = time.Time{}
+	a.UsageUpdatedAtSpark = time.Time{}
 }
 
 // SetReset7dAt 设置 7d 窗口重置时间
@@ -3007,6 +3022,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
 	mu                                 sync.RWMutex
+	accountMutationMu                  sync.Mutex // serializes account-set and scheduler mutations without nesting their locks
 	accounts                           []*Account
 	accountsByID                       map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
 	globalProxy                        string
@@ -4888,6 +4904,25 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			account.SetUsageSnapshot5hAt(parsed, resetAt, updatedAt)
 		}
 	}
+	if usagePctSpark := row.GetCredential("codex_spark_used_percent"); usagePctSpark != "" {
+		if parsed, err := strconv.ParseFloat(usagePctSpark, 64); err == nil {
+			resetAt := time.Time{}
+			if r := row.GetCredential("codex_spark_reset_at"); r != "" {
+				if t, err := time.Parse(time.RFC3339, r); err == nil {
+					resetAt = t
+				}
+			}
+			updatedAt := time.Time{}
+			if usageUpdatedAtSpark := row.GetCredential("codex_spark_usage_updated_at"); usageUpdatedAtSpark != "" {
+				if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAtSpark); err == nil {
+					updatedAt = parsedTime
+				} else {
+					log.Printf("[账号 %d] 解析 codex_spark_usage_updated_at 失败: %v", row.ID, err)
+				}
+			}
+			account.SetUsageSnapshotSparkAt(parsed, resetAt, updatedAt)
+		}
+	}
 	// 恢复积分余额快照：积分只有 wham 探针能刷，不恢复的话重启后账号会被判成
 	// 「没积分」——积分顶替限流失效，还会被「清理限流账号」当成真限流删掉。
 	account.RestoreCreditBalanceFromJSON(row.GetCredential("codex_credits"))
@@ -5485,17 +5520,22 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
 func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+// NextExcludingWithDispatch 按用量策略选号。spark 请求忽略账号级 5h/7d。
+func (s *Store) NextExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
 	filter = s.withUsableEgressFilter(filter)
 	if s.GetLazyMode() {
-		return s.nextExcludingWithFilterLazy(apiKeyID, exclude, filter)
+		return s.nextExcludingWithFilterLazy(apiKeyID, exclude, filter, policy)
 	}
 	if scheduler := s.getFastScheduler(); scheduler != nil {
 		for attempts := 0; attempts < 16; attempts++ {
-			acc := scheduler.AcquireExcludingWithFilter(apiKeyID, exclude, filter)
+			acc := scheduler.AcquireExcludingWithDispatch(apiKeyID, exclude, filter, policy)
 			if acc == nil {
 				break
 			}
-			if s.accountHasCachedCooldown(acc) {
+			if s.accountHasBlockingCachedCooldown(acc, policy) {
 				scheduler.Release(acc)
 				continue
 			}
@@ -5504,8 +5544,6 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 	}
 
 	for attempts := 0; attempts < 16; attempts++ {
-		s.mu.RLock()
-
 		var best *Account
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
@@ -5514,11 +5552,11 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		var bestLimit int64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-		for _, acc := range s.accounts {
+		for _, acc := range s.Accounts() {
 			if exclude != nil && exclude[acc.DBID] {
 				continue
 			}
-			if !acc.IsAvailable() {
+			if !acc.dispatchableForPolicy(policy) {
 				continue
 			}
 			if !s.accountAllowedForAPIKey(acc, apiKeyID) {
@@ -5529,7 +5567,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			}
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
-			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
+			tier, _, dispatchScore, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, policy)
 			if limit <= 0 || load >= limit {
 				continue
 			}
@@ -5550,12 +5588,10 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				best = acc
 			}
 		}
-		s.mu.RUnlock()
-
 		if best == nil {
 			return nil
 		}
-		if s.accountHasCachedCooldown(best) {
+		if s.accountHasBlockingCachedCooldown(best, policy) {
 			continue
 		}
 		if s.tryAcquireAccount(best, bestLimit, true) {
@@ -5670,10 +5706,8 @@ func (s *Store) acquireLazyCandidate(acc *Account, maxConcurrency int64) bool {
 	return s.tryAcquireAccount(acc, limit, true)
 }
 
-func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
 	for attempts := 0; attempts < 16; attempts++ {
-		s.mu.RLock()
-
 		var best *Account
 		var metadataRefreshCandidate *Account
 		bestSchedulerPriority := minSchedulerPriority - 1
@@ -5682,11 +5716,14 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		var bestLoad int64 = math.MaxInt64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-		for _, acc := range s.accounts {
+		for _, acc := range s.Accounts() {
 			if exclude != nil && exclude[acc.DBID] {
 				continue
 			}
-			if !s.accountLazySelectable(acc) {
+			if !acc.dispatchableForPolicy(policy) {
+				continue
+			}
+			if policy == DispatchPolicyStandard && !s.accountLazySelectable(acc) {
 				continue
 			}
 			if !s.accountAllowedForAPIKey(acc, apiKeyID) {
@@ -5704,7 +5741,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			}
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
-			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
+			tier, _, dispatchScore, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, policy)
 			if limit <= 0 || load >= limit {
 				continue
 			}
@@ -5724,15 +5761,13 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				best = acc
 			}
 		}
-		s.mu.RUnlock()
-
 		if best == nil {
 			if metadataRefreshCandidate != nil && s.ensureLazyDispatchReady(metadataRefreshCandidate) {
 				continue
 			}
 			return nil
 		}
-		if s.accountHasCachedCooldown(best) {
+		if s.accountHasBlockingCachedCooldown(best, policy) {
 			continue
 		}
 		if s.acquireLazyCandidate(best, maxConcurrency) {
@@ -5870,7 +5905,12 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
 // 会重新建立绑定。
 func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false)
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+}
+
+// NextForSessionWithDispatch 优先复用绑定账号，并按用量策略选号。
+func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
 }
 
 // NextForContinuationWithFilter preserves an existing account binding for a
@@ -5878,7 +5918,12 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 // to the account that created them, so bounded-affinity escape must not rotate
 // accounts.
 func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true)
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+}
+
+// NextForContinuationWithDispatch preserves a bound turn and applies a usage policy.
+func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, policy)
 }
 
 // nextForSessionWithFilter 是会话选号的统一实现。preserveBinding=true(续链请求)时
@@ -5891,13 +5936,13 @@ func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclud
 //
 // 绑定本身不存在时仍走完整挑号，与普通请求一致；TTL 过期只影响普通请求，
 // preserveBinding=true 的续链请求仍保留原账号。
-func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool) (*Account, string) {
+func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string) {
 	if s == nil {
 		return nil, ""
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), ""
 	}
 
 	now := time.Now()
@@ -5913,13 +5958,13 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if mode == AffinityModeOff && !preserveBinding {
-		return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), ""
 	}
 
 	if ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, policy), ""
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
 			ok = false
@@ -5944,7 +5989,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 
 		if expired || escape {
 			s.UnbindSessionAffinity(key, binding.accountID)
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding); acc != nil {
+		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, policy); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
 			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
@@ -5960,10 +6005,10 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, policy), ""
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
-			return s.nextAccountForFreshAffinity(key, apiKeyID, exclude, filter), ""
+			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), ""
 		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
@@ -5972,7 +6017,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 		if cacheMode == AffinityModeBounded && !preserveBinding && !s.affinityAccountStillHealthy(binding.accountID) {
 			// 不复用,落到完整挑号
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding); acc != nil {
+		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, policy); acc != nil {
 			s.sessionMu.Lock()
 			if s.sessionBindings == nil {
 				s.sessionBindings = make(map[string]sessionAffinity)
@@ -5985,7 +6030,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 
-	return s.nextAccountForFreshAffinity(key, apiKeyID, exclude, filter), ""
+	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), ""
 }
 
 // nextAccountForFreshAffinity 为"新亲和键首次绑定"选号(issue #484)。
@@ -5998,11 +6043,15 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 // 下一名,账号增删只迁移受影响的键。层间仍严格尊重运营者设置的调度优先级
 // 与健康档位,层内才忽略分数差异。
 func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
 	if s == nil {
 		return nil
 	}
 	if !s.GetSessionAffinitySpread() || strings.TrimSpace(key) == "" {
-		return s.NextExcludingWithFilter(apiKeyID, exclude, filter)
+		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
 	}
 	filter = s.withUsableEgressFilter(filter)
 
@@ -6015,13 +6064,13 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 	}
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
-	s.mu.RLock()
-	candidates := make([]affinityCandidate, 0, len(s.accounts))
-	for _, acc := range s.accounts {
+	accounts := s.Accounts()
+	candidates := make([]affinityCandidate, 0, len(accounts))
+	for _, acc := range accounts {
 		if exclude != nil && exclude[acc.DBID] {
 			continue
 		}
-		if !acc.IsAvailable() {
+		if !acc.dispatchableForPolicy(policy) {
 			continue
 		}
 		if !s.accountAllowedForAPIKey(acc, apiKeyID) {
@@ -6031,7 +6080,7 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 			continue
 		}
 		load := atomic.LoadInt64(&acc.ActiveRequests)
-		tier, _, _, limit := acc.schedulerSnapshot(maxConcurrency)
+		tier, _, _, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, policy)
 		if limit <= 0 || load >= limit {
 			continue
 		}
@@ -6047,7 +6096,6 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 			weight:            hasher.Sum64(),
 		})
 	}
-	s.mu.RUnlock()
 
 	if len(candidates) == 0 {
 		return nil
@@ -6070,7 +6118,7 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 	sort.Slice(layer, func(i, j int) bool { return layer[i].weight > layer[j].weight })
 
 	for _, c := range layer {
-		if s.accountHasCachedCooldown(c.acc) {
+		if s.accountHasBlockingCachedCooldown(c.acc, policy) {
 			continue
 		}
 		if s.tryAcquireAccount(c.acc, c.limit, true) {
@@ -6078,7 +6126,7 @@ func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude 
 		}
 	}
 	// 整层都拿不下(并发/冷却)时回退到常规调度,宁可暂时聚集也不拒绝请求。
-	return s.NextExcludingWithFilter(apiKeyID, exclude, filter)
+	return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
 }
 
 // affinityProxyStillValid verifies that a sticky proxy still matches the
@@ -6190,7 +6238,7 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 }
 
 func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.takeByIDMode(id, apiKeyID, exclude, filter, false)
+	return s.takeByIDMode(id, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
 }
 
 // TakePreferredAccountWithFilter attempts to acquire one specific account
@@ -6198,14 +6246,18 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 // concurrency gates as normal scheduling. It intentionally bypasses session
 // affinity policy so callers can preserve opaque upstream-owned state.
 func (s *Store) TakePreferredAccountWithFilter(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.takeByIDExcluding(id, apiKeyID, exclude, filter)
+	return s.TakePreferredAccountWithDispatch(id, apiKeyID, exclude, filter, DispatchPolicyStandard)
 }
 
-func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.takeByIDMode(id, apiKeyID, exclude, filter, true)
+func (s *Store) TakePreferredAccountWithDispatch(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
+	return s.takeByIDMode(id, apiKeyID, exclude, filter, false, policy)
 }
 
-func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool) *Account {
+func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
+	return s.takeByIDMode(id, apiKeyID, exclude, filter, true, policy)
+}
+
+func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool, policy DispatchPolicy) *Account {
 	if s == nil || id == 0 {
 		return nil
 	}
@@ -6220,16 +6272,18 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 		return nil
 	}
 	continuationEligible := continuation && target.UsageLimitContinuationEligible()
+	sparkEligible := policy == DispatchPolicySpark && target.SparkDispatchEligible()
 	if s.GetLazyMode() {
-		if !s.accountLazySelectable(target) && !continuationEligible {
+		if !s.accountLazySelectable(target) && !continuationEligible && !sparkEligible {
 			return nil
 		}
-	} else if !target.IsAvailable() && !continuationEligible {
+	} else if !target.IsAvailable() && !continuationEligible && !sparkEligible {
 		return nil
 	}
 	if s.accountHasCachedCooldown(target) {
 		continuationEligible = continuation && target.UsageLimitContinuationEligible()
-		if !continuationEligible {
+		sparkEligible = policy == DispatchPolicySpark && target.SparkDispatchEligible()
+		if !continuationEligible && !sparkEligible {
 			return nil
 		}
 	}
@@ -6255,7 +6309,7 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 	if continuationEligible {
 		_, _, limit, _, available = target.fastSchedulerSnapshotForContinuation(maxConcurrency, now)
 	} else {
-		_, _, limit, _, available = target.fastSchedulerSnapshot(maxConcurrency, now)
+		_, _, limit, _, available = target.fastSchedulerSnapshotForPolicy(maxConcurrency, now, policy)
 	}
 	if !available || limit <= 0 {
 		return nil
@@ -6278,30 +6332,30 @@ func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout
 }
 
 func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
+	return s.hasDispatchCandidateWithDispatch(apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+func (s *Store) hasDispatchCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
 	if s == nil {
 		return false
 	}
 	filter = s.withUsableEgressFilter(filter)
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, acc := range s.accounts {
+	for _, acc := range s.Accounts() {
 		if acc == nil {
 			continue
 		}
 		if exclude != nil && exclude[acc.DBID] {
 			continue
 		}
-		if s.GetLazyMode() {
-			if !s.accountLazySelectable(acc) {
-				continue
-			}
-		} else if !acc.IsAvailable() {
+		if !acc.dispatchableForPolicy(policy) {
 			continue
 		}
-		if s.accountHasCachedCooldown(acc) {
+		if policy == DispatchPolicyStandard && s.GetLazyMode() && !s.accountLazySelectable(acc) {
+			continue
+		}
+		if s.accountHasBlockingCachedCooldown(acc, policy) {
 			continue
 		}
 		if !s.accountAllowedForAPIKey(acc, apiKeyID) {
@@ -6311,7 +6365,7 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 			continue
 		}
 
-		_, _, _, limit := acc.schedulerSnapshot(maxConcurrency)
+		_, _, _, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, policy)
 		if limit > 0 {
 			return true
 		}
@@ -6323,6 +6377,10 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 // from a genuinely empty or unhealthy pool. Matching account, API-key, model,
 // group, and egress constraints are still applied before reporting 429.
 func (s *Store) HasUsageLimitedCandidateWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
+	return s.HasUsageLimitedCandidateWithDispatch(apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+func (s *Store) HasUsageLimitedCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
 	if s == nil {
 		return false
 	}
@@ -6339,8 +6397,16 @@ func (s *Store) HasUsageLimitedCandidateWithFilter(apiKeyID int64, exclude map[i
 		}
 		cachedCooldown := s.accountHasCachedCooldown(acc)
 		usageLimited := acc.FreshDispatchUsageLimited()
+		if policy == DispatchPolicySpark {
+			usageLimited = acc.SparkDispatchUsageLimited()
+		}
 		if cachedCooldown && !usageLimited {
-			continue
+			if policy == DispatchPolicySpark && acc.SparkDispatchEligible() {
+				continue
+			}
+			if policy != DispatchPolicySpark {
+				continue
+			}
 		}
 		if usageLimited {
 			return true
@@ -6350,6 +6416,10 @@ func (s *Store) HasUsageLimitedCandidateWithFilter(apiKeyID int64, exclude map[i
 }
 
 func (s *Store) hasContinuationCandidateWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
+	return s.hasContinuationCandidateWithDispatch(key, apiKeyID, exclude, filter, DispatchPolicyStandard)
+}
+
+func (s *Store) hasContinuationCandidateWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
 	accountID, ok := s.SessionAffinityAccountID(key)
 	if !ok || accountID == 0 || (exclude != nil && exclude[accountID]) {
 		return false
@@ -6367,12 +6437,14 @@ func (s *Store) hasContinuationCandidateWithFilter(key string, apiKeyID int64, e
 	}
 
 	continuationEligible := acc.UsageLimitContinuationEligible()
-	if !acc.IsAvailable() && !continuationEligible {
+	sparkEligible := policy == DispatchPolicySpark && acc.SparkDispatchEligible()
+	if !acc.IsAvailable() && !continuationEligible && !sparkEligible {
 		return false
 	}
 	if s.accountHasCachedCooldown(acc) {
 		continuationEligible = acc.UsageLimitContinuationEligible()
-		if !continuationEligible {
+		sparkEligible = policy == DispatchPolicySpark && acc.SparkDispatchEligible()
+		if !continuationEligible && !sparkEligible {
 			return false
 		}
 	}
@@ -6382,30 +6454,42 @@ func (s *Store) hasContinuationCandidateWithFilter(key string, apiKeyID int64, e
 		_, _, limit, _, available := acc.fastSchedulerSnapshotForContinuation(maxConcurrency, time.Now())
 		return available && limit > 0
 	}
+	if sparkEligible {
+		_, _, limit, _, available := acc.fastSchedulerSnapshotForSpark(maxConcurrency, time.Now())
+		return available && limit > 0
+	}
 	_, _, limit, _, available := acc.fastSchedulerSnapshot(maxConcurrency, time.Now())
 	return available && limit > 0
 }
 
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false)
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+}
+
+func (s *Store) WaitForSessionAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
 }
 
 // WaitForContinuationAvailableWithFilter waits for the account already bound
 // to a stateful continuation instead of falling through to another account.
 func (s *Store) WaitForContinuationAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true)
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
 }
 
-func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool) (*Account, string) {
+func (s *Store) WaitForContinuationAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+}
+
+func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	hasCandidate := func() bool {
 		if preserveBinding {
-			return s.hasContinuationCandidateWithFilter(key, apiKeyID, exclude, filter)
+			return s.hasContinuationCandidateWithDispatch(key, apiKeyID, exclude, filter, policy)
 		}
-		return s.hasDispatchCandidateWithFilter(apiKeyID, exclude, filter)
+		return s.hasDispatchCandidateWithDispatch(apiKeyID, exclude, filter, policy)
 	}
 	if !hasCandidate() {
 		return nil, ""
@@ -6434,9 +6518,9 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 			var acc *Account
 			var proxyURL string
 			if preserveBinding {
-				acc, proxyURL = s.NextForContinuationWithFilter(key, apiKeyID, exclude, filter)
+				acc, proxyURL = s.NextForContinuationWithDispatch(key, apiKeyID, exclude, filter, policy)
 			} else {
-				acc, proxyURL = s.NextForSessionWithFilter(key, apiKeyID, exclude, filter)
+				acc, proxyURL = s.NextForSessionWithDispatch(key, apiKeyID, exclude, filter, policy)
 			}
 			if acc != nil {
 				return acc, proxyURL
@@ -7347,8 +7431,13 @@ func (s *Store) AddAccounts(accounts []*Account) {
 		return
 	}
 
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
+
 	now := time.Now().UnixNano()
 	added := make([]*Account, 0, len(accounts))
+	ignoreUsageLimit := s.IgnoreUsageLimitStatus()
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
@@ -7357,6 +7446,12 @@ func (s *Store) AddAccounts(accounts []*Account) {
 		if atomic.LoadInt64(&acc.AddedAt) == 0 {
 			atomic.StoreInt64(&acc.AddedAt, now)
 		}
+		acc.mu.Lock()
+		acc.grokRuntimeSink = s
+		acc.recomputeEffectiveIgnoreUsageLimitStatus(ignoreUsageLimit)
+		acc.recomputeEffectiveGroupBaseConcurrency(s)
+		acc.recomputeSchedulerLocked(maxConcurrency)
+		acc.mu.Unlock()
 		added = append(added, acc)
 	}
 	if len(added) == 0 {
@@ -7364,18 +7459,6 @@ func (s *Store) AddAccounts(accounts []*Account) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ignoreUsageLimit := s.IgnoreUsageLimitStatus()
-	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-	for _, acc := range added {
-		acc.mu.Lock()
-		acc.grokRuntimeSink = s
-		acc.recomputeEffectiveIgnoreUsageLimitStatus(ignoreUsageLimit)
-		acc.recomputeEffectiveGroupBaseConcurrency(s)
-		acc.recomputeSchedulerLocked(maxConcurrency)
-		acc.mu.Unlock()
-	}
 	s.accounts = append(s.accounts, added...)
 	if s.accountsByID == nil {
 		s.rebuildAccountIndex()
@@ -7384,6 +7467,8 @@ func (s *Store) AddAccounts(accounts []*Account) {
 			s.accountsByID[acc.DBID] = acc
 		}
 	}
+	s.mu.Unlock()
+
 	if scheduler := s.getFastScheduler(); scheduler != nil {
 		scheduler.UpdateMany(added)
 	}
@@ -7391,20 +7476,28 @@ func (s *Store) AddAccounts(accounts []*Account) {
 
 // RemoveAccount 从内存池移除账号
 func (s *Store) RemoveAccount(dbID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
 
+	removed := false
+	s.mu.Lock()
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			s.rebuildAccountIndex()
-			s.fastSchedulerRemove(dbID)
-			// 清理 RefreshScheduler 中可能残留的任务
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(dbID)
-			}
-			return
+			removed = true
+			break
 		}
+	}
+	s.mu.Unlock()
+	if !removed {
+		return
+	}
+
+	s.fastSchedulerRemove(dbID)
+	// 清理 RefreshScheduler 中可能残留的任务
+	if scheduler := s.GetRefreshScheduler(); scheduler != nil {
+		scheduler.CancelTask(dbID)
 	}
 }
 
@@ -9558,19 +9651,20 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		return
 	}
 
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
+
 	removeSet := make(map[int64]struct{}, len(dbIDs))
 	for _, id := range dbIDs {
 		removeSet[id] = struct{}{}
 	}
 
+	removedIDs := make([]int64, 0, len(removeSet))
 	s.mu.Lock()
 	kept := s.accounts[:0]
 	for _, acc := range s.accounts {
 		if _, remove := removeSet[acc.DBID]; remove {
-			s.fastSchedulerRemove(acc.DBID)
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(acc.DBID)
-			}
+			removedIDs = append(removedIDs, acc.DBID)
 		} else {
 			kept = append(kept, acc)
 		}
@@ -9578,6 +9672,14 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 	s.accounts = kept
 	s.rebuildAccountIndex()
 	s.mu.Unlock()
+
+	refreshScheduler := s.GetRefreshScheduler()
+	for _, dbID := range removedIDs {
+		s.fastSchedulerRemove(dbID)
+		if refreshScheduler != nil {
+			refreshScheduler.CancelTask(dbID)
+		}
+	}
 }
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {

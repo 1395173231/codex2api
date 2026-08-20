@@ -104,6 +104,9 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 {
 		t.Fatalf("locked retry remaining=%d body=%s", got, repeatRecorder.Body.String())
 	}
+	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.audit_reference").String(); got == "" || got != lock.IncidentID {
+		t.Fatalf("locked retry audit reference=%q incident=%q body=%s", got, lock.IncidentID, repeatRecorder.Body.String())
+	}
 	if retryAfter := repeat.Writer.Header().Get("Retry-After"); retryAfter == "" {
 		t.Fatalf("locked retry missing Retry-After header: %v", repeat.Writer.Header())
 	}
@@ -153,6 +156,28 @@ func TestContinuousRetryCatchAllAuditsCYBWithoutLockingConversation(t *testing.T
 	}
 	if _, err := db.GetActivePromptConversationLock(t.Context(), lockIdentity.LockKey); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("catch-all CYB persisted a conversation lock: %v", err)
+	}
+}
+
+func TestPromptCyberRestrictionDerivesAuditReferenceForLegacyLocalLock(t *testing.T) {
+	requestID := "298ee1bb-ad0f-4e96-8924-d34066def71e"
+	restriction := promptCyberRestrictionDecision(&database.PromptConversationLock{
+		DecisionID: "local-block:" + requestID,
+		ReasonCode: "terminal_policy_match",
+		LockedAt:   time.Now().UTC(),
+	}, promptfilter.DefaultConfig())
+	if restriction.AuditReference != requestID {
+		t.Fatalf("audit reference = %q, want %q", restriction.AuditReference, requestID)
+	}
+	if !strings.Contains(restriction.Message, "审计编号："+requestID) {
+		t.Fatalf("restriction message lacks audit reference: %q", restriction.Message)
+	}
+	if !strings.Contains(restriction.Message, "本地高风险规则") || strings.Contains(restriction.Message, "因上游 CYB 已锁定") {
+		t.Fatalf("local restriction origin is misleading: %q", restriction.Message)
+	}
+	details := promptCyberRestrictionDetails(restriction, nil)
+	if details["audit_reference"] != requestID || details["decision_id"] != "local-block:"+requestID || details["trigger_reason_code"] != "terminal_policy_match" {
+		t.Fatalf("restriction details = %#v", details)
 	}
 }
 

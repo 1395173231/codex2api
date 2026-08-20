@@ -393,15 +393,15 @@ func waitForContinuousPoolRetry(ctx context.Context) bool {
 // availability wait. Once the request has actually entered unlimited retry,
 // it slices that wait at the heartbeat interval so an empty account pool does
 // not leave an SSE/WebSocket client idle until the wait expires.
-func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
+func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	waitForAccount := func(waitCtx context.Context, timeout time.Duration) (*auth.Account, string) {
 		if preserveBinding {
-			return h.store.WaitForContinuationAvailableWithFilter(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter)
+			return h.store.WaitForContinuationAvailableWithDispatch(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter, policy)
 		}
-		return h.store.WaitForSessionAvailableWithFilter(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter)
+		return h.store.WaitForSessionAvailableWithDispatch(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter, policy)
 	}
 	const maximumWait = 30 * time.Second
 	if !continuousRetryKeepaliveActive(ctx) || continuousRetryKeepaliveInterval <= 0 {
@@ -456,11 +456,19 @@ func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey 
 }
 
 func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
-	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false)
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false, auth.DispatchPolicyStandard)
+}
+
+func (h *Handler) nextRetryAccountForSessionWithDispatch(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false, policy)
 }
 
 func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
-	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true)
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true, auth.DispatchPolicyStandard)
+}
+
+func (h *Handler) nextRetryAccountForContinuationWithDispatch(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true, policy)
 }
 
 // reconcileGraceWait bounds how long a missed request waits for the shared
@@ -474,7 +482,7 @@ const reconcileGraceWait = 2 * time.Second
 // churn cannot pin a request in the loop beyond its context lifetime.
 const maxReconcileReentries = 3
 
-func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
+func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
@@ -484,15 +492,15 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 		var account *auth.Account
 		var stickyProxyURL string
 		if preserveBinding {
-			account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.store.NextForContinuationWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
 		} else {
-			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
 		}
 		if account != nil {
 			return account, stickyProxyURL
 		}
 		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
-		account, stickyProxyURL = h.waitForRetryAccountAvailable(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding)
+		account, stickyProxyURL = h.waitForRetryAccountAvailable(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, policy)
 		if account != nil {
 			return account, stickyProxyURL
 		}

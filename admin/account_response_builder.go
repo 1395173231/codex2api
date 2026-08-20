@@ -210,6 +210,9 @@ func (h *Handler) buildAccountResponse(
 		if usagePct5h, ok := runtimeAccount.GetUsagePercent5h(); ok {
 			resp.UsagePercent5h = &usagePct5h
 		}
+		if usagePctSpark, ok := runtimeAccount.GetUsagePercentSpark(); ok {
+			resp.UsagePercentSpark = &usagePctSpark
+		}
 		if credits, ok := runtimeAccount.GetRateLimitResetCredits(); ok {
 			resp.RateLimitResetCredits = &credits
 		}
@@ -238,6 +241,9 @@ func (h *Handler) buildAccountResponse(
 		}
 		if t := runtimeAccount.GetReset7dAt(); !t.IsZero() {
 			resp.Reset7dAt = t.Format(time.RFC3339)
+		}
+		if t := runtimeAccount.GetResetSparkAt(); !t.IsZero() {
+			resp.ResetSparkAt = t.Format(time.RFC3339)
 		}
 		if sec := runtimeAccount.GetWindow7dSeconds(); sec > 0 {
 			resp.Window7dSeconds = &sec
