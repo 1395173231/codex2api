@@ -1830,6 +1830,29 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 		return false
 	}
 	policy := continuousRetryPolicyForCall(policies)
+	continuousSelected := imageStreamRetryLimit(err, 0, policy) == -1
+	if !continuousSelected {
+		// Keep the pre-continuous-retry image contract for disabled and
+		// unselected failures: the legacy keyword guard, finite retry budget,
+		// and ordinary endpoint attempt cap remain authoritative.
+		if !retryBudgetAvailable(*generalRetries, maxGeneralRetries) || attempt >= maxAttempts-1 {
+			return false
+		}
+		msg := strings.ToLower(err.Error())
+		for _, keyword := range []string{
+			"content_policy", "safety", "cyber_policy",
+			"unsupported_country", "invalid_request",
+		} {
+			if strings.Contains(msg, keyword) {
+				return false
+			}
+		}
+		*generalRetries++
+		return true
+	}
+
+	// Continuous selection is opt-in. Only this branch may apply the new
+	// structured refusal/quota guards and bypass the ordinary image cap.
 	if payload := imageResponseFailedPayload(err); len(payload) > 0 {
 		if isExplicitUpstreamCyberPolicy(payload) {
 			return false
@@ -1856,7 +1879,6 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 			}
 		}
 	}
-	continuousSelected := imageStreamRetryLimit(err, 0, policy) == -1
 	maxGeneralRetries = imageStreamRetryLimit(err, maxGeneralRetries, policy)
 	if !retryAllowedByEndpointCap(attempt, maxAttempts, continuousSelected) {
 		return false

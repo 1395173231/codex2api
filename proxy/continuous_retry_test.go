@@ -484,13 +484,25 @@ func TestContinuousRetryImageStreamSelectionHonorsPolicyAndSafety(t *testing.T) 
 	}
 	moderationFailure := newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":500,"error":{"code":"moderation_blocked"}}}`))
 	general := 0
-	if shouldRetryImageStreamError(moderationFailure, &general, 2, 0, maxImageAttempts, policy) {
-		t.Fatal("structured image moderation refusal was retried")
+	for name, failure := range map[string]error{
+		"disabled moderation": moderationFailure,
+		"disabled quota":      newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":429,"error":{"code":"insufficient_quota"}}}`)),
+	} {
+		general = 0
+		if !shouldRetryImageStreamError(failure, &general, 1, 0, maxImageAttempts, database.ContinuousRetryPolicy{}) {
+			t.Fatalf("%s did not preserve the disabled legacy retry", name)
+		}
+	}
+	general = 0
+	if !shouldRetryImageStreamError(moderationFailure, &general, 2, 0, maxImageAttempts, policy) {
+		t.Fatal("unselected structured image moderation refusal did not preserve the finite legacy retry")
 	}
 	quotaFailure := newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":429,"error":{"code":"insufficient_quota"}}}`))
-	if shouldRetryImageStreamError(quotaFailure, &general, 2, 0, maxImageAttempts, policy) {
-		t.Fatal("unselected permanent image quota failure was retried")
+	general = 0
+	if !shouldRetryImageStreamError(quotaFailure, &general, 2, 0, maxImageAttempts, policy) {
+		t.Fatal("unselected permanent image quota failure did not preserve the finite legacy retry")
 	}
+	general = 0
 	policy.ErrorCodes = []string{"insufficient_quota"}
 	if !shouldRetryImageStreamError(quotaFailure, &general, 0, 0, maxImageAttempts, policy) {
 		t.Fatal("explicitly selected image quota code did not use the bounded continuous retry")
