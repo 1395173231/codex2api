@@ -1629,7 +1629,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var streamAttempt *continuousRetryStreamAttempt
 		if stream {
 			downstreamFlusher, _ := c.Writer.(http.Flusher)
-			streamAttempt = newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
+			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
 			usage, imageCount, firstTokenMs, imageLogInfo, wroteImageOutput, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start, upscalePlan, streamAttempt)
 			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
 				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
@@ -1699,6 +1699,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		statusCode := http.StatusOK
 		if readErr != nil {
 			statusCode = http.StatusBadGateway
+			localReplayFailure := isContinuousRetryLocalFailure(readErr)
+			if localReplayFailure {
+				statusCode = http.StatusInternalServerError
+			}
 			// Retry stream read errors on next account when there are attempts left.
 			// Stream disconnects and upstream image generation failures can be
 			// transient (e.g. upstream model overload, network hiccup).
@@ -1707,9 +1711,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Connected/keepalive comments do not commit model output. A retry is
 			// still transparent until the first partial/completed image event.
 			downstreamWrote := streamAttempt.downstreamWrote(wroteImageOutput)
-			willRetry := !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
+			willRetry := !localReplayFailure && !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
 			// Always record the failed attempt so it appears in usage stats.
 			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+			if localReplayFailure {
+				failedLog.StatusCode = http.StatusInternalServerError
+				failedLog.UpstreamErrorKind = "local"
+				failedLog.ErrorMessage = usageLogFailureMessage(http.StatusInternalServerError, continuousRetryLocalFailureMessage)
+			}
 			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
 			if promptPolicyIncidentID != "" {
 				failedLog.UpstreamErrorKind = "cyber_policy"
@@ -1741,7 +1750,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			_ = streamAttempt.Close()
 			// A pre-output failure may follow an already-flushed keepalive comment,
 			// so finish it as an SSE error instead of attempting a JSON response.
-			if !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && c.Writer.Written() {
+			if localReplayFailure && c.Request.Context().Err() == nil {
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					writeImageStreamErrorEvent(c, readErr)
+				}
+			} else if !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && c.Writer.Written() {
 				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					writeImageStreamErrorEvent(c, readErr)
 				}
@@ -1760,6 +1773,21 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				return
 			}
 			if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
+				if isContinuousRetryLocalFailure(commitErr) {
+					localErr := errors.New(continuousRetryLocalFailureMessage)
+					failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, false, localErr, usage, imageLogInfo)
+					failedLog.StatusCode = http.StatusInternalServerError
+					failedLog.UpstreamErrorKind = "local"
+					failedLog.ErrorMessage = usageLogFailureMessage(http.StatusInternalServerError, continuousRetryLocalFailureMessage)
+					h.logUsageForRequest(c, failedLog)
+					if c.Request.Context().Err() == nil {
+						writeImageStreamErrorEvent(c, commitErr)
+					}
+					_ = streamAttempt.Close()
+					resp.Body.Close()
+					h.store.Release(account)
+					return
+				}
 				if c.Request.Context().Err() == nil && c.Writer.Written() {
 					writeImageStreamErrorEvent(c, commitErr)
 				}
@@ -1931,6 +1959,9 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 }
 
 func imageStreamRetryLimit(err error, generalLimit int, policies ...database.ContinuousRetryPolicy) int {
+	if isContinuousRetryLocalFailure(err) {
+		return generalLimit
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	payload := imageResponseFailedPayload(err)
 	if len(payload) > 0 {
@@ -2500,10 +2531,22 @@ func writeImageStreamErrorEvent(c *gin.Context, err error) {
 	if c == nil || err == nil {
 		return
 	}
+	message := err.Error()
+	localFailure := isContinuousRetryLocalFailure(err)
+	if localFailure {
+		message = continuousRetryLocalFailureMessage
+		if !c.Writer.Written() {
+			c.Status(http.StatusInternalServerError)
+		}
+	}
 	var frame bytes.Buffer
 	frame.WriteString("event: error\n")
 	frame.WriteString("data: ")
-	frame.Write(buildImagesStreamErrorPayload(err.Error()))
+	if localFailure {
+		frame.Write(buildImagesStreamLocalErrorPayload(message))
+	} else {
+		frame.Write(buildImagesStreamErrorPayload(message))
+	}
 	frame.WriteString("\n\n")
 	if _, writeErr := c.Writer.Write(frame.Bytes()); writeErr != nil {
 		return
@@ -3047,5 +3090,12 @@ func addImageMetaToPayload(payload []byte, meta imageCallResult) []byte {
 func buildImagesStreamErrorPayload(message string) []byte {
 	payload := []byte(`{"error":{"message":"","type":"upstream_error"}}`)
 	payload, _ = sjson.SetBytes(payload, "error.message", message)
+	return payload
+}
+
+func buildImagesStreamLocalErrorPayload(message string) []byte {
+	payload := []byte(`{"error":{"message":"","type":"server_error"}}`)
+	payload, _ = sjson.SetBytes(payload, "error.message", message)
+	payload, _ = sjson.SetBytes(payload, "error.code", ErrorCodeInternalError)
 	return payload
 }

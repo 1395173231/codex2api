@@ -78,6 +78,13 @@ func (h *Handler) commitResponsesStreamAttempt(c *gin.Context, attempt *continuo
 	}
 
 	if err := h.commitStreamAttempt(c, attempt); err != nil {
+		// Headers are staged before replay/filter commit; remove the token on
+		// failure so local replay errors cannot expose turn state or provenance.
+		// Header 会先于回放/过滤提交暂存；失败时移除 token，避免本地回放错误
+		// 暴露账号绑定的续链状态或出处数据。
+		if stagedHeader && c != nil && c.Writer != nil && !c.Writer.Written() {
+			c.Writer.Header().Del(codexTurnStateHeader)
+		}
 		return err
 	}
 	if stagedHeader && token != "" {

@@ -488,6 +488,87 @@ func writeCommittedAnthropicRetryError(c *gin.Context, errorType, message string
 	return true
 }
 
+// Replay can fail before a retry heartbeat commits HTTP. These helpers write a
+// protocol terminal to the real writer in either state: normal JSON after SSE
+// would corrupt the stream, while silence would look like success.
+// 回放可能在重试心跳提交 HTTP 前失败；这些 helper 会在两种状态下都向真实 writer
+// 写入协议终态，避免在 SSE 后追加普通 JSON 或静默返回造成错误语义。
+func writeContinuousRetryLocalResponsesError(c *gin.Context) bool {
+	if c == nil || c.Writer == nil {
+		return false
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return true
+	}
+	if !c.Writer.Written() {
+		c.Status(http.StatusInternalServerError)
+	}
+	payload, _ := json.Marshal(gin.H{
+		"type": "response.failed",
+		"response": gin.H{
+			"status": "failed",
+			"error": gin.H{
+				"message": continuousRetryLocalFailureMessage,
+				"type":    "server_error",
+				"code":    ErrorCodeInternalError,
+			},
+		},
+	})
+	_, _ = c.Writer.WriteString("data: " + string(payload) + "\n\n")
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return true
+}
+
+func writeContinuousRetryLocalChatError(c *gin.Context) bool {
+	if c == nil || c.Writer == nil {
+		return false
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return true
+	}
+	if !c.Writer.Written() {
+		c.Status(http.StatusInternalServerError)
+	}
+	payload, _ := json.Marshal(gin.H{
+		"error": gin.H{
+			"message": continuousRetryLocalFailureMessage,
+			"type":    "server_error",
+			"code":    ErrorCodeInternalError,
+		},
+	})
+	_, _ = c.Writer.WriteString("data: " + string(payload) + "\n\n")
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return true
+}
+
+func writeContinuousRetryLocalAnthropicError(c *gin.Context) bool {
+	if c == nil || c.Writer == nil {
+		return false
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return true
+	}
+	if !c.Writer.Written() {
+		c.Status(http.StatusInternalServerError)
+	}
+	payload, _ := json.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    "api_error",
+			"message": continuousRetryLocalFailureMessage,
+		},
+	})
+	_, _ = c.Writer.WriteString("event: error\ndata: " + string(payload) + "\n\n")
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return true
+}
+
 // abortContinuousRetryCommitFailure closes a winning attempt that could not
 // be replayed to the downstream. Replay/storage/write failures are local
 // proxy failures, not upstream failures: retrying would only duplicate a paid

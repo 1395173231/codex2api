@@ -33,6 +33,10 @@ type continuousRetryReplay struct {
 	memoryLimit int64
 	totalLimit  int64
 	closed      bool
+	// beforeReadForTest forces a file-backed commit failure after private writes;
+	// production constructors leave it nil.
+	// beforeReadForTest 在私有写入完成后注入文件回放提交失败；生产构造器保持 nil。
+	beforeReadForTest func(*continuousRetryReplay)
 }
 
 func newContinuousRetryReplay() *continuousRetryReplay {
@@ -113,6 +117,10 @@ func (r *continuousRetryReplay) Flush() {}
 func (r *continuousRetryReplay) reader() (io.Reader, error) {
 	if r == nil || r.closed {
 		return nil, errContinuousRetryReplayClosed
+	}
+	if hook := r.beforeReadForTest; hook != nil {
+		r.beforeReadForTest = nil
+		hook(r)
 	}
 	if r.file == nil {
 		return bytes.NewReader(r.memory.Bytes()), nil
@@ -199,11 +207,37 @@ func newContinuousRetryStreamAttempt(enabled bool, downstream io.Writer, flusher
 	if !enabled {
 		return nil
 	}
+	return newContinuousRetryStreamAttemptWithReplay(true, downstream, flusher, newContinuousRetryReplay())
+}
+
+func newContinuousRetryStreamAttemptWithReplay(enabled bool, downstream io.Writer, flusher http.Flusher, replay *continuousRetryReplay) *continuousRetryStreamAttempt {
+	if !enabled {
+		return nil
+	}
+	if replay == nil {
+		replay = newContinuousRetryReplay()
+	}
 	return &continuousRetryStreamAttempt{
-		replay:     newContinuousRetryReplay(),
+		replay:     replay,
 		downstream: downstream,
 		flusher:    flusher,
 	}
+}
+
+func (h *Handler) newContinuousRetryReplay() *continuousRetryReplay {
+	if h != nil && h.continuousRetryReplayFactory != nil {
+		if replay := h.continuousRetryReplayFactory(); replay != nil {
+			return replay
+		}
+	}
+	return newContinuousRetryReplay()
+}
+
+func (h *Handler) newContinuousRetryStreamAttempt(enabled bool, downstream io.Writer, flusher http.Flusher) *continuousRetryStreamAttempt {
+	if !enabled {
+		return nil
+	}
+	return newContinuousRetryStreamAttemptWithReplay(true, downstream, flusher, h.newContinuousRetryReplay())
 }
 
 func (a *continuousRetryStreamAttempt) writerOr(downstream io.Writer) io.Writer {
@@ -256,6 +290,10 @@ type continuousRetryWSReplay struct {
 
 func newContinuousRetryWSReplay() *continuousRetryWSReplay {
 	return &continuousRetryWSReplay{replay: newContinuousRetryReplay()}
+}
+
+func (h *Handler) newContinuousRetryWSReplay() *continuousRetryWSReplay {
+	return &continuousRetryWSReplay{replay: h.newContinuousRetryReplay()}
 }
 
 func (r *continuousRetryWSReplay) WriteMessage(payload []byte) error {

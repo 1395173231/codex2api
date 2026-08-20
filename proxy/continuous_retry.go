@@ -97,6 +97,9 @@ func continuousRetryLimitForRequestError(err error, generalLimit int, policies .
 	if err == nil || errors.Is(err, context.Canceled) {
 		return generalLimit
 	}
+	if isContinuousRetryLocalFailure(err) {
+		return generalLimit
+	}
 	if isExplicitUpstreamCyberPolicyError(err) {
 		return generalLimit
 	}
@@ -148,7 +151,7 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 	if !policy.Enabled || err == nil {
 		return false
 	}
-	if errors.Is(err, errContinuousRetryDeadlineExceeded) {
+	if errors.Is(err, errContinuousRetryDeadlineExceeded) || isContinuousRetryLocalFailure(err) {
 		return false
 	}
 	if isExplicitUpstreamCyberPolicyError(err) {
@@ -168,7 +171,7 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 
 func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
 	policy := continuousRetryPolicyForCall(policies)
-	if !policy.Enabled {
+	if !policy.Enabled || outcome.terminalLocal {
 		return false
 	}
 	eventType = normalizedUpstreamSSEEventType(eventType, payload)
@@ -223,7 +226,7 @@ func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventT
 // catch-all policies. A catch-all changes which failures are retried; it must
 // never turn a clean terminal response into another paid upstream attempt.
 func isActualUpstreamStreamFailure(outcome streamOutcome, eventType string) bool {
-	if outcome.logStatusCode == logStatusClientClosed {
+	if outcome.terminalLocal || outcome.logStatusCode == logStatusClientClosed {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(eventType)) {
@@ -271,7 +274,7 @@ func terminalUpstreamErrorPayload(payload []byte) []byte {
 // into account-scoped 4xx/context/error-frame failures whose legacy outcome is
 // not penalized.
 func continuousRetryStreamFailureSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
-	if strings.EqualFold(strings.TrimSpace(outcome.failureKind), "continuous_retry_timeout") {
+	if outcome.terminalLocal || strings.EqualFold(strings.TrimSpace(outcome.failureKind), "continuous_retry_timeout") {
 		return false
 	}
 	if isExplicitUpstreamCyberPolicy(payload) || isExplicitUpstreamCyberPolicy(outcome.failurePayload) || strings.EqualFold(strings.TrimSpace(outcome.failureKind), "cyber_policy") {

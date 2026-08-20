@@ -603,7 +603,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		if !retainedHTTPFallback {
+		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
 			if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
 				h.store.Release(account)
 				return errResponsesWSClientGone
@@ -734,11 +734,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 			if shouldRetry {
 				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
-				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %s, ws)", account.ID(), retryAttemptProgress(attempt, maxRetries))
-				}
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)) {
 					return errResponsesWSClientGone
+				}
+				if !h.bindBufferedStickyRetryAffinity(c.Request.Context(), affinityKey, account, proxyURL, stickyRetry, continuousRetryPolicy) {
+					return errResponsesWSClientGone
+				}
+				if stickyRetry {
+					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %s, ws)", account.ID(), retryAttemptProgress(attempt, maxRetries))
 				}
 				continue
 			}
@@ -1029,7 +1032,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	wroteAnyBody := false
 	var wsReplay *continuousRetryWSReplay
 	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-		wsReplay = newContinuousRetryWSReplay()
+		wsReplay = h.newContinuousRetryWSReplay()
 	}
 	writeClientMessage := func(payload []byte) error {
 		return writeResponsesWSMessage(conn, payload)
@@ -1247,8 +1250,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		return &responsesWSContinuationNotFoundError{}
 	}
 
-	totalDuration := int(time.Since(start).Milliseconds())
-	outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
+		totalDuration := int(time.Since(start).Milliseconds())
+		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
+		outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 	var candidatePromoted bool
 	terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
 	if candidatePromoted {
@@ -1262,7 +1266,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	ttftGuard.Stop()
 	var responseFailedDecision codex429Decision
 	promptPolicyIncidentID := ""
-	if len(terminalFailurePayload) > 0 {
+	if len(terminalFailurePayload) > 0 && !outcome.terminalLocal {
 		outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		if withContinuousRetryDeadlinePending(c.Request.Context(), func() {
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
@@ -1281,6 +1285,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			outcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
 		}
 	}
+	outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
 	}
@@ -1324,28 +1329,29 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		return &responsesWSRetryableStreamError{outcome: outcome, eventType: terminalFailureEventType}
 	}
-	if outcome.logStatusCode == http.StatusOK {
-		if !claimContinuousRetrySuccessContext(c.Request.Context()) {
+		if outcome.logStatusCode == http.StatusOK {
+			if !claimContinuousRetrySuccessContext(c.Request.Context()) {
+				if wsReplay != nil {
+					_ = wsReplay.Close()
+				}
+				resp.Body.Close()
+				h.store.Release(account)
+				return errResponsesWSClientGone
+			}
+			SyncCodexUsageState(h.store, account, resp)
 			if wsReplay != nil {
-				_ = wsReplay.Close()
-			}
-			resp.Body.Close()
-			h.store.Release(account)
-			return errResponsesWSClientGone
-		}
-		SyncCodexUsageState(h.store, account, resp)
-		if wsReplay != nil {
-			committedAny, commitErr := replayResponsesWSSuccess(wsReplay, outputBuffer, writeClientMessage)
-			wroteAnyBody = wroteAnyBody || committedAny
-			if commitErr != nil {
-				writeErr = commitErr
-				// Filtering, replay storage, and downstream writes are local commit
-				// failures. They terminate this turn and must never reopen an upstream
-				// attempt that already reached a successful protocol terminal.
-				outcome = classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), nil, writeErr, false)
+				committedAny, commitErr := replayResponsesWSSuccess(wsReplay, outputBuffer, writeClientMessage)
+				wroteAnyBody = wroteAnyBody || committedAny
+				if commitErr != nil {
+					writeErr = commitErr
+					// Filtering, replay storage, and downstream writes are local commit
+					// failures. They terminate this turn and must never reopen an upstream
+					// attempt that already reached a successful protocol terminal.
+					outcome = classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), nil, writeErr, false)
+					outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
+				}
 			}
 		}
-	}
 	downstreamWrote := wroteAnyBody
 	if outcome.logStatusCode == http.StatusOK && writeErr == nil && downstreamWrote {
 		if wsReplay != nil {
@@ -1364,6 +1370,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 	}
 	_ = wsReplay.Close()
+	if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+	}
 	if outcome.logStatusCode != http.StatusOK {
 		log.Printf("Responses WebSocket stream ended abnormally (account %d, status %d): %s, relayed about %d chars", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 		if deltaCharCount > 0 && usage == nil {
@@ -1430,6 +1439,11 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 	}
 	h.store.Release(account)
+	if outcome.terminalLocal {
+		apiErr := api.NewAPIError(api.ErrCodeServerError, continuousRetryLocalFailureMessage, api.ErrorTypeServer)
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(websocket.CloseInternalServerErr, apiErr.Message, apiErr)
+	}
 	if c.Request.Context().Err() != nil {
 		return errResponsesWSClientGone
 	}
