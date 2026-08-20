@@ -2824,7 +2824,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, NormalizeRetryLimit(s.MaxRetries), NormalizeRetryLimit(s.MaxRateLimitRetries), s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
+		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
 		s.UsageProbeConcurrency, s.UsageProbeResponsesFallbackEnabled,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
@@ -3012,9 +3012,8 @@ func NormalizeCodexWSStatelessSlots(slots int) int {
 	return slots
 }
 
-// NormalizeRetryLimit 把公开的有限重试预算限制在 0-10。
-// 持续重试由独立策略控制；内部使用的 -1 哨兵不能通过设置接口持久化。
-func NormalizeRetryLimit(retries int) int {
+// normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
+func normalizeCodexWSSilentMaxRetries(retries int) int {
 	if retries < 0 {
 		return 0
 	}
@@ -3022,11 +3021,6 @@ func NormalizeRetryLimit(retries int) int {
 		return 10
 	}
 	return retries
-}
-
-// normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
-func normalizeCodexWSSilentMaxRetries(retries int) int {
-	return NormalizeRetryLimit(retries)
 }
 
 // UTLS 优雅关闭等待上限的边界（分钟，issue #446）。

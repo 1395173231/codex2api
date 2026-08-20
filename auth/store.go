@@ -3555,7 +3555,6 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			RecoveryProbeIntervalMinutes:       30,
 			LazyMode:                           false,
 			ProxyURL:                           "",
-			MaxRetries:                         2,
 			MaxRateLimitRetries:                1,
 			SchedulerMode:                      "round_robin",
 			CodexWSHideUpstreamErrors:          true,
@@ -3606,8 +3605,16 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
 	s.lazyMode.Store(settings.LazyMode)
-	atomic.StoreInt64(&s.maxRetries, int64(database.NormalizeRetryLimit(settings.MaxRetries)))
-	atomic.StoreInt64(&s.maxRateLimitRetries, int64(database.NormalizeRetryLimit(settings.MaxRateLimitRetries)))
+	retries := int64(settings.MaxRetries)
+	if retries <= 0 {
+		retries = 2 // 默认重试 2 次
+	}
+	atomic.StoreInt64(&s.maxRetries, retries)
+	rateLimitRetries := int64(settings.MaxRateLimitRetries)
+	if rateLimitRetries < 0 {
+		rateLimitRetries = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	s.schedulerMode.Store(settings.SchedulerMode)
 	s.SetAffinityMode(settings.AffinityMode)
@@ -3799,7 +3806,13 @@ func normalizeWSKeepaliveInterval(sec int) int64 {
 
 // normalizeWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
 func normalizeWSSilentMaxRetries(retries int) int64 {
-	return int64(database.NormalizeRetryLimit(retries))
+	if retries < 0 {
+		return 0
+	}
+	if retries > 10 {
+		return 10
+	}
+	return int64(retries)
 }
 
 // SetCodexForceWebsocket 设置"强制 Codex 上游走 WebSocket"开关（运行时热更新）。
@@ -6572,9 +6585,12 @@ func (s *Store) GetMaxConcurrency() int {
 	return int(atomic.LoadInt64(&s.maxConcurrency))
 }
 
-// SetMaxRetries 动态更新原有的有限重试次数（0-10）。
+// SetMaxRetries 动态更新最大重试次数
 func (s *Store) SetMaxRetries(n int) {
-	atomic.StoreInt64(&s.maxRetries, int64(database.NormalizeRetryLimit(n)))
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&s.maxRetries, int64(n))
 }
 
 // GetMaxRetries 获取当前最大重试次数
@@ -6583,7 +6599,10 @@ func (s *Store) GetMaxRetries() int {
 }
 
 func (s *Store) SetMaxRateLimitRetries(n int) {
-	atomic.StoreInt64(&s.maxRateLimitRetries, int64(database.NormalizeRetryLimit(n)))
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, int64(n))
 }
 
 func (s *Store) GetMaxRateLimitRetries() int {

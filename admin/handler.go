@@ -9881,7 +9881,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.CodexWSSilentMaxRetries != nil {
-		v := database.NormalizeRetryLimit(*req.CodexWSSilentMaxRetries)
+		v := *req.CodexWSSilentMaxRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
 		h.store.SetCodexWSSilentMaxRetries(v)
 		runtimeCfg.CodexWSSilentRetries = v
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
@@ -10078,13 +10084,25 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.MaxRetries != nil {
-		v := database.NormalizeRetryLimit(*req.MaxRetries)
+		v := *req.MaxRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
 		h.store.SetMaxRetries(v)
 		log.Printf("设置已更新: max_retries = %d", v)
 	}
 
 	if req.MaxRateLimitRetries != nil {
-		v := database.NormalizeRetryLimit(*req.MaxRateLimitRetries)
+		v := *req.MaxRateLimitRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
 		h.store.SetMaxRateLimitRetries(v)
 		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
 	}
