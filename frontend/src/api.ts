@@ -664,8 +664,10 @@ export const api = {
       refreshed: boolean
       usage_percent_5h?: number
       usage_percent_7d?: number
+      usage_percent_spark?: number
       reset_5h_at?: string
       reset_7d_at?: string
+      reset_spark_at?: string
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),

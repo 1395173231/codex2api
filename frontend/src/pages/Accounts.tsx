@@ -11885,6 +11885,10 @@ function isActiveAutoPauseWindowReached(
 
 // Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
 // k12/edu are paid education workspaces with 5h limits (issue #307/#309).
+function isSparkUsagePlan(planType?: string): boolean {
+  return normalizePlanType(planType) === "pro";
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return [
     "plus",
@@ -14401,6 +14405,14 @@ function usageBarColor(pct: number): string {
   return "bg-emerald-500";
 }
 
+// 标签 / 条 / 百分比 三列固定，避免 7d 与 spark 把进度条拉成不同长度。
+const USAGE_BAR_LABEL_CLASS =
+  "w-10 shrink-0 text-[11px] font-medium text-muted-foreground";
+const USAGE_BAR_TRACK_CLASS =
+  "h-1.5 w-[88px] shrink-0 rounded-full bg-muted overflow-hidden";
+const USAGE_BAR_META_CLASS =
+  "text-[11px] font-medium text-muted-foreground mt-0.5 pl-[46px]";
+
 // 单行用量进度条
 function UsageBar({
   label,
@@ -14421,29 +14433,20 @@ function UsageBar({
   return (
     <div>
       <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-7 shrink-0">
-          {label}
-        </span>
-        <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
+        <div className={USAGE_BAR_TRACK_CLASS}>
           <div
             className={`h-full rounded-full transition-all ${usageBarColor(pct)}`}
             style={{ width: `${Math.min(100, pct)}%` }}
           />
         </div>
-        <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">
+        <span className="w-[42px] shrink-0 text-right text-[12px] font-semibold tabular-nums">
           {pct.toFixed(1)}%
         </span>
       </div>
-      {detailText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]">
-          {detailText}
-        </div>
-      )}
+      {detailText && <div className={USAGE_BAR_META_CLASS}>{detailText}</div>}
       {resetTime && (
-        <div
-          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]"
-          title={resetTime.title}
-        >
+        <div className={USAGE_BAR_META_CLASS} title={resetTime.title}>
           ⏱ {resetTime.label}
         </div>
       )}
@@ -14471,7 +14474,7 @@ function UsageWindowStat({
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="w-7 shrink-0">{label}</span>
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
         <span>
           {formatCompactUsageNumber(detail?.requests)}{" "}
           {t("accounts.usageReqUnit")} /{" "}
@@ -14480,7 +14483,7 @@ function UsageWindowStat({
         </span>
       </div>
       {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[34px]">
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[46px]">
           {accountBilledText && (
             <span>
               {t("accounts.accountBilledLabel")}: ${accountBilledText}
@@ -14692,6 +14695,10 @@ function UsageCell({
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
+  const hasSparkPct =
+    account.usage_percent_spark !== null &&
+    account.usage_percent_spark !== undefined;
+  const showSpark = isSparkUsagePlan(account.plan_type);
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
@@ -14703,12 +14710,28 @@ function UsageCell({
   // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
   const showFiveHour = fiveHourPresent;
 
+  const sparkBar = showSpark ? (
+    hasSparkPct ? (
+      <UsageBar
+        label="spark"
+        pct={account.usage_percent_spark!}
+        resetAt={account.reset_spark_at}
+      />
+    ) : (
+      <UsageBar
+        label="spark"
+        pct={0}
+        resetAt={account.reset_spark_at}
+      />
+    )
+  ) : null;
+
   if (showFiveHour) {
-    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset && !showSpark)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
-      <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
-        <div className="flex-1 space-y-1.5">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
           {has5h ? (
             <UsageBar
               label="5h"
@@ -14719,6 +14742,28 @@ function UsageCell({
           ) : (
             <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
           )}
+          {sparkBar}
+          {has7d ? (
+            <UsageBar
+              label={longWindowLabel}
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+          )}
+        </div>
+        {refreshButton}
+      </div>
+    );
+  }
+
+  if (showSpark) {
+    return (
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
+          {sparkBar}
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14737,8 +14782,8 @@ function UsageCell({
 
   if (sevenDayPresent) {
     return (
-      <div className={`${wide ? "w-full" : "w-48"} flex items-start gap-1`}>
-        <div className="flex-1">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px]">
           {has7d ? (
             <UsageBar
               label={longWindowLabel}

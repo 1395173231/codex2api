@@ -3988,6 +3988,39 @@ func TestApply429CooldownPremiumMarks5hRateLimitFromWindow(t *testing.T) {
 	}
 }
 
+func TestApply429CooldownSparkUsageLimitDoesNotMarkAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 202, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	account.SetUsageSnapshot5h(40, time.Now().Add(2*time.Hour))
+
+	decision := Apply429Cooldown(
+		store,
+		account,
+		[]byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":1800}}`),
+		&http.Response{Header: make(http.Header)},
+		"gpt-5.3-codex-spark",
+	)
+	if decision.Scope != rateLimitScopeAccount {
+		t.Fatalf("decision.Scope = %q, want account", decision.Scope)
+	}
+	pct, resetAt, ok := account.GetUsageSnapshotSpark()
+	if !ok || pct != 100 {
+		t.Fatalf("spark snapshot = (%v, %v), want 100", pct, ok)
+	}
+	if got := time.Until(resetAt); got < 25*time.Minute || got > 35*time.Minute {
+		t.Fatalf("spark reset delta = %v, want about 30m", got)
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("spark usage_limit_reached must not enter rate_limited_5h")
+	}
+	if reason := account.GetCooldownReason(); reason != "" {
+		t.Fatalf("cooldown_reason = %q, want empty", reason)
+	}
+	if pct5h, ok := account.GetUsagePercent5h(); !ok || pct5h != 40 {
+		t.Fatalf("main 5h snapshot = (%v, %v), want unchanged 40", pct5h, ok)
+	}
+}
+
 func TestApply429CooldownUsageLimitUpdatesFreePlanMetadata(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
