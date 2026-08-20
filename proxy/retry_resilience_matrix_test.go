@@ -24,9 +24,7 @@ func TestShouldRetryHTTPStatusUnlimitedBudgets(t *testing.T) {
 	t.Run("general transient statuses", func(t *testing.T) {
 		for _, statusCode := range []int{
 			http.StatusInternalServerError,
-			http.StatusBadGateway,
 			http.StatusServiceUnavailable,
-			http.StatusGatewayTimeout,
 		} {
 			t.Run(http.StatusText(statusCode), func(t *testing.T) {
 				generalRetries := 0
@@ -40,6 +38,19 @@ func TestShouldRetryHTTPStatusUnlimitedBudgets(t *testing.T) {
 					t.Fatalf("status %d consumed rate-limit budget: %d", statusCode, rateLimitRetries)
 				}
 			})
+		}
+	})
+
+	t.Run("502 and 504 stay outside the legacy set", func(t *testing.T) {
+		for _, statusCode := range []int{http.StatusBadGateway, http.StatusGatewayTimeout} {
+			generalRetries := 0
+			rateLimitRetries := 0
+			if shouldRetryHTTPStatus(statusCode, nil, &generalRetries, &rateLimitRetries, -1, -1) {
+				t.Fatalf("status %d used an unlimited legacy budget", statusCode)
+			}
+			if generalRetries != 0 || rateLimitRetries != 0 {
+				t.Fatalf("status %d changed counters: general=%d rate_limit=%d", statusCode, generalRetries, rateLimitRetries)
+			}
 		}
 	})
 
@@ -84,12 +95,12 @@ func TestShouldRetryHTTPStatusFiniteAndDisabledBudgets(t *testing.T) {
 		generalRetries := 0
 		rateLimitRetries := 0
 		for attempt := 0; attempt < 2; attempt++ {
-			if !shouldRetryHTTPStatus(http.StatusBadGateway, nil, &generalRetries, &rateLimitRetries, 2, 1) {
-				t.Fatalf("502 retry %d unexpectedly denied", attempt+1)
+			if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, nil, &generalRetries, &rateLimitRetries, 2, 1) {
+				t.Fatalf("503 retry %d unexpectedly denied", attempt+1)
 			}
 		}
-		if shouldRetryHTTPStatus(http.StatusBadGateway, nil, &generalRetries, &rateLimitRetries, 2, 1) {
-			t.Fatal("502 retry exceeded the finite general budget")
+		if shouldRetryHTTPStatus(http.StatusServiceUnavailable, nil, &generalRetries, &rateLimitRetries, 2, 1) {
+			t.Fatal("503 retry exceeded the finite general budget")
 		}
 
 		if !shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
@@ -99,6 +110,75 @@ func TestShouldRetryHTTPStatusFiniteAndDisabledBudgets(t *testing.T) {
 			t.Fatal("429 retry exceeded the finite rate-limit budget")
 		}
 	})
+}
+
+func TestBadGatewayAndGatewayTimeoutRetryPolicyMatrix(t *testing.T) {
+	tests := []struct {
+		name   string
+		limit  int
+		policy func(int) database.ContinuousRetryPolicy
+		want   bool
+	}{
+		{
+			name:  "disabled policy",
+			limit: -1,
+			policy: func(int) database.ContinuousRetryPolicy {
+				return database.ContinuousRetryPolicy{Enabled: false, Categories: []string{database.ContinuousRetryCategoryHTTP5xx}}
+			},
+		},
+		{
+			name:  "finite legacy budget",
+			limit: 2,
+			policy: func(int) database.ContinuousRetryPolicy {
+				return database.ContinuousRetryPolicy{}
+			},
+		},
+		{
+			name:  "http 5xx category",
+			limit: 0,
+			policy: func(int) database.ContinuousRetryPolicy {
+				return database.ContinuousRetryPolicy{Enabled: true, Categories: []string{database.ContinuousRetryCategoryHTTP5xx}}
+			},
+			want: true,
+		},
+		{
+			name:  "exact status",
+			limit: 0,
+			policy: func(status int) database.ContinuousRetryPolicy {
+				return database.ContinuousRetryPolicy{Enabled: true, StatusCodes: []int{status}}
+			},
+			want: true,
+		},
+		{
+			name:  "catch all",
+			limit: 0,
+			policy: func(int) database.ContinuousRetryPolicy {
+				return database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+			},
+			want: true,
+		},
+	}
+
+	for _, statusCode := range []int{http.StatusBadGateway, http.StatusGatewayTimeout} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%d/%s", statusCode, tt.name), func(t *testing.T) {
+				policy := tt.policy(statusCode)
+				generalRetries, rateLimitRetries := 0, 0
+				if got := shouldRetryHTTPStatus(statusCode, nil, &generalRetries, &rateLimitRetries, tt.limit, 0, policy); got != tt.want {
+					t.Fatalf("HTTP response retry = %v, want %v", got, tt.want)
+				}
+
+				generalRetries = 0
+				requestErr := ErrUpstream(statusCode, http.StatusText(statusCode), errors.New("upstream status failure"))
+				if got := shouldRetryRequestError(requestErr, &generalRetries, tt.limit, policy); got != tt.want {
+					t.Fatalf("structured request-error retry = %v, want %v", got, tt.want)
+				}
+				if !tt.want && (generalRetries != 0 || rateLimitRetries != 0) {
+					t.Fatalf("unselected status changed counters: general=%d rate_limit=%d", generalRetries, rateLimitRetries)
+				}
+			})
+		}
+	}
 }
 
 func TestHTTPRetryBackoffStateUsesMatchingBudget(t *testing.T) {

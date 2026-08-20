@@ -2802,9 +2802,7 @@ func responsesIncompleteFinishReason(eventType, reason string) string {
 // 402 同理：deactivated_workspace（team 空间被封）等计费维度拒绝是纯账号侧
 // 问题，applyCooldownForModel 已把该账号标错隔离，换号重试即可成功。
 func isRetryableStatus(code int) bool {
-	return code == http.StatusBadGateway ||
-		code == http.StatusServiceUnavailable ||
-		code == http.StatusGatewayTimeout ||
+	return code == http.StatusServiceUnavailable ||
 		code == http.StatusUnauthorized ||
 		code == http.StatusInternalServerError ||
 		code == http.StatusPaymentRequired ||
