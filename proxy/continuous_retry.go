@@ -305,6 +305,7 @@ func isContextRetryError(payload []byte) bool {
 // while explicit cyber_policy always remains a hard stop. Match structured
 // machine codes only so a harmless mention of "content policy" in an error
 // message cannot disable a genuinely recoverable selective retry.
+// 这里只匹配结构化机器码，不扫描自由文本 message，避免误伤可恢复故障。
 func isExplicitUpstreamSafetyPolicy(payload []byte) bool {
 	if isExplicitUpstreamCyberPolicy(payload) {
 		return true
@@ -317,6 +318,8 @@ func isExplicitUpstreamSafetyPolicy(payload []byte) bool {
 		"response.error.type",
 		"response.status_details.error.code",
 		"response.status_details.error.type",
+		"incomplete_details.reason",
+		"response.incomplete_details.reason",
 		"code",
 		"type",
 	} {
@@ -325,6 +328,12 @@ func isExplicitUpstreamSafetyPolicy(payload []byte) bool {
 		case "content_policy",
 			"content_policy_violation",
 			"content_filter",
+			"invalid_prompt",
+			"jailbreak",
+			"refusal",
+			"sanitizer_error",
+			"image_generation_user_error",
+			"unsupported_country_region_territory",
 			"policy_violation",
 			"responsible_ai_policy_violation",
 			"responsibleaipolicyviolation",

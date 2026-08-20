@@ -164,6 +164,13 @@ func TestContinuousRetrySelectivePolicyNeverSelectsStructuredSafetyRefusals(t *t
 		[]byte(`{"error":{"code":"cyber_policy"}}`),
 		[]byte(`{"error":{"type":"content_policy_violation"}}`),
 		[]byte(`{"type":"response.failed","response":{"error":{"code":"moderation_blocked"}}}`),
+		[]byte(`{"error":{"code":"invalid_prompt"}}`),
+		[]byte(`{"error":{"type":"jailbreak"}}`),
+		[]byte(`{"type":"response.failed","response":{"error":{"code":"refusal"}}}`),
+		[]byte(`{"response":{"status_details":{"error":{"type":"sanitizer_error"}}}}`),
+		[]byte(`{"code":"image_generation_user_error"}`),
+		[]byte(`{"type":"unsupported_country_region_territory"}`),
+		[]byte(`{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}`),
 	} {
 		if continuousRetryHTTPSelected(policy, http.StatusInternalServerError, body) {
 			t.Fatalf("structured safety refusal selected for HTTP retry: %s", body)
