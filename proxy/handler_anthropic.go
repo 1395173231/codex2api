@@ -418,9 +418,12 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/messages): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			if retryable && !timedOut {
@@ -921,13 +924,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 			}
-			if !isFirstTokenTimeoutOutcome(outcome) {
-				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
-				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
-					return
-				}
-			} else {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy))
+			retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(outcome), retryOrdinal, retryLimit, resp) {
+				return
 			}
 			continue
 		}

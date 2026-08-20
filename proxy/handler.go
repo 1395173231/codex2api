@@ -2993,6 +2993,15 @@ func (h *Handler) waitBeforeRetryWithBudget(ctx context.Context, retryOrdinal, r
 	return h.waitBeforeRetryWithBudgetMode(ctx, retryOrdinal, retryLimit, true, responses...)
 }
 
+// waitBeforeRetryWithFirstTokenTimeout preserves the finite TTFT shortcut, but
+// 无限预算必须走统一退避，避免首字超时形成零等待循环。
+func (h *Handler) waitBeforeRetryWithFirstTokenTimeout(ctx context.Context, firstTokenTimeout bool, retryOrdinal, retryLimit int, responses ...*http.Response) bool {
+	if firstTokenTimeout && retryLimit != -1 {
+		return ctx == nil || ctx.Err() == nil
+	}
+	return h.waitBeforeRetryWithBudget(ctx, retryOrdinal, retryLimit, responses...)
+}
+
 func (h *Handler) waitBeforeRetryWithBudgetMode(ctx context.Context, retryOrdinal, retryLimit int, useRequestKeepalive bool, responses ...*http.Response) bool {
 	if ctx != nil && ctx.Err() != nil {
 		return false
@@ -3561,9 +3570,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				}
 				if timedOut && shouldRetry {
-					activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
+					retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %s, account %d): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
+					if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+						return
+					}
 					continue
 				}
 				if retryable && !timedOut && !stickyRetry {
@@ -4000,14 +4012,10 @@ func (h *Handler) Responses(c *gin.Context) {
 					retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 					retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 				}
-				// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-				if !isFirstTokenTimeoutOutcome(outcome) {
-					retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
-					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
-						return
-					}
-				} else {
-					activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy))
+				// 有限首字超时已白等一轮；无限预算仍强制退避，避免无等待循环。
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(outcome), retryOrdinal, retryLimit, resp) {
+					return
 				}
 				continue
 			}
@@ -4194,9 +4202,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/responses): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			if retryable && !timedOut && !stickyRetry {
@@ -4805,14 +4816,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 			}
-			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-			if !isFirstTokenTimeoutOutcome(outcome) {
-				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
-				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
-					return
-				}
-			} else {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy))
+			// 有限首字超时已白等一轮；无限预算仍强制退避，避免无等待循环。
+			retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(outcome), retryOrdinal, retryLimit, resp) {
+				return
 			}
 			continue
 		}
@@ -6012,9 +6019,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/chat/completions): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+					return
+				}
 				continue
 			}
 			if retryable && !timedOut && !stickyRetry {
@@ -6500,14 +6510,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 			}
-			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-			if !isFirstTokenTimeoutOutcome(outcome) {
-				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
-				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
-					return
-				}
-			} else {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy))
+			// 有限首字超时已白等一轮；无限预算仍强制退避，避免无等待循环。
+			retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(outcome), retryOrdinal, retryLimit, resp) {
+				return
 			}
 			continue
 		}

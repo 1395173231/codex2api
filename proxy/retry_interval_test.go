@@ -199,6 +199,42 @@ func TestUnlimitedRetryWaitIsCancellable(t *testing.T) {
 	}
 }
 
+func TestFirstTokenTimeoutRetryWaitPolicy(t *testing.T) {
+	h, store := newRetryTestHandler(t)
+	store.SetRetryIntervalMS(5000)
+
+	t.Run("finite retry preserves immediate shortcut", func(t *testing.T) {
+		started := time.Now()
+		if !h.waitBeforeRetryWithFirstTokenTimeout(context.Background(), true, 1, 2) {
+			t.Fatal("finite first-token timeout retry was canceled")
+		}
+		if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+			t.Fatalf("finite first-token timeout added a retry delay: %v", elapsed)
+		}
+	})
+
+	t.Run("finite retry still honors cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if h.waitBeforeRetryWithFirstTokenTimeout(ctx, true, 1, 2) {
+			t.Fatal("canceled finite first-token timeout retry continued")
+		}
+	})
+
+	t.Run("unlimited retry uses cancellable backoff", func(t *testing.T) {
+		store.SetRetryIntervalMS(0)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		if h.waitBeforeRetryWithFirstTokenTimeout(ctx, true, 1, -1) {
+			t.Fatal("unlimited first-token timeout retry ignored cancellation")
+		}
+		if elapsed := time.Since(started); elapsed < 10*time.Millisecond {
+			t.Fatalf("unlimited first-token timeout backoff was skipped: %v", elapsed)
+		}
+	})
+}
+
 func TestUnlimitedRetrySmallRetryAfterDoesNotBypassBackoff(t *testing.T) {
 	h, store := newRetryTestHandler(t)
 	store.SetRetryIntervalMS(0)

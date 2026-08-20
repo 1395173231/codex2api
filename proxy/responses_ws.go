@@ -683,9 +683,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
-				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %s, account %d): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+					return errResponsesWSClientGone
+				}
 				continue
 			}
 			if retryable && !timedOut && !stickyRetry {
@@ -854,12 +857,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					}
 					retryOrdinal, retryLimit := retryStateForStreamEvent(retryErr.outcome, eventType, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 					log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %s, account %d): %s", retryAttemptProgress(retryOrdinal-1, retryLimit), account.ID(), retryErr.outcome.failureMessage)
-					// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
-					if !isFirstTokenTimeoutOutcome(retryErr.outcome) && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					// 有限首字超时已白等一轮；无限预算仍强制退避，避免无等待循环。
+					if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(retryErr.outcome), retryOrdinal, retryLimit, resp) {
 						return errResponsesWSClientGone
-					}
-					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
-						activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimit)
 					}
 					continue
 				}
