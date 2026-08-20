@@ -4557,9 +4557,6 @@ func (h *Handler) Responses(c *gin.Context) {
 					baseBody:  upstreamBody,
 					maxRounds: contMaxRounds,
 					forward:   forward,
-					readStream: func(body io.Reader, callback func(event string, data []byte) bool) error {
-						return readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), body, callback)
-					},
 					observe: func(data []byte) {
 						// 被缓冲（暂未转发给客户端）的事件只用来保活首字超时 guard，
 						// 避免纯 message 响应在整体缓冲期间被误判超时。这里不置位
@@ -4578,9 +4575,16 @@ func (h *Handler) Responses(c *gin.Context) {
 						downstreamMu.Lock()
 						defer downstreamMu.Unlock()
 						// Buffered retry modes use the request-level heartbeat, which
-						// writes to the real ResponseWriter. Writing through streamWriter
-						// here would only append a fake heartbeat to the attempt replay.
+						// writes to the real ResponseWriter. Keep the write on this fold
+						// tick so hidden-round reads and heartbeats remain serialized.
 						if requestKeepaliveOwnsWrites {
+							if keepalive := continuousRetryKeepaliveForContext(c.Request.Context()); keepalive != nil {
+								if err := keepalive.Keepalive(); err != nil {
+									writeErr = err
+									clientGone = true
+									return false
+								}
+							}
 							return !clientGone
 						}
 						// 首个真实字节写出前绝不保活:注释一旦落笔就提交 200 header,
@@ -4607,15 +4611,12 @@ func (h *Handler) Responses(c *gin.Context) {
 							lastUpstreamCancel()
 						}
 						rctx, rcancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-						// A hidden round gets exactly one request on this account. Any
-						// failure returns to the outer attempt loop, which can discard the
-						// buffered attempt and rotate accounts under continuousRetryPolicy.
+						// A hidden round gets exactly one request on this account. Failures
+						// stay inside the fold and become a synthetic response.incomplete;
+						// encrypted reasoning must never participate in account rotation.
 						rctx = WithPayloadRuleIdentity(rctx, attemptIdentity)
 						lastUpstreamCancel = rcancel
-						clearNewAPIUpstreamCyberPolicyDecision(c)
-						roundResp, roundErr := executeHTTPWithContinuousRetryKeepalive(rctx, func() (*http.Response, error) {
-							return ExecuteRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
-						})
+						roundResp, roundErr := ExecuteRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 						// 续想轮同样消耗账号额度：成功开轮后同步上游用量头，
 						// 否则多轮隐藏请求的额度对自动暂停/配速不可见。
 						if roundErr == nil && roundResp != nil && roundResp.StatusCode == http.StatusOK {
@@ -4627,18 +4628,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				foldRes := runContinueThinkingFold(resp, fold)
 				readErr = foldRes.ReadErr
-				if foldRes.InternalErr != nil {
-					writeErr = foldRes.InternalErr
-				}
-				if foldRes.UpstreamFailure != nil && len(foldRes.UpstreamFailure.Payload) > 0 {
-					terminalFailurePayload = append(terminalFailurePayload[:0], foldRes.UpstreamFailure.Payload...)
-					preContentErrorCandidate = nil
-					if !contentTokenSeen && !wroteAnyBody {
-						abortedForHTTPError = true
-					}
-				}
-				// 只有上游真实 completed/incomplete 才是正常终态。隐藏轮失败和
-				// 无终态 EOF 保持 gotTerminal=false，交由外层 attempt loop 重试。
+				// 折叠可能产出合成/重构的 response.incomplete 终态（续想失败/EOF），
+				// forward 只对 completed/failed 置位 gotTerminal，这里据折叠结果补齐，
+				// 否则正常收尾的折叠流会被误判为断流：惩罚账号、解绑亲和、用估算值覆盖真实 usage。
 				if foldRes.GotTerminal {
 					gotTerminal = true
 				}
