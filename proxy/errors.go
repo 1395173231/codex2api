@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -102,7 +103,13 @@ func (e *Error) UpstreamErrorBody() []byte {
 	if e == nil || e.Type != ErrorTypeUpstreamError {
 		return nil
 	}
-	return []byte(fmt.Sprintf(`{"error":{"code":%q,"type":%q,"message":%q}}`, e.Code, e.Type, e.Message))
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]string{"code": e.Code, "type": e.Type, "message": e.Message},
+	})
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 // ToGinH converts the error to a gin.H map for JSON response

@@ -1601,6 +1601,90 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsConcurrentContinuousRetryPartialUpdatesDoNotLoseFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	settings := defaultBootstrapSettings()
+	initialPolicy := database.ContinuousRetryPolicy{
+		Enabled:     true,
+		CatchAll:    true,
+		Categories:  []string{database.ContinuousRetryCategoryTransport},
+		StatusCodes: []int{},
+		ErrorCodes:  []string{},
+	}
+	settings.ContinuousRetryPolicy = database.EncodeContinuousRetryPolicy(initialPolicy)
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	if _, err := db.UpdateContinuousRetryPolicy(context.Background(), database.ContinuousRetryPolicyUpdate{
+		Enabled:     &initialPolicy.Enabled,
+		CatchAll:    &initialPolicy.CatchAll,
+		Categories:  &initialPolicy.Categories,
+		StatusCodes: &initialPolicy.StatusCodes,
+		ErrorCodes:  &initialPolicy.ErrorCodes,
+	}); err != nil {
+		t.Fatalf("seed continuous retry policy: %v", err)
+	}
+
+	cache1 := cache.NewMemory(4)
+	cache2 := cache.NewMemory(4)
+	t.Cleanup(func() { _ = cache1.Close() })
+	t.Cleanup(func() { _ = cache2.Close() })
+	store1 := auth.NewStore(db, cache1, settings)
+	store2 := auth.NewStore(db, cache2, settings)
+	t.Cleanup(store1.Stop)
+	t.Cleanup(store2.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handlers := []*Handler{
+		NewHandler(store1, db, cache1, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret"),
+		NewHandler(store2, db, cache2, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret"),
+	}
+	bodies := []string{
+		`{"continuous_retry_catch_all":false}`,
+		`{"continuous_retry_status_codes":[403]}`,
+	}
+
+	type updateResult struct {
+		code int
+		body string
+	}
+	start := make(chan struct{})
+	results := make(chan updateResult, len(handlers))
+	for index := range handlers {
+		handler := handlers[index]
+		body := bodies[index]
+		go func() {
+			<-start
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			handler.UpdateSettings(ctx)
+			results <- updateResult{code: recorder.Code, body: recorder.Body.String()}
+		}()
+	}
+	close(start)
+	for range handlers {
+		result := <-results
+		if result.code != http.StatusOK {
+			t.Fatalf("concurrent update status=%d body=%s", result.code, result.body)
+		}
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	policy := database.ParseContinuousRetryPolicy(persisted.ContinuousRetryPolicy)
+	if !policy.Enabled || policy.CatchAll || len(policy.StatusCodes) != 1 || policy.StatusCodes[0] != 403 || len(policy.Categories) != 1 || policy.Categories[0] != database.ContinuousRetryCategoryTransport {
+		t.Fatalf("concurrent admin updates lost a policy field: %#v", policy)
+	}
+}
+
 func TestUpdateSettingsConnectionPoolCeilingIs5000(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

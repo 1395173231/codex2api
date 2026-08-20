@@ -203,6 +203,8 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 
 	// 2. 选号前只解析模型/effort/tier，不把整段 Messages 转成有损 Codex 体。
 	// Grok 账号选中后再走一次 TranslateAnthropicToResponsesForGrok；
@@ -234,6 +236,11 @@ func (h *Handler) Messages(c *gin.Context) {
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
+	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, isStream, "text/event-stream; charset=utf-8")
+	defer stopRetryKeepalive()
+	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		activateContinuousRetryKeepalive(c.Request.Context())
+	}
 
 	reasoningEffort := extractReasoningEffort(routingBody)
 	serviceTier := extractServiceTier(routingBody)
@@ -269,16 +276,28 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", "All accounts rate limited") {
+					return
+				}
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
 			}
 			// 候选被 scope 预算剔空时给出真实原因（issue #439）。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", msg) {
+					return
+				}
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", msg)
+				return
+			}
+			if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel)) {
 				return
 			}
 			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
 			return
+		}
+		if attempt > 0 {
+			clearNewAPIUpstreamCyberPolicyDecision(c)
 		}
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
@@ -337,6 +356,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				if translateErr != nil {
 					ttftGuard.Stop()
 					h.store.Release(account)
+					if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", "Request translation failed") {
+						return
+					}
 					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+translateErr.Error())
 					return
 				}
@@ -345,18 +367,25 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
-			resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolMessages, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+				return ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolMessages, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			})
 		} else {
 			codexBody, translateErr := h.translateAnthropicMessagesToCodexOnce(&codexTranslation, rawBody, supportedModels)
 			if translateErr != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)
+				if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", "Request translation failed") {
+					return
+				}
 				sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+translateErr.Error())
 				return
 			}
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+				return ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			})
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -376,10 +405,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
-			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr)
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
 			shouldRetry := false
 			if retryable {
-				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
 			}
 			if retryable && shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
@@ -389,18 +418,25 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
+				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/messages): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
 				continue
 			}
 			if retryable && !timedOut {
-				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries)
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
 			}
 
 			if !retryable {
 				var structured *Error
 				if errors.As(reqErr, &structured) && structured.HTTPStatus == http.StatusBadRequest {
+					if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", structured.Message) {
+						return
+					}
 					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", structured.Message)
+					return
+				}
+				if isStream && writeCommittedAnthropicRetryError(c, "api_error", "Upstream request failed") {
 					return
 				}
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
@@ -409,10 +445,13 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
 			if shouldRetry {
-				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries)) {
+				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)) {
 					return
 				}
 				continue
+			}
+			if isStream && writeCommittedAnthropicRetryError(c, "api_error", "Upstream request failed") {
+				return
 			}
 			sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
 			return
@@ -434,7 +473,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries)
+			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
@@ -443,7 +482,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -469,15 +508,19 @@ func (h *Handler) Messages(c *gin.Context) {
 			})
 
 			if shouldRetry {
+				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
 			}
 			if isExplicitUpstreamCyberPolicy(errBody) {
+				if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", upstreamCyberPolicyResponseMessage(c)) {
+					return
+				}
 				sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", upstreamCyberPolicyResponseMessage(c))
 				return
 			}
@@ -486,12 +529,18 @@ func (h *Handler) Messages(c *gin.Context) {
 			// 上游账号 401（OAuth token 失效）是账号侧问题，不是下游客户端凭证无效；
 			// 原样以 401 透传会让客户端误判自己的 key 失效（issue #323），改写为 503。
 			if resp.StatusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(errBody) {
+				if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", "账号池暂无可用账号（上游账号鉴权失效），请稍后重试") {
+					return
+				}
 				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "账号池暂无可用账号（上游账号鉴权失效），请稍后重试")
 				return
 			}
 			// 上游账号 403 也是账号侧问题（额度/套餐/工作区受限）：换号重试耗尽后仍 403，
 			// 原样透传会让 Claude Code 误判自身无权限而停工（issue #396），改写为 503 池级错误。
 			if resp.StatusCode == http.StatusForbidden {
+				if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试") {
+					return
+				}
 				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试")
 				return
 			}
@@ -500,26 +549,41 @@ func (h *Handler) Messages(c *gin.Context) {
 			if msg == "" || msg == fmt.Sprintf("HTTP %d", resp.StatusCode) {
 				msg = fmt.Sprintf("Upstream returned status %d", resp.StatusCode)
 			}
+			if isStream && writeCommittedAnthropicRetryError(c, errType, msg) {
+				return
+			}
 			sendAnthropicError(c, resp.StatusCode, errType, msg)
 			return
 		}
 		if isGrokNativeRouteResponse(resp) {
-			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop)
+			downstreamFlusher, _ := c.Writer.(http.Flusher)
+			streamAttempt := newContinuousRetryStreamAttempt(isStream && continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
 			totalDuration := int(time.Since(start).Milliseconds())
 			ttftGuard.Stop()
 			resp.Body.Close()
-			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+			downstreamWrote := streamAttempt.downstreamWrote(wroteAnyBody)
+			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, downstreamWrote, c.Request.Context().Err(), nil, continuousRetryPolicy) {
+				_ = streamAttempt.Close()
 				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
-				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
 			}
-			nativeHTTPError := !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil
+			if outcome.logStatusCode == http.StatusOK {
+				copyGrokNativeResponseHeaders(c, resp.Header)
+				if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
+					abortContinuousRetryCommitFailure(h, account, resp, streamAttempt)
+					return
+				}
+			}
+			_ = streamAttempt.Close()
+			nativeHTTPError := !downstreamWrote && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil
 			if nativeHTTPError {
 				h.sendGrokNativeHTTPError(c, GrokProtocolMessages, outcome)
 			}
@@ -569,16 +633,16 @@ func (h *Handler) Messages(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var terminalFailurePayload []byte
+		var preContentErrorCandidate []byte
+		contentStarted := false
 		var anthropicResp *anthropicResponse
 		promptPolicyIncidentID := ""
 		upstreamCyberPolicyLogged := false
+		var streamAttempt *continuousRetryStreamAttempt
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
-			c.Header("Content-Type", "text/event-stream; charset=utf-8")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("X-Accel-Buffering", "no")
+			setSSEStreamHeaders(c, "text/event-stream; charset=utf-8")
 
 			flusher, ok := c.Writer.(http.Flusher)
 			if !ok {
@@ -590,18 +654,17 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			translator := newAnthropicStreamTranslator(originalModel)
-			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
+			streamAttempt = newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
+			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
 			// contentStarted 用严格口径（isFirstTokenResult）跟踪"首个真实内容帧"，
 			// 专供流提交决策（缓冲/重试窗口/failed 抑制）使用；ttftRecorded 按
 			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
 			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
 			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
-			contentStarted := false
-
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
-				eventType := parsed.Get("type").String()
+				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 
 				// TTFT 跟踪
 				ttftGuard.MarkProgress(eventType)
@@ -612,6 +675,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 				if !contentStarted && isFirstTokenResult(parsed) {
 					contentStarted = true
+				}
+				if contentStarted {
+					preContentErrorCandidate = nil
 				}
 
 				// 累计 delta 字符数
@@ -626,10 +692,24 @@ func (h *Handler) Messages(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					gotTerminal = true
+					preContentErrorCandidate = nil
 				}
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					preContentErrorCandidate = nil
+				}
+				visibleBody := wroteAnyBody && !continuousRetryBuffersAttempts(continuousRetryPolicy)
+				if eventType == "error" && continuousRetryBuffersAttempts(continuousRetryPolicy) {
+					// The attempt is private in continuous mode. Do not translate or
+					// write an upstream error event to the real ResponseWriter.
+					terminalFailurePayload = terminalUpstreamErrorPayload(data)
+					gotTerminal = true
+					return false
+				}
+				if !contentStarted && !visibleBody && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy) {
+					preContentErrorCandidate = append(preContentErrorCandidate[:0], data...)
+					return true
 				}
 
 				// 首 token 前的 response.failed 不翻译进下游流（issue #412）：
@@ -637,22 +717,28 @@ func (h *Handler) Messages(c *gin.Context) {
 				// 不可重试或重试耗尽时中止转发，循环外按真实错误码返回 JSON。
 				// 否则 handleFailed 会把失败翻译成 stop_reason=end_turn 的"正常空结束"，
 				// 下游网关会把它当成功计一条 0 token 请求且无从重试。
-				if shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentStarted, wroteAnyBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr) {
+				if shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentStarted, visibleBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr, continuousRetryPolicy) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
-				if shouldReturnHTTPErrorForResponseFailed(eventType, contentStarted, wroteAnyBody, writeErr != nil) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentStarted, visibleBody, writeErr != nil) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
 				// 正文已下发后收到 response.failed：无法整段重试，且 handleFailed 会把失败
 				// 翻译成 stop_reason=end_turn 的干净收尾，下游把截断响应当成功、无从感知
 				// 与重试（issue #435）。按 Anthropic 协议改发流内 error 事件后中止转发。
-				if eventType == "response.failed" && wroteAnyBody && writeErr == nil {
-					failedOutcome := classifyResponseFailedOutcome(terminalFailurePayload)
+				if (eventType == "response.failed" || eventType == "error") && visibleBody && writeErr == nil {
+					failurePayload := terminalUpstreamErrorPayload(data)
+					if eventType == "response.failed" && len(terminalFailurePayload) > 0 {
+						failurePayload = terminalFailurePayload
+					}
+					failedOutcome := classifyResponseFailedOutcome(failurePayload)
+					terminalFailurePayload = append([]byte(nil), failurePayload...)
+					gotTerminal = true
 					var policyDetails gin.H
-					if isExplicitUpstreamCyberPolicy(terminalFailurePayload) {
-						promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
+					if isExplicitUpstreamCyberPolicy(failurePayload) {
+						promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(failurePayload), upstreamCyberPolicyAttempt{
 							Transport: upstreamPromptPolicyTransport(true, useWebsocket), StatusCode: failedOutcome.logStatusCode,
 							AccountID: account.ID(), AttemptIndex: attempt + 1,
 						}))
@@ -727,9 +813,15 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			accumulator := newAnthropicResponseAccumulator(originalModel)
 
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
-				eventType := parsed.Get("type").String()
+				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				if eventType == "error" {
+					terminalFailurePayload = terminalUpstreamErrorPayload(data)
+					gotTerminal = true
+					preContentErrorCandidate = nil
+					return false
+				}
 				accumulator.apply(translator.translateEvent(data))
 
 				ttftGuard.MarkProgress(eventType)
@@ -752,7 +844,11 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					preContentErrorCandidate = nil
 					return false
+				}
+				if isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy) {
+					preContentErrorCandidate = append(preContentErrorCandidate[:0], data...)
 				}
 				return true
 			})
@@ -765,6 +861,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		terminalFailurePayload, _ = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentStarted, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
@@ -788,7 +885,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 		}
-		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		downstreamWrote := streamAttempt.downstreamWrote(wroteAnyBody)
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, downstreamWrote, c.Request.Context().Err(), writeErr) {
+			_ = streamAttempt.Close()
 			wsElapsed := time.Since(start)
 			resp.Body.Close()
 			wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage))
@@ -796,7 +895,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
-		if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, downstreamWrote, c.Request.Context().Err(), writeErr, continuousRetryPolicy) {
+			_ = streamAttempt.Close()
+			clearNewAPIUpstreamCyberPolicyDecision(c)
 			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: "/v1/messages", Model: model, EffectiveModel: attemptEffectiveModel,
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
@@ -815,21 +916,30 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			resp.Body.Close()
 			h.store.Release(account)
-			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries)
+			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries, continuousRetryPolicy)
 			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
-				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries) == -1 {
-				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries)
+				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
+				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 			}
 			if !isFirstTokenTimeoutOutcome(outcome) {
-				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries)
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
+			} else {
+				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy))
 			}
 			continue
 		}
+		if outcome.logStatusCode == http.StatusOK {
+			if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
+				abortContinuousRetryCommitFailure(h, account, resp, streamAttempt)
+				return
+			}
+		}
+		_ = streamAttempt.Close()
 
-		if isStream && !wroteAnyBody && writeErr == nil && c.Request.Context().Err() == nil && outcome.logStatusCode != http.StatusOK {
+		if isStream && !downstreamWrote && writeErr == nil && c.Request.Context().Err() == nil && outcome.logStatusCode != http.StatusOK {
 			// 流式：首包前上游失败、未向下游写过任何字节（收尾 flush 有 wroteAnyBody 守卫，
 			// 200 header 尚未提交）——按真实错误码返回 Anthropic 错误 JSON，而不是空 200 流，
 			// 让下游网关/客户端能感知失败并自行重试（issue #412）。
@@ -837,8 +947,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			if statusCode < 400 || statusCode > 599 || statusCode == logStatusUpstreamStreamBreak {
 				statusCode = http.StatusBadGateway
 			}
-			c.Header("Content-Type", "application/json; charset=utf-8")
-			sendAnthropicError(c, statusCode, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage)
+			if !writeCommittedAnthropicRetryError(c, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage) {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				sendAnthropicError(c, statusCode, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage)
+			}
 		}
 		if !isStream {
 			if anthropicResp != nil {

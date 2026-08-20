@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/tidwall/gjson"
 )
+
+type errorReadCloser struct {
+	err error
+}
+
+func (r *errorReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (r *errorReadCloser) Close() error             { return nil }
 
 // --- fixture 构造 -----------------------------------------------------------
 
@@ -26,6 +34,11 @@ func sseBody(events ...string) io.ReadCloser {
 
 func sseResponse(events ...string) *http.Response {
 	return &http.Response{StatusCode: http.StatusOK, Body: sseBody(events...)}
+}
+
+func namedSSEResponse(event, payload string) *http.Response {
+	body := fmt.Sprintf("event: %s\ndata: %s\n\n", event, payload)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
 }
 
 func evCreated() string {
@@ -62,6 +75,10 @@ func evMessageDone(seq, oi int, text string) string {
 
 func evCompleted(seq, inputTokens, outputTokens, reasoningTokens int) string {
 	return fmt.Sprintf(`{"type":"response.completed","sequence_number":%d,"response":{"id":"resp_r1","status":"completed","usage":{"input_tokens":%d,"output_tokens":%d,"total_tokens":%d,"input_tokens_details":{"cached_tokens":40},"output_tokens_details":{"reasoning_tokens":%d}}}}`, seq, inputTokens, outputTokens, inputTokens+outputTokens, reasoningTokens)
+}
+
+func evIncomplete(seq, inputTokens, outputTokens, reasoningTokens int) string {
+	return fmt.Sprintf(`{"type":"response.incomplete","sequence_number":%d,"response":{"id":"resp_r1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":%d,"output_tokens":%d,"total_tokens":%d,"output_tokens_details":{"reasoning_tokens":%d}}}}`, seq, inputTokens, outputTokens, inputTokens+outputTokens, reasoningTokens)
 }
 
 func evFailed(seq int) string {
@@ -445,22 +462,25 @@ func TestFoldContinuationRoundRejected(t *testing.T) {
 	if res.FinalUsage == nil || res.FinalUsage.ReasoningTokens != 516 {
 		t.Fatalf("FinalUsage 应为最后成功轮真实用量: %+v", res.FinalUsage)
 	}
-	if !res.GotTerminal {
-		t.Fatalf("续想失败已合成终态, GotTerminal 应为 true")
+	if res.GotTerminal {
+		t.Fatalf("续想 HTTP 失败不能伪装成正常协议终态")
 	}
-	final := c.events[len(c.events)-1]
-	if gjson.GetBytes(final, "type").String() != "response.incomplete" {
-		t.Fatalf("续想失败应合成 response.incomplete: %s", final)
+	if res.UpstreamFailure == nil || res.UpstreamFailure.StatusCode != http.StatusBadRequest {
+		t.Fatalf("续想 HTTP 失败应交还外层 attempt loop: %+v", res.UpstreamFailure)
 	}
-	if gjson.GetBytes(final, "response.incomplete_details.reason").String() != "upstream_error" {
-		t.Fatalf("incomplete reason 错误: %s", final)
+	if got := gjson.GetBytes(res.UpstreamFailure.Payload, "response.error.message").String(); got != "bad request" {
+		t.Fatalf("续想 HTTP 错误体未保留: %s", res.UpstreamFailure.Payload)
 	}
-	assertMonotonicSeq(t, c.events)
+	for _, event := range c.events {
+		if gjson.GetBytes(event, "type").String() == "response.incomplete" {
+			t.Fatalf("续想 HTTP 失败不得合成 response.incomplete: %s", event)
+		}
+	}
 }
 
 func TestFoldFirstRoundContinuationFailsBillsRound1(t *testing.T) {
-	// 第 1 轮命中指纹但首次续想开轮即失败：FinalUsage 必须保留第 1 轮真实用量
-	// （否则整轮消耗漏记），且已合成终态（否则会被误判断流惩罚账号）。
+	// 第 1 轮命中指纹但首次续想开轮即失败：FinalUsage 必须保留第 1 轮真实用量，
+	// 同时把传输失败交给最外层 attempt loop，不能合成成功终态。
 	c := &foldCollector{
 		nextErr: []error{fmt.Errorf("dial timeout")},
 	}
@@ -479,8 +499,8 @@ func TestFoldFirstRoundContinuationFailsBillsRound1(t *testing.T) {
 	if res.FailedContinuation == nil {
 		t.Fatalf("首次续想失败应记入 FailedContinuation")
 	}
-	if !res.GotTerminal {
-		t.Fatalf("已合成终态, GotTerminal 应为 true(避免误判断流)")
+	if res.GotTerminal || res.UpstreamFailure == nil || res.UpstreamFailure.Err == nil {
+		t.Fatalf("续想传输失败应明确交还外层: terminal=%v failure=%+v", res.GotTerminal, res.UpstreamFailure)
 	}
 }
 
@@ -530,6 +550,9 @@ func TestFoldFirstRoundEOFSilent(t *testing.T) {
 	if res.GotTerminal || res.StopReason != continueStopUpstreamEOF {
 		t.Fatalf("第 1 轮 EOF 应静默(交给上层透明重试): %+v", res)
 	}
+	if res.UpstreamFailure == nil || res.ReadErr == nil {
+		t.Fatalf("第 1 轮 EOF 应明确标成上游失败: %+v", res)
+	}
 	for _, ev := range c.events {
 		if gjson.GetBytes(ev, "type").String() == "response.incomplete" {
 			t.Fatalf("第 1 轮无输出 EOF 不应合成 incomplete: %s", ev)
@@ -537,9 +560,9 @@ func TestFoldFirstRoundEOFSilent(t *testing.T) {
 	}
 }
 
-func TestFoldFirstRoundEOFWithBufferedContentFlushes(t *testing.T) {
-	// 第 1 轮缓冲了 message 内容后 EOF（无 terminal）：不应静默丢弃，
-	// 应冲刷缓冲内容并合成 incomplete，避免客户端收到空的 200 流。
+func TestFoldFirstRoundEOFWithBufferedContentStaysPrivate(t *testing.T) {
+	// 第 1 轮缓冲了 message 内容后 EOF（无 terminal）：残缺 attempt 必须整体
+	// 丢弃并交给外层重试，不能把暂定输出冲刷成看似成功的 incomplete。
 	c := &foldCollector{}
 	res := c.fold(testBaseBody, 8, sseResponse(
 		evCreated(),
@@ -547,18 +570,15 @@ func TestFoldFirstRoundEOFWithBufferedContentFlushes(t *testing.T) {
 		evMessageDelta(2, 0, "partial answer"),
 		// 无 terminal
 	))
-	if !res.GotTerminal || res.StopReason != continueStopUpstreamEOF {
-		t.Fatalf("有缓冲内容的 EOF 应合成终态: %+v", res)
+	if res.GotTerminal || res.StopReason != continueStopUpstreamEOF || res.UpstreamFailure == nil {
+		t.Fatalf("有缓冲内容的 EOF 应返回上游失败: %+v", res)
 	}
 	joined := ""
 	for _, ev := range c.events {
 		joined += string(ev)
 	}
-	if !strings.Contains(joined, "partial answer") {
-		t.Fatalf("缓冲内容应被冲刷给客户端, events=%v", c.eventTypes())
-	}
-	if c.eventTypes()[len(c.eventTypes())-1] != "response.incomplete" {
-		t.Fatalf("末事件应为 incomplete: %v", c.eventTypes())
+	if strings.Contains(joined, "partial answer") || strings.Contains(joined, "response.incomplete") {
+		t.Fatalf("失败 attempt 的缓冲内容不得泄漏: events=%v", c.eventTypes())
 	}
 }
 
@@ -574,29 +594,77 @@ func TestFoldContinuationRoundEOF(t *testing.T) {
 		evReasoningDone(2, 0, "enc-a"),
 		evCompleted(3, 100, 516, 516),
 	))
-	if !res.GotTerminal || res.StopReason != continueStopUpstreamEOF {
-		t.Fatalf("续想轮 EOF 应合成终态: %+v", res)
+	if res.GotTerminal || res.StopReason != continueStopUpstreamEOF || res.UpstreamFailure == nil || res.ReadErr == nil {
+		t.Fatalf("续想轮 EOF 应交还外层 attempt loop: %+v", res)
 	}
-	final := c.events[len(c.events)-1]
-	if gjson.GetBytes(final, "type").String() != "response.incomplete" ||
-		gjson.GetBytes(final, "response.incomplete_details.reason").String() != "upstream_eof" {
-		t.Fatalf("应合成 incomplete(upstream_eof): %s", final)
+	for _, event := range c.events {
+		if gjson.GetBytes(event, "type").String() == "response.incomplete" {
+			t.Fatalf("续想轮 EOF 不得合成 response.incomplete: %s", event)
+		}
 	}
 }
 
-func TestFoldFirstRoundFailedPassthrough(t *testing.T) {
+func TestFoldContinuationRoundReadError(t *testing.T) {
+	wantErr := errors.New("upstream reset")
+	c := &foldCollector{
+		nextResp: []*http.Response{{
+			StatusCode: http.StatusOK,
+			Body:       &errorReadCloser{err: wantErr},
+		}},
+	}
+	res := c.fold(testBaseBody, 8, fingerprintFirstRound())
+	if res.GotTerminal || res.StopReason != continueStopUpstreamEOF || res.UpstreamFailure == nil {
+		t.Fatalf("续想读流错误应返回上游失败: %+v", res)
+	}
+	if !errors.Is(res.ReadErr, wantErr) || !errors.Is(res.UpstreamFailure.Err, wantErr) {
+		t.Fatalf("续想读流错误未保留: read=%v failure=%+v", res.ReadErr, res.UpstreamFailure)
+	}
+}
+
+func TestFoldNamedErrorEventWithoutJSONTypeReturnsUpstreamFailure(t *testing.T) {
+	payload := `{"error":{"code":"rate_limited","message":"slow down"}}`
+	c := &foldCollector{}
+	res := c.fold(testBaseBody, 8, namedSSEResponse("error", payload))
+	if res.GotTerminal || res.StopReason != continueStopRoundError || res.UpstreamFailure == nil {
+		t.Fatalf("event:error 应返回上游失败: %+v", res)
+	}
+	if res.UpstreamFailure.EventType != "error" || string(res.UpstreamFailure.Payload) != payload {
+		t.Fatalf("event:error 名称或 payload 丢失: %+v", res.UpstreamFailure)
+	}
+	if len(c.events) != 0 {
+		t.Fatalf("event:error 不得下发客户端: %v", c.eventTypes())
+	}
+}
+
+func TestFoldRealResponseIncompleteIsNormalTerminal(t *testing.T) {
+	c := &foldCollector{}
+	res := c.fold(testBaseBody, 8, sseResponse(
+		evCreated(),
+		evMessageAdded(1, 0),
+		evMessageDelta(2, 0, "partial by model limit"),
+		evMessageDone(3, 0, "partial by model limit"),
+		evIncomplete(4, 100, 300, 0),
+	))
+	if !res.GotTerminal || res.StopReason != continueStopClean || res.UpstreamFailure != nil {
+		t.Fatalf("真实 response.incomplete 应是正常终态: %+v", res)
+	}
+	if got := c.eventTypes()[len(c.eventTypes())-1]; got != "response.incomplete" {
+		t.Fatalf("真实 response.incomplete 应原协议下发, got %q", got)
+	}
+}
+
+func TestFoldFirstRoundFailedReturnsUpstreamFailure(t *testing.T) {
 	failed := evFailed(1)
 	c := &foldCollector{}
 	res := c.fold(testBaseBody, 8, sseResponse(
 		evCreated(),
 		failed,
 	))
-	if res.StopReason != continueStopClean {
+	if res.StopReason != continueStopRoundError || res.GotTerminal || res.UpstreamFailure == nil {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	final := c.events[len(c.events)-1]
-	if string(final) != failed {
-		t.Fatalf("第 1 轮无输出的 failed 应字节级透传:\ngot  %s\nwant %s", final, failed)
+	if res.UpstreamFailure.EventType != "response.failed" || string(res.UpstreamFailure.Payload) != failed {
+		t.Fatalf("response.failed 应原样交给外层分类:\ngot  %s\nwant %s", res.UpstreamFailure.Payload, failed)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 type continuousRetryTestHTTPError struct {
@@ -14,9 +16,59 @@ type continuousRetryTestHTTPError struct {
 	body   []byte
 }
 
+func TestContinuousRetryPolicyForRequestKeepsInitialSnapshot(t *testing.T) {
+	previous := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previous) })
+
+	c := &gin.Context{}
+	rememberContinuousRetryPolicyForRequest(c, database.ContinuousRetryPolicy{})
+
+	updated := previous
+	updated.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	ApplyRuntimeSettings(updated)
+
+	if policy := continuousRetryPolicyForRequest(c); policy.Enabled || policy.CatchAll {
+		t.Fatalf("request policy changed after hot reload: %#v", policy)
+	}
+}
+
 func (e continuousRetryTestHTTPError) Error() string             { return "upstream websocket handshake failed" }
 func (e continuousRetryTestHTTPError) UpstreamStatusCode() int   { return e.status }
 func (e continuousRetryTestHTTPError) UpstreamErrorBody() []byte { return e.body }
+
+func TestContinuousRetryPreflightPassthroughStopsBeforeAnyRetryPolicy(t *testing.T) {
+	settings := RuntimeSettings{CodexPreflightSSEPassthrough: true}
+	if !continuousRetryPreflightPassthrough(settings) {
+		t.Fatal("disabled continuous retry unexpectedly blocked preflight passthrough")
+	}
+	settings.ContinuousRetryPolicy = database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryResponseFailed},
+	}
+	if continuousRetryPreflightPassthrough(settings) {
+		t.Fatal("selective continuous retry leaked preflight metadata before the retry boundary")
+	}
+	settings.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	if continuousRetryPreflightPassthrough(settings) {
+		t.Fatal("catch-all continuous retry leaked preflight metadata before the retry boundary")
+	}
+}
+
+func TestContinuousRetryBuffersEveryEnabledSelectorMode(t *testing.T) {
+	if continuousRetryBuffersAttempts(database.ContinuousRetryPolicy{}) {
+		t.Fatal("disabled policy unexpectedly enabled attempt buffering")
+	}
+	selective := database.ContinuousRetryPolicy{
+		Enabled:     true,
+		StatusCodes: []int{http.StatusServiceUnavailable},
+	}
+	if !continuousRetryBuffersAttempts(selective) {
+		t.Fatal("selective continuous retry must buffer the full attempt")
+	}
+	if !continuousRetryBuffersAttempts(database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}) {
+		t.Fatal("catch-all continuous retry must buffer the full attempt")
+	}
+}
 
 func TestContinuousRetryHTTPSelectionIsOptInAndExact(t *testing.T) {
 	disabled := database.ContinuousRetryPolicy{
@@ -91,12 +143,19 @@ func TestContinuousRetryCatchAllSelectsUnknownUpstreamFailures(t *testing.T) {
 	if shouldTransparentRetryStreamWithBudgets(outcome, &general, &rate, 0, 0, false, context.Canceled, nil, policy) {
 		t.Fatal("catch-all policy ignored downstream cancellation")
 	}
+
+	success := streamOutcome{logStatusCode: http.StatusOK}
+	if continuousRetryStreamSelected(success, nil, "response.completed", policy) {
+		t.Fatal("catch-all policy selected a successful terminal response")
+	}
+	if shouldTransparentRetryStreamWithBudgets(success, &general, &rate, 0, 0, false, nil, nil, policy) {
+		t.Fatal("catch-all policy retried a successful terminal response")
+	}
 }
 
-func TestContinuousRetryNeverSelectsStructuredSafetyRefusals(t *testing.T) {
+func TestContinuousRetrySelectivePolicyNeverSelectsStructuredSafetyRefusals(t *testing.T) {
 	policy := database.ContinuousRetryPolicy{
 		Enabled:     true,
-		CatchAll:    true,
 		Categories:  []string{database.ContinuousRetryCategoryHTTP4xx, database.ContinuousRetryCategoryHTTP5xx, database.ContinuousRetryCategoryResponseFailed},
 		StatusCodes: []int{http.StatusBadRequest, http.StatusInternalServerError},
 		ErrorCodes:  []string{"content_policy_violation"},
@@ -128,6 +187,23 @@ func TestContinuousRetryNeverSelectsStructuredSafetyRefusals(t *testing.T) {
 	ordinary := []byte(`{"error":{"code":"server_error","message":"content policy service temporarily unavailable"}}`)
 	if !continuousRetryHTTPSelected(policy, http.StatusInternalServerError, ordinary) {
 		t.Fatal("an unstructured message mention suppressed an otherwise selected 500")
+	}
+}
+
+func TestContinuousRetryCatchAllSelectsStructuredUpstreamSafetyRefusals(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	body := []byte(`{"error":{"code":"content_policy_violation","message":"blocked"}}`)
+	if !continuousRetryHTTPSelected(policy, http.StatusForbidden, body) {
+		t.Fatal("catch-all did not select a structured upstream safety HTTP failure")
+	}
+	outcome := classifyResponseFailedOutcome([]byte(`{"type":"response.failed","response":{"status_code":400,"error":{"code":"content_policy_violation"}}}`))
+	if !continuousRetryStreamSelected(outcome, outcome.failurePayload, "response.failed", policy) {
+		t.Fatal("catch-all did not select a structured upstream safety stream failure")
+	}
+	err := continuousRetryTestHTTPError{status: http.StatusForbidden, body: body}
+	general := 0
+	if !shouldRetryRequestError(err, &general, 0, policy) {
+		t.Fatal("catch-all did not select a structured upstream safety handshake failure")
 	}
 }
 
@@ -218,8 +294,111 @@ func TestContinuousRetryStreamErrorDoesNotSelectDeterministicResponseFailed(t *t
 		Enabled:    true,
 		Categories: []string{database.ContinuousRetryCategoryStreamError},
 	}
+	explicitError := []byte(`{"type":"error","error":{"code":"future_stream_error"}}`)
+	if !continuousRetryStreamSelected(classifyResponseFailedOutcome(explicitError), explicitError, "error", streamErrorPolicy) {
+		t.Fatal("stream-error category did not select an explicit in-stream error event")
+	}
+	responseFailed := []byte(`{"type":"response.failed","response":{"status_code":598,"error":{"code":"future_failure"}}}`)
+	if continuousRetryStreamSelected(classifyResponseFailedOutcome(responseFailed), responseFailed, "response.failed", streamErrorPolicy) {
+		t.Fatal("stream-error category selected response.failed without its own selector")
+	}
 	if !continuousRetryStreamSelected(readFailure, readFailure.failurePayload, "", streamErrorPolicy) {
 		t.Fatal("stream-error category did not select a real stream read failure")
+	}
+}
+
+func TestContinuousRetryHTTPSelectorsRequireStatusEvidenceForStreamFailures(t *testing.T) {
+	serverOnly := database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryHTTP5xx},
+	}
+	for _, payload := range [][]byte{
+		[]byte(`{"type":"provider_specific_failure","message":"bad input"}`),
+		[]byte(`{"type":"error","error":{"code":"future_unknown_failure"}}`),
+	} {
+		outcome := classifyResponseFailedOutcome(payload)
+		if outcome.logStatusCode != http.StatusInternalServerError {
+			t.Fatalf("log fallback status = %d, want 500 for %s", outcome.logStatusCode, payload)
+		}
+		if continuousRetryStreamSelected(outcome, payload, "error", serverOnly) {
+			t.Fatalf("http_5xx selected a stream failure without status evidence: %s", payload)
+		}
+	}
+
+	transportOutcome := streamOutcome{
+		logStatusCode:  logStatusUpstreamStreamBreak,
+		failureKind:    "transport",
+		failurePayload: []byte("unexpected EOF"),
+		penalize:       true,
+	}
+	if continuousRetryStreamSelected(transportOutcome, transportOutcome.failurePayload, "", serverOnly) {
+		t.Fatal("http_5xx selected the synthetic stream-break status")
+	}
+
+	evidenced := []byte(`{"type":"error","error":{"status_code":503,"code":"future_unknown_failure"}}`)
+	if !continuousRetryStreamSelected(classifyResponseFailedOutcome(evidenced), evidenced, "error", serverOnly) {
+		t.Fatal("http_5xx did not select an explicit stream status")
+	}
+
+	mapped := []byte(`{"type":"error","code":"temporarily_unavailable"}`)
+	if !continuousRetryStreamSelected(classifyResponseFailedOutcome(mapped), mapped, "error", serverOnly) {
+		t.Fatal("http_5xx did not select a reliably mapped top-level error code")
+	}
+
+	exactCode := database.ContinuousRetryPolicy{Enabled: true, ErrorCodes: []string{"future_unknown_failure"}}
+	unknown := []byte(`{"type":"error","error":{"code":"future_unknown_failure"}}`)
+	if !continuousRetryStreamSelected(classifyResponseFailedOutcome(unknown), unknown, "error", exactCode) {
+		t.Fatal("status-evidence guard disabled an exact error-code selector")
+	}
+}
+
+func TestTerminalUpstreamErrorPayloadSynthesizesEmptyEvent(t *testing.T) {
+	payload := terminalUpstreamErrorPayload(nil)
+	if gjson.GetBytes(payload, "type").String() != "error" ||
+		gjson.GetBytes(payload, "error.code").String() != "upstream_error" {
+		t.Fatalf("empty error payload was not normalized: %s", payload)
+	}
+	original := []byte(`{"type":"error","error":{"code":"custom"}}`)
+	if got := terminalUpstreamErrorPayload(original); string(got) != string(original) {
+		t.Fatalf("non-empty error payload changed: %s", got)
+	}
+}
+
+func TestContinuousRetryResponseFailedCategoryUsesTopLevelEventType(t *testing.T) {
+	policy := database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryResponseFailed},
+	}
+	messageMention := []byte(`{"type":"error","error":{"code":"invalid_request","message":"provider mentioned response.failed in diagnostics"}}`)
+	outcome := classifyResponseFailedOutcome(messageMention)
+	if continuousRetryStreamSelected(outcome, messageMention, "", policy) {
+		t.Fatal("response.failed category matched a diagnostic message instead of the top-level event type")
+	}
+
+	actualFailure := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request"}}}`)
+	outcome = classifyResponseFailedOutcome(actualFailure)
+	if !continuousRetryStreamSelected(outcome, actualFailure, "", policy) {
+		t.Fatal("response.failed category did not match the top-level response.failed event")
+	}
+}
+
+func TestContinuousRetrySelectedTransportBypassesStickyAccount(t *testing.T) {
+	h, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("sticky")
+	err := errors.New("connection reset by peer")
+
+	if !h.shouldStickyTransportRetry(err, "transport", false, true, database.ContinuousRetryPolicy{}) {
+		t.Fatal("finite retry lost the configured sticky-account behavior")
+	}
+	transport := database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryTransport},
+	}
+	if h.shouldStickyTransportRetry(err, "transport", false, true, transport) {
+		t.Fatal("selected continuous transport failure stayed on the same account")
+	}
+	if h.shouldStickyTransportRetry(err, "transport", false, true, database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}) {
+		t.Fatal("catch-all transport failure stayed on the same account")
 	}
 }
 
@@ -255,8 +434,11 @@ func TestContinuousRetryImageStreamSelectionHonorsPolicyAndSafety(t *testing.T) 
 	if !shouldRetryImageStreamError(quotaFailure, &general, 0, 0, maxImageAttempts, catchAll) {
 		t.Fatal("catch-all did not select a permanent image quota failure")
 	}
-	if shouldRetryImageStreamError(quotaFailure, &general, 0, maxImageAttempts-1, maxImageAttempts, catchAll) {
-		t.Fatal("catch-all bypassed the image total-attempt cap")
+	if !shouldRetryImageStreamError(moderationFailure, &general, 0, 0, maxImageAttempts, catchAll) {
+		t.Fatal("catch-all did not select a structured image moderation refusal")
+	}
+	if !shouldRetryImageStreamError(quotaFailure, &general, 0, maxImageAttempts-1, maxImageAttempts, catchAll) {
+		t.Fatal("catch-all did not bypass the ordinary image attempt cap")
 	}
 }
 
@@ -274,6 +456,13 @@ func TestContinuousRetryErrorFrameUsesSelectedPolicyBeforeResponseFailed(t *test
 	}
 	if isRetryableUpstreamErrorFrame("response.output_text.delta", errorFrame, policy) {
 		t.Fatal("non-error event was classified as a retryable error frame")
+	}
+	typelessError := []byte(`{"error":{"status_code":403,"code":"forbidden"}}`)
+	if !isRetryableUpstreamErrorFrame("error", typelessError, policy) {
+		t.Fatal("SSE event:error without a JSON lifecycle type was not selected")
+	}
+	if !isRetryableUpstreamErrorFrame("", typelessError, policy) {
+		t.Fatal("top-level error object without a lifecycle type was not selected")
 	}
 }
 
@@ -363,8 +552,8 @@ func TestContinuousRetryCatchAllSelectsOnlyStructuredStatuslessUpstreamErrors(t 
 		Message: "blocked",
 		Type:    ErrorTypeUpstreamError,
 	}
-	if isRetryableRequestErrorForContext(context.Background(), safetyErr, policy) {
-		t.Fatal("catch-all selected a statusless structured safety refusal")
+	if !isRetryableRequestErrorForContext(context.Background(), safetyErr, policy) {
+		t.Fatal("catch-all did not select a statusless structured upstream safety refusal")
 	}
 	canceled := ErrUpstream(0, "upstream request canceled", context.Canceled)
 	if isRetryableRequestErrorForContext(context.Background(), canceled, policy) {

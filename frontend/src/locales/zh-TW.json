@@ -20,6 +20,7 @@
     "planWorkspaceId": "空間 ID：{{id}}"
   },
   "settings": {
+    "continuousRetryCategoryStream": "串流內 error 事件 / 串流讀取失敗",
     "modelCooldownTitle": "模型 429 冷卻策略",
     "modelCooldownDesc": "分別控制 API 直連上游與 OAuth 帳號池的模型級 429 冷卻。",
     "relayModelCooldownTitle": "API 計畫 / 直連上游",

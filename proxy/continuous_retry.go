@@ -1,13 +1,18 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
+
+const continuousRetryPolicyRequestContextKey = "continuous_retry_policy_snapshot"
 
 func continuousRetryPolicyForCall(policies []database.ContinuousRetryPolicy) database.ContinuousRetryPolicy {
 	if len(policies) > 0 {
@@ -16,8 +21,42 @@ func continuousRetryPolicyForCall(policies []database.ContinuousRetryPolicy) dat
 	return database.NormalizeContinuousRetryPolicy(CurrentRuntimeSettings().ContinuousRetryPolicy)
 }
 
+func rememberContinuousRetryPolicyForRequest(c *gin.Context, policy database.ContinuousRetryPolicy) {
+	if c == nil {
+		return
+	}
+	c.Set(continuousRetryPolicyRequestContextKey, database.NormalizeContinuousRetryPolicy(policy))
+}
+
+func continuousRetryPolicyForRequest(c *gin.Context) database.ContinuousRetryPolicy {
+	if c != nil {
+		if value, exists := c.Get(continuousRetryPolicyRequestContextKey); exists {
+			if policy, ok := value.(database.ContinuousRetryPolicy); ok {
+				return database.NormalizeContinuousRetryPolicy(policy)
+			}
+		}
+	}
+	return continuousRetryPolicyForCall(nil)
+}
+
+// continuousRetryBuffersAttempts is true for both selector modes. Once an
+// operator enables continuous retry, an error can arrive after arbitrary
+// stream output, so the whole attempt must stay private until its terminal
+// outcome is known. Catch-all only changes which upstream failures retry.
+func continuousRetryBuffersAttempts(policy database.ContinuousRetryPolicy) bool {
+	return database.NormalizeContinuousRetryPolicy(policy).Enabled
+}
+
+func continuousRetryPreflightPassthrough(settings RuntimeSettings) bool {
+	policy := database.NormalizeContinuousRetryPolicy(settings.ContinuousRetryPolicy)
+	return settings.CodexPreflightSSEPassthrough && !policy.Enabled
+}
+
 func continuousRetryHTTPSelected(policy database.ContinuousRetryPolicy, status int, body []byte) bool {
-	if !policy.Enabled || isExplicitUpstreamSafetyPolicy(body) {
+	if !policy.Enabled {
+		return false
+	}
+	if isExplicitUpstreamSafetyPolicy(body) && !policy.CatchesAllUpstreamFailures() {
 		return false
 	}
 	// A generic 429 category should not turn a permanent billing/quota failure
@@ -99,19 +138,22 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 		}
 		var upstreamErr *Error
 		return errors.As(err, &upstreamErr) &&
-			upstreamErr.Type == ErrorTypeUpstreamError &&
-			!isExplicitUpstreamSafetyPolicy(upstreamErr.UpstreamErrorBody())
+			upstreamErr.Type == ErrorTypeUpstreamError
 	}
 	return continuousRetryHTTPSelected(policy, status, body)
 }
 
 func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
 	policy := continuousRetryPolicyForCall(policies)
-	if !policy.Enabled || isExplicitUpstreamSafetyPolicy(payload) {
+	if !policy.Enabled {
 		return false
 	}
-	if eventType == "" && strings.Contains(strings.ToLower(string(payload)), "response.failed") {
-		eventType = "response.failed"
+	eventType = normalizedUpstreamSSEEventType(eventType, payload)
+	if !isActualUpstreamStreamFailure(outcome, eventType) {
+		return false
+	}
+	if isExplicitUpstreamSafetyPolicy(payload) && !policy.CatchesAllUpstreamFailures() {
+		return false
 	}
 	if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.CatchesAllUpstreamFailures() && !policy.MatchesErrorCodes(payload) {
 		return false
@@ -119,8 +161,13 @@ func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventT
 	if policy.CatchesAllUpstreamFailures() {
 		return true
 	}
-	if continuousRetryHTTPSelected(policy, outcome.logStatusCode, payload) {
-		return true
+	// Stream outcomes also use synthetic statuses for logging (an unknown error
+	// frame falls back to 500 and a broken stream uses 598). Those values are not
+	// HTTP evidence and must not activate an HTTP selector.
+	if status, evidenced := responseFailedStatusCodeWithEvidence(payload); evidenced {
+		if continuousRetryHTTPSelected(policy, status, payload) {
+			return true
+		}
 	}
 	if policy.MatchesErrorCodes(payload) {
 		return true
@@ -131,11 +178,65 @@ func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventT
 	if eventType == "response.failed" && policy.HasCategory(database.ContinuousRetryCategoryResponseFailed) {
 		return true
 	}
-	streamReadFailure := outcome.logStatusCode == logStatusUpstreamStreamBreak ||
-		outcome.failureKind == "transport" || outcome.failureKind == "timeout"
+	// stream_error covers an explicit in-stream error event as well as a read
+	// failure or abnormal EOF. response.failed remains its own selector: a
+	// provider failure terminal must not enter stream_error merely because its
+	// synthetic/log status resembles a broken stream.
+	if eventType == "error" && policy.HasCategory(database.ContinuousRetryCategoryStreamError) {
+		return true
+	}
+	streamReadFailure := eventType != "response.failed" &&
+		(outcome.logStatusCode == logStatusUpstreamStreamBreak ||
+			outcome.failureKind == "transport" || outcome.failureKind == "timeout")
 	return streamReadFailure &&
 		(policy.HasCategory(database.ContinuousRetryCategoryTransport) ||
 			policy.HasCategory(database.ContinuousRetryCategoryStreamError))
+}
+
+// isActualUpstreamStreamFailure is the success gate shared by selective and
+// catch-all policies. A catch-all changes which failures are retried; it must
+// never turn a clean terminal response into another paid upstream attempt.
+func isActualUpstreamStreamFailure(outcome streamOutcome, eventType string) bool {
+	if outcome.logStatusCode == logStatusClientClosed {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "error", "response.failed":
+		return true
+	}
+	if outcome.penalize || strings.TrimSpace(outcome.failureKind) != "" {
+		return true
+	}
+	return outcome.logStatusCode != 0 && outcome.logStatusCode != http.StatusOK
+}
+
+func normalizedUpstreamSSEEventType(eventName string, payload []byte) string {
+	// An explicit SSE error event is authoritative even when a non-standard
+	// provider puts an error subtype (for example invalid_request_error) in the
+	// JSON `type` field. Otherwise that frame can be mistaken for ordinary data
+	// and leak through catch-all mode.
+	if eventType := strings.TrimSpace(eventName); strings.EqualFold(eventType, "error") {
+		return "error"
+	}
+	if eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); eventType != "" {
+		return eventType
+	}
+	if eventType := strings.TrimSpace(eventName); eventType != "" {
+		return eventType
+	}
+	if errorValue := gjson.GetBytes(payload, "error"); errorValue.Exists() && errorValue.Type != gjson.Null {
+		return "error"
+	}
+	return ""
+}
+
+var emptyUpstreamErrorEventPayload = []byte(`{"type":"error","error":{"type":"upstream_error","code":"upstream_error","message":"Upstream returned an empty error event"}}`)
+
+func terminalUpstreamErrorPayload(payload []byte) []byte {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return append([]byte(nil), emptyUpstreamErrorEventPayload...)
+	}
+	return append([]byte(nil), payload...)
 }
 
 // continuousRetryStreamFailureSelected includes the legacy retryable outcome
@@ -163,11 +264,12 @@ func isContextRetryError(payload []byte) bool {
 	return false
 }
 
-// isExplicitUpstreamSafetyPolicy keeps deterministic provider safety refusals
-// outside continuous retry even when an operator selected a broad 4xx/5xx
-// category or the exact HTTP status. Match structured machine codes only so a
-// harmless mention of "content policy" in an error message cannot disable a
-// genuinely recoverable retry.
+// isExplicitUpstreamSafetyPolicy identifies deterministic provider safety
+// refusals so selective policies do not accidentally turn a broad 4xx/5xx
+// category into an endless loop. The explicit catch-all override still selects
+// them, as promised by the high-risk super switch. Match structured machine
+// codes only so a harmless mention of "content policy" in an error message
+// cannot disable a genuinely recoverable selective retry.
 func isExplicitUpstreamSafetyPolicy(payload []byte) bool {
 	if isExplicitUpstreamCyberPolicy(payload) {
 		return true

@@ -15,6 +15,7 @@ import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
   buildContinuousRetryCatchAllPatch,
   buildContinuousRetryEnabledPatch,
+  createContinuousRetrySaveQueue,
   parseContinuousRetryErrorCodes,
   parseContinuousRetryStatusCodes,
 } from '../lib/continuousRetrySettings'
@@ -1471,6 +1472,7 @@ export default function Settings() {
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSaveStatusTimerRef = useRef<number | null>(null)
+  const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
 
   useEffect(() => {
@@ -1598,6 +1600,10 @@ export default function Settings() {
       finishAutoSaveRequest('error')
     }
   }, [commitSettingsForm, finishAutoSaveRequest, showToast, t])
+
+  const autoSaveContinuousRetryPatch = useCallback((patch: Partial<SystemSettings>) => {
+    return continuousRetrySaveQueueRef.current(() => autoSaveSettingsPatch(patch))
+  }, [autoSaveSettingsPatch])
 
   const autoSaveBooleanField = useCallback((field: keyof SystemSettings, value: boolean, extraPatch: Partial<SystemSettings> = {}) => {
     void autoSaveSettingsPatch({
@@ -2279,8 +2285,9 @@ export default function Settings() {
                     layout="switch"
                   >
                     <Switch
+                      aria-label={t('settings.continuousRetryEnabled')}
                       checked={settingsForm.continuous_retry_enabled}
-                      onCheckedChange={(checked) => void autoSaveSettingsPatch(buildContinuousRetryEnabledPatch(checked))}
+                      onCheckedChange={(checked) => void autoSaveContinuousRetryPatch(buildContinuousRetryEnabledPatch(checked))}
                     />
                   </SettingField>
                   <SettingField
@@ -2294,8 +2301,9 @@ export default function Settings() {
                     )}
                   >
                     <Switch
+                      aria-label={t('settings.continuousRetryCatchAll')}
                       checked={settingsForm.continuous_retry_catch_all}
-                      onCheckedChange={(checked) => void autoSaveSettingsPatch(buildContinuousRetryCatchAllPatch(checked))}
+                      onCheckedChange={(checked) => void autoSaveContinuousRetryPatch(buildContinuousRetryCatchAllPatch(checked))}
                     />
                   </SettingField>
                   <div className={cn('grid gap-3 sm:grid-cols-2 lg:grid-cols-4', continuousRetryFineControlsDisabled && 'opacity-60')}>
@@ -2307,6 +2315,7 @@ export default function Settings() {
                         className="rounded-lg border border-border/60 px-3 py-2"
                       >
                         <Switch
+                          aria-label={option.label}
                           checked={(settingsForm.continuous_retry_categories ?? []).includes(option.value)}
                           disabled={continuousRetryFineControlsDisabled}
                           onCheckedChange={(checked) => {
@@ -2314,7 +2323,7 @@ export default function Settings() {
                             const next = checked
                               ? Array.from(new Set([...current, option.value]))
                               : current.filter((value) => value !== option.value)
-                            void autoSaveSettingsPatch({ continuous_retry_categories: next })
+                            void autoSaveContinuousRetryPatch({ continuous_retry_categories: next })
                           }}
                         />
                       </SettingField>
@@ -2326,6 +2335,7 @@ export default function Settings() {
                       description={t('settings.continuousRetryStatusCodesDesc')}
                     >
                       <Input
+                        aria-label={t('settings.continuousRetryStatusCodes')}
                         value={continuousRetryStatusCodesDraft}
                         disabled={continuousRetryFineControlsDisabled}
                         placeholder="403,404,429,500,501,502,503,504"
@@ -2333,7 +2343,7 @@ export default function Settings() {
                         onBlur={(event) => {
                           const values = parseContinuousRetryStatusCodes(event.target.value)
                           setContinuousRetryStatusCodesDraft(values.join(','))
-                          void autoSaveSettingsPatch({ continuous_retry_status_codes: values })
+                          void autoSaveContinuousRetryPatch({ continuous_retry_status_codes: values })
                         }}
                       />
                     </SettingField>
@@ -2342,6 +2352,7 @@ export default function Settings() {
                       description={t('settings.continuousRetryErrorCodesDesc')}
                     >
                       <Input
+                        aria-label={t('settings.continuousRetryErrorCodes')}
                         value={continuousRetryErrorCodesDraft}
                         disabled={continuousRetryFineControlsDisabled}
                         placeholder="rate_limited,context_length_exceeded"
@@ -2349,7 +2360,7 @@ export default function Settings() {
                         onBlur={(event) => {
                           const values = parseContinuousRetryErrorCodes(event.target.value)
                           setContinuousRetryErrorCodesDraft(values.join(','))
-                          void autoSaveSettingsPatch({ continuous_retry_error_codes: values })
+                          void autoSaveContinuousRetryPatch({ continuous_retry_error_codes: values })
                         }}
                       />
                     </SettingField>

@@ -22,6 +22,7 @@ import (
 func newRetryTestHandler(t *testing.T) (*Handler, *auth.Store) {
 	t.Helper()
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 2})
+	t.Cleanup(store.Stop)
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 	return handler, store
 }
@@ -195,6 +196,19 @@ func TestUnlimitedRetryWaitIsCancellable(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Fatalf("context did not interrupt unlimited retry backoff promptly: %v", elapsed)
+	}
+}
+
+func TestUnlimitedRetrySmallRetryAfterDoesNotBypassBackoff(t *testing.T) {
+	h, store := newRetryTestHandler(t)
+	store.SetRetryIntervalMS(0)
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+	defer cancel()
+
+	if h.waitBeforeRetryWithBudget(ctx, 8, -1, resp) {
+		t.Fatal("small Retry-After bypassed the larger unlimited retry backoff")
 	}
 }
 

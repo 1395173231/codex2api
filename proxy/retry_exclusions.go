@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -163,11 +164,11 @@ func (r *retryAccountExclusions) MarkRequestFailure(accountID int64, err error, 
 		r.MarkHard(accountID)
 		return
 	}
-	if policy.MatchesTransport("transport") || (err != nil && policy.MatchesTransport(err.Error())) {
-		r.MarkTransient(accountID)
-		return
+	selected := policy.CatchesAllUpstreamFailures() || policy.HasCategory(database.ContinuousRetryCategoryTransport)
+	if err != nil {
+		selected = policy.MatchesTransport(err.Error())
 	}
-	if retryLimit == -1 {
+	if selected || retryLimit == -1 {
 		r.MarkTransient(accountID)
 		return
 	}
@@ -341,6 +342,30 @@ func nextBoundedRetryAccount(exclusions *retryAccountExclusions, selectAccount f
 	return selectAccount(exclusions.ForSelection())
 }
 
+// nextContinuousRetryAccount preserves the endpoint's normal bounded account
+// selection until a policy-selected failure has marked at least one account as
+// recoverable. From that point it keeps polling the pool until an account is
+// available or the downstream request is canceled.
+func nextContinuousRetryAccount(ctx context.Context, exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string)) (*auth.Account, string) {
+	for {
+		account, proxyURL := nextBoundedRetryAccount(exclusions, selectAccount)
+		if account != nil || exclusions == nil || !exclusions.CanContinueTransientCycle() {
+			return account, proxyURL
+		}
+		if !waitForContinuousPoolRetry(ctx) {
+			return nil, ""
+		}
+	}
+}
+
+// retryAllowedByEndpointCap preserves the endpoint's ordinary finite cap, but
+// lets an explicitly selected continuous-retry failure cross it. The boolean
+// is deliberately separate from the numeric retry budget: a legacy/internal
+// -1 budget must not silently opt a media request into the high-risk mode.
+func retryAllowedByEndpointCap(attempt, maxAttempts int, continuousSelected bool) bool {
+	return continuousSelected || attempt < maxAttempts-1
+}
+
 const continuousPoolRetryPollInterval = 5 * time.Second
 
 func waitForContinuousPoolRetry(ctx context.Context) bool {
@@ -355,9 +380,73 @@ func waitForContinuousPoolRetry(ctx context.Context) bool {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		if keepalive := continuousRetryKeepaliveForContext(ctx); keepalive != nil && keepalive.Active() {
+			return keepalive.Keepalive() == nil
+		}
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// waitForRetryAccountAvailable preserves the scheduler's normal 30-second
+// availability wait. Once the request has actually entered unlimited retry,
+// it slices that wait at the heartbeat interval so an empty account pool does
+// not leave an SSE/WebSocket client idle until the wait expires.
+func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitForAccount := func(waitCtx context.Context, timeout time.Duration) (*auth.Account, string) {
+		if preserveBinding {
+			return h.store.WaitForContinuationAvailableWithFilter(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter)
+		}
+		return h.store.WaitForSessionAvailableWithFilter(waitCtx, affinityKey, timeout, apiKeyID, exclude, filter)
+	}
+	const maximumWait = 30 * time.Second
+	if !continuousRetryKeepaliveActive(ctx) || continuousRetryKeepaliveInterval <= 0 {
+		return waitForAccount(ctx, maximumWait)
+	}
+
+	deadline := time.Now().Add(maximumWait)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || (ctx != nil && ctx.Err() != nil) {
+			return nil, ""
+		}
+		keepalive := continuousRetryKeepaliveForContext(ctx)
+		if keepalive == nil {
+			return nil, ""
+		}
+		step := continuousRetryKeepaliveDelay(keepalive)
+		if step <= 0 {
+			if keepalive.Keepalive() != nil {
+				return nil, ""
+			}
+			continue
+		}
+		if step > remaining {
+			step = remaining
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, step)
+		// Let the slice context own the heartbeat deadline. The store keeps its
+		// normal upper bound, while an immediate no-candidate return remains
+		// distinguishable from a real timed wait without elapsed-time guesses.
+		account, proxyURL := waitForAccount(waitCtx, maximumWait)
+		waitErr := waitCtx.Err()
+		cancel()
+		if account != nil || (ctx != nil && ctx.Err() != nil) {
+			return account, proxyURL
+		}
+		if !errors.Is(waitErr, context.DeadlineExceeded) {
+			// The scheduler had no candidate and returned immediately. Preserve
+			// its existing reset/poll behavior instead of adding an artificial
+			// 15-second delay just to emit a heartbeat.
+			return nil, ""
+		}
+		if keepalive.Keepalive() != nil {
+			return nil, ""
+		}
 	}
 }
 
@@ -398,11 +487,7 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 			return account, stickyProxyURL
 		}
 		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
-		if preserveBinding {
-			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
-		} else {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
-		}
+		account, stickyProxyURL = h.waitForRetryAccountAvailable(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding)
 		if account != nil {
 			return account, stickyProxyURL
 		}

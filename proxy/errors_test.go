@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
@@ -84,6 +85,18 @@ func TestErrorUpstream(t *testing.T) {
 	}
 	if notFound := ErrUpstream(http.StatusNotFound, "not found", cause); notFound.Retryable {
 		t.Error("404 upstream error should not be retryable without a narrow classification")
+	}
+}
+
+func TestUpstreamErrorBodyIsValidJSONForInvalidUTF8(t *testing.T) {
+	err := &Error{
+		Code:    "upstream_error",
+		Message: string([]byte{'b', 0xff, 'd'}),
+		Type:    ErrorTypeUpstreamError,
+	}
+	body := err.UpstreamErrorBody()
+	if !json.Valid(body) {
+		t.Fatalf("UpstreamErrorBody returned invalid JSON: %q", body)
 	}
 }
 

@@ -19,6 +19,16 @@ type ContinuousRetryPolicy struct {
 	ErrorCodes  []string `json:"error_codes"`
 }
 
+// ContinuousRetryPolicyUpdate identifies the policy fields edited by one
+// admin request. Nil fields retain the latest value already in the database.
+type ContinuousRetryPolicyUpdate struct {
+	Enabled     *bool
+	CatchAll    *bool
+	Categories  *[]string
+	StatusCodes *[]int
+	ErrorCodes  *[]string
+}
+
 const (
 	ContinuousRetryCategoryTransport      = "transport"
 	ContinuousRetryCategoryHTTP429        = "http_429"
@@ -185,7 +195,11 @@ func (p ContinuousRetryPolicy) MatchesHTTP(status int, body []byte) bool {
 	if !p.Enabled {
 		return false
 	}
-	if p.CatchAll && status > 0 && (status < 200 || status >= 300) {
+	// The proxied inference protocols in this service have one successful
+	// upstream status: 200. Catch-all therefore keeps retrying every other
+	// status, including unusual 2xx responses that the handlers cannot decode
+	// as a completed model result.
+	if p.CatchAll && status > 0 && status != 200 {
 		return true
 	}
 	if p.HasStatusCode(status) || p.MatchesErrorCodes(body) {

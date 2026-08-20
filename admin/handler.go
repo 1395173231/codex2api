@@ -9133,6 +9133,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
 	}
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
+	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
@@ -9221,11 +9222,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
-		ContinuousRetryEnabled:              h.store.GetContinuousRetryPolicy().Enabled,
-		ContinuousRetryCatchAll:             h.store.GetContinuousRetryPolicy().CatchAll,
-		ContinuousRetryCategories:           h.store.GetContinuousRetryPolicy().Categories,
-		ContinuousRetryStatusCodes:          h.store.GetContinuousRetryPolicy().StatusCodes,
-		ContinuousRetryErrorCodes:           h.store.GetContinuousRetryPolicy().ErrorCodes,
+		ContinuousRetryEnabled:              continuousRetryPolicy.Enabled,
+		ContinuousRetryCatchAll:             continuousRetryPolicy.CatchAll,
+		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
+		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
+		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
 		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
@@ -9636,7 +9637,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
-	continuousRetryChanged := false
+	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
+		Enabled:     req.ContinuousRetryEnabled,
+		CatchAll:    req.ContinuousRetryCatchAll,
+		Categories:  req.ContinuousRetryCategories,
+		StatusCodes: req.ContinuousRetryStatusCodes,
+		ErrorCodes:  req.ContinuousRetryErrorCodes,
+	}
+	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
 	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
@@ -10089,27 +10097,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
 		h.store.SetTransportRetryPolicy(v)
 		log.Printf("设置已更新: transport_retry_policy = %s", v)
-	}
-
-	if req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil {
-		if req.ContinuousRetryEnabled != nil {
-			continuousRetryPolicy.Enabled = *req.ContinuousRetryEnabled
-		}
-		if req.ContinuousRetryCatchAll != nil {
-			continuousRetryPolicy.CatchAll = *req.ContinuousRetryCatchAll
-		}
-		if req.ContinuousRetryCategories != nil {
-			continuousRetryPolicy.Categories = append([]string(nil), (*req.ContinuousRetryCategories)...)
-		}
-		if req.ContinuousRetryStatusCodes != nil {
-			continuousRetryPolicy.StatusCodes = append([]int(nil), (*req.ContinuousRetryStatusCodes)...)
-		}
-		if req.ContinuousRetryErrorCodes != nil {
-			continuousRetryPolicy.ErrorCodes = append([]string(nil), (*req.ContinuousRetryErrorCodes)...)
-		}
-		continuousRetryPolicy = database.NormalizeContinuousRetryPolicy(continuousRetryPolicy)
-		continuousRetryChanged = true
-		log.Printf("设置已更新: continuous_retry enabled=%t catch_all=%t categories=%d status_codes=%d error_codes=%d", continuousRetryPolicy.Enabled, continuousRetryPolicy.CatchAll, len(continuousRetryPolicy.Categories), len(continuousRetryPolicy.StatusCodes), len(continuousRetryPolicy.ErrorCodes))
 	}
 
 	if req.CodexFingerprintDefaultMode != nil {
@@ -10634,15 +10621,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	} else {
 		if continuousRetryChanged {
-			if updateErr := h.db.UpdateContinuousRetryPolicy(c.Request.Context(), continuousRetryPolicy); updateErr != nil {
+			committed, updateErr := h.db.UpdateContinuousRetryPolicy(c.Request.Context(), continuousRetryUpdate)
+			if updateErr != nil {
 				writeError(c, http.StatusInternalServerError, "保存持续重试策略失败")
 				return
 			}
+			continuousRetryPolicy = committed
 			h.store.SetContinuousRetryPolicy(continuousRetryPolicy)
 			proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				current.ContinuousRetryPolicy = continuousRetryPolicy
 				return current
 			})
+			log.Printf("设置已更新: continuous_retry enabled=%t catch_all=%t categories=%d status_codes=%d error_codes=%d", continuousRetryPolicy.Enabled, continuousRetryPolicy.CatchAll, len(continuousRetryPolicy.Categories), len(continuousRetryPolicy.StatusCodes), len(continuousRetryPolicy.ErrorCodes))
 		}
 		if promptFilterChanged {
 			if req.PromptFilterCustomPatterns == nil {
@@ -10820,11 +10810,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
-		ContinuousRetryEnabled:              h.store.GetContinuousRetryPolicy().Enabled,
-		ContinuousRetryCatchAll:             h.store.GetContinuousRetryPolicy().CatchAll,
-		ContinuousRetryCategories:           h.store.GetContinuousRetryPolicy().Categories,
-		ContinuousRetryStatusCodes:          h.store.GetContinuousRetryPolicy().StatusCodes,
-		ContinuousRetryErrorCodes:           h.store.GetContinuousRetryPolicy().ErrorCodes,
+		ContinuousRetryEnabled:              continuousRetryPolicy.Enabled,
+		ContinuousRetryCatchAll:             continuousRetryPolicy.CatchAll,
+		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
+		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
+		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
 		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,

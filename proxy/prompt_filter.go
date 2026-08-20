@@ -498,7 +498,13 @@ func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model 
 	// storage failure must not turn a verified upstream CYB into an untracked one.
 	metadata, delegated := h.emitNewAPIUpstreamCyberPolicyDecision(c, endpoint, model, body)
 	if delegated {
-		metadata.ConversationLocked = h.lockPromptConversationAfterUpstreamCYB(c, endpoint, model, incidentID, metadata)
+		// Catch-all treats an upstream CYB response as an intermediate account
+		// failure. Keep the audit record and signed decision, but do not persist a
+		// local conversation lock that would stop the next request even after a
+		// later account completed this one successfully.
+		if !continuousRetryPolicyForRequest(c).CatchesAllUpstreamFailures() {
+			metadata.ConversationLocked = h.lockPromptConversationAfterUpstreamCYB(c, endpoint, model, incidentID, metadata)
+		}
 		c.Set(newAPIUpstreamCyberDecisionContextKey, metadata)
 	}
 	return incidentID, accepted

@@ -160,9 +160,26 @@ func TestRetryAccountExclusionsRequestErrorUsesSelectedPolicy(t *testing.T) {
 	}
 
 	codePolicy := database.ContinuousRetryPolicy{Enabled: true, ErrorCodes: []string{"temporarily_unavailable"}}
-	exclusions.MarkRequestFailure(2, errors.New("upstream temporarily_unavailable"), 0, codePolicy)
-	if !exclusions.CanContinueTransientCycle() {
+	codeExclusions := newRetryAccountExclusions()
+	codeExclusions.MarkRequestFailure(2, errors.New("upstream temporarily_unavailable"), 0, codePolicy)
+	if !codeExclusions.CanContinueTransientCycle() {
 		t.Fatal("selected transport error code was marked permanently excluded")
+	}
+
+	// Exact upstream error-code selectors must inspect a real error string.
+	// MarkTransportFailure has no such payload, so a code literally named
+	// "transport" must not masquerade as the transport category.
+	codeNamedTransport := database.ContinuousRetryPolicy{Enabled: true, ErrorCodes: []string{"transport"}}
+	missingError := newRetryAccountExclusions()
+	missingError.MarkTransportFailure(3, 0, codeNamedTransport)
+	if missingError.CanContinueTransientCycle() || !missingError.ForSelection()[3] {
+		t.Fatal("synthetic transport marker matched an exact error-code selector")
+	}
+
+	selectedTransport := newRetryAccountExclusions()
+	selectedTransport.MarkTransportFailure(4, 0, transportOnly)
+	if !selectedTransport.CanContinueTransientCycle() {
+		t.Fatal("transport category did not keep a transport failure recoverable")
 	}
 }
 
@@ -337,6 +354,7 @@ func TestWaitForContinuousPoolRetryCancellation(t *testing.T) {
 
 func TestNextRetryAccountStartsNewTransientCycle(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
 	account := &auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady}
 	store.AddAccount(account)
 	h := &Handler{store: store}
@@ -352,6 +370,7 @@ func TestNextRetryAccountStartsNewTransientCycle(t *testing.T) {
 
 func TestNextRetryAccountDoesNotCyclePermanentFailures(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
 	account := &auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady}
 	store.AddAccount(account)
 	h := &Handler{store: store}
@@ -370,7 +389,9 @@ func TestNextRetryAccountDoesNotCyclePermanentFailures(t *testing.T) {
 }
 
 func TestNextRetryAccountContinuousWaitHonorsCancellation(t *testing.T) {
-	h := &Handler{store: auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})}
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
+	h := &Handler{store: store}
 	exclusions := newRetryAccountExclusions()
 	exclusions.MarkTransient(99)
 

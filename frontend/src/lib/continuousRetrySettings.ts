@@ -1,5 +1,18 @@
 const CONTINUOUS_RETRY_ERROR_CODE_PATTERN = /^[a-z0-9_.-]+$/
 
+export function createContinuousRetrySaveQueue() {
+  let tail: Promise<void> = Promise.resolve()
+
+  return function enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const result = tail.then(task, task)
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+}
+
 export function buildContinuousRetryEnabledPatch(enabled: boolean) {
   return enabled
     ? { continuous_retry_enabled: true }

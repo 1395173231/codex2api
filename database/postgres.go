@@ -2511,20 +2511,88 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	return s, err
 }
 
-// UpdateContinuousRetryPolicy persists the opt-in retry selector separately
-// from the large legacy settings upsert. This keeps old callers that build a
-// partial SystemSettings snapshot from accidentally clearing the new policy.
-func (db *DB) UpdateContinuousRetryPolicy(ctx context.Context, policy ContinuousRetryPolicy) error {
+// UpdateContinuousRetryPolicy atomically merges one admin partial update into
+// the latest persisted policy. The row lock prevents concurrent tabs or
+// replicas from replacing fields they did not edit with a stale JSON snapshot.
+func (db *DB) UpdateContinuousRetryPolicy(ctx context.Context, update ContinuousRetryPolicyUpdate) (ContinuousRetryPolicy, error) {
 	if db == nil || db.conn == nil {
-		return nil
+		return DefaultContinuousRetryPolicy(), nil
 	}
-	_, err := db.conn.ExecContext(ctx, `
-		INSERT INTO system_settings (id, continuous_retry_policy)
-		VALUES (1, $1)
-		ON CONFLICT (id) DO UPDATE SET
-			continuous_retry_policy = EXCLUDED.continuous_retry_policy
-	`, EncodeContinuousRetryPolicy(policy))
-	return err
+
+	var committed ContinuousRetryPolicy
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		defaultRaw := EncodeContinuousRetryPolicy(DefaultContinuousRetryPolicy())
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO system_settings (id, continuous_retry_policy)
+			VALUES (1, $1)
+			ON CONFLICT (id) DO NOTHING
+		`, defaultRaw); err != nil {
+			return err
+		}
+
+		var currentRaw string
+		if err := tx.QueryRowContext(ctx, continuousRetryPolicySelectQuery(!db.isSQLite())).Scan(&currentRaw); err != nil {
+			return err
+		}
+		current := DefaultContinuousRetryPolicy()
+		if strings.TrimSpace(currentRaw) != "" {
+			current = ParseContinuousRetryPolicy(currentRaw)
+		}
+		next := current
+		if update.Enabled != nil {
+			next.Enabled = *update.Enabled
+		}
+		if update.CatchAll != nil {
+			next.CatchAll = *update.CatchAll
+		}
+		if update.Categories != nil {
+			next.Categories = append([]string(nil), (*update.Categories)...)
+		}
+		if update.StatusCodes != nil {
+			next.StatusCodes = append([]int(nil), (*update.StatusCodes)...)
+		}
+		if update.ErrorCodes != nil {
+			next.ErrorCodes = append([]string(nil), (*update.ErrorCodes)...)
+		}
+		next = NormalizeContinuousRetryPolicy(next)
+		nextRaw := EncodeContinuousRetryPolicy(next)
+		if nextRaw != strings.TrimSpace(currentRaw) {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE system_settings
+				SET continuous_retry_policy = $1
+				WHERE id = 1
+			`, nextRaw); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = next
+		return nil
+	})
+	if err != nil {
+		return ContinuousRetryPolicy{}, err
+	}
+	return committed, nil
+}
+
+func continuousRetryPolicySelectQuery(forUpdate bool) string {
+	query := `
+		SELECT COALESCE(continuous_retry_policy, '')
+		FROM system_settings
+		WHERE id = 1
+	`
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	return query
 }
 
 // NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到四个已知

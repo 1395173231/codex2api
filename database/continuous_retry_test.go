@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -82,13 +83,13 @@ func TestContinuousRetryPolicyMatchesStatusAndErrorCode(t *testing.T) {
 	}
 
 	catchAll := ContinuousRetryPolicy{Enabled: true, CatchAll: true}
-	for _, status := range []int{308, 418, 499, 520, 599, 600, 701} {
+	for _, status := range []int{201, 202, 204, 308, 418, 499, 520, 599, 600, 701} {
 		if !catchAll.MatchesHTTP(status, nil) {
 			t.Errorf("catch-all policy did not match HTTP status %d", status)
 		}
 	}
-	if catchAll.MatchesHTTP(200, nil) || catchAll.MatchesHTTP(204, nil) {
-		t.Error("catch-all policy selected a successful HTTP response")
+	if catchAll.MatchesHTTP(200, nil) {
+		t.Error("catch-all policy selected the protocol's successful HTTP response")
 	}
 	if !catchAll.MatchesTransport("an unrecognized upstream failure") {
 		t.Error("catch-all policy did not match an unrecognized transport failure")
@@ -117,6 +118,17 @@ func TestContinuousRetryPolicyEncodeParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestContinuousRetryPolicySelectQueryLocksPostgresRow(t *testing.T) {
+	postgresQuery := continuousRetryPolicySelectQuery(true)
+	if !strings.Contains(strings.ToUpper(postgresQuery), "FOR UPDATE") {
+		t.Fatalf("PostgreSQL policy read lacks FOR UPDATE: %s", postgresQuery)
+	}
+	sqliteQuery := continuousRetryPolicySelectQuery(false)
+	if strings.Contains(strings.ToUpper(sqliteQuery), "FOR UPDATE") {
+		t.Fatalf("SQLite policy read must not contain FOR UPDATE: %s", sqliteQuery)
+	}
+}
+
 func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "continuous-retry.sqlite"))
 	if err != nil {
@@ -132,8 +144,18 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 		StatusCodes: []int{403, 404},
 		ErrorCodes:  []string{"forbidden"},
 	}
-	if err := db.UpdateContinuousRetryPolicy(ctx, want); err != nil {
+	committed, err := db.UpdateContinuousRetryPolicy(ctx, ContinuousRetryPolicyUpdate{
+		Enabled:     &want.Enabled,
+		CatchAll:    &want.CatchAll,
+		Categories:  &want.Categories,
+		StatusCodes: &want.StatusCodes,
+		ErrorCodes:  &want.ErrorCodes,
+	})
+	if err != nil {
 		t.Fatalf("UpdateContinuousRetryPolicy: %v", err)
+	}
+	if !committed.Enabled || !committed.CatchAll || len(committed.StatusCodes) != 2 {
+		t.Fatalf("committed policy = %#v", committed)
 	}
 	settings, err := db.GetSystemSettings(ctx)
 	if err != nil {
@@ -154,6 +176,67 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 	}
 	if got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy); !got.Enabled || !got.CatchAll || len(got.StatusCodes) != 2 {
 		t.Fatalf("full settings write cleared policy = %#v", got)
+	}
+}
+
+func TestSQLiteContinuousRetryPolicyConcurrentPartialUpdatesDoNotLoseFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "continuous-retry-concurrent.sqlite")
+	db1, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New sqlite db1: %v", err)
+	}
+	t.Cleanup(func() { _ = db1.Close() })
+	db2, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New sqlite db2: %v", err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+
+	enabled := true
+	catchAll := true
+	categories := []string{ContinuousRetryCategoryTransport}
+	if _, err := db1.UpdateContinuousRetryPolicy(context.Background(), ContinuousRetryPolicyUpdate{
+		Enabled:    &enabled,
+		CatchAll:   &catchAll,
+		Categories: &categories,
+	}); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+
+	catchAll = false
+	statusCodes := []int{403}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := db1.UpdateContinuousRetryPolicy(context.Background(), ContinuousRetryPolicyUpdate{CatchAll: &catchAll})
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := db2.UpdateContinuousRetryPolicy(context.Background(), ContinuousRetryPolicyUpdate{StatusCodes: &statusCodes})
+		errs <- err
+	}()
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent policy update: %v", err)
+		}
+	}
+
+	settings, err := db1.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	got := ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
+	if !got.Enabled || got.CatchAll || len(got.StatusCodes) != 1 || got.StatusCodes[0] != 403 || len(got.Categories) != 1 || got.Categories[0] != ContinuousRetryCategoryTransport {
+		t.Fatalf("concurrent partial updates lost a field: %#v", got)
 	}
 }
 

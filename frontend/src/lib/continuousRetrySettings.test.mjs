@@ -4,9 +4,35 @@ import test from 'node:test'
 import {
   buildContinuousRetryCatchAllPatch,
   buildContinuousRetryEnabledPatch,
+  createContinuousRetrySaveQueue,
   parseContinuousRetryErrorCodes,
   parseContinuousRetryStatusCodes,
 } from './continuousRetrySettings.ts'
+
+test('continuous retry saves run in user action order even when requests overlap', async () => {
+  const enqueue = createContinuousRetrySaveQueue()
+  const events = []
+  let releaseFirst
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve })
+
+  const first = enqueue(async () => {
+    events.push('first:start')
+    await firstGate
+    events.push('first:end')
+    return 'first'
+  })
+  const second = enqueue(async () => {
+    events.push('second:start')
+    events.push('second:end')
+    return 'second'
+  })
+
+  await Promise.resolve()
+  assert.deepEqual(events, ['first:start'])
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, second]), ['first', 'second'])
+  assert.deepEqual(events, ['first:start', 'first:end', 'second:start', 'second:end'])
+})
 
 test('continuous retry catch-all is one click and cannot remain active behind the master switch', () => {
   assert.deepEqual(buildContinuousRetryCatchAllPatch(true), {

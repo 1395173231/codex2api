@@ -52,7 +52,7 @@ func continueKeepAllEncrypted() bool {
 }
 
 // stripReasoningEncryptedContent 删除 reasoning item 的 encrypted_content 字段
-//（保留 summary 文本），非 reasoning item 原样返回。
+// （保留 summary 文本），非 reasoning item 原样返回。
 func stripReasoningEncryptedContent(item json.RawMessage) json.RawMessage {
 	if gjson.GetBytes(item, "type").String() != "reasoning" {
 		return item
@@ -85,6 +85,16 @@ type continueRoundStat struct {
 	ErrMessage string
 }
 
+// continueUpstreamFailure describes a genuine upstream failure that must be
+// handed back to the request-level attempt loop. Hidden continuation rounds
+// must never turn these failures into a successful response.incomplete.
+type continueUpstreamFailure struct {
+	EventType  string
+	Payload    []byte
+	StatusCode int
+	Err        error
+}
+
 // continueFoldResult 是一次折叠的汇总结果。
 type continueFoldResult struct {
 	// Rounds 仅含「成功读到终态」的真实上游轮次，按顺序排列；最后一条对应 FinalUsage。
@@ -94,7 +104,9 @@ type continueFoldResult struct {
 	FailedContinuation *continueRoundStat
 	FinalUsage         *UsageInfo     // 最终成功轮的真实 usage（终态计费用）
 	FinalResponse      *http.Response // 最终轮响应（body 已关，仅供读 header 做 cooldown/quota 同步）
-	GotTerminal        bool           // 客户端是否已收到终态事件（据此判定是否算正常结束）
+	GotTerminal        bool           // 是否产出了最终正常协议终态（completed / incomplete）
+	UpstreamFailure    *continueUpstreamFailure
+	InternalErr        error
 	ReadErr            error
 	StopReason         string
 	RoundsRun          int
@@ -109,6 +121,10 @@ type continueFold struct {
 	observe    func(data []byte)                         // 对被缓冲（未转发）的事件做旁路观察（TTFT 等）
 	openRound  func(body []byte) (*http.Response, error) // 用同一账号/通道开续想轮
 	clientGone func() bool                               // 客户端是否已断开
+	// readStream preserves the SSE event field. The handler injects the
+	// request-level keepalive reader here so catch-all heartbeats bypass the
+	// per-attempt replay buffer and reach the real downstream connection.
+	readStream func(body io.Reader, callback func(event string, data []byte) bool) error
 
 	// keepalive 隐藏轮期间向下游写 SSE 注释保活,返回 false 表示下游已死、停止
 	// 保活(折叠本身继续,由 clientGone 语义收尾)。nil 关闭保活。回调运行在独立
@@ -204,7 +220,7 @@ func buildContinuationBody(baseBody []byte, replayTail []json.RawMessage) ([]byt
 // 保留完整 encrypted_content，更早各轮的 reasoning 剥离该字段。续想把每轮
 // reasoning 全量累加进 finalOutput（正常单响应只含 1 份）；不收敛会让客户端把
 // N 份账号绑定的加密载荷回传，逐轮把上下文顶爆窗口、并在跨账号换号时成批被拒
-//（issue #353）。早期各轮的加密上下文已在折叠时经 replayTail 回放并产出最终答案，
+// （issue #353）。早期各轮的加密上下文已在折叠时经 replayTail 回放并产出最终答案，
 // 使命已尽，无需再让客户端驱动一遍。逃生阀见 continueKeepAllEncrypted。
 func (st *foldState) clientFacingOutput() []json.RawMessage {
 	start := st.lastRoundReasoningStart
@@ -294,37 +310,14 @@ func (st *foldState) rebuildUsage(finalRoundUsage *UsageInfo) []byte {
 	return raw
 }
 
-// syntheticIncompleteEvent 合成 response.incomplete terminal 事件（续想轮
-// 失败/上游 EOF 时兜底，避免客户端挂死在无终态的流上）。
-func (st *foldState) syntheticIncompleteEvent(reason string, finalRoundUsage *UsageInfo) []byte {
-	base := st.baseResponse
-	if len(base) == 0 {
-		base = json.RawMessage(`{}`)
-	}
-	resp := []byte(base)
-	outputRaw, err := json.Marshal(st.clientFacingOutput())
-	if err != nil {
-		outputRaw = []byte(`[]`)
-	}
-	resp, _ = sjson.SetRawBytes(resp, "output", outputRaw)
-	resp, _ = sjson.SetBytes(resp, "status", "incomplete")
-	resp, _ = sjson.SetBytes(resp, "incomplete_details.reason", reason)
-	if usageRaw := st.rebuildUsage(finalRoundUsage); usageRaw != nil {
-		resp, _ = sjson.SetRawBytes(resp, "usage", usageRaw)
-	}
-	out := []byte(`{}`)
-	out, _ = sjson.SetBytes(out, "type", "response.incomplete")
-	out, _ = sjson.SetRawBytes(out, "response", resp)
-	out, _ = sjson.SetBytes(out, "sequence_number", st.nextSeq())
-	return out
-}
-
 // roundOutcome 是单轮读取的结果。
 type roundOutcome struct {
 	terminal       []byte            // terminal 事件原始字节（nil = EOF 无终态）
 	usage          *UsageInfo        // 本轮 usage
 	roundReasoning []json.RawMessage // 本轮 reasoning items（output_item.done 的快照）
 	buffered       []*bufferedOutputItem
+	failureEvent   string // event:error / response.failed
+	failurePayload []byte
 	aborted        bool  // forward 返回 false
 	readErr        error // SSE 读取错误
 }
@@ -336,11 +329,22 @@ func (st *foldState) readRound(body io.Reader, roundNo int, f *continueFold) rou
 	reasoningOI := map[int64]int64{}
 	bufferByOI := map[int64]*bufferedOutputItem{}
 
-	out.readErr = ReadSSEStream(body, func(data []byte) bool {
+	readStream := f.readStream
+	if readStream == nil {
+		readStream = ReadSSEStreamWithEvent
+	}
+	out.readErr = readStream(body, func(sseEvent string, data []byte) bool {
 		parsed := gjson.ParseBytes(data)
-		eventType := parsed.Get("type").String()
+		eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 
 		switch eventType {
+		case "error", "response.failed":
+			out.failureEvent = eventType
+			out.failurePayload = append([]byte(nil), data...)
+			if eventType == "response.failed" {
+				out.usage = extractUsageFromResult(parsed.Get("response.usage"))
+			}
+			return false
 		case "response.created", "response.in_progress":
 			if roundNo > 1 {
 				// 隐藏轮的生命周期事件不下发，但仍供 TTFT 观察。
@@ -357,7 +361,7 @@ func (st *foldState) readRound(body io.Reader, roundNo int, f *continueFold) rou
 				return false
 			}
 			return true
-		case "response.completed", "response.failed", "response.incomplete":
+		case "response.completed", "response.incomplete":
 			out.terminal = append([]byte(nil), data...)
 			out.usage = extractUsageFromResult(parsed.Get("response.usage"))
 			return false
@@ -469,6 +473,32 @@ func shouldContinueRound(terminal []byte, usage *UsageInfo, roundReasoning []jso
 	return true, ""
 }
 
+// continuationHTTPFailurePayload preserves an HTTP continuation rejection as
+// a Responses failure frame so the outer retry selector can match its status
+// and error code exactly.
+func continuationHTTPFailurePayload(statusCode int, body []byte) []byte {
+	payload := []byte(`{"type":"response.failed","response":{}}`)
+	payload, _ = sjson.SetBytes(payload, "response.status_code", statusCode)
+	if upstreamError := gjson.GetBytes(body, "error"); upstreamError.Exists() && strings.TrimSpace(upstreamError.Raw) != "" {
+		payload, _ = sjson.SetRawBytes(payload, "response.error", []byte(upstreamError.Raw))
+		return payload
+	}
+	if gjson.ValidBytes(body) {
+		parsed := gjson.ParseBytes(body)
+		if parsed.IsObject() && strings.TrimSpace(parsed.Raw) != "" {
+			payload, _ = sjson.SetRawBytes(payload, "response.error", []byte(parsed.Raw))
+			return payload
+		}
+	}
+	payload, _ = sjson.SetBytes(payload, "response.error.code", "upstream_http_error")
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		message = fmt.Sprintf("upstream continuation returned HTTP %d", statusCode)
+	}
+	payload, _ = sjson.SetBytes(payload, "response.error.message", message)
+	return payload
+}
+
 // runContinueThinkingFold 执行多轮折叠主循环。firstResp 是已确认 2xx 的第 1 轮
 // 上游响应（由调用方负责其生命周期外的资源），后续轮通过 f.openRound 打开。
 func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continueFoldResult {
@@ -511,7 +541,6 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 			<-keepaliveDone
 		}
 	}()
-
 	resp := firstResp
 	roundNo := 0
 	for {
@@ -525,17 +554,57 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 		outcome := st.readRound(resp.Body, roundNo, f)
 		resp.Body.Close()
 
-		statusCode := http.StatusOK
-		if outcome.terminal != nil {
-			if t := gjson.GetBytes(outcome.terminal, "type").String(); t == "response.failed" || t == "response.incomplete" {
-				// 非 completed 终态一定是最终轮（fold 只在 completed+命中指纹时续想），
-				// 这里记录真实状态而非一律 200，便于统计区分。
-				statusCode = 0
-			}
+		result.ReadErr = outcome.readErr
+
+		if outcome.aborted {
+			result.StopReason = continueStopForwardAbort
+			return result
 		}
+
+		if len(outcome.failurePayload) > 0 {
+			statusCode := responseFailedStatusCode(outcome.failurePayload)
+			result.UpstreamFailure = &continueUpstreamFailure{
+				EventType:  outcome.failureEvent,
+				Payload:    append([]byte(nil), outcome.failurePayload...),
+				StatusCode: statusCode,
+			}
+			result.GotTerminal = false
+			result.StopReason = continueStopRoundError
+			if roundNo == 1 {
+				result.FinalUsage = outcome.usage
+			} else {
+				result.FailedContinuation = &continueRoundStat{
+					Usage:      outcome.usage,
+					StatusCode: statusCode,
+					DurationMs: int(time.Since(roundStart).Milliseconds()),
+					ErrMessage: fmt.Sprintf("continuation round returned %s", outcome.failureEvent),
+				}
+			}
+			return result
+		}
+
+		if outcome.terminal == nil {
+			// 没有协议终态就是上游失败。即使隐藏轮已经产生 reasoning 或暂定
+			// message，也不能把残缺内容冲刷并伪装成 response.incomplete；整次
+			// attempt 交还最外层账号轮换循环处理。
+			if result.ReadErr == nil {
+				result.ReadErr = io.ErrUnexpectedEOF
+			}
+			result.UpstreamFailure = &continueUpstreamFailure{Err: result.ReadErr}
+			result.GotTerminal = false
+			result.StopReason = continueStopUpstreamEOF
+			if roundNo > 1 {
+				result.FailedContinuation = &continueRoundStat{
+					DurationMs: int(time.Since(roundStart).Milliseconds()),
+					ErrMessage: result.ReadErr.Error(),
+				}
+			}
+			return result
+		}
+
 		stat := continueRoundStat{
 			Usage:      outcome.usage,
-			StatusCode: statusCode,
+			StatusCode: http.StatusOK,
 			DurationMs: int(time.Since(roundStart).Milliseconds()),
 		}
 		result.Rounds = append(result.Rounds, stat)
@@ -546,30 +615,6 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 			st.sumReasoning += outcome.usage.ReasoningTokens
 		}
 		result.FinalUsage = outcome.usage
-		result.ReadErr = outcome.readErr
-
-		if outcome.aborted {
-			result.StopReason = continueStopForwardAbort
-			return result
-		}
-
-		if outcome.terminal == nil {
-			// 上游 EOF 无终态。第 1 轮且从未产出任何输出（含缓冲）时保持静默，让上层的
-			// 透明断流重试接管；否则冲刷已缓冲内容 + 合成 incomplete 给客户端一个终态，
-			// 避免缓冲内容被丢弃或客户端收到空的 200 流。
-			result.StopReason = continueStopUpstreamEOF
-			if roundNo == 1 && len(st.finalOutput) == 0 && !st.flushedAny && len(outcome.buffered) == 0 {
-				return result
-			}
-			if !st.flushBuffered(outcome.buffered, f) {
-				result.StopReason = continueStopForwardAbort
-				return result
-			}
-			f.forward(st.syntheticIncompleteEvent("upstream_eof", outcome.usage))
-			result.GotTerminal = true
-			return result
-		}
-		result.GotTerminal = true
 
 		doContinue, stopReason := shouldContinueRound(
 			outcome.terminal, outcome.usage, outcome.roundReasoning,
@@ -577,19 +622,15 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 		)
 
 		if !doContinue {
-			// 第 1 轮直接 failed 且从未向客户端写过折叠输出：原样透传 terminal，
-			// 保证现有的失败抑制 / 换号 / cooldown 语义字节级不变。
-			if roundNo == 1 && len(st.finalOutput) == 0 && !st.flushedAny && len(outcome.buffered) == 0 &&
-				gjson.GetBytes(outcome.terminal, "type").String() != "response.completed" {
-				f.forward(outcome.terminal)
-				result.StopReason = stopReason
-				return result
-			}
 			if !st.flushBuffered(outcome.buffered, f) {
 				result.StopReason = continueStopForwardAbort
 				return result
 			}
-			f.forward(st.rebuildTerminalEvent(outcome.terminal, outcome.usage))
+			if !f.forward(st.rebuildTerminalEvent(outcome.terminal, outcome.usage)) {
+				result.StopReason = continueStopForwardAbort
+				return result
+			}
+			result.GotTerminal = true
 			result.StopReason = stopReason
 			return result
 		}
@@ -608,25 +649,44 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 		nextBody, err := buildContinuationBody(f.baseBody, st.replayTail)
 		if err != nil {
 			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error()}
-			f.forward(st.syntheticIncompleteEvent("upstream_error", outcome.usage))
+			result.InternalErr = fmt.Errorf("build continuation request: %w", err)
+			result.GotTerminal = false
 			result.StopReason = continueStopRoundError
 			return result
 		}
 		nextResp, err := f.openRound(nextBody)
 		if err != nil {
 			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error()}
-			f.forward(st.syntheticIncompleteEvent("upstream_error", outcome.usage))
+			result.ReadErr = err
+			result.UpstreamFailure = &continueUpstreamFailure{Err: err}
+			result.GotTerminal = false
+			result.StopReason = continueStopRoundError
+			return result
+		}
+		if nextResp == nil {
+			err = fmt.Errorf("continuation round returned no response")
+			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error()}
+			result.ReadErr = err
+			result.UpstreamFailure = &continueUpstreamFailure{Err: err}
+			result.GotTerminal = false
 			result.StopReason = continueStopRoundError
 			return result
 		}
 		if nextResp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(io.LimitReader(nextResp.Body, 2048))
 			nextResp.Body.Close()
+			failurePayload := continuationHTTPFailurePayload(nextResp.StatusCode, errBody)
 			result.FailedContinuation = &continueRoundStat{
 				StatusCode: nextResp.StatusCode,
 				ErrMessage: fmt.Sprintf("continuation round rejected: %s", upstreamErrorConsoleBody(errBody)),
 			}
-			f.forward(st.syntheticIncompleteEvent("upstream_error", outcome.usage))
+			result.FinalResponse = nextResp
+			result.UpstreamFailure = &continueUpstreamFailure{
+				EventType:  "response.failed",
+				Payload:    failurePayload,
+				StatusCode: nextResp.StatusCode,
+			}
+			result.GotTerminal = false
 			result.StopReason = continueStopRoundError
 			return result
 		}

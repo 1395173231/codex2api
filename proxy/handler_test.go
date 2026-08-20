@@ -623,8 +623,10 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 	completedSSE := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 
 	cases := []struct {
-		name     string
-		rejected func() *http.Response
+		name            string
+		preflight       bool
+		continuousRetry bool
+		rejected        func() *http.Response
 	}{
 		{
 			name: "http status rejection",
@@ -633,6 +635,18 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 					StatusCode: http.StatusBadRequest,
 					Header:     make(http.Header),
 					Body:       io.NopCloser(strings.NewReader(previousResponseNotFoundBody)),
+				}
+			},
+		},
+		{
+			name:            "in-stream error with catch-all replay",
+			continuousRetry: true,
+			rejected: func() *http.Response {
+				sse := "event: error\ndata: {\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp_stale' not found.\"}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(sse)),
 				}
 			},
 		},
@@ -652,7 +666,8 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 		{
 			// 真实 ChatGPT WS 几乎总会先推 rate_limits / metadata。本机 2004 还开了
 			// loose + preflight passthrough，这两帧会先落到客户端。降级不能被它们挡住。
-			name: "in-stream response.failed after preflight",
+			name:      "in-stream response.failed after preflight",
+			preflight: true,
 			rejected: func() *http.Response {
 				sse := "data: {\"type\":\"codex.rate_limits\",\"plan_type\":\"plus\"}\n\n" +
 					"data: {\"type\":\"codex.response.metadata\",\"headers\":{\"x-codex-turn-state\":\"turn\"}}\n\n" +
@@ -669,11 +684,18 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
-			if tc.name == "in-stream response.failed after preflight" {
+			if tc.preflight || tc.continuousRetry {
 				prev := CurrentRuntimeSettings()
 				next := prev
-				next.FirstTokenMode = FirstTokenModeLoose
-				next.CodexPreflightSSEPassthrough = true
+				if tc.preflight {
+					next.FirstTokenMode = FirstTokenModeLoose
+					next.CodexPreflightSSEPassthrough = true
+				}
+				if tc.continuousRetry {
+					next.CodexWSSilentRetry = false
+					next.CodexWSSilentRetries = 0
+					next.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+				}
 				ApplyRuntimeSettings(next)
 				t.Cleanup(func() { ApplyRuntimeSettings(prev) })
 			}

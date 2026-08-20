@@ -17,6 +17,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestShouldRetryHTTPStatusUnlimitedBudgets(t *testing.T) {
@@ -235,7 +236,7 @@ func TestTransparentStreamRetryBudgetsStayIndependent(t *testing.T) {
 	}
 }
 
-func TestUnlimitedImageRetryStillHonorsTotalAttemptCap(t *testing.T) {
+func TestImageRetryCapOnlyYieldsToSelectedContinuousPolicy(t *testing.T) {
 	generalRetries := 0
 	streamErr := errors.New("upstream image stream disconnected")
 	for attempt := 0; attempt < maxImageAttempts-1; attempt++ {
@@ -244,7 +245,21 @@ func TestUnlimitedImageRetryStillHonorsTotalAttemptCap(t *testing.T) {
 		}
 	}
 	if shouldRetryImageStreamError(streamErr, &generalRetries, -1, maxImageAttempts-1, maxImageAttempts) {
-		t.Fatal("unlimited text retry budget bypassed the image total-attempt cap")
+		t.Fatal("unselected legacy retry budget bypassed the image total-attempt cap")
+	}
+
+	policy := database.ContinuousRetryPolicy{
+		Enabled:    true,
+		Categories: []string{database.ContinuousRetryCategoryTransport},
+	}
+	if !shouldRetryImageStreamError(streamErr, &generalRetries, 0, maxImageAttempts-1, maxImageAttempts, policy) {
+		t.Fatal("selected continuous image failure did not bypass the ordinary attempt cap")
+	}
+	if !retryAllowedByEndpointCap(maxGrokMediaAttempts-1, maxGrokMediaAttempts, true) {
+		t.Fatal("selected continuous Grok media failure did not bypass the ordinary attempt cap")
+	}
+	if retryAllowedByEndpointCap(maxGrokMediaAttempts-1, maxGrokMediaAttempts, false) {
+		t.Fatal("ordinary Grok media retry bypassed the endpoint attempt cap")
 	}
 }
 
@@ -375,6 +390,7 @@ func TestResponsesContinuousRetryCatchAllRotatesAndRepeatsPool(t *testing.T) {
 		current.CodexForceWebsocket = false
 		current.CodexWSSilentRetry = false
 		current.CodexWSSilentRetries = 0
+		current.CodexPreflightSSEPassthrough = true
 		return current
 	})
 
@@ -394,7 +410,9 @@ func TestResponsesContinuousRetryCatchAllRotatesAndRepeatsPool(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if attempt == 2 {
-			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"future_stream_failure","message":"must stay upstream"}}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"codex.rate_limits","plan_type":"plus"}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"failed-attempt-partial"}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"content_policy_violation","message":"must stay upstream"}}}`+"\n\n")
 			return
 		}
 		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_catch_all_recovered","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
@@ -451,8 +469,208 @@ func TestResponsesContinuousRetryCatchAllRotatesAndRepeatsPool(t *testing.T) {
 		t.Fatalf("downstream status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	if !strings.Contains(body, `"id":"resp_catch_all_recovered"`) || strings.Contains(body, "must stay upstream") {
+	if !strings.Contains(body, `"id":"resp_catch_all_recovered"`) || strings.Contains(body, "failed-attempt-partial") || strings.Contains(body, "must stay upstream") || strings.Contains(body, "codex.rate_limits") {
 		t.Fatalf("catch-all retry was not transparent: %s", body)
+	}
+}
+
+func TestContinuousRetryCatchAllDoesNotReplaySuccessfulNonStreamingResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		UpdateRuntimeSettings(func(RuntimeSettings) RuntimeSettings { return previousRuntime })
+	})
+	UpdateRuntimeSettings(func(current RuntimeSettings) RuntimeSettings {
+		current.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+		current.CodexForceWebsocket = false
+		return current
+	})
+
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		invoke func(*Handler, *gin.Context)
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-4.1-direct","input":"hello","stream":false}`, invoke: (*Handler).Responses},
+		{name: "chat completions", path: "/v1/chat/completions", body: `{"model":"gpt-4.1-direct","messages":[{"role":"user","content":"hello"}]}`, invoke: (*Handler).ChatCompletions},
+		{name: "anthropic messages", path: "/v1/messages", body: `{"model":"gpt-4.1-direct","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`, invoke: (*Handler).Messages},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				requestBody, _ := io.ReadAll(r.Body)
+				if !gjson.GetBytes(requestBody, "stream").Bool() {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"resp_success_once","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				for _, event := range []string{
+					`{"type":"response.created","response":{"id":"resp_success_once"}}`,
+					`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+					`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"OK"}`,
+					`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}}`,
+					`{"type":"response.completed","response":{"id":"resp_success_once","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+				} {
+					_, _ = io.WriteString(w, "data: "+event+"\n\n")
+				}
+			}))
+			t.Cleanup(upstream.Close)
+
+			store := newOpenAIResponsesRelayStore(upstream.URL)
+			t.Cleanup(store.Stop)
+			handler := NewHandler(store, nil, nil, nil)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			requestCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			ctx.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)).WithContext(requestCtx)
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			tc.invoke(handler, ctx)
+
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("successful upstream calls = %d, want exactly 1; status=%d body=%s", got, recorder.Code, recorder.Body.String())
+			}
+			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "OK") {
+				t.Fatalf("successful response was not returned: status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestContinuousRetryNonStreamingErrorEventCannotBeOverriddenByCompleted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	enableCatchAllContinuousRetry(t)
+
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		invoke func(*Handler, *gin.Context)
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-4.1-direct","input":"hello","stream":false}`, invoke: (*Handler).Responses},
+		{name: "chat completions", path: "/v1/chat/completions", body: `{"model":"gpt-4.1-direct","messages":[{"role":"user","content":"hello"}]}`, invoke: (*Handler).ChatCompletions},
+		{name: "anthropic messages", path: "/v1/messages", body: `{"model":"gpt-4.1-direct","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`, invoke: (*Handler).Messages},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				attempt := calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				if attempt == 1 {
+					_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"code\":\"future_failure\",\"message\":\"must stay upstream\"}}\n\n")
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_poisoned\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"poisoned-success\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+					return
+				}
+				if tc.name == "responses" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"resp_real","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real-success"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+					return
+				}
+				for _, event := range []string{
+					`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+					`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"real-success"}`,
+					`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real-success"}]}}`,
+					`{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real-success"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+				} {
+					_, _ = io.WriteString(w, "data: "+event+"\n\n")
+				}
+			}))
+			t.Cleanup(upstream.Close)
+
+			store := newOpenAIResponsesRelayStore(upstream.URL)
+			t.Cleanup(store.Stop)
+			handler := NewHandler(store, nil, nil, nil)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			ctx.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)).WithContext(requestCtx)
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			tc.invoke(handler, ctx)
+
+			body := recorder.Body.String()
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("upstream calls = %d, want error attempt plus success; status=%d body=%s", got, recorder.Code, body)
+			}
+			if recorder.Code != http.StatusOK || !strings.Contains(body, "real-success") {
+				t.Fatalf("successful retry missing: status=%d body=%s", recorder.Code, body)
+			}
+			if strings.Contains(body, "poisoned-success") || strings.Contains(body, "must stay upstream") || strings.Contains(body, "future_failure") {
+				t.Fatalf("error attempt was accepted or leaked: %s", body)
+			}
+		})
+	}
+}
+
+func TestContinuousRetryCatchAllClearsPolicyHeadersBeforeHeartbeat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	previousKeepaliveInterval := continuousRetryKeepaliveInterval
+	t.Cleanup(func() {
+		UpdateRuntimeSettings(func(RuntimeSettings) RuntimeSettings { return previousRuntime })
+		continuousRetryKeepaliveInterval = previousKeepaliveInterval
+	})
+	UpdateRuntimeSettings(func(current RuntimeSettings) RuntimeSettings {
+		current.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+		current.CodexForceWebsocket = false
+		return current
+	})
+	continuousRetryKeepaliveInterval = time.Millisecond
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempt := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempt == 1 {
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","status_code":400,"error":{"code":"cyber_policy","message":"must stay upstream"}}}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"recovered-after-policy"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_policy_recovered","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := promptGuardTestConfig()
+	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{{
+		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
+		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
+	}})
+	t.Cleanup(handler.store.Stop)
+	for id := int64(1); id <= 2; id++ {
+		handler.store.AddAccount(&auth.Account{
+			DBID: id, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL,
+			APIKey: fmt.Sprintf("policy-retry-%d", id), Models: []string{"gpt-4.1-direct"}, PlanType: "api",
+		})
+	}
+	body := []byte(`{"model":"gpt-4.1-direct","input":"ordinary request","stream":true}`)
+	c, recorder := signedBoundPromptConversationContextWithRecorder(t, "policy-retry-request", newAPIIdentity{
+		UserID: "42", ClientIP: "203.0.113.8",
+	}, body, "0123456789abcdef0123456789abcdef")
+
+	handler.Responses(c)
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want policy failure then success; body=%s", got, recorder.Body.String())
+	}
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered-after-policy") || strings.Contains(recorder.Body.String(), "must stay upstream") {
+		t.Fatalf("policy retry was not transparent: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for name := range recorder.Result().Header {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Codex2api-Policy-") {
+			t.Fatalf("heartbeat committed stale policy header %q", name)
+		}
+	}
+	if _, ok := newAPIUpstreamCyberPolicyDecision(c); ok {
+		t.Fatal("successful request retained the failed attempt's policy decision")
 	}
 }
 

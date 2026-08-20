@@ -123,6 +123,39 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	}
 }
 
+func TestContinuousRetryCatchAllAuditsCYBWithoutLockingConversation(t *testing.T) {
+	previousRuntime := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previousRuntime) })
+	nextRuntime := previousRuntime
+	nextRuntime.ContinuousRetryPolicy = database.ContinuousRetryPolicy{Enabled: true, CatchAll: true}
+	ApplyRuntimeSettings(nextRuntime)
+
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	fingerprint := "0123456789abcdef0123456789abcdef"
+	c := signedBoundNewAPIPolicyContext(t, "catch-all-cyb-no-lock", newAPIIdentity{
+		UserID: "42", ClientIP: "203.0.113.8",
+	}, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	setIngressRequestBodyIfAbsent(c, body)
+
+	_, accepted := handler.logUpstreamCyberPolicy(c, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
+	metadata, delegated := newAPIUpstreamCyberPolicyDecision(c)
+	if !delegated || metadata.ConversationLocked {
+		t.Fatalf("catch-all CYB decision = %+v delegated=%t", metadata, delegated)
+	}
+	if !accepted {
+		t.Fatal("catch-all CYB was not retained in the local audit queue")
+	}
+	policyContext, verified := handler.verifyNewAPIPolicyContext(c, handler.promptFilterConfigForRequest(c).Advanced.NewAPI, body)
+	lockIdentity, ok := verifiedPromptConversationLockIdentity(c, policyContext)
+	if !verified || !ok {
+		t.Fatal("signed session identity was not available")
+	}
+	if _, err := db.GetActivePromptConversationLock(t.Context(), lockIdentity.LockKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("catch-all CYB persisted a conversation lock: %v", err)
+	}
+}
+
 func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
 	handler, _ := newPromptConversationLockTestHandler(t)
 	cfg := handler.store.GetPromptFilterConfig()

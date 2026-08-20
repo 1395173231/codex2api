@@ -43,7 +43,8 @@ var responsesWSUpgrader = websocket.Upgrader{
 var errResponsesWSClientGone = errors.New("responses websocket client disconnected")
 
 type responsesWSRetryableStreamError struct {
-	outcome streamOutcome
+	outcome   streamOutcome
+	eventType string
 }
 
 func (e *responsesWSRetryableStreamError) Error() string {
@@ -460,6 +461,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	if compactionAffinity.Known {
 		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
 	}
+	baseAccountFilter := accountFilter
 	if turnContinuation && turnHasBinding {
 		accountFilter = accountIDOnlyFilter(turnBoundAccountID, accountFilter)
 	}
@@ -470,6 +472,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
 	silentRetryEnabled := wsRetrySettings.CodexWSSilentRetry
 	continuousRetryPolicy := database.NormalizeContinuousRetryPolicy(wsRetrySettings.ContinuousRetryPolicy)
+	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
+	stopRetryKeepalive := installContinuousRetryWSKeepalive(c, conn)
+	defer stopRetryKeepalive()
+	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		activateContinuousRetryKeepalive(c.Request.Context())
+	}
 	// The continuous selector is independent from the legacy finite WebSocket
 	// silent-retry switch. Selected failures use its unlimited budget even when
 	// the legacy switch is disabled; unselected failures retain old semantics.
@@ -494,6 +502,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	degradeContinuation := func(reason string, attempt int) {
 		continuationDegraded = true
 		continuationPinned = false
+		accountFilter = baseAccountFilter
 		codexBody = degradeResponsesWSContinuationBody(codexBody, respCacheOwner)
 		expandedInputRaw = responsesInputRaw(codexBody)
 		log.Printf("Responses WebSocket continuation degraded: %s, stripped previous_response_id and retried once (attempt %d)", reason, attempt)
@@ -564,6 +573,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			_ = writeResponsesWSError(conn, apiErr)
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
+		if attempt > 0 {
+			clearNewAPIUpstreamCyberPolicyDecision(c)
+		}
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
@@ -608,7 +620,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+			return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		})
 		durationMs := int(time.Since(start).Milliseconds())
 		if c.Request.Context().Err() != nil {
 			ttftGuard.Stop()
@@ -638,7 +652,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
 			shouldRetry := retryEnabled && retryable && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
+			stickyRetry := h.shouldStickyTransportRetry(reqErr, kind, timedOut, shouldRetry, continuousRetryPolicy)
 			if retryable && kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -647,6 +661,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
+				activateContinuousRetryKeepaliveForLimit(c.Request.Context(), continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy))
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %s, account %d): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
 				continue
@@ -763,6 +778,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			})
 
 			if shouldRetry {
+				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastRetryableUpstreamErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
@@ -806,17 +822,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					log.Printf("Responses WebSocket upstream close 1009 before first event; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), retryErr.outcome.failureMessage)
 					continue
 				}
-				if retryEnabled && shouldTransparentRetryStreamWithBudgets(retryErr.outcome, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, false, c.Request.Context().Err(), nil, continuousRetryPolicy) {
+				eventType := strings.TrimSpace(retryErr.eventType)
+				if retryEnabled && shouldTransparentRetryStreamEventWithBudgets(retryErr.outcome, eventType, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, false, c.Request.Context().Err(), nil, continuousRetryPolicy) {
 					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
 						retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 					} else {
-						retryExclusions.MarkStreamFailure(account.ID(), retryErr.outcome, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+						retryExclusions.MarkStreamFailureForEvent(account.ID(), retryErr.outcome, eventType, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 					}
-					retryOrdinal, retryLimit := retryStateForStreamOutcome(retryErr.outcome, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+					retryOrdinal, retryLimit := retryStateForStreamEvent(retryErr.outcome, eventType, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 					log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %s, account %d): %s", retryAttemptProgress(retryOrdinal-1, retryLimit), account.ID(), retryErr.outcome.failureMessage)
 					// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 					if !isFirstTokenTimeoutOutcome(retryErr.outcome) && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 						return errResponsesWSClientGone
+					}
+					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
+						activateContinuousRetryKeepaliveForLimit(c.Request.Context(), retryLimit)
 					}
 					continue
 				}
@@ -835,6 +855,42 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		return nil
 	}
+}
+
+func replayResponsesWSSuccess(replay *continuousRetryWSReplay, outputBuffer *wsPromptOutputBuffer, writeMessage func([]byte) error) (bool, error) {
+	if replay == nil {
+		return false, nil
+	}
+	if writeMessage == nil {
+		return false, errors.New("nil Responses WebSocket replay writer")
+	}
+	wroteAny := false
+	writeFiltered := func(messages [][]byte) error {
+		for _, message := range messages {
+			if err := writeMessage(message); err != nil {
+				return err
+			}
+			wroteAny = true
+		}
+		return nil
+	}
+	if err := replay.ForEachMessage(func(payload []byte) error {
+		release, err := outputBuffer.Push(payload)
+		if err != nil {
+			return err
+		}
+		return writeFiltered(release)
+	}); err != nil {
+		return wroteAny, err
+	}
+	remaining, err := outputBuffer.Flush()
+	if err != nil {
+		return wroteAny, err
+	}
+	if err := writeFiltered(remaining); err != nil {
+		return wroteAny, err
+	}
+	return wroteAny, nil
 }
 
 func (h *Handler) streamResponsesWSUpstream(
@@ -882,7 +938,9 @@ func (h *Handler) streamResponsesWSUpstream(
 	// preflight passthrough，这两帧会先写出并置位 wroteAnyBody。若用它们做
 	// 「首包前」判断，previous_response_not_found 降级在真实上游上永远进不去（#541）。
 	contentTokenSeen := false
-	preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
+	preflightSettings := CurrentRuntimeSettings()
+	preflightSettings.ContinuousRetryPolicy = continuousRetryPolicy
+	preflightPassthrough := continuousRetryPreflightPassthrough(preflightSettings)
 	gotTerminal := false
 	deltaCharCount := 0
 	var readErr error
@@ -890,7 +948,18 @@ func (h *Handler) streamResponsesWSUpstream(
 	clientGone := false
 	var imageLogInfo imageUsageLogInfo
 	var terminalFailurePayload []byte
+	var terminalFailureClientPayload []byte
+	var preContentErrorCandidate []byte
+	var completedResponsePayload []byte
+	terminalFailureEventType := ""
 	wroteAnyBody := false
+	var wsReplay *continuousRetryWSReplay
+	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		wsReplay = newContinuousRetryWSReplay()
+	}
+	writeClientMessage := func(payload []byte) error {
+		return writeResponsesWSMessage(conn, payload)
+	}
 	// 首 token 前收到不可重试的 response.failed 时置位:不把原始失败帧透传给客户端,
 	// 循环外改写 error 帧并按错误类别用非正常 close code 关闭,
 	// 让下游中转/计费方明确感知失败,而不是把它当成一次正常结束的会话。
@@ -910,7 +979,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			}
 			wrotePending := false
 			for _, filtered := range release {
-				if err := writeResponsesWSMessage(conn, filtered); err != nil {
+				if err := writeClientMessage(filtered); err != nil {
 					writeErr = err
 					clientGone = true
 					return false
@@ -924,10 +993,12 @@ func (h *Handler) streamResponsesWSUpstream(
 		return true
 	}
 
-	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-		h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
+	readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+		if wsReplay == nil {
+			h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
+		}
 		parsed := gjson.ParseBytes(data)
-		eventType := parsed.Get("type").String()
+		eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 		clientData := data
 		if options != nil && options.transformClientEvent != nil {
 			if transformed := options.transformClientEvent(data); len(transformed) > 0 {
@@ -947,6 +1018,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		if !contentTokenSeen && isFirstTokenResult(parsed) {
 			contentTokenSeen = true
 		}
+		if contentTokenSeen {
+			preContentErrorCandidate = nil
+		}
 		if eventType == "response.output_text.delta" {
 			deltaCharCount += len(parsed.Get("delta").String())
 		}
@@ -959,16 +1033,50 @@ func (h *Handler) streamResponsesWSUpstream(
 				actualServiceTier = tier
 			}
 			if eventType == "response.completed" {
-				if options != nil && options.onResponseCompleted != nil {
-					options.onResponseCompleted(append([]byte(nil), data...))
-				}
-				// 截断态不入缓存：它不是完整回合，展开后会把半截输出当历史。
-				cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+				completedResponsePayload = append([]byte(nil), data...)
 			}
 			gotTerminal = true
+			preContentErrorCandidate = nil
 		}
 		if eventType == "response.failed" {
 			terminalFailurePayload = append([]byte(nil), data...)
+			terminalFailureEventType = eventType
+			gotTerminal = true
+			preContentErrorCandidate = nil
+		}
+		if wsReplay != nil {
+			// Continuous retry keeps the complete attempt private. Any upstream
+			// error event is authoritative and ends the attempt immediately, even if
+			// the provider later appends a contradictory response.completed frame.
+			// Selective and catch-all modes differ only in whether the classified
+			// failure below is selected for another attempt.
+			if eventType == "error" {
+				terminalFailurePayload = append([]byte(nil), data...)
+				terminalFailureEventType = eventType
+				gotTerminal = true
+			}
+			if eventType == "error" || eventType == "response.failed" {
+				if allowContinuationDegrade && !contentTokenSeen && isPreviousResponseNotFoundBody(data) {
+					continuationNotFound = true
+					return false
+				}
+				terminalFailureClientPayload = append([]byte(nil), clientData...)
+				return false
+			}
+			if err := wsReplay.WriteMessage(clientData); err != nil {
+				writeErr = err
+				return false
+			}
+			return !isResponsesSuccessTerminalEvent(eventType)
+		}
+		standaloneErrorAfterOutput := eventType == "error" && wroteAnyBody
+		if !contentTokenSeen && !wroteAnyBody && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy) {
+			preContentErrorCandidate = append(preContentErrorCandidate[:0], data...)
+			return true
+		}
+		if standaloneErrorAfterOutput {
+			terminalFailurePayload = append([]byte(nil), data...)
+			terminalFailureEventType = "error"
 			gotTerminal = true
 		}
 		if !clientGone {
@@ -978,7 +1086,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			// 分类不属于可重试帧，立即写出会置位 wroteAnyBody，随后的 response.failed
 			// 就进不了下面的续链降级分支。
 			shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
-				(!contentTokenSeen && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy)) ||
+				(!contentTokenSeen && !wroteAnyBody && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy)) ||
 				(allowContinuationDegrade && !contentTokenSeen && !gotTerminal && eventType == "error" && isPreviousResponseNotFoundBody(data))
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
@@ -1030,7 +1138,7 @@ func (h *Handler) streamResponsesWSUpstream(
 					return false
 				}
 				for _, filtered := range release {
-					if err := writeResponsesWSMessage(conn, filtered); err != nil {
+					if err := writeClientMessage(filtered); err != nil {
 						writeErr = err
 						clientGone = true
 					} else {
@@ -1039,15 +1147,15 @@ func (h *Handler) streamResponsesWSUpstream(
 				}
 			}
 		}
-		return !isResponsesTerminalEvent(eventType)
+		return !standaloneErrorAfterOutput && !isResponsesTerminalEvent(eventType)
 	})
-	if writeErr == nil && outputBuffer != nil {
+	if writeErr == nil && outputBuffer != nil && wsReplay == nil {
 		remaining, err := outputBuffer.Flush()
 		if err != nil {
 			writeErr = err
 		} else {
 			for _, message := range remaining {
-				if err := writeResponsesWSMessage(conn, message); err != nil {
+				if err := writeClientMessage(message); err != nil {
 					writeErr = err
 					break
 				}
@@ -1058,6 +1166,7 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	// 续链 id 失效且首包前拦下：账号无过错，不记失败也不解绑，交回外层降级重试。
 	if continuationNotFound && !contentTokenSeen && writeErr == nil && c.Request.Context().Err() == nil {
+		_ = wsReplay.Close()
 		ttftGuard.Stop()
 		resp.Body.Close()
 		h.store.Release(account)
@@ -1066,6 +1175,13 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	totalDuration := int(time.Since(start).Milliseconds())
 	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+	var candidatePromoted bool
+	terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
+	if candidatePromoted {
+		terminalFailureEventType = "error"
+	} else if len(terminalFailurePayload) > 0 && terminalFailureEventType == "" {
+		terminalFailureEventType = gjson.GetBytes(terminalFailurePayload, "type").String()
+	}
 	if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 		outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 	}
@@ -1089,18 +1205,24 @@ func (h *Handler) streamResponsesWSUpstream(
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
 	}
-	if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated && metadata.EventID != "" {
+	downstreamWroteBeforeCommit := wroteAnyBody && wsReplay == nil
+	transparentRetrySelected := retryEnabled && continuousRetryStreamFailureSelected(outcome, terminalFailurePayload, terminalFailureEventType, continuousRetryPolicy) && !downstreamWroteBeforeCommit && c.Request.Context().Err() == nil && writeErr == nil
+	if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated && metadata.EventID != "" && !transparentRetrySelected {
+		_ = wsReplay.Close()
 		// WebSocket response headers were committed during the upgrade. Carry the
 		// signed CYB decision in a per-turn error frame so NewAPI can count it and
 		// decide whether this is the first warning or a ban-worthy recurrence.
 		_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
 		return nil
 	}
-	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, downstreamWroteBeforeCommit, c.Request.Context().Err(), writeErr) {
+		_ = wsReplay.Close()
 		resp.Body.Close()
-		return &responsesWSRetryableStreamError{outcome: outcome}
+		return &responsesWSRetryableStreamError{outcome: outcome, eventType: terminalFailureEventType}
 	}
-	if retryEnabled && continuousRetryStreamFailureSelected(outcome, terminalFailurePayload, "response.failed", continuousRetryPolicy) && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+	if transparentRetrySelected {
+		_ = wsReplay.Close()
+		clearNewAPIUpstreamCyberPolicyDecision(c)
 		h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 			AccountID: account.ID(), Endpoint: "/v1/responses", Model: model, EffectiveModel: logEffectiveModel,
 			StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
@@ -1116,8 +1238,37 @@ func (h *Handler) streamResponsesWSUpstream(
 		if !preserveAffinity {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		}
-		return &responsesWSRetryableStreamError{outcome: outcome}
+		return &responsesWSRetryableStreamError{outcome: outcome, eventType: terminalFailureEventType}
 	}
+	if outcome.logStatusCode == http.StatusOK && wsReplay != nil {
+		committedAny, commitErr := replayResponsesWSSuccess(wsReplay, outputBuffer, writeClientMessage)
+		wroteAnyBody = wroteAnyBody || committedAny
+		if commitErr != nil {
+			writeErr = commitErr
+			// Filtering, replay storage, and downstream writes are local commit
+			// failures. They terminate this turn and must never reopen an upstream
+			// attempt that already reached a successful protocol terminal.
+			outcome = classifyStreamOutcome(c.Request.Context().Err(), nil, writeErr, false)
+		}
+	}
+	downstreamWrote := wroteAnyBody
+	if outcome.logStatusCode == http.StatusOK && writeErr == nil && downstreamWrote {
+		if wsReplay != nil {
+			_ = wsReplay.ForEachMessage(func(payload []byte) error {
+				h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
+				return nil
+			})
+		}
+		if len(completedResponsePayload) > 0 {
+			if options != nil && options.onResponseCompleted != nil {
+				options.onResponseCompleted(append([]byte(nil), completedResponsePayload...))
+			}
+			// Only committed response.completed events become continuation history.
+			// Failed attempts and locally blocked/unwritable replays leave no cache.
+			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), completedResponsePayload)
+		}
+	}
+	_ = wsReplay.Close()
 	if outcome.logStatusCode != http.StatusOK {
 		log.Printf("Responses WebSocket stream ended abnormally (account %d, status %d): %s, relayed about %d chars", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 		if deltaCharCount > 0 && usage == nil {
@@ -1196,7 +1347,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	if writeErr != nil {
 		return errResponsesWSClientGone
 	}
-	if abortedForErrorClose && !wroteAnyBody {
+	if abortedForErrorClose && !downstreamWrote {
 		// 首 token 前上游失败且未向客户端写过任何帧:发结构化 error 帧后按错误类别
 		// 关闭连接,避免下游把"正常收尾的会话"当成功并按预估 input token 计费。
 		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
@@ -1214,7 +1365,16 @@ func (h *Handler) streamResponsesWSUpstream(
 		_ = writeResponsesWSError(conn, clientErr)
 		return newResponsesWSCloseError(responsesWSCloseCodeForStatus(outcome.logStatusCode), clientErr.Message, apiErr)
 	}
-	if outcome.logStatusCode != http.StatusOK && hideUpstreamErrors && len(terminalFailurePayload) > 0 && !wroteAnyBody {
+	if outcome.logStatusCode != http.StatusOK && !hideUpstreamErrors && len(terminalFailureClientPayload) > 0 && !downstreamWrote {
+		// An unselected selective-mode failure still ends the logical turn. Its
+		// preceding attempt output remains discarded, while the terminal upstream
+		// failure is returned without running the local output filter.
+		if err := writeClientMessage(terminalFailureClientPayload); err != nil {
+			return errResponsesWSClientGone
+		}
+		return nil
+	}
+	if outcome.logStatusCode != http.StatusOK && hideUpstreamErrors && len(terminalFailurePayload) > 0 && !downstreamWrote {
 		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
 		clientErr := responsesWSClientUpstreamAPIError(apiErr, true)
 		_ = writeResponsesWSError(conn, clientErr)
