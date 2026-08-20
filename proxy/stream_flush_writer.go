@@ -143,8 +143,11 @@ func (a streamFlushWriterAdapter) Write(data []byte) (int, error) {
 // attempt has reached a successful protocol terminal. A filter or downstream
 // write failure is local and must never trigger another upstream request.
 func (h *Handler) commitStreamAttempt(c *gin.Context, attempt *continuousRetryStreamAttempt) error {
-	if attempt == nil || attempt.replay == nil {
+	if attempt == nil {
 		return nil
+	}
+	if attempt.closed || attempt.replay == nil {
+		return errContinuousRetryReplayClosed
 	}
 	flusher, _ := c.Writer.(http.Flusher)
 	filtered := h.newStreamFlushWriter(c, c.Writer, flusher)

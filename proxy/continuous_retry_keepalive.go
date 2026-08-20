@@ -336,7 +336,12 @@ func waitWithContinuousRetryKeepalive(ctx context.Context, interval time.Duratio
 			if err := keepalive.Keepalive(); err != nil {
 				return false
 			}
-			continue
+			// A disabled or custom heartbeat may not advance its deadline.
+			// 心跳未推进截止时间时必须实际等待，避免处理协程零延迟忙等。
+			step = continuousRetryKeepaliveDelay(keepalive)
+			if step <= 0 {
+				step = continuousRetryKeepaliveInterval
+			}
 		}
 		if step > remaining {
 			step = remaining

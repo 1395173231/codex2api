@@ -526,7 +526,7 @@ func TestContinuousRetryCatchAllDoesNotReplaySuccessfulNonStreamingResponses(t *
 			handler := NewHandler(store, nil, nil, nil)
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			requestCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			ctx.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)).WithContext(requestCtx)
 			ctx.Request.Header.Set("Content-Type", "application/json")

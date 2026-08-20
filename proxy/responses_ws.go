@@ -875,6 +875,9 @@ func replayResponsesWSSuccess(replay *continuousRetryWSReplay, outputBuffer *wsP
 		return nil
 	}
 	if err := replay.ForEachMessage(func(payload []byte) error {
+		if outputBuffer == nil {
+			return writeFiltered([][]byte{payload})
+		}
 		release, err := outputBuffer.Push(payload)
 		if err != nil {
 			return err
@@ -882,6 +885,9 @@ func replayResponsesWSSuccess(replay *continuousRetryWSReplay, outputBuffer *wsP
 		return writeFiltered(release)
 	}); err != nil {
 		return wroteAny, err
+	}
+	if outputBuffer == nil {
+		return wroteAny, nil
 	}
 	remaining, err := outputBuffer.Flush()
 	if err != nil {

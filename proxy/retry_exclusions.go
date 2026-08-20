@@ -423,7 +423,12 @@ func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey 
 			if keepalive.Keepalive() != nil {
 				return nil, ""
 			}
-			continue
+			// A heartbeat implementation may be unable to advance its deadline.
+			// 心跳无法推进截止时间时使用配置间隔作为下限，避免忙等。
+			step = continuousRetryKeepaliveDelay(keepalive)
+			if step <= 0 {
+				step = continuousRetryKeepaliveInterval
+			}
 		}
 		if step > remaining {
 			step = remaining

@@ -114,6 +114,25 @@ func TestWaitWithContinuousRetryKeepaliveHonorsExistingHeartbeatDeadline(t *test
 	}
 }
 
+func TestWaitWithContinuousRetryKeepaliveFallsBackWhenHeartbeatCannotAdvance(t *testing.T) {
+	previousInterval := continuousRetryKeepaliveInterval
+	continuousRetryKeepaliveInterval = 5 * time.Millisecond
+	t.Cleanup(func() { continuousRetryKeepaliveInterval = previousInterval })
+
+	keepalive := &requestContinuousRetryKeepalive{
+		active: true,
+		last:   time.Now().Add(-continuousRetryKeepaliveInterval),
+	}
+	ctx := context.WithValue(context.Background(), continuousRetryKeepaliveContextKey{}, continuousRetryKeepalive(keepalive))
+	started := time.Now()
+	if !waitWithContinuousRetryKeepalive(ctx, 5*time.Millisecond) {
+		t.Fatal("wait failed when heartbeat could not advance")
+	}
+	if elapsed := time.Since(started); elapsed < time.Millisecond {
+		t.Fatalf("zero-delay fallback returned too quickly: %v", elapsed)
+	}
+}
+
 func TestFiniteRetryWaitDoesNotActivateKeepalive(t *testing.T) {
 	h, store := newRetryTestHandler(t)
 	store.SetRetryIntervalMS(1)

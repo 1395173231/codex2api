@@ -192,6 +192,7 @@ type continuousRetryStreamAttempt struct {
 	replay     *continuousRetryReplay
 	downstream io.Writer
 	flusher    http.Flusher
+	closed     bool
 }
 
 func newContinuousRetryStreamAttempt(enabled bool, downstream io.Writer, flusher http.Flusher) *continuousRetryStreamAttempt {
@@ -224,16 +225,24 @@ func (a *continuousRetryStreamAttempt) downstreamWrote(attemptWrote bool) bool {
 }
 
 func (a *continuousRetryStreamAttempt) Commit() error {
-	if a == nil || a.replay == nil {
+	if a == nil {
 		return nil
+	}
+	if a.closed || a.replay == nil {
+		return errContinuousRetryReplayClosed
 	}
 	return a.replay.CommitTo(a.downstream, a.flusher)
 }
 
 func (a *continuousRetryStreamAttempt) Close() error {
-	if a == nil || a.replay == nil {
+	if a == nil {
 		return nil
 	}
+	if a.closed || a.replay == nil {
+		a.closed = true
+		return nil
+	}
+	a.closed = true
 	err := a.replay.Close()
 	a.replay = nil
 	return err
@@ -242,6 +251,7 @@ func (a *continuousRetryStreamAttempt) Close() error {
 type continuousRetryWSReplay struct {
 	replay *continuousRetryReplay
 	count  int
+	closed bool
 }
 
 func newContinuousRetryWSReplay() *continuousRetryWSReplay {
@@ -273,8 +283,11 @@ func (r *continuousRetryWSReplay) WriteMessage(payload []byte) error {
 // ForEachMessage visits each buffered message without changing or closing the
 // replay, so a successful attempt can be inspected before it is committed.
 func (r *continuousRetryWSReplay) ForEachMessage(visit func([]byte) error) error {
-	if r == nil || r.replay == nil {
+	if r == nil {
 		return nil
+	}
+	if r.closed || r.replay == nil {
+		return errContinuousRetryReplayClosed
 	}
 	if visit == nil {
 		return errors.New("nil continuous retry websocket writer")
@@ -323,9 +336,14 @@ func (r *continuousRetryWSReplay) Commit(writeMessage func([]byte) error) error 
 }
 
 func (r *continuousRetryWSReplay) Close() error {
-	if r == nil || r.replay == nil {
+	if r == nil {
 		return nil
 	}
+	if r.closed || r.replay == nil {
+		r.closed = true
+		return nil
+	}
+	r.closed = true
 	err := r.replay.Close()
 	r.replay = nil
 	return err

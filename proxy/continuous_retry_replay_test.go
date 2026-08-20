@@ -200,3 +200,42 @@ func TestContinuousRetryWSReplaySizeCheckDoesNotWritePartialRecord(t *testing.T)
 		t.Fatalf("failed message changed replay: size=%d count=%d", buffer.size, replay.count)
 	}
 }
+
+func TestContinuousRetryReplayCommitAfterCloseFails(t *testing.T) {
+	attempt := newContinuousRetryStreamAttempt(true, &bytes.Buffer{}, nil)
+	if err := attempt.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := attempt.Commit(); !errors.Is(err, errContinuousRetryReplayClosed) {
+		t.Fatalf("Commit after Close = %v, want closed error", err)
+	}
+}
+
+func TestContinuousRetryWSReplayCommitAfterCloseFails(t *testing.T) {
+	replay := newContinuousRetryWSReplay()
+	if err := replay.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := replay.Commit(func([]byte) error { return nil }); !errors.Is(err, errContinuousRetryReplayClosed) {
+		t.Fatalf("Commit after Close = %v, want closed error", err)
+	}
+}
+
+func TestReplayResponsesWSSuccessWithoutOutputFilter(t *testing.T) {
+	replay := newContinuousRetryWSReplay()
+	t.Cleanup(func() { _ = replay.Close() })
+	if err := replay.WriteMessage([]byte("response.completed")); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	var got [][]byte
+	wroteAny, err := replayResponsesWSSuccess(replay, nil, func(payload []byte) error {
+		got = append(got, append([]byte(nil), payload...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replayResponsesWSSuccess: %v", err)
+	}
+	if !wroteAny || len(got) != 1 || string(got[0]) != "response.completed" {
+		t.Fatalf("replayed output = wrote:%v messages:%q", wroteAny, got)
+	}
+}
