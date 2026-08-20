@@ -3802,26 +3802,27 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
-		Source:          "local_filter",
-		Endpoint:        "/v1/messages",
-		Protocol:        "claude",
-		Provider:        "anthropic",
-		Model:           "gpt-5.4",
-		Action:          "allow",
-		Mode:            "block",
-		Score:           70,
-		AuditScore:      100,
-		Threshold:       50,
-		PolicyProfile:   "strict",
-		ReasonCode:      "terminal_policy_match",
-		PrimaryOrigin:   "current_user",
-		StrikeEligible:  true,
-		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
-		TextPreview:     "preview",
-		MatchContext:    "actual trigger excerpt",
-		ReviewModel:     "omni-moderation-latest",
-		ReviewFlagged:   false,
-		ReviewError:     "temporary failure",
+		Source:               "local_filter",
+		Endpoint:             "/v1/messages",
+		Protocol:             "claude",
+		Provider:             "anthropic",
+		Model:                "gpt-5.4",
+		Action:               "allow",
+		Mode:                 "block",
+		Score:                70,
+		AuditScore:           100,
+		Threshold:            50,
+		PolicyProfile:        "strict",
+		ReasonCode:           "terminal_policy_match",
+		PrimaryOrigin:        "current_user",
+		StrikeEligible:       true,
+		MatchedPatterns:      `[{"name":"credential_theft","weight":100}]`,
+		TextPreview:          "preview",
+		MatchContext:         "actual trigger excerpt",
+		ReviewModel:          "omni-moderation-latest",
+		ReviewFlagged:        false,
+		ReviewError:          "temporary failure",
+		RequestCorrelationID: "298ee1bb-ad0f-4e96-8924-d34066def71e",
 	}); err != nil {
 		t.Fatalf("InsertPromptFilterLog 返回错误: %v", err)
 	}
@@ -3853,6 +3854,14 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if matchTotal != 1 || len(matched) != 1 || matched[0].MatchContext != "actual trigger excerpt" {
 		t.Fatalf("match context search total=%d logs=%+v", matchTotal, matched)
+	}
+
+	byAuditReference, auditReferenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "298ee1bb-ad0f-4e96-8924-d34066def71e"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(audit reference) 返回错误: %v", err)
+	}
+	if auditReferenceTotal != 1 || len(byAuditReference) != 1 || byAuditReference[0].RequestCorrelationID != "298ee1bb-ad0f-4e96-8924-d34066def71e" {
+		t.Fatalf("audit reference search total=%d logs=%+v", auditReferenceTotal, byAuditReference)
 	}
 
 	nearest, err := db.FindNearestPromptFilterLog(ctx, got.CreatedAt, "local_filter", "/v1/messages", 0, 5)

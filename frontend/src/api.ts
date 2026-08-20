@@ -1094,7 +1094,7 @@ export const api = {
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
-	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string } = {}) => {
+	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
 		search.set('page_size', String(params.pageSize || 20))
@@ -1105,6 +1105,7 @@ export const api = {
 		if (params.accountId) search.set('account_id', params.accountId)
 		if (params.minScore) search.set('min_score', params.minScore)
 		if (params.q) search.set('q', params.q)
+		if (params.lockedOnly) search.set('locked_only', 'true')
 		return request<import('./types').PromptRiskProfilesResponse>(`/prompt-policy/risk-profiles?${search.toString()}`)
 	},
 	getPromptRiskProfile: (subjectType: string, subjectKey: string, eventPage = 1, eventPageSize = 20, trustEventPage = 1, trustEventPageSize = 20) =>
