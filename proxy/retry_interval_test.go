@@ -77,7 +77,7 @@ func TestWaitBeforeRetry(t *testing.T) {
 		}
 	})
 
-	t.Run("Retry-After 等待可被客户端取消", func(t *testing.T) {
+	t.Run("unlimited Retry-After 等待可被客户端取消", func(t *testing.T) {
 		store.SetRetryIntervalMS(0)
 		resp := &http.Response{Header: make(http.Header)}
 		resp.Header.Set("Retry-After", "60")
@@ -87,7 +87,7 @@ func TestWaitBeforeRetry(t *testing.T) {
 			cancel()
 		}()
 		start := time.Now()
-		if h.waitBeforeRetry(ctx, resp) {
+		if h.waitBeforeRetryWithBudget(ctx, 1, -1, resp) {
 			t.Fatal("want false when canceled during Retry-After wait")
 		}
 		elapsed := time.Since(start)
@@ -96,6 +96,19 @@ func TestWaitBeforeRetry(t *testing.T) {
 		}
 		if elapsed > time.Second {
 			t.Fatalf("cancel should abort Retry-After promptly, took %v", elapsed)
+		}
+	})
+
+	t.Run("finite retry ignores upstream Retry-After", func(t *testing.T) {
+		store.SetRetryIntervalMS(0)
+		resp := &http.Response{Header: make(http.Header)}
+		resp.Header.Set("Retry-After", "60")
+		started := time.Now()
+		if !h.waitBeforeRetryWithBudget(context.Background(), 1, 2, resp) {
+			t.Fatal("finite retry was unexpectedly canceled")
+		}
+		if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+			t.Fatalf("finite retry inherited upstream Retry-After, took %v", elapsed)
 		}
 	})
 }

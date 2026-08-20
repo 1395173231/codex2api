@@ -3019,20 +3019,25 @@ func (h *Handler) waitBeforeRetryWithBudgetMode(ctx context.Context, retryOrdina
 	if h != nil && h.store != nil {
 		interval = time.Duration(h.store.GetRetryIntervalMS()) * time.Millisecond
 	}
-	for _, resp := range responses {
-		if resp == nil {
-			continue
-		}
-		rawRetryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
-		if rawRetryAfter == "" {
-			continue
-		}
-		retryAfter := parseRetryAfterHeader(rawRetryAfter)
-		if retryAfter > maxRetryAfterDelay {
-			retryAfter = maxRetryAfterDelay
-		}
-		if retryAfter > interval {
-			interval = retryAfter
+	// Retry-After is part of the continuous-retry contract only. Finite and
+	// disabled retry budgets retain the historical local retry interval and do
+	// not let an upstream response introduce an unexpected delay.
+	if retryLimit == -1 {
+		for _, resp := range responses {
+			if resp == nil {
+				continue
+			}
+			rawRetryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
+			if rawRetryAfter == "" {
+				continue
+			}
+			retryAfter := parseRetryAfterHeader(rawRetryAfter)
+			if retryAfter > maxRetryAfterDelay {
+				retryAfter = maxRetryAfterDelay
+			}
+			if retryAfter > interval {
+				interval = retryAfter
+			}
 		}
 	}
 	if retryLimit == -1 {
