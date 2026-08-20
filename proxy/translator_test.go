@@ -3825,3 +3825,24 @@ func TestIsReservedCodexTool(t *testing.T) {
 		}
 	}
 }
+
+// 顶层 type 是 Responses WS 事件信封字段，HTTP /responses 上游不接受
+// (400 Unsupported parameter: type)；prepare 阶段必须剥离顶层、保留嵌套 (issue #548)。
+func TestPrepareResponsesBodyStripsTopLevelWebSocketEnvelopeType(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	for name, prepare := range map[string]func([]byte) ([]byte, string){
+		"http": PrepareResponsesBody,
+		"ws":   PrepareResponsesWebSocketBody,
+	} {
+		got, _ := prepare(raw)
+		if gjson.GetBytes(got, "type").Exists() {
+			t.Fatalf("%s: top-level type should be stripped: %s", name, got)
+		}
+		if it := gjson.GetBytes(got, "input.0.type").String(); it != "message" {
+			t.Fatalf("%s: nested input type = %q, want message; body=%s", name, it, got)
+		}
+		if ct := gjson.GetBytes(got, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("%s: nested content type = %q, want input_text; body=%s", name, ct, got)
+		}
+	}
+}

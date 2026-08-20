@@ -267,8 +267,10 @@ func TestRealtimeWebSocketTranslatesTextConversationToResponses(t *testing.T) {
 	}
 	select {
 	case gotBody := <-bodyCh:
-		if got := gjson.GetBytes(gotBody, "type").String(); got != "response.create" {
-			t.Fatalf("upstream type = %q body=%s", got, gotBody)
+		// 顶层 type 信封在 prepare 阶段剥离（HTTP 上游不接受，issue #548）；
+		// WS 出站帧的 type 由 wsrelay 的 prepareWebsocketBody 统一重设，不在此边界。
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("upstream body should not carry envelope type: %s", gotBody)
 		}
 		if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4" {
 			t.Fatalf("upstream model = %q body=%s", got, gotBody)
@@ -481,8 +483,10 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 	select {
 	case gotBody := <-bodyCh:
-		if gjson.GetBytes(gotBody, "type").String() != "response.create" {
-			t.Fatalf("upstream type missing: %s", gotBody)
+		// 顶层 type 信封在 prepare 阶段剥离（HTTP 上游不接受，issue #548）；
+		// WS 出站帧的 type 由 wsrelay 的 prepareWebsocketBody 统一重设，不在此边界。
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("upstream body should not carry envelope type: %s", gotBody)
 		}
 		if model := gjson.GetBytes(gotBody, "model").String(); model != "gpt-5.4" {
 			t.Fatalf("upstream model = %q, want mapped gpt-5.4; body=%s", model, gotBody)
@@ -523,6 +527,223 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	case <-bodyCh:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for second upstream request")
+	}
+}
+
+// TestResponsesWebSocket1009FallbackStripsEnvelopeType 覆盖 issue #548：native WS
+// ingress 收到上游 close 1009 后降级 HTTP，fallback 请求体必须剥掉 WS 事件信封的
+// 顶层 type（HTTP 上游会 400 Unsupported parameter: type），嵌套 type 保持完整；
+// 同时 1009 体积喂给体积路由，后续同尺寸请求直接首发 HTTP 不再进 WS。
+func TestResponsesWebSocket1009FallbackStripsEnvelopeType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		resinCfg.Store(previousResin)
+		globalWSSizeRouter = websocketSizeRouter{}
+	})
+	globalWSSizeRouter = websocketSizeRouter{}
+
+	var wsCalls int32
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		atomic.AddInt32(&wsCalls, 1)
+		return nil, errors.New("websocket send error: websocket: close 1009 (message too big)")
+	}
+
+	httpBodyCh := make(chan []byte, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		httpBodyCh <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			`data: {"type":"response.output_text.delta","delta":"fallback"}` + "\n\n" +
+				`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n",
+		))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 大输入让 1009 时的体积达到体积路由的学习样本下限（64KB）。
+	bigText := strings.Repeat("issue548 ", 8192)
+	payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}`, bigText)
+
+	readTurnEvents := func(turn string) {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, first, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("%s: read first event: %v", turn, err)
+		}
+		if eventType := gjson.GetBytes(first, "type").String(); eventType != "response.output_text.delta" {
+			t.Fatalf("%s: first event type = %q body=%s", turn, eventType, first)
+		}
+		_, second, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("%s: read terminal event: %v", turn, err)
+		}
+		if eventType := gjson.GetBytes(second, "type").String(); eventType != "response.completed" {
+			t.Fatalf("%s: terminal event type = %q body=%s", turn, eventType, second)
+		}
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case gotBody := <-httpBodyCh:
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("HTTP fallback body should not carry envelope type: %.300s", gotBody)
+		}
+		if it := gjson.GetBytes(gotBody, "input.0.type").String(); it != "message" {
+			t.Fatalf("nested input type = %q, want message", it)
+		}
+		if ct := gjson.GetBytes(gotBody, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("nested content type = %q, want input_text", ct)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP fallback request")
+	}
+	if got := atomic.LoadInt32(&wsCalls); got != 1 {
+		t.Fatalf("wsCalls = %d, want 1 (WS 尝试一次后降级 HTTP)", got)
+	}
+	readTurnEvents("turn-1")
+
+	// 第二帧同体积：体积路由已从 1009 学习阈值，应直接首发 HTTP，WS 调用数不变。
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	select {
+	case gotBody := <-httpBodyCh:
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("size-routed HTTP body should not carry envelope type: %.300s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for size-routed HTTP request")
+	}
+	if got := atomic.LoadInt32(&wsCalls); got != 1 {
+		t.Fatalf("wsCalls = %d, want 1 (体积路由应跳过第二次 WS 尝试)", got)
+	}
+	readTurnEvents("turn-2")
+}
+
+// TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache 覆盖 issue #548
+// 的续链缺口：HTTP fallback 前若本地响应缓存命中 previous_response_id，历史应展开进
+// input[] 并剥离续链 id，避免 executor 出站删除该字段时静默丢失上游会话历史。
+func TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		resinCfg.Store(previousResin)
+		globalWSSizeRouter = websocketSizeRouter{}
+	})
+	globalWSSizeRouter = websocketSizeRouter{}
+
+	// 匿名请求的缓存归属是 "anon"；历史含 function_call 才会入缓存。
+	cacheCompletedResponse("anon",
+		[]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"earlier"}]}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_issue548","output":[{"type":"function_call","call_id":"call_548","name":"lookup","arguments":"{}"}]}}`))
+
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		return nil, errors.New("websocket send error: websocket: close 1009 (message too big)")
+	}
+
+	httpBodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		httpBodyCh <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := `{"type":"response.create","model":"gpt-5.4","previous_response_id":"resp_issue548","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case gotBody := <-httpBodyCh:
+		if prev := gjson.GetBytes(gotBody, "previous_response_id"); prev.Exists() {
+			t.Fatalf("previous_response_id should be expanded away before HTTP fallback: %s", gotBody)
+		}
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("HTTP fallback body should not carry envelope type: %s", gotBody)
+		}
+		input := gjson.GetBytes(gotBody, "input")
+		if !input.IsArray() {
+			t.Fatalf("input should be an array: %s", gotBody)
+		}
+		foundHistory := false
+		foundCurrent := false
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Get("call_id").String() == "call_548" {
+				foundHistory = true
+			}
+			if strings.Contains(item.Get("content.0.text").String(), "continue") {
+				foundCurrent = true
+			}
+			return true
+		})
+		if !foundHistory {
+			t.Fatalf("cached history (call_548) missing from expanded input: %s", gotBody)
+		}
+		if !foundCurrent {
+			t.Fatalf("current turn message missing from expanded input: %s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP fallback request")
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, event, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read terminal event: %v", err)
+	}
+	if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+		t.Fatalf("terminal event type = %q body=%s", eventType, event)
 	}
 }
 
