@@ -340,12 +340,14 @@ func sendGrokMediaWithProfiles(ctx context.Context, account *auth.Account, proxy
 	}
 	for idx, profile := range profiles {
 		body, model := buildBody(profile)
-		resp, err := doGrokMediaRequest(ctx, account, profile, proxyURL, method, suffix, body, downstreamHeaders, model, nil)
+		resp, err := executeHTTPWithContinuousRetryKeepalive(ctx, func() (*http.Response, error) {
+			return doGrokMediaRequest(ctx, account, profile, proxyURL, method, suffix, body, downstreamHeaders, model, nil)
+		})
 		if err != nil {
 			return grokMediaSendResult{}, err
 		}
 		if idx < len(profiles)-1 && grokMediaShouldFallbackProfile(resp.StatusCode) {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
+			_, _ = readAllWithContinuousRetryKeepalive(ctx, io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
 			_ = resp.Body.Close()
 			continue
 		}
@@ -521,6 +523,8 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolOpenAI)
 	defer stopRetryDeadline()
+	stopRetryKeepalive := installContinuousRetryHTTPInformationalKeepalive(c)
+	defer stopRetryKeepalive()
 	maxRetries := h.getMaxRetries()
 	generalRetries := 0
 	rateLimitRetries := 0
@@ -610,7 +614,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		recordGrokUpstreamObservations(account, resp.Header)
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
+			errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolOpenAI) {
@@ -649,7 +653,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 			return
 		}
 
-		out, readErr := io.ReadAll(io.LimitReader(resp.Body, grokImagesResponseLimit))
+		out, readErr := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, grokImagesResponseLimit))
 		resp.Body.Close()
 		imageCount := int(gjson.GetBytes(out, "data.#").Int())
 		if readErr != nil || !gjson.ValidBytes(out) || imageCount <= 0 {
@@ -828,6 +832,10 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
 	}
+	if gjson.GetBytes(rawBody, "stream").Bool() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: stream is not supported for grok-imagine-video models", "type": "invalid_request_error"}})
+		return
+	}
 
 	model := normalizeGrokMediaModel(gjson.GetBytes(rawBody, "model").String())
 	if model == "" {
@@ -883,6 +891,8 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolOpenAI)
 	defer stopRetryDeadline()
+	stopRetryKeepalive := installContinuousRetryHTTPInformationalKeepalive(c)
+	defer stopRetryKeepalive()
 	maxRetries := h.getMaxRetries()
 	generalRetries := 0
 	rateLimitRetries := 0
@@ -972,7 +982,7 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 		recordGrokUpstreamObservations(account, resp.Header)
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
+			errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, grokMediaErrorBodyLimit))
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolOpenAI) {
@@ -1011,7 +1021,7 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 			return
 		}
 
-		out, readErr := io.ReadAll(io.LimitReader(resp.Body, grokVideoStatusBodyLimit))
+		out, readErr := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, grokVideoStatusBodyLimit))
 		resp.Body.Close()
 		requestID := strings.TrimSpace(gjson.GetBytes(out, "request_id").String())
 		if requestID == "" {

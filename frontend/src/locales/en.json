@@ -3446,7 +3446,7 @@
     "maxRateLimitRetries": "429 Retry Switches",
     "maxRateLimitRetriesRange": "Maximum account switches after a 429 rate limit (0~10); continuous retry is controlled separately below",
     "continuousRetryTitle": "Continuous Upstream Retry",
-    "continuousRetryDesc": "Each upstream attempt is retained in full. A selected failure discards that attempt, rotates accounts, and keeps retrying; only a successful protocol terminal is sent to the client. SSE and Responses WebSocket clients receive keepalives while waiting.",
+    "continuousRetryDesc": "Each upstream attempt is retained in full. A selected failure discards that attempt, rotates accounts, and keeps retrying; only a successful protocol terminal is sent to the client. SSE and Responses WebSocket clients receive keepalives while waiting, and non-streaming Grok media uses best-effort HTTP 102 Processing informational responses without changing its final JSON status.",
     "continuousRetryEnabled": "Enable continuous retry",
     "continuousRetryEnabledDesc": "Default off. Streaming output is replayed only after one upstream attempt finishes successfully, so tokens are no longer delivered in real time. Unlimited retry stops at the configured wall-clock limit.",
     "continuousRetryMaxDuration": "Maximum retry duration (seconds)",

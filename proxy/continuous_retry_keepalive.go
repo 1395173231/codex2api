@@ -93,6 +93,59 @@ func installContinuousRetrySSEKeepalive(c *gin.Context, stream bool, contentType
 	}
 }
 
+// installContinuousRetryHTTPInformationalKeepalive installs a non-committing
+// keepalive for ordinary JSON endpoints. HTTP 102 is sent through the
+// unwrapped net/http writer so the final JSON status/body can still be chosen
+// later; calling Gin's WriteHeader or Flush here would commit an accidental
+// 200 response. 非流式 JSON 不能插入 SSE 注释，因此用标准 HTTP 102
+// Processing 保活，同时保留最终 JSON 的状态码和响应体语义。
+func installContinuousRetryHTTPInformationalKeepalive(c *gin.Context) func() {
+	if c == nil || c.Request == nil || c.Writer == nil || !c.Request.ProtoAtLeast(1, 1) {
+		return func() {}
+	}
+	writer, ok := c.Writer.(http.ResponseWriter)
+	if !ok {
+		return func() {}
+	}
+	// Gin exposes one Unwrap layer, but middleware may add another. Resolve a
+	// short chain while refusing to guess when the final writer is unknown.
+	unwrapped := false
+	for depth := 0; depth < 8; depth++ {
+		unwrapper, canUnwrap := writer.(interface{ Unwrap() http.ResponseWriter })
+		if !canUnwrap {
+			break
+		}
+		next := unwrapper.Unwrap()
+		if next == nil {
+			return func() {}
+		}
+		writer = next
+		unwrapped = true
+	}
+	if !unwrapped {
+		return func() {}
+	}
+	if _, stillWrapped := writer.(interface{ Unwrap() http.ResponseWriter }); stillWrapped {
+		return func() {}
+	}
+	original := c.Request
+	requestCtx, cancel := context.WithCancelCause(original.Context())
+	keepalive := &requestContinuousRetryKeepalive{
+		write: func() error {
+			// net/http flushes informational headers immediately. Do not call
+			// Flush: it would implicitly send the final 200 status.
+			writer.WriteHeader(http.StatusProcessing)
+			return nil
+		},
+		cancel: cancel,
+	}
+	c.Request = original.WithContext(context.WithValue(requestCtx, continuousRetryKeepaliveContextKey{}, continuousRetryKeepalive(keepalive)))
+	return func() {
+		cancel(nil)
+		c.Request = original
+	}
+}
+
 func installContinuousRetryWSKeepalive(c *gin.Context, conn *websocket.Conn) func() {
 	if c == nil || c.Request == nil || conn == nil {
 		return func() {}
@@ -221,6 +274,52 @@ func executeHTTPWithContinuousRetryKeepalive(ctx context.Context, execute func()
 		case callResult := <-result:
 			stopContinuousRetryTimer(timer)
 			return callResult.response, callResult.err
+		case <-timer.C:
+			if err := keepalive.Keepalive(); err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			stopContinuousRetryTimer(timer)
+			return nil, continuousRetryContextError(ctx)
+		}
+	}
+}
+
+type continuousRetryReadResult struct {
+	data []byte
+	err  error
+}
+
+// readAllWithContinuousRetryKeepalive keeps an active JSON retry alive while
+// the upstream response body is still being read. The worker owns the read;
+// the caller goroutine remains the sole downstream writer. 上游 JSON body
+// 读取也要纳入保活窗口，避免已进入持续重试后长时间卡在读体阶段无任何字节。
+func readAllWithContinuousRetryKeepalive(ctx context.Context, reader io.Reader) ([]byte, error) {
+	keepalive := continuousRetryKeepaliveForContext(ctx)
+	if keepalive == nil || !keepalive.Active() || continuousRetryKeepaliveInterval <= 0 {
+		return io.ReadAll(reader)
+	}
+	result := make(chan continuousRetryReadResult, 1)
+	go func() {
+		data, err := io.ReadAll(reader)
+		result <- continuousRetryReadResult{data: data, err: err}
+	}()
+	for {
+		delay := continuousRetryKeepaliveDelay(keepalive)
+		if delay <= 0 {
+			if err := keepalive.Keepalive(); err != nil {
+				return nil, err
+			}
+			delay = continuousRetryKeepaliveDelay(keepalive)
+			if delay <= 0 {
+				delay = continuousRetryKeepaliveInterval
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case callResult := <-result:
+			stopContinuousRetryTimer(timer)
+			return callResult.data, callResult.err
 		case <-timer.C:
 			if err := keepalive.Keepalive(); err != nil {
 				return nil, err

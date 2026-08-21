@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -280,6 +282,98 @@ func TestContinuousRetrySSEKeepaliveAndCommittedErrors(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, `"type":"response.failed"`) || !strings.Contains(body, "upstream failed") {
 		t.Fatalf("committed Responses SSE error = %q", body)
+	}
+}
+
+func TestContinuousRetryHTTPInformationalKeepalivePreservesFinalJSONStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/json", func(c *gin.Context) {
+		stop := installContinuousRetryHTTPInformationalKeepalive(c)
+		defer stop()
+		keepalive, ok := continuousRetryKeepaliveForContext(c.Request.Context()).(*requestContinuousRetryKeepalive)
+		if !ok {
+			t.Fatal("HTTP informational heartbeat was not installed")
+		}
+		keepalive.Activate()
+		keepalive.last = time.Time{}
+		if err := keepalive.Keepalive(); err != nil {
+			t.Fatalf("write HTTP informational heartbeat: %v", err)
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream"})
+	})
+	server := httptest.NewServer(engine)
+	defer server.Close()
+
+	gotInformational := make(chan int, 1)
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+		select {
+		case gotInformational <- code:
+		default:
+		}
+		return nil
+	}}
+	request, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, server.URL+"/json", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer response.Body.Close()
+	select {
+	case code := <-gotInformational:
+		if code != http.StatusProcessing {
+			t.Fatalf("informational status = %d, want %d", code, http.StatusProcessing)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP 102 informational heartbeat was not observed")
+	}
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("final status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read final JSON: %v", err)
+	}
+	if string(body) != `{"error":"upstream"}` {
+		t.Fatalf("final JSON = %q", body)
+	}
+}
+
+func TestReadAllWithContinuousRetryKeepaliveWhileWaitingForBody(t *testing.T) {
+	previousInterval := continuousRetryKeepaliveInterval
+	continuousRetryKeepaliveInterval = time.Millisecond
+	t.Cleanup(func() { continuousRetryKeepaliveInterval = previousInterval })
+
+	release := make(chan struct{})
+	keepalive := &requestContinuousRetryKeepalive{
+		active: true,
+		last:   time.Now(),
+		write: func() error {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+			return nil
+		},
+	}
+	ctx := context.WithValue(context.Background(), continuousRetryKeepaliveContextKey{}, continuousRetryKeepalive(keepalive))
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = reader.Close() })
+	go func() {
+		<-release
+		_, _ = io.WriteString(writer, `{"request_id":"body-ready"}`)
+		_ = writer.Close()
+	}()
+	body, err := readAllWithContinuousRetryKeepalive(ctx, reader)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != `{"request_id":"body-ready"}` {
+		t.Fatalf("body = %q", body)
 	}
 }
 
