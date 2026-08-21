@@ -175,6 +175,7 @@ func (h *Handler) buildAccountResponse(
 		runtimeAccount.Mu().RUnlock()
 		resp.ActiveRequests = runtimeAccount.GetActiveRequests()
 		resp.OccupiedRequests = runtimeAccount.GetOccupiedRequests()
+		resp.SessionSlotBufferEnabled = h.store.SessionSlotBufferEnabled()
 		resp.TotalRequests = runtimeAccount.GetTotalRequests()
 		debug := runtimeAccount.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
 		resp.HealthTier = debug.HealthTier

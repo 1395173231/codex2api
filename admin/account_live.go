@@ -36,5 +36,8 @@ func (h *Handler) GetAccountLiveState(c *gin.Context) {
 			OccupiedRequests: account.GetOccupiedRequests(),
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"accounts": live})
+	c.JSON(http.StatusOK, gin.H{
+		"accounts":                    live,
+		"session_slot_buffer_enabled": h.store.SessionSlotBufferEnabled(),
+	})
 }

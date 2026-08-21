@@ -153,6 +153,7 @@ export interface AccountRow {
   codex_usage_updated_at?: ISODateString
   active_requests?: number
   occupied_requests?: number
+  session_slot_buffer_enabled?: boolean
   total_requests?: number
   last_used_at?: ISODateString
   success_requests?: number
@@ -291,6 +292,7 @@ export interface AccountPageStatsResponse {
 
 export interface AccountLiveStateResponse {
   accounts: Record<string, { active_requests: number; occupied_requests: number }>
+  session_slot_buffer_enabled: boolean
 }
 
 export interface AccountsPageParams {

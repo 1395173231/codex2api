@@ -1480,6 +1480,7 @@ type accountResponse struct {
 	Codex5HUsageUpdatedAt         string                      `json:"codex_5h_usage_updated_at,omitempty"`
 	ActiveRequests                int64                       `json:"active_requests"`
 	OccupiedRequests              int64                       `json:"occupied_requests"`
+	SessionSlotBufferEnabled      bool                        `json:"session_slot_buffer_enabled"`
 	TotalRequests                 int64                       `json:"total_requests"`
 	LastUsedAt                    string                      `json:"last_used_at"`
 	SuccessRequests               int64                       `json:"success_requests"`
