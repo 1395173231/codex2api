@@ -342,6 +342,68 @@ func TestContinuousRetryHTTPInformationalKeepalivePreservesFinalJSONStatus(t *te
 	}
 }
 
+func TestContinuousRetryHTTPInformationalKeepaliveHTTP2(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/json", func(c *gin.Context) {
+		stop := installContinuousRetryHTTPInformationalKeepalive(c)
+		defer stop()
+		keepalive, ok := continuousRetryKeepaliveForContext(c.Request.Context()).(*requestContinuousRetryKeepalive)
+		if !ok {
+			t.Fatal("HTTP informational heartbeat was not installed")
+		}
+		keepalive.Activate()
+		keepalive.last = time.Time{}
+		if err := keepalive.Keepalive(); err != nil {
+			t.Fatalf("write HTTP informational heartbeat: %v", err)
+		}
+		c.JSON(http.StatusAccepted, gin.H{"ok": true})
+	})
+	server := httptest.NewUnstartedServer(engine)
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	gotInformational := make(chan int, 1)
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+		select {
+		case gotInformational <- code:
+		default:
+		}
+		return nil
+	}}
+	request, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, server.URL+"/json", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer response.Body.Close()
+	select {
+	case code := <-gotInformational:
+		if code != http.StatusProcessing {
+			t.Fatalf("informational status = %d, want %d", code, http.StatusProcessing)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP/2 102 informational heartbeat was not observed")
+	}
+	if response.ProtoMajor != 2 {
+		t.Fatalf("protocol = %s, want HTTP/2", response.Proto)
+	}
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("final status = %d, want %d", response.StatusCode, http.StatusAccepted)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read final JSON: %v", err)
+	}
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("final JSON = %q", body)
+	}
+}
+
 func TestReadAllWithContinuousRetryKeepaliveWhileWaitingForBody(t *testing.T) {
 	previousInterval := continuousRetryKeepaliveInterval
 	continuousRetryKeepaliveInterval = time.Millisecond
