@@ -152,6 +152,7 @@ export interface AccountRow {
   updated_at: ISODateString
   codex_usage_updated_at?: ISODateString
   active_requests?: number
+  occupied_requests?: number
   total_requests?: number
   last_used_at?: ISODateString
   success_requests?: number
@@ -289,7 +290,7 @@ export interface AccountPageStatsResponse {
 }
 
 export interface AccountLiveStateResponse {
-  accounts: Record<string, { active_requests: number }>
+  accounts: Record<string, { active_requests: number; occupied_requests: number }>
 }
 
 export interface AccountsPageParams {
@@ -1372,6 +1373,8 @@ export interface SystemSettings {
   scheduler_mode: string
   affinity_mode?: string
   session_affinity_spread?: boolean
+  session_slot_buffer_enabled: boolean
+  session_slot_buffer_seconds: number
   grok_affinity_mode?: string
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number

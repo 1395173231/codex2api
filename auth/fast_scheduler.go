@@ -540,10 +540,7 @@ func (s *FastScheduler) refreshEntryLocked(tier AccountHealthTier, idx int, disp
 }
 
 func (s *FastScheduler) Release(acc *Account) {
-	if acc == nil {
-		return
-	}
-	atomic.AddInt64(&acc.ActiveRequests, -1)
+	releaseOccupiedAccountSlot(acc)
 }
 
 func (s *FastScheduler) tryAcquireAccount(acc *Account, limit int64) bool {
@@ -740,15 +737,10 @@ func tryAcquireAccount(acc *Account, limit int64) bool {
 		return false
 	}
 
-	for {
-		current := atomic.LoadInt64(&acc.ActiveRequests)
-		if current >= limit {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
-			atomic.AddInt64(&acc.TotalRequests, 1)
-			atomic.StoreInt64(&acc.LastUsedAt, time.Now().UnixNano())
-			return true
-		}
+	if !reserveOccupiedAccountSlot(acc, limit) {
+		return false
 	}
+	atomic.AddInt64(&acc.TotalRequests, 1)
+	atomic.StoreInt64(&acc.LastUsedAt, time.Now().UnixNano())
+	return true
 }

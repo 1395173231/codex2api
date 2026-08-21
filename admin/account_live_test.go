@@ -16,6 +16,7 @@ func TestGetAccountLiveStateReturnsVisibleInflightCounts(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	account := &auth.Account{DBID: 42, AccessToken: "token"}
 	atomic.StoreInt64(&account.ActiveRequests, 3)
+	atomic.StoreInt64(&account.OccupiedRequests, 5)
 	store.AddAccount(account)
 	handler := &Handler{store: store}
 
@@ -35,6 +36,9 @@ func TestGetAccountLiveStateReturnsVisibleInflightCounts(t *testing.T) {
 	}
 	if got := response.Accounts["42"].ActiveRequests; got != 3 {
 		t.Fatalf("active_requests = %d, want 3", got)
+	}
+	if got := response.Accounts["42"].OccupiedRequests; got != 5 {
+		t.Fatalf("occupied_requests = %d, want 5", got)
 	}
 	if _, exists := response.Accounts["99"]; exists {
 		t.Fatal("missing account unexpectedly returned")

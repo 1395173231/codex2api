@@ -1479,6 +1479,7 @@ type accountResponse struct {
 	CodexUsageUpdatedAt           string                      `json:"codex_usage_updated_at,omitempty"`
 	Codex5HUsageUpdatedAt         string                      `json:"codex_5h_usage_updated_at,omitempty"`
 	ActiveRequests                int64                       `json:"active_requests"`
+	OccupiedRequests              int64                       `json:"occupied_requests"`
 	TotalRequests                 int64                       `json:"total_requests"`
 	LastUsedAt                    string                      `json:"last_used_at"`
 	SuccessRequests               int64                       `json:"success_requests"`
@@ -8312,6 +8313,8 @@ type settingsResponse struct {
 	SchedulerMode                       string `json:"scheduler_mode"`
 	AffinityMode                        string `json:"affinity_mode"`
 	SessionAffinitySpread               bool   `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            bool   `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            int    `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    string `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
@@ -8467,6 +8470,8 @@ type updateSettingsReq struct {
 	SchedulerMode                       *string  `json:"scheduler_mode"`
 	AffinityMode                        *string  `json:"affinity_mode"`
 	SessionAffinitySpread               *bool    `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            *bool    `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            *int     `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    *string  `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
@@ -9205,6 +9210,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
@@ -9553,6 +9560,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	persistedAutoResetCreditsEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
+	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
+	sessionSlotBufferSeconds := database.NormalizeSessionSlotBufferSeconds(int(h.store.GetSessionSlotBuffer() / time.Second))
 	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
 	if settingsErr != nil {
 		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
@@ -9572,6 +9581,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
+		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(existingSettings.SessionSlotBufferSeconds)
+	}
+	if req.SessionSlotBufferEnabled != nil {
+		sessionSlotBufferEnabled = *req.SessionSlotBufferEnabled
+	}
+	if req.SessionSlotBufferSeconds != nil {
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(*req.SessionSlotBufferSeconds)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -10000,7 +10017,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetSessionAffinitySpread(*req.SessionAffinitySpread)
 		log.Printf("设置已更新: session_affinity_spread = %t", *req.SessionAffinitySpread)
 	}
-
 	if req.GrokAffinityMode != nil {
 		h.store.SetGrokAffinityMode(*req.GrokAffinityMode)
 		log.Printf("设置已更新: grok_affinity_mode = %s", *req.GrokAffinityMode)
@@ -10536,6 +10552,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            sessionSlotBufferEnabled,
+		SessionSlotBufferSeconds:            sessionSlotBufferSeconds,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -10598,6 +10616,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.SessionSlotBufferEnabled != nil || req.SessionSlotBufferSeconds != nil {
+			writeError(c, http.StatusInternalServerError, "保存会话并发槽缓冲设置失败，设置未生效")
+			return
+		}
 		if modelCooldownUpdateRequested {
 			writeError(c, http.StatusInternalServerError, "保存模型冷却设置前无法持久化系统设置")
 			return
@@ -10616,6 +10638,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	} else {
+		if req.SessionSlotBufferSeconds != nil {
+			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
+			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
+		}
+		if req.SessionSlotBufferEnabled != nil {
+			h.store.SetSessionSlotBufferEnabled(sessionSlotBufferEnabled)
+			log.Printf("设置已更新: session_slot_buffer_enabled = %t", sessionSlotBufferEnabled)
+		}
 		if promptFilterChanged {
 			if req.PromptFilterCustomPatterns == nil {
 				// The database preserved this field atomically because the request did
@@ -10781,6 +10811,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
