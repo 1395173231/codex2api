@@ -85,10 +85,21 @@ func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclud
 }
 
 func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextAccountForSessionWithDispatch(sessionID, apiKeyID, exclude, filter, auth.DispatchPolicyStandard)
+}
+
+func (h *Handler) nextAccountForSessionWithDispatch(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
+	return h.store.NextForSessionWithDispatch(sessionID, apiKeyID, exclude, filter, policy)
+}
+
+func dispatchPolicyForModel(model string) auth.DispatchPolicy {
+	if isProOnlyModel(model) {
+		return auth.DispatchPolicySpark
+	}
+	return auth.DispatchPolicyStandard
 }
 
 func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
@@ -334,7 +345,7 @@ func requestUpstreamChannel(c *gin.Context) string {
 }
 
 // applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
-// grok 渠道换成 Grok 专属过滤（账号未声明模型时直接透传请求模型，不再要求声明）；
+// grok 渠道换成 Grok 专属过滤（账号未声明模型时按可见目录或保守默认集准入）；
 // codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
 func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
 	switch requestUpstreamChannel(c) {
@@ -352,7 +363,7 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 }
 
 // grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
-// 账号声明了 Models 白名单则要求命中（mapping 先行），未声明则放行全部模型。
+// mapping 先行，再按账号可见目录准入；显式 Models 白名单只会进一步收窄。
 func grokChannelAccountFilter(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
@@ -703,10 +714,10 @@ func grokNativeTerminalEvent(protocol GrokProtocol, payload []byte) (terminal bo
 		}
 		return false, false
 	default:
-		switch root.Get("type").String() {
-		case "response.completed":
+		switch eventType := root.Get("type").String(); {
+		case isResponsesSuccessTerminalEvent(eventType):
 			return true, false
-		case "response.failed", "error":
+		case eventType == "response.failed", eventType == "error":
 			return true, true
 		}
 		return false, false
@@ -2567,6 +2578,33 @@ func shouldWriteStreamBreakEvent(gotTerminal, wroteAnyBody bool, ctxErr, writeEr
 	return !gotTerminal && wroteAnyBody && ctxErr == nil && writeErr == nil
 }
 
+// isResponsesSuccessTerminalEvent 判断事件是否为 Responses 的正常终态。
+// response.incomplete 与 response.completed 同为正常终态：上游按
+// max_output_tokens 截断时只发前者，且照样带完整 output 与 usage。漏认它会
+// 让收尾逻辑把正常截断当断流——合成假的 response.failed / overloaded_error、
+// 丢弃真实 usage 改用估算、并按断流惩罚账号。
+func isResponsesSuccessTerminalEvent(eventType string) bool {
+	return eventType == "response.completed" || eventType == "response.incomplete"
+}
+
+// isResponsesTerminalEvent 覆盖 Responses 的全部终态（正常/截断/失败），
+// 供 SSE 读取循环判定"读到这里就可以收工"。
+func isResponsesTerminalEvent(eventType string) bool {
+	return isResponsesSuccessTerminalEvent(eventType) || eventType == "response.failed"
+}
+
+// responsesIncompleteFinishReason 把 Responses 的截断原因映射成 Chat 的
+// finish_reason；非截断终态返回空串表示"沿用推导值"。
+func responsesIncompleteFinishReason(eventType, reason string) string {
+	if eventType != "response.incomplete" {
+		return ""
+	}
+	if reason == "content_filter" {
+		return "content_filter"
+	}
+	return "length"
+}
+
 // isRetryableStatus 检查是否可重试的上游状态码。
 // 403 也视为可重试：Codex 上游 403 全是账号侧问题（payment_required /
 // deactivated_workspace / codex_access_restricted 等 OAuth/套餐/工作区维度），
@@ -2963,20 +3001,21 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	capacityShedRetries := map[int64]int{}
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
-				account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			}
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+				account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			} else if turnContinuationPinned {
-				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+				account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
@@ -2993,7 +3032,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
-			if h.store.HasUsageLimitedCandidateWithFilter(apiKeyID, retryExclusions.ForSelection(), accountFilter) {
+			if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
 				return
 			}
@@ -3327,7 +3366,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
-					if eventType == "response.completed" {
+					if isResponsesSuccessTerminalEvent(eventType) {
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
 							actualServiceTier = tier
@@ -3376,7 +3415,7 @@ func (h *Handler) Responses(c *gin.Context) {
 							wroteAnyBody = true
 						}
 					}
-					return eventType != "response.completed" && eventType != "response.failed"
+					return !isResponsesTerminalEvent(eventType)
 				})
 				// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 				// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
@@ -3846,13 +3885,16 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				// 提取 usage + service_tier
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+					if eventType == "response.completed" {
+						// 缓存响应上下文，供后续 previous_response_id 展开使用。
+						// 截断态不入缓存：它不是完整回合，展开后会把半截输出当历史。
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -3903,7 +3945,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						wroteAnyBody = true
 					}
 				}
-				return eventType != "response.completed" && eventType != "response.failed"
+				return !isResponsesTerminalEvent(eventType)
 			}
 
 			// 思考截断自动续想（默认关闭）：开启时用折叠状态机包裹 forward，
@@ -4030,13 +4072,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+					if eventType == "response.completed" {
+						// 截断态不入缓存，理由同流式分支。
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -4394,17 +4438,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	invalidEncryptedContentRetried := false
 	relayContinuationAttempted := false
 
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		var account *auth.Account
 		var stickyProxyURL string
 		if attempt == 0 && compactionAffinity.Known {
-			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter)
+			account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if compactionAffinity.Known {
@@ -4419,7 +4464,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithDispatch(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 			if account == nil {
 				if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -5062,10 +5107,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	capacityShedRetries := map[int64]int{}
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -5412,7 +5458,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -5447,7 +5493,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						wroteAnyBody = true
 					}
 					if shouldDefer && !wrote {
-						return eventType != "response.completed" && eventType != "response.failed"
+						return !isResponsesTerminalEvent(eventType)
 					}
 				}
 				if !clientGone && done {
@@ -5506,6 +5552,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var fullContent strings.Builder
 			var fullReasoning strings.Builder
 			var toolCalls []ToolCallResult
+			var finishReasonOverride string
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -5524,11 +5571,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullReasoning.WriteString(parsed.Get("delta").String())
 				case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
-				case "response.completed":
+				case "response.completed", "response.incomplete":
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					finishReasonOverride = responsesIncompleteFinishReason(eventType,
+						parsed.Get("response.incomplete_details.reason").String())
 					// 从 response.output 提取 function_call 项
 					toolCalls = ExtractToolCallsFromOutput(data)
 					gotTerminal = true
@@ -5541,7 +5590,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+			compactResult = BuildCompactResponseWithFinishReason(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage, finishReasonOverride)
 		}
 
 		// 断流检测 + token 估算
@@ -6157,6 +6206,10 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		)
 		decision.ResetAt = cooldown.ResetAt
 		decision.Cooldown = time.Until(cooldown.ResetAt)
+		return decision
+	}
+	if isProOnlyModel(model) && IsUsageLimitReachedError(body) && decision.Scope == rateLimitScopeAccount {
+		store.MarkSparkUsageExhausted(account, decision.ResetAt)
 		return decision
 	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {

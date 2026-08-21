@@ -575,6 +575,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		if responsesLite {
 			requestBody = normalizeCodexResponsesLiteBody(requestBody, false)
 		}
+		// 出站前最后兜底：任何中间改写都不能把普通 input 项放到
+		// compaction_trigger 后面，否则上游直接返回 invalid_request_error。
+		requestBody = normalizeCompactionTriggerFinal(requestBody, false)
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
@@ -586,6 +589,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if responsesLite {
 		requestBody = normalizeCodexResponsesLiteBody(requestBody, true)
 	}
+	requestBody = normalizeCompactionTriggerFinal(requestBody, false)
 
 	account.Mu().RLock()
 	accessToken := account.AccessToken
@@ -624,6 +628,11 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+	// 顶层 type 是 Responses WS 事件信封字段（response.create），native WS ingress 的
+	// 1009 降级、生图强制 HTTP、Agent Identity 强制 HTTP 都会复用带信封的 body，而
+	// HTTP /responses 上游不接受它（400 Unsupported parameter: type）。此处为出站
+	// 收口兜底；sjson 只删顶层路径，input[] 等嵌套 type 不受影响（issue #548）。
+	requestBody, _ = sjson.DeleteBytes(requestBody, "type")
 
 	// 3. 注入 prompt_cache_key（如果请求体中没有，且 sessionID 不为空）
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
@@ -700,6 +709,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	resetWsAcquireAudit(ctx)
 	responsesLite := gateResponsesLiteForModel(codexResponsesLiteRequested(requestBody, headers), requestBody)
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
+	requestBody = normalizeCompactionTriggerFinal(requestBody, false)
 
 	baseURL, apiKey := account.OpenAIResponsesCredentials()
 	account.Mu().RLock()
@@ -900,6 +910,8 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+	// 顶层 type 是 WS 事件信封字段，compact HTTP 端点同样不接受，兜底删除(issue #548)。
+	requestBody, _ = sjson.DeleteBytes(requestBody, "type")
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 	// 指纹收敛：与 ExecuteRequest 同样在请求体定稿后、构造出站请求前改写
 	// client_metadata。漏掉这一步会让 compact 路径只收敛请求头、请求体仍带客户端

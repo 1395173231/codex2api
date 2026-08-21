@@ -55,13 +55,18 @@ done
 command -v go >/dev/null || die "go is required"
 command -v npm >/dev/null || die "npm is required"
 command -v git >/dev/null || die "git is required"
+command -v sha256sum >/dev/null || die "sha256sum is required"
+
+status=$(git -C "$repo_root" status --porcelain --untracked-files=all)
+[[ -z "$status" ]] || die "release build requires a clean worktree"
 
 revision=$(git -C "$repo_root" rev-parse --short=7 HEAD)
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/codex2api-release-build.XXXXXX")
 trap 'rm -rf "$build_dir"' EXIT
 
 mkdir -p "$output_dir"
-artifact="$output_dir/codex2api-${version}-${revision}-linux-amd64"
+artifact_dir=$(cd "$output_dir" && pwd)
+artifact="$artifact_dir/codex2api-${version}-${revision}-linux-amd64"
 
 echo "release_version=$version"
 echo "revision=$revision"
@@ -91,5 +96,6 @@ grep -a -F -q "$version" "$build_dir/codex2api" ||
 
 cp "$build_dir/codex2api" "$artifact"
 chmod 755 "$artifact"
-sha256sum "$artifact" | tee "$artifact.sha256"
+artifact_name=${artifact##*/}
+(cd "$artifact_dir" && sha256sum "$artifact_name") | tee "$artifact.sha256"
 echo "release_artifact=$artifact"

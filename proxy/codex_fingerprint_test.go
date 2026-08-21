@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -33,6 +34,17 @@ func codexClientHeaders(turnMetadata, sessionID string) http.Header {
 	return headers
 }
 
+// codexUUIDUnixMilli 解出 v7 UUID 前 48 bit 的毫秒时间戳，用于断言时间戳位被正确写入。
+func codexUUIDUnixMilli(t *testing.T, id string) int64 {
+	t.Helper()
+	u, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("uuid.Parse(%q) error = %v", id, err)
+	}
+	return int64(u[0])<<40 | int64(u[1])<<32 | int64(u[2])<<24 | int64(u[3])<<16 | int64(u[4])<<8 | int64(u[5])
+}
+
+// deriveStableCodexUUID 现在只服务 installation_id：真实客户端的 installation 标识是 v4。
 func TestDeriveStableCodexUUIDIsDeterministicAndV4(t *testing.T) {
 	first := deriveStableCodexUUID("seed-a")
 	if second := deriveStableCodexUUID("seed-a"); first != second {
@@ -47,10 +59,83 @@ func TestDeriveStableCodexUUIDIsDeterministicAndV4(t *testing.T) {
 		t.Fatalf("uuid.Parse(%q) error = %v", first, err)
 	}
 	if parsed.Version() != 4 {
-		t.Fatalf("UUID version = %d, want 4 (must match the client's v4 identifiers)", parsed.Version())
+		t.Fatalf("UUID version = %d, want 4 (installation id must match the client's v4 identifier)", parsed.Version())
 	}
 	if parsed.Variant() != uuid.RFC4122 {
 		t.Fatalf("UUID variant = %v, want RFC4122", parsed.Variant())
+	}
+}
+
+// TestDeriveStableCodexUUIDv7 锁定 session/thread/window 的派生：真实客户端这三个标识
+// 是 UUIDv7，收敛值必须同为 v7 且时间戳位被精确写入（否则按 UUID 排序会暴露，见 #536）。
+func TestDeriveStableCodexUUIDv7(t *testing.T) {
+	const ts int64 = 1786949015072 // 抓包量级的毫秒时间戳
+	first := deriveStableCodexUUIDv7("seed-a", ts)
+	if second := deriveStableCodexUUIDv7("seed-a", ts); first != second {
+		t.Fatalf("deriveStableCodexUUIDv7(%q) = %q then %q, want identical values", "seed-a", first, second)
+	}
+	if other := deriveStableCodexUUIDv7("seed-b", ts); other == first {
+		t.Fatalf("different seeds produced the same value %q", first)
+	}
+
+	parsed, err := uuid.Parse(first)
+	if err != nil {
+		t.Fatalf("uuid.Parse(%q) error = %v", first, err)
+	}
+	if parsed.Version() != 7 {
+		t.Fatalf("UUID version = %d, want 7 (must match the client's v7 session/thread/window)", parsed.Version())
+	}
+	if parsed.Variant() != uuid.RFC4122 {
+		t.Fatalf("UUID variant = %v, want RFC4122", parsed.Variant())
+	}
+	if got := codexUUIDUnixMilli(t, first); got != ts {
+		t.Fatalf("timestamp bits = %d, want %d written into the leading 48 bits", got, ts)
+	}
+}
+
+// TestConvergedIdentityUUIDVersionsAndTimestamp 走完整推导，断言 session/thread/window
+// 是 v7 且时间戳锚定在账号加入时间的散布窗口内，而 installation 仍是 v4。
+func TestConvergedIdentityUUIDVersionsAndTimestamp(t *testing.T) {
+	const addedAtMilli int64 = 1780000000000
+	account := &auth.Account{DBID: 42, CodexFingerprintMode: auth.CodexFingerprintModeSession}
+	account.AddedAt = addedAtMilli * int64(time.Millisecond)
+
+	ids := resolveCodexFingerprintIDs(account, codexClientHeaders("", "client-session"))
+	if ids == nil {
+		t.Fatal("session mode returned nil")
+	}
+
+	for name, id := range map[string]string{
+		"session": ids.sessionID,
+		"thread":  ids.threadID,
+		"window":  strings.TrimSuffix(ids.windowID, ":0"),
+	} {
+		parsed, err := uuid.Parse(id)
+		if err != nil {
+			t.Fatalf("%s id %q not a valid uuid: %v", name, id, err)
+		}
+		if parsed.Version() != 7 {
+			t.Fatalf("%s id version = %d, want 7", name, parsed.Version())
+		}
+		ms := codexUUIDUnixMilli(t, id)
+		if ms < addedAtMilli || ms >= addedAtMilli+codexIdentitySpreadMilli {
+			t.Fatalf("%s id timestamp = %d, want within [%d, %d) anchored to account added time",
+				name, ms, addedAtMilli, addedAtMilli+codexIdentitySpreadMilli)
+		}
+	}
+
+	// installation 真实是 v4，不受 v7 改动影响。
+	installation, err := uuid.Parse(ids.installationID)
+	if err != nil {
+		t.Fatalf("installation id %q not a valid uuid: %v", ids.installationID, err)
+	}
+	if installation.Version() != 4 {
+		t.Fatalf("installation id version = %d, want 4", installation.Version())
+	}
+
+	// session 与 thread 种子不同，时间戳位应随之散开而非全部撞在同一毫秒。
+	if codexUUIDUnixMilli(t, ids.sessionID) == codexUUIDUnixMilli(t, ids.threadID) {
+		t.Fatal("session and thread share the same v7 timestamp, want the per-seed spread to separate them")
 	}
 }
 
@@ -111,6 +196,40 @@ func TestResolveCodexFingerprintIDsPerMode(t *testing.T) {
 	noSession := resolveCodexFingerprintIDs(fingerprintAccount(t, auth.CodexFingerprintModeSession), http.Header{})
 	if noSession.threadID != noSession.sessionID {
 		t.Fatalf("thread id = %q, want fallback to session id %q", noSession.threadID, noSession.sessionID)
+	}
+}
+
+func TestResolveCodexFingerprintIDsSessionModeKeepsDistinctClientThreads(t *testing.T) {
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	parent := resolveCodexFingerprintIDs(account, codexClientHeaders(
+		`{"session_id":"client-session","thread_id":"client-session"}`, "client-session"))
+	spawn := resolveCodexFingerprintIDs(account, func() http.Header {
+		headers := codexClientHeaders(
+			`{"session_id":"client-session","thread_id":"client-thread"}`, "client-session")
+		headers.Set("Thread-Id", "client-thread")
+		return headers
+	}())
+	if parent == nil || spawn == nil {
+		t.Fatal("session mode returned nil")
+	}
+	if spawn.sessionID != parent.sessionID {
+		t.Fatalf("spawn session id = %q, want parent session %q", spawn.sessionID, parent.sessionID)
+	}
+	if spawn.threadID == parent.threadID {
+		t.Fatal("spawn thread collapsed onto the parent session thread")
+	}
+	if spawn.threadID == spawn.sessionID {
+		t.Fatal("spawn thread id equals session id, want a thread derived from the client thread")
+	}
+
+	repeat := resolveCodexFingerprintIDs(account, func() http.Header {
+		headers := codexClientHeaders(
+			`{"session_id":"client-session","thread_id":"client-thread"}`, "client-session")
+		headers.Set("Thread-Id", "client-thread")
+		return headers
+	}())
+	if repeat.threadID != spawn.threadID {
+		t.Fatalf("thread id = %q, want %q (same client thread must be stable)", repeat.threadID, spawn.threadID)
 	}
 }
 
@@ -535,6 +654,11 @@ func TestConvergedClientRequestIDFollowsClientIdentity(t *testing.T) {
 		ids := resolveCodexFingerprintIDs(account, downstream)
 		if got := outbound.Get("X-Client-Request-Id"); got != ids.threadID {
 			t.Fatalf("X-Client-Request-Id = %q, want converged thread id %q", got, ids.threadID)
+		}
+		parent := resolveCodexFingerprintIDs(account, codexClientHeaders(
+			`{"session_id":"client-session","thread_id":"client-session"}`, "client-session"))
+		if got := outbound.Get("X-Client-Request-Id"); got == parent.threadID {
+			t.Fatal("X-Client-Request-Id collapsed onto the parent session thread")
 		}
 	})
 

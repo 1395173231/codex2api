@@ -53,6 +53,9 @@ func (s *liveCallStore) save(ctx context.Context, record *liveCallRecord, accoun
 	if err := s.acquireLeases(ctx, record); err != nil {
 		return err
 	}
+	// Promote the controller before the record is published: once the session
+	// is in the map, the record is shared and may only be mutated under s.mu.
+	record.Controller = liveControllerObserver
 	if err := s.persist(ctx, record); err != nil {
 		s.releaseLeases(ctx, record)
 		return err
@@ -68,8 +71,6 @@ func (s *liveCallStore) save(ctx context.Context, record *liveCallRecord, accoun
 	s.mu.Lock()
 	s.sessions[record.CallHash] = session
 	s.mu.Unlock()
-	record.Controller = liveControllerObserver
-	_ = s.persist(ctx, record)
 	go s.watch(watchCtx, session)
 	return nil
 }
@@ -82,10 +83,16 @@ func (s *liveCallStore) get(ctx context.Context, callID string) (*liveCallRecord
 	hash := hashLiveCallID(callID)
 	s.mu.Lock()
 	session := s.sessions[hash]
-	s.mu.Unlock()
 	if session != nil && session.record != nil && session.record.CallID == callID {
-		return session.record, session, nil
+		// Hand out a snapshot: the canonical record keeps being mutated under
+		// s.mu (claimProxy/finalize), and callers read fields without the lock.
+		// Store methods re-resolve the canonical record via CallHash, so a
+		// snapshot round-trips through them correctly.
+		snapshot := *session.record
+		s.mu.Unlock()
+		return &snapshot, session, nil
 	}
+	s.mu.Unlock()
 	record, ok, err := s.load(ctx, hash)
 	if err != nil {
 		return nil, nil, err
@@ -175,7 +182,10 @@ func (s *liveCallStore) watch(ctx context.Context, session *liveSession) {
 			s.finalize(session.record)
 			return
 		case <-refresh.C:
-			if session.record.Controller == liveControllerClosed {
+			s.mu.Lock()
+			closed := session.record.Controller == liveControllerClosed
+			s.mu.Unlock()
+			if closed {
 				return
 			}
 			_ = s.persist(ctx, session.record)

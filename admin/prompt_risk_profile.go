@@ -75,9 +75,18 @@ func (h *Handler) ListPromptRiskProfiles(c *gin.Context) {
 	// 5 秒会在 SQLite 正常计算完成前主动取消，表现为稳定的 500。
 	ctx, cancel := context.WithTimeout(c.Request.Context(), promptRiskProfileListTimeout)
 	defer cancel()
+	lockTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.ConversationLockTTLHours) * time.Hour
+	userCooldownTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.UserCyberCooldownMinutes) * time.Minute
+	if h.store != nil {
+		normalized := promptfilter.NormalizeAdvancedConfig(h.store.GetPromptFilterConfig().Advanced)
+		lockTTL = time.Duration(normalized.Enforcement.ConversationLockTTLHours) * time.Hour
+		userCooldownTTL = time.Duration(normalized.Enforcement.UserCyberCooldownMinutes) * time.Minute
+	}
 	profiles, total, err := h.db.ListPromptRiskProfiles(ctx, database.PromptRiskProfileQuery{
 		Page: page, PageSize: pageSize, SubjectType: c.Query("subject_type"), Platform: c.Query("platform"),
 		RiskLevel: c.Query("risk_level"), APIKeyID: apiKeyID, AccountID: accountID, MinScore: minScore, Query: c.Query("q"),
+		PrioritizeActiveLocks: true, ActiveLocksOnly: c.Query("locked_only") == "true",
+		ConversationLockTTL: lockTTL, UserCyberCooldownTTL: userCooldownTTL,
 	})
 	if err != nil {
 		writeInternalError(c, err)

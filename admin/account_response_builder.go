@@ -68,6 +68,10 @@ func (h *Handler) buildAccountResponse(
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	}
+	balanceQueryURL := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		balanceQueryURL = row.GetCredential(openAIResponsesBalanceQueryURLCredential)
+	}
 	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
 	codexFingerprintMode := ""
 	if !isOpenAIResponsesAccount && !isGrokAccount {
@@ -94,38 +98,33 @@ func (h *Handler) buildAccountResponse(
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
 	}
 	resp := accountResponse{
-		DetailLoaded:          includeDetails,
-		ID:                    row.ID,
-		Name:                  row.Name,
-		Email:                 email,
-		EmailDomain:           accountEmailDomain(email),
-		ChatGPTAccountID:      row.GetCredential("account_id"),
-		TokenWorkspaceID:      tokenWorkspaceID,
-		WorkspaceIDOverride:   workspaceIDOverride,
-		EffectiveWorkspaceID:  effectiveWorkspaceID,
-		PlanType:              planType,
-		SubscriptionExpiresAt: row.GetCredential("subscription_expires_at"),
-		Status:                row.Status,
-		ErrorMessage:          row.ErrorMessage,
-		ATOnly:                !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
-		CreditEnabled:         row.CreditEnabled,
-		CreditSkipUsageWindow: row.CreditSkipUsageWindow,
-		SkipWarmTier:          row.SkipWarmTier,
-		AccountType:           row.Type,
-		AccessTokenType:       accountAccessTokenType(row),
-		OpenAIResponsesAPI:    isOpenAIResponsesAccount,
-		GrokAPI:               isGrokAccount,
-		AgentIdentity:         isAgentIdentityCredentialRow(row),
-		GrokAuthKind:          grokAuthKind,
-		GrokPlan:              grokPlan,
-		GrokBilling:           grokBilling,
-		BaseURL:               baseURL,
-		BalanceQueryURL: func() string {
-			if includeDetails && isOpenAIResponsesAccount {
-				return row.GetCredential(openAIResponsesBalanceQueryURLCredential)
-			}
-			return ""
-		}(),
+		DetailLoaded:             includeDetails,
+		ID:                       row.ID,
+		Name:                     row.Name,
+		Email:                    email,
+		EmailDomain:              accountEmailDomain(email),
+		ChatGPTAccountID:         row.GetCredential("account_id"),
+		TokenWorkspaceID:         tokenWorkspaceID,
+		WorkspaceIDOverride:      workspaceIDOverride,
+		EffectiveWorkspaceID:     effectiveWorkspaceID,
+		PlanType:                 planType,
+		SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
+		Status:                   row.Status,
+		ErrorMessage:             row.ErrorMessage,
+		ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+		CreditEnabled:            row.CreditEnabled,
+		CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
+		SkipWarmTier:             row.SkipWarmTier,
+		AccountType:              row.Type,
+		AccessTokenType:          accountAccessTokenType(row),
+		OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+		GrokAPI:                  isGrokAccount,
+		AgentIdentity:            isAgentIdentityCredentialRow(row),
+		GrokAuthKind:             grokAuthKind,
+		GrokPlan:                 grokPlan,
+		GrokBilling:              grokBilling,
+		BaseURL:                  baseURL,
+		BalanceQueryURL:          balanceQueryURL,
 		Models:                   row.GetCredentialStringSlice("models"),
 		ModelMapping:             modelMapping,
 		CodexClientMetadataMode:  codexClientMetadataMode,
@@ -216,6 +215,9 @@ func (h *Handler) buildAccountResponse(
 		if usagePct5h, ok := runtimeAccount.GetUsagePercent5h(); ok {
 			resp.UsagePercent5h = &usagePct5h
 		}
+		if usagePctSpark, ok := runtimeAccount.GetUsagePercentSpark(); ok {
+			resp.UsagePercentSpark = &usagePctSpark
+		}
 		if credits, ok := runtimeAccount.GetRateLimitResetCredits(); ok {
 			resp.RateLimitResetCredits = &credits
 		}
@@ -244,6 +246,9 @@ func (h *Handler) buildAccountResponse(
 		}
 		if t := runtimeAccount.GetReset7dAt(); !t.IsZero() {
 			resp.Reset7dAt = t.Format(time.RFC3339)
+		}
+		if t := runtimeAccount.GetResetSparkAt(); !t.IsZero() {
+			resp.ResetSparkAt = t.Format(time.RFC3339)
 		}
 		if sec := runtimeAccount.GetWindow7dSeconds(); sec > 0 {
 			resp.Window7dSeconds = &sec

@@ -58,44 +58,47 @@ type accountListSnapshot struct {
 }
 
 type accountListSnapshotItem struct {
-	Row                *database.AccountRow
-	ID                 int64
-	Status             string
-	CooldownReason     string
-	Enabled            bool
-	Locked             bool
-	UsingCredits       bool
-	PlanType           string
-	GrokAuthKind       string
-	GrokPlanCategory   string
-	Email              string
-	EmailDomain        string
-	Tags               []string
-	GroupIDs           []int64
-	GroupSortKey       string
-	UsagePercent5h     float64
-	UsagePercent5hOK   bool
-	UsagePercent7d     float64
-	UsagePercent7dOK   bool
-	RequestCount       int64
-	TodayRequests      int64
-	TodayTokens        int64
-	TodayAccountBilled float64
-	SchedulerPriority  int64
-	HealthTier         string
-	DispatchScore      float64
-	LatencyPenalty     float64
-	LastUnauthorizedAt time.Time
-	LastRateLimitedAt  time.Time
-	LastTimeoutAt      time.Time
-	Reset5hAt          time.Time
-	Reset7dAt          time.Time
-	CooldownUntil      time.Time
-	Window7dSeconds    int64
-	ActiveRequests     int64
-	DynamicConcurrency int64
-	OpenAIResponses    bool
-	SearchText         string
+	Row                 *database.AccountRow
+	ID                  int64
+	Status              string
+	CooldownReason      string
+	Enabled             bool
+	Locked              bool
+	UsingCredits        bool
+	PlanType            string
+	GrokAuthKind        string
+	GrokPlanCategory    string
+	Email               string
+	EmailDomain         string
+	Tags                []string
+	GroupIDs            []int64
+	GroupSortKey        string
+	UsagePercent5h      float64
+	UsagePercent5hOK    bool
+	UsagePercent7d      float64
+	UsagePercent7dOK    bool
+	UsagePercentSpark   float64
+	UsagePercentSparkOK bool
+	ResetSparkAt        time.Time
+	RequestCount        int64
+	TodayRequests       int64
+	TodayTokens         int64
+	TodayAccountBilled  float64
+	SchedulerPriority   int64
+	HealthTier          string
+	DispatchScore       float64
+	LatencyPenalty      float64
+	LastUnauthorizedAt  time.Time
+	LastRateLimitedAt   time.Time
+	LastTimeoutAt       time.Time
+	Reset5hAt           time.Time
+	Reset7dAt           time.Time
+	CooldownUntil       time.Time
+	Window7dSeconds     int64
+	ActiveRequests      int64
+	DynamicConcurrency  int64
+	OpenAIResponses     bool
+	SearchText          string
 }
 
 type accountListSummary struct {
@@ -723,6 +726,9 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			if runtimeSnapshot.UsagePercent7dValid {
 				item.UsagePercent7d, item.UsagePercent7dOK = runtimeSnapshot.UsagePercent7d, true
 			}
+			if runtimeSnapshot.UsagePercentSparkValid {
+				item.UsagePercentSpark, item.UsagePercentSparkOK = runtimeSnapshot.UsagePercentSpark, true
+			}
 			item.HealthTier = runtimeSnapshot.HealthTier
 			item.DispatchScore = runtimeSnapshot.DispatchScore
 			item.LatencyPenalty = runtimeSnapshot.LatencyPenalty
@@ -733,6 +739,7 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			item.DynamicConcurrency = runtimeSnapshot.DynamicConcurrencyLimit
 			item.Reset5hAt = runtimeSnapshot.Reset5hAt
 			item.Reset7dAt = runtimeSnapshot.Reset7dAt
+			item.ResetSparkAt = runtimeSnapshot.ResetSparkAt
 			item.Window7dSeconds = runtimeSnapshot.Window7dSeconds
 			if runtimeSnapshot.CooldownReason != "" {
 				item.CooldownReason = runtimeSnapshot.CooldownReason
