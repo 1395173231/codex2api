@@ -8333,6 +8333,7 @@ type settingsResponse struct {
 	ContinuousRetryCategories          []string                         `json:"continuous_retry_categories"`
 	ContinuousRetryStatusCodes         []int                            `json:"continuous_retry_status_codes"`
 	ContinuousRetryErrorCodes          []string                         `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds  int                              `json:"continuous_retry_max_duration_seconds"`
 	CodexFingerprintDefaultMode        string                           `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration               bool                             `json:"allow_remote_migration"`
 	DatabaseDriver                     string                           `json:"database_driver"`
@@ -8489,6 +8490,7 @@ type updateSettingsReq struct {
 	ContinuousRetryCategories           *[]string `json:"continuous_retry_categories"`
 	ContinuousRetryStatusCodes          *[]int    `json:"continuous_retry_status_codes"`
 	ContinuousRetryErrorCodes           *[]string `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds   *int      `json:"continuous_retry_max_duration_seconds"`
 	CodexFingerprintDefaultMode         *string   `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration                *bool     `json:"allow_remote_migration"`
 	ModelMapping                        *string   `json:"model_mapping"`
@@ -9235,6 +9237,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
 		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
 		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
+		ContinuousRetryMaxDurationSeconds:   continuousRetryPolicy.MaxDurationSeconds,
 		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
@@ -9646,13 +9649,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
-		Enabled:     req.ContinuousRetryEnabled,
-		CatchAll:    req.ContinuousRetryCatchAll,
-		Categories:  req.ContinuousRetryCategories,
-		StatusCodes: req.ContinuousRetryStatusCodes,
-		ErrorCodes:  req.ContinuousRetryErrorCodes,
+		Enabled:            req.ContinuousRetryEnabled,
+		CatchAll:           req.ContinuousRetryCatchAll,
+		Categories:         req.ContinuousRetryCategories,
+		StatusCodes:        req.ContinuousRetryStatusCodes,
+		ErrorCodes:         req.ContinuousRetryErrorCodes,
+		MaxDurationSeconds: req.ContinuousRetryMaxDurationSeconds,
 	}
-	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil
+	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil || req.ContinuousRetryMaxDurationSeconds != nil
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
 	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
@@ -10841,6 +10845,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
 		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
 		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
+		ContinuousRetryMaxDurationSeconds:   continuousRetryPolicy.MaxDurationSeconds,
 		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,

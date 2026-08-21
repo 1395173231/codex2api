@@ -12,24 +12,30 @@ import (
 // auth, proxy, admin, and runtime packages can share one normalized policy
 // without introducing an import cycle.
 type ContinuousRetryPolicy struct {
-	Enabled     bool     `json:"enabled"`
-	CatchAll    bool     `json:"catch_all"`
-	Categories  []string `json:"categories"`
-	StatusCodes []int    `json:"status_codes"`
-	ErrorCodes  []string `json:"error_codes"`
+	Enabled            bool     `json:"enabled"`
+	CatchAll           bool     `json:"catch_all"`
+	Categories         []string `json:"categories"`
+	StatusCodes        []int    `json:"status_codes"`
+	ErrorCodes         []string `json:"error_codes"`
+	MaxDurationSeconds int      `json:"max_duration_seconds"`
 }
 
 // ContinuousRetryPolicyUpdate identifies the policy fields edited by one
 // admin request. Nil fields retain the latest value already in the database.
 type ContinuousRetryPolicyUpdate struct {
-	Enabled     *bool
-	CatchAll    *bool
-	Categories  *[]string
-	StatusCodes *[]int
-	ErrorCodes  *[]string
+	Enabled            *bool
+	CatchAll           *bool
+	Categories         *[]string
+	StatusCodes        *[]int
+	ErrorCodes         *[]string
+	MaxDurationSeconds *int
 }
 
 const (
+	DefaultContinuousRetryMaxDurationSeconds = 600
+	MinContinuousRetryMaxDurationSeconds     = 1
+	MaxContinuousRetryMaxDurationSeconds     = 900
+
 	ContinuousRetryCategoryTransport      = "transport"
 	ContinuousRetryCategoryHTTP429        = "http_429"
 	ContinuousRetryCategoryHTTP4xx        = "http_4xx"
@@ -63,8 +69,9 @@ func DefaultContinuousRetryPolicy() ContinuousRetryPolicy {
 			ContinuousRetryCategoryHTTP5xx,
 			ContinuousRetryCategoryStreamError,
 		},
-		StatusCodes: []int{},
-		ErrorCodes:  []string{},
+		StatusCodes:        []int{},
+		ErrorCodes:         []string{},
+		MaxDurationSeconds: DefaultContinuousRetryMaxDurationSeconds,
 	}
 }
 
@@ -72,6 +79,13 @@ func DefaultContinuousRetryPolicy() ContinuousRetryPolicy {
 // exact status selectors to valid HTTP status codes. Empty values are retained
 // as empty slices so JSON responses stay stable and editable in the UI.
 func NormalizeContinuousRetryPolicy(policy ContinuousRetryPolicy) ContinuousRetryPolicy {
+	if policy.MaxDurationSeconds == 0 {
+		policy.MaxDurationSeconds = DefaultContinuousRetryMaxDurationSeconds
+	} else if policy.MaxDurationSeconds < MinContinuousRetryMaxDurationSeconds {
+		policy.MaxDurationSeconds = MinContinuousRetryMaxDurationSeconds
+	} else if policy.MaxDurationSeconds > MaxContinuousRetryMaxDurationSeconds {
+		policy.MaxDurationSeconds = MaxContinuousRetryMaxDurationSeconds
+	}
 	if !policy.Enabled {
 		policy.CatchAll = false
 	}
@@ -151,7 +165,7 @@ func EncodeContinuousRetryPolicy(policy ContinuousRetryPolicy) string {
 	normalized := NormalizeContinuousRetryPolicy(policy)
 	raw, err := json.Marshal(normalized)
 	if err != nil {
-		return `{"enabled":false,"catch_all":false,"categories":[],"status_codes":[],"error_codes":[]}`
+		return `{"enabled":false,"catch_all":false,"categories":[],"status_codes":[],"error_codes":[],"max_duration_seconds":600}`
 	}
 	return string(raw)
 }

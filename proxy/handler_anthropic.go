@@ -24,6 +24,9 @@ const upstreamErrorBodyReadMaxBytes = 1 << 20
 
 // sendAnthropicError 发送 Anthropic 格式的错误响应
 func sendAnthropicError(c *gin.Context, statusCode int, errType, message string) {
+	if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
+		return
+	}
 	c.JSON(statusCode, gin.H{
 		"type": "error",
 		"error": gin.H{
@@ -236,6 +239,8 @@ func (h *Handler) Messages(c *gin.Context) {
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolAnthropic)
+	defer stopRetryDeadline()
 	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, isStream, "text/event-stream; charset=utf-8")
 	defer stopRetryKeepalive()
 	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -275,6 +280,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
+				return
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", "All accounts rate limited") {
 					return
@@ -305,7 +313,10 @@ func (h *Handler) Messages(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
-			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+			if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
+				h.store.Release(account)
+				return
+			}
 		}
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
@@ -418,6 +429,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
+				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
 				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %s, account %d, /v1/messages): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), reqErr)
@@ -448,6 +460,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
 			if shouldRetry {
+				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)) {
 					return
 				}
@@ -465,15 +478,20 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-			}
-			SyncCodexUsageState(h.store, account, resp)
 			errBody, readErr := readAllLimited(resp.Body, upstreamErrorBodyReadMaxBytes)
 			if readErr != nil {
 				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
 			}
+			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
+			if continuousRetryCommitExpired(c, continuousRetryProtocolAnthropic) {
+				h.store.Release(account)
+				return
+			}
+			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -567,6 +585,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			resp.Body.Close()
 			downstreamWrote := streamAttempt.downstreamWrote(wroteAnyBody)
 			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, downstreamWrote, c.Request.Context().Err(), nil, continuousRetryPolicy) {
+				rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, outcome.failurePayload)
 				_ = streamAttempt.Close()
 				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 				h.store.Release(account)
@@ -579,6 +598,11 @@ func (h *Handler) Messages(c *gin.Context) {
 				continue
 			}
 			if outcome.logStatusCode == http.StatusOK {
+				if !claimContinuousRetrySuccess(c, continuousRetryProtocolAnthropic) {
+					_ = streamAttempt.Close()
+					h.store.Release(account)
+					return
+				}
 				copyGrokNativeResponseHeaders(c, resp.Header)
 				if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
 					abortContinuousRetryCommitFailure(h, account, resp, streamAttempt)
@@ -863,7 +887,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
-		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
 		terminalFailurePayload, _ = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentStarted, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
@@ -882,8 +906,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			// 流式 response.failed 也要把额度耗尽/限流账号冷却下来，
 			// 否则该账号会保持高分继续被调度（与 /v1/responses 路径保持一致）。
-			responseFailedDecision := h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
-			outcome = applyResponseFailedDecisionKind(outcome, terminalFailurePayload, responseFailedDecision)
+			var responseFailedDecision codex429Decision
+			if withContinuousRetryDeadlinePending(c.Request.Context(), func() {
+				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
+			}) {
+				outcome = applyResponseFailedDecisionKind(outcome, terminalFailurePayload, responseFailedDecision)
+			} else {
+				outcome = classifyStreamOutcome(errContinuousRetryDeadlineExceeded, nil, nil, false)
+			}
 		}
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
@@ -899,6 +929,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 		if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, downstreamWrote, c.Request.Context().Err(), writeErr, continuousRetryPolicy) {
+			rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, terminalFailurePayload)
 			_ = streamAttempt.Close()
 			clearNewAPIUpstreamCyberPolicyDecision(c)
 			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
@@ -931,6 +962,12 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 		if outcome.logStatusCode == http.StatusOK {
+			if !claimContinuousRetrySuccess(c, continuousRetryProtocolAnthropic) {
+				_ = streamAttempt.Close()
+				resp.Body.Close()
+				h.store.Release(account)
+				return
+			}
 			if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
 				abortContinuousRetryCommitFailure(h, account, resp, streamAttempt)
 				return
@@ -952,14 +989,18 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 		}
 		if !isStream {
-			if anthropicResp != nil {
+			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
+				// The deadline owns the terminal response.
+			} else if anthropicResp != nil {
 				c.JSON(http.StatusOK, anthropicResp)
 			} else {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
 			}
 		}
 
-		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		if outcome.logStatusCode == http.StatusOK {
+			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		}
 
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {

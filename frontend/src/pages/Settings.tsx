@@ -17,6 +17,7 @@ import {
   buildContinuousRetryEnabledPatch,
   createContinuousRetrySaveQueue,
   parseContinuousRetryErrorCodes,
+  parseContinuousRetryMaxDurationSeconds,
   parseContinuousRetryStatusCodes,
 } from '../lib/continuousRetrySettings'
 import {
@@ -1366,6 +1367,7 @@ export default function Settings() {
     continuous_retry_categories: ['transport', 'http_429', 'http_5xx', 'stream_error'],
     continuous_retry_status_codes: [],
     continuous_retry_error_codes: [],
+    continuous_retry_max_duration_seconds: 600,
     codex_fingerprint_default_mode: 'off',
     allow_remote_migration: false,
     database_driver: 'postgres',
@@ -2304,6 +2306,32 @@ export default function Settings() {
                       aria-label={t('settings.continuousRetryCatchAll')}
                       checked={settingsForm.continuous_retry_catch_all}
                       onCheckedChange={(checked) => void autoSaveContinuousRetryPatch(buildContinuousRetryCatchAllPatch(checked))}
+                    />
+                  </SettingField>
+                  <SettingField
+                    label={t('settings.continuousRetryMaxDuration')}
+                    description={t('settings.continuousRetryMaxDurationDesc')}
+                  >
+                    <Input
+                      aria-label={t('settings.continuousRetryMaxDuration')}
+                      type="number"
+                      min={1}
+                      max={900}
+                      step={1}
+                      value={settingsForm.continuous_retry_max_duration_seconds}
+                      disabled={!settingsForm.continuous_retry_enabled}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        setSettingsForm((current) => ({
+                          ...current,
+                          continuous_retry_max_duration_seconds: Number.isFinite(value) ? value : 600,
+                        }))
+                      }}
+                      onBlur={(event) => {
+                        const value = parseContinuousRetryMaxDurationSeconds(event.target.value)
+                        setSettingsForm((current) => ({ ...current, continuous_retry_max_duration_seconds: value }))
+                        void autoSaveContinuousRetryPatch({ continuous_retry_max_duration_seconds: value })
+                      }}
                     />
                   </SettingField>
                   <div className={cn('grid gap-3 sm:grid-cols-2 lg:grid-cols-4', continuousRetryFineControlsDisabled && 'opacity-60')}>

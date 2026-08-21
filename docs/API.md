@@ -1474,6 +1474,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "continuous_retry_categories": ["transport", "http_429", "http_5xx", "stream_error"],
   "continuous_retry_status_codes": [],
   "continuous_retry_error_codes": [],
+  "continuous_retry_max_duration_seconds": 600,
   "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
@@ -1528,11 +1529,13 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 
 开启持续重试后，流式上游尝试会先完整暂存，只有正常终态才一次性回放给客户端。因此失败尝试的半截文本、工具调用和错误帧不会泄漏，但客户端也不再实时逐 token 收到该次结果。SSE 路径在退避、等待账号、等待响应头和读取暂存流时写注释心跳并 flush；Responses WebSocket 使用 Ping。`retry_interval_ms` 是本地等待下限；实际等待取该值、带抖动的指数退避（250ms 起步、30 秒封顶）和有效 `Retry-After`（最多 5 分钟）中的较大值。非流式 JSON 响应不能插入应用层心跳，仍可能受中间代理 idle timeout 限制。
 
+`continuous_retry_max_duration_seconds`（默认 600，范围 1-900）是无限预算的墙钟上限，从请求第一次进入 `retryLimit=-1` 时开始，后续尝试不会重置。到期会取消正在进行的上游请求，并返回最近一次真实上游失败；已提交的 SSE 将该失败转换为协议错误事件，Responses WebSocket 使用错误帧并以 1013 关闭。若尚无上游失败可返回，才回退到 504 `upstream_timeout`。Grok 图片/视频创建保持非流式 JSON，不发送应用层 heartbeat。
+
 每次流式尝试最多暂存 64 MiB：前 8 MiB 保存在内存，超过后写入立即 unlink 的 mode-0600 临时文件。达到单次上限或本地存储失败会立即结束请求，不会再次调用上游；当前没有跨请求的进程级暂存总预算，高并发部署仍需自行限制并发并监控内存和临时磁盘。Responses HTTP 的 `X-Codex-Turn-State` 只能在心跳尚未提交响应头时从最终成功账号转发；若等待期间已经发出 SSE 心跳，该响应头会被省略，不能用失败账号的值替代。账号绑定的 continuation 在无法安全展开为自包含请求时也会保留原账号语义。
 
-只有真实上游失败能够触发持续重试。客户端取消、下游写入失败、入口校验、账号池/并发调度、本地提示词或输出策略拒绝、暂存资源失败以及成功结果回放失败都会立即结束，不会伪装成上游错误继续消耗账号。持续重试可能无限重复消耗 input/output token、请求次数、余额、账号配额、暂存内存与磁盘，并让客户端长期等待；等待中的请求仍占用相应 API Key 与 scope 并发槽位，可能阻塞较新的请求。
+只有真实上游失败能够触发持续重试。客户端取消、持续重试期限到达、下游写入失败、入口校验、账号池/并发调度、本地提示词或输出策略拒绝、暂存资源失败以及成功结果回放失败都会立即结束，不会伪装成上游错误继续消耗账号。期限会保证等待中的 API Key 与 scope 并发槽位最终释放。
 
-普通图片请求仍受 5 次总尝试上限约束，普通 Grok 图片/视频创建请求仍受 3 次总尝试上限约束；错误被持续重试策略选中后（含超级模式）会越过普通上限，直到成功或客户端取消。由于上游未必提供可靠幂等键，图片/视频创建可能重复生成和重复扣费。Grok 视频状态/内容查询沿用绑定账号与各自的请求语义。任何入口收到明确的上游 `cyber_policy` 都会立即停止，并保留本地审计、signed decision、conversation lock 与已验证用户冷却；超级模式不能覆盖此安全终态。初始账号池为空、模型无任何合格账号、scope/并发预算拒绝等本地调度失败不是“上游返回错误”，仍会返回明确的本地错误。
+普通图片请求仍受 5 次总尝试上限约束，普通 Grok 图片/视频创建请求仍受 3 次总尝试上限约束；错误被持续重试策略选中后（含超级模式）会越过普通上限，直到成功、客户端取消或期限到达。由于上游未必提供可靠幂等键，图片/视频创建可能重复生成和重复扣费。Grok 视频状态/内容查询沿用绑定账号与各自的请求语义。任何入口收到明确的上游 `cyber_policy` 都会立即停止，并保留本地审计、signed decision、conversation lock 与已验证用户冷却；超级模式不能覆盖此安全终态。初始账号池为空、模型无任何合格账号、scope/并发预算拒绝等本地调度失败不是“上游返回错误”，仍会返回明确的本地错误。
 
 Responses 上下文缓存字段使用原始字节数：
 

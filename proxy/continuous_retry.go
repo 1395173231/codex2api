@@ -148,6 +148,9 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 	if !policy.Enabled || err == nil {
 		return false
 	}
+	if errors.Is(err, errContinuousRetryDeadlineExceeded) {
+		return false
+	}
 	if isExplicitUpstreamCyberPolicyError(err) {
 		return false
 	}
@@ -268,6 +271,9 @@ func terminalUpstreamErrorPayload(payload []byte) []byte {
 // into account-scoped 4xx/context/error-frame failures whose legacy outcome is
 // not penalized.
 func continuousRetryStreamFailureSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
+	if strings.EqualFold(strings.TrimSpace(outcome.failureKind), "continuous_retry_timeout") {
+		return false
+	}
 	if isExplicitUpstreamCyberPolicy(payload) || isExplicitUpstreamCyberPolicy(outcome.failurePayload) || strings.EqualFold(strings.TrimSpace(outcome.failureKind), "cyber_policy") {
 		return false
 	}

@@ -1546,7 +1546,7 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	ctx.Request = httptest.NewRequest(
 		http.MethodPut,
 		"/api/admin/settings",
-		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky","continuous_retry_enabled":true,"continuous_retry_catch_all":true,"continuous_retry_categories":["http_4xx","server","unknown"],"continuous_retry_status_codes":[404,403,404,99,600],"continuous_retry_error_codes":["Forbidden","forbidden","bad code!"]}`),
+		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky","continuous_retry_enabled":true,"continuous_retry_catch_all":true,"continuous_retry_categories":["http_4xx","server","unknown"],"continuous_retry_status_codes":[404,403,404,99,600],"continuous_retry_error_codes":["Forbidden","forbidden","bad code!"],"continuous_retry_max_duration_seconds":75}`),
 	)
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
@@ -1580,13 +1580,16 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	if got := strings.Join(response.ContinuousRetryErrorCodes, ","); got != "forbidden" {
 		t.Fatalf("continuous_retry_error_codes = %q, want forbidden", got)
 	}
+	if response.ContinuousRetryMaxDurationSeconds != 75 {
+		t.Fatalf("continuous_retry_max_duration_seconds = %d, want 75", response.ContinuousRetryMaxDurationSeconds)
+	}
 
 	for label, policy := range map[string]database.ContinuousRetryPolicy{
 		"store":   store.GetContinuousRetryPolicy(),
 		"runtime": proxy.CurrentRuntimeSettings().ContinuousRetryPolicy,
 	} {
 		if !policy.Enabled || !policy.CatchAll || strings.Join(policy.Categories, ",") != "http_4xx,http_5xx" ||
-			fmt.Sprint(policy.StatusCodes) != "[403 404]" || strings.Join(policy.ErrorCodes, ",") != "forbidden" {
+			fmt.Sprint(policy.StatusCodes) != "[403 404]" || strings.Join(policy.ErrorCodes, ",") != "forbidden" || policy.MaxDurationSeconds != 75 {
 			t.Fatalf("%s continuous retry policy = %#v", label, policy)
 		}
 	}
@@ -1596,7 +1599,7 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 	if policy := database.ParseContinuousRetryPolicy(persisted.ContinuousRetryPolicy); !policy.Enabled || !policy.CatchAll ||
 		strings.Join(policy.Categories, ",") != "http_4xx,http_5xx" || fmt.Sprint(policy.StatusCodes) != "[403 404]" ||
-		strings.Join(policy.ErrorCodes, ",") != "forbidden" {
+		strings.Join(policy.ErrorCodes, ",") != "forbidden" || policy.MaxDurationSeconds != 75 {
 		t.Fatalf("persisted continuous retry policy = %#v", policy)
 	}
 }

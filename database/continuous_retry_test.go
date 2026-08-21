@@ -17,6 +17,9 @@ func TestContinuousRetryPolicyDefaultsAndNormalization(t *testing.T) {
 	if defaultPolicy.CatchAll {
 		t.Fatal("continuous retry catch-all must be disabled by default")
 	}
+	if defaultPolicy.MaxDurationSeconds != DefaultContinuousRetryMaxDurationSeconds {
+		t.Fatalf("default max duration = %d, want %d", defaultPolicy.MaxDurationSeconds, DefaultContinuousRetryMaxDurationSeconds)
+	}
 	if len(defaultPolicy.Categories) == 0 {
 		t.Fatal("default policy should preserve the common transient categories")
 	}
@@ -43,6 +46,12 @@ func TestContinuousRetryPolicyDefaultsAndNormalization(t *testing.T) {
 	}
 	if disabled := NormalizeContinuousRetryPolicy(ContinuousRetryPolicy{CatchAll: true}); disabled.CatchAll {
 		t.Fatal("normalization retained catch-all behind a disabled master switch")
+	}
+	if value := NormalizeContinuousRetryPolicy(ContinuousRetryPolicy{MaxDurationSeconds: -1}).MaxDurationSeconds; value != MinContinuousRetryMaxDurationSeconds {
+		t.Fatalf("negative max duration = %d, want minimum", value)
+	}
+	if value := NormalizeContinuousRetryPolicy(ContinuousRetryPolicy{MaxDurationSeconds: MaxContinuousRetryMaxDurationSeconds + 1}).MaxDurationSeconds; value != MaxContinuousRetryMaxDurationSeconds {
+		t.Fatalf("oversized max duration = %d, want %d", value, MaxContinuousRetryMaxDurationSeconds)
 	}
 }
 
@@ -102,11 +111,12 @@ func TestContinuousRetryPolicyMatchesStatusAndErrorCode(t *testing.T) {
 
 func TestContinuousRetryPolicyEncodeParseRoundTrip(t *testing.T) {
 	want := ContinuousRetryPolicy{
-		Enabled:     true,
-		CatchAll:    true,
-		Categories:  []string{ContinuousRetryCategoryHTTP4xx},
-		StatusCodes: []int{403, 404},
-		ErrorCodes:  []string{"forbidden"},
+		Enabled:            true,
+		CatchAll:           true,
+		Categories:         []string{ContinuousRetryCategoryHTTP4xx},
+		StatusCodes:        []int{403, 404},
+		ErrorCodes:         []string{"forbidden"},
+		MaxDurationSeconds: 75,
 	}
 	raw := EncodeContinuousRetryPolicy(want)
 	got := ParseContinuousRetryPolicy(raw)
@@ -115,6 +125,13 @@ func TestContinuousRetryPolicyEncodeParseRoundTrip(t *testing.T) {
 	}
 	if strings.Join(intsToStrings(got.StatusCodes), ",") != "403,404" || strings.Join(got.ErrorCodes, ",") != "forbidden" {
 		t.Fatalf("round-trip selectors = %#v", got)
+	}
+	if got.MaxDurationSeconds != want.MaxDurationSeconds {
+		t.Fatalf("round-trip max duration = %d, want %d", got.MaxDurationSeconds, want.MaxDurationSeconds)
+	}
+	legacy := ParseContinuousRetryPolicy(`{"enabled":true,"categories":["transport"]}`)
+	if legacy.MaxDurationSeconds != DefaultContinuousRetryMaxDurationSeconds {
+		t.Fatalf("legacy max duration = %d, want default", legacy.MaxDurationSeconds)
 	}
 }
 
@@ -138,23 +155,25 @@ func TestSQLiteContinuousRetryPolicyPersistsIndependently(t *testing.T) {
 
 	ctx := context.Background()
 	want := ContinuousRetryPolicy{
-		Enabled:     true,
-		CatchAll:    true,
-		Categories:  []string{ContinuousRetryCategoryHTTP4xx},
-		StatusCodes: []int{403, 404},
-		ErrorCodes:  []string{"forbidden"},
+		Enabled:            true,
+		CatchAll:           true,
+		Categories:         []string{ContinuousRetryCategoryHTTP4xx},
+		StatusCodes:        []int{403, 404},
+		ErrorCodes:         []string{"forbidden"},
+		MaxDurationSeconds: 45,
 	}
 	committed, err := db.UpdateContinuousRetryPolicy(ctx, ContinuousRetryPolicyUpdate{
-		Enabled:     &want.Enabled,
-		CatchAll:    &want.CatchAll,
-		Categories:  &want.Categories,
-		StatusCodes: &want.StatusCodes,
-		ErrorCodes:  &want.ErrorCodes,
+		Enabled:            &want.Enabled,
+		CatchAll:           &want.CatchAll,
+		Categories:         &want.Categories,
+		StatusCodes:        &want.StatusCodes,
+		ErrorCodes:         &want.ErrorCodes,
+		MaxDurationSeconds: &want.MaxDurationSeconds,
 	})
 	if err != nil {
 		t.Fatalf("UpdateContinuousRetryPolicy: %v", err)
 	}
-	if !committed.Enabled || !committed.CatchAll || len(committed.StatusCodes) != 2 {
+	if !committed.Enabled || !committed.CatchAll || len(committed.StatusCodes) != 2 || committed.MaxDurationSeconds != 45 {
 		t.Fatalf("committed policy = %#v", committed)
 	}
 	settings, err := db.GetSystemSettings(ctx)

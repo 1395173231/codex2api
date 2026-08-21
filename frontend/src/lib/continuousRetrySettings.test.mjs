@@ -6,6 +6,7 @@ import {
   buildContinuousRetryEnabledPatch,
   createContinuousRetrySaveQueue,
   parseContinuousRetryErrorCodes,
+  parseContinuousRetryMaxDurationSeconds,
   parseContinuousRetryStatusCodes,
 } from './continuousRetrySettings.ts'
 
@@ -60,4 +61,11 @@ test('continuous retry error-code drafts normalize exact machine tokens', () => 
     parseContinuousRetryErrorCodes(' Rate_Limited,server.error,rate_limited,bad code!,context-error '),
     ['context-error', 'rate_limited', 'server.error'],
   )
+})
+
+test('continuous retry max duration is always bounded', () => {
+  assert.equal(parseContinuousRetryMaxDurationSeconds(''), 600)
+  assert.equal(parseContinuousRetryMaxDurationSeconds('-1'), 1)
+  assert.equal(parseContinuousRetryMaxDurationSeconds('12.9'), 12)
+  assert.equal(parseContinuousRetryMaxDurationSeconds('901'), 900)
 })

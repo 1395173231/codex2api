@@ -302,7 +302,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_continue_max_rounds INTEGER DEFAULT 8,
 					retry_interval_ms INTEGER DEFAULT 0,
 					transport_retry_policy TEXT DEFAULT 'rotate',
-					continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[]}',
+					continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}',
 					codex_synced_cli_version TEXT DEFAULT '',
 					codex_cli_version_sync_enabled INTEGER DEFAULT 1,
 					codex_cli_version_sync_interval_hours INTEGER DEFAULT 12,

@@ -318,6 +318,9 @@ func ErrorToGinResponse(c *gin.Context, err error) {
 	if err == nil {
 		return
 	}
+	if !claimContinuousRetryTerminal(c, continuousRetryProtocolOpenAI) {
+		return
+	}
 
 	var e *Error
 	if errors.As(err, &e) {

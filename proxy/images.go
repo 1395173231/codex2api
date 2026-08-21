@@ -1438,6 +1438,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
+	defer stopRetryDeadline()
 	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, stream, "text/event-stream")
 	defer stopRetryKeepalive()
 	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -1479,10 +1481,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			account, stickyProxyURL = nextBoundedRetryAccount(retryExclusions, selectAccount)
 		}
 		if account == nil {
+			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+				return
+			}
 			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
 			account, stickyProxyURL = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
 			if account == nil {
-				if c.Request.Context().Err() != nil {
+				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) || c.Request.Context().Err() != nil {
 					return
 				}
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -1537,6 +1542,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
 			shouldRetry := retryAllowedByEndpointCap(attempt, maxImageAttempts, continuousSelected) && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
 			if shouldRetry {
+				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
 				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
 				continuousRetryActive = continuousRetryActive || continuousSelected
 				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit) {
@@ -1552,12 +1558,17 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
+			resp.Body.Close()
+			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+				h.store.Release(account)
+				return
+			}
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody, upstreamCyberPolicyAttempt{
@@ -1634,6 +1645,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				}))
 			}
 			if readErr == nil {
+				if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
+					resp.Body.Close()
+					h.store.Release(account)
+					return
+				}
 				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
@@ -1651,6 +1667,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				}
 				h.logUsageForRequest(c, failedLog)
 				if willRetry {
+					rememberContinuousRetryStreamFailure(c.Request.Context(), streamOutcome{
+						logStatusCode:  http.StatusBadGateway,
+						failureKind:    "upstream_error",
+						failureMessage: readErr.Error(),
+					}, imageResponseFailedPayload(readErr))
 					clearNewAPIUpstreamCyberPolicyDecision(c)
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
@@ -1666,6 +1687,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 						retryExclusions.MarkHard(account.ID())
 					}
 					continue
+				}
+				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					return
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
 				return
@@ -1692,6 +1716,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			}
 			h.logUsageForRequest(c, failedLog)
 			if willRetry {
+				rememberContinuousRetryStreamFailure(c.Request.Context(), streamOutcome{
+					logStatusCode:  http.StatusBadGateway,
+					failureKind:    "upstream_error",
+					failureMessage: readErr.Error(),
+				}, imageResponseFailedPayload(readErr))
 				_ = streamAttempt.Close()
 				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = statusCode
@@ -1713,13 +1742,23 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// A pre-output failure may follow an already-flushed keepalive comment,
 			// so finish it as an SSE error instead of attempting a JSON response.
 			if !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && c.Writer.Written() {
-				writeImageStreamErrorEvent(c, readErr)
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					writeImageStreamErrorEvent(c, readErr)
+				}
 			} else if !c.Writer.Written() {
-				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+				}
 			}
 			return
 		}
 		if streamAttempt != nil {
+			if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
+				_ = streamAttempt.Close()
+				resp.Body.Close()
+				h.store.Release(account)
+				return
+			}
 			if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
 				if c.Request.Context().Err() == nil && c.Writer.Written() {
 					writeImageStreamErrorEvent(c, commitErr)

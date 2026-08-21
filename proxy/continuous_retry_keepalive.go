@@ -384,16 +384,33 @@ func retryKeepaliveCommitted(c *gin.Context) bool {
 
 func writeCommittedResponsesRetryError(c *gin.Context, message string) bool {
 	if !retryKeepaliveCommitted(c) {
+		if c != nil && c.Request != nil && !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+			return true
+		}
 		return false
 	}
-	if c.Request != nil && c.Request.Context().Err() != nil {
+	timedOut := c.Request != nil && continuousRetryDeadlineExceeded(c.Request.Context())
+	if !timedOut && c.Request != nil && !claimContinuousRetrySuccessContext(c.Request.Context()) {
+		timedOut = true
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil && !timedOut {
 		return true
+	}
+	code := "upstream_error"
+	if timedOut {
+		c.Set(continuousRetryTimeoutWrittenKey, true)
+		if failure, ok := continuousRetryLastFailure(c.Request.Context()); ok {
+			writeContinuousRetryLastFailure(c, continuousRetryProtocolResponses, failure)
+			return true
+		}
+		code = ErrorCodeUpstreamTimeout
+		message = continuousRetryTimeoutMessage
 	}
 	payload, _ := json.Marshal(gin.H{
 		"type": "response.failed",
 		"response": gin.H{
 			"status": "failed",
-			"error":  gin.H{"message": message, "type": "upstream_error", "code": "upstream_error"},
+			"error":  gin.H{"message": message, "type": "upstream_error", "code": code},
 		},
 	})
 	_, _ = c.Writer.WriteString("data: " + string(payload) + "\n\n")
@@ -405,13 +422,30 @@ func writeCommittedResponsesRetryError(c *gin.Context, message string) bool {
 
 func writeCommittedChatRetryError(c *gin.Context, message string) bool {
 	if !retryKeepaliveCommitted(c) {
+		if c != nil && c.Request != nil && !claimContinuousRetryTerminal(c, continuousRetryProtocolChat) {
+			return true
+		}
 		return false
 	}
-	if c.Request != nil && c.Request.Context().Err() != nil {
+	timedOut := c.Request != nil && continuousRetryDeadlineExceeded(c.Request.Context())
+	if !timedOut && c.Request != nil && !claimContinuousRetrySuccessContext(c.Request.Context()) {
+		timedOut = true
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil && !timedOut {
 		return true
 	}
+	code := ErrorCodeUpstreamStreamBreak
+	if timedOut {
+		c.Set(continuousRetryTimeoutWrittenKey, true)
+		if failure, ok := continuousRetryLastFailure(c.Request.Context()); ok {
+			writeContinuousRetryLastFailure(c, continuousRetryProtocolChat, failure)
+			return true
+		}
+		code = ErrorCodeUpstreamTimeout
+		message = continuousRetryTimeoutMessage
+	}
 	payload, _ := json.Marshal(gin.H{
-		"error": gin.H{"message": message, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
+		"error": gin.H{"message": message, "type": ErrorTypeUpstreamError, "code": code},
 	})
 	_, _ = c.Writer.WriteString("data: " + string(payload) + "\n\n")
 	if flusher, ok := c.Writer.(http.Flusher); ok {
@@ -422,10 +456,26 @@ func writeCommittedChatRetryError(c *gin.Context, message string) bool {
 
 func writeCommittedAnthropicRetryError(c *gin.Context, errorType, message string) bool {
 	if !retryKeepaliveCommitted(c) {
+		if c != nil && c.Request != nil && !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
+			return true
+		}
 		return false
 	}
-	if c.Request != nil && c.Request.Context().Err() != nil {
+	timedOut := c.Request != nil && continuousRetryDeadlineExceeded(c.Request.Context())
+	if !timedOut && c.Request != nil && !claimContinuousRetrySuccessContext(c.Request.Context()) {
+		timedOut = true
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil && !timedOut {
 		return true
+	}
+	if timedOut {
+		c.Set(continuousRetryTimeoutWrittenKey, true)
+		if failure, ok := continuousRetryLastFailure(c.Request.Context()); ok {
+			writeContinuousRetryLastFailure(c, continuousRetryProtocolAnthropic, failure)
+			return true
+		}
+		errorType = "api_error"
+		message = continuousRetryTimeoutMessage
 	}
 	payload, _ := json.Marshal(gin.H{
 		"type":  "error",

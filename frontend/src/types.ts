@@ -1393,6 +1393,7 @@ export interface SystemSettings {
   continuous_retry_categories: string[]
   continuous_retry_status_codes: number[]
   continuous_retry_error_codes: string[]
+  continuous_retry_max_duration_seconds: number
   /** 新导入/新建 Codex 账号默认盖上的设备指纹收敛档位（off/device/session/full）。 */
   codex_fingerprint_default_mode: string
   allow_remote_migration: boolean

@@ -1,4 +1,5 @@
 const CONTINUOUS_RETRY_ERROR_CODE_PATTERN = /^[a-z0-9_.-]+$/
+const CONTINUOUS_RETRY_DEFAULT_MAX_DURATION_SECONDS = 600
 
 export function createContinuousRetrySaveQueue() {
   let tail: Promise<void> = Promise.resolve()
@@ -44,4 +45,12 @@ export function parseContinuousRetryErrorCodes(raw: string): string[] {
     .filter((value) => CONTINUOUS_RETRY_ERROR_CODE_PATTERN.test(value))
 
   return Array.from(new Set(values)).sort()
+}
+
+export function parseContinuousRetryMaxDurationSeconds(raw: string): number {
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value === 0) {
+    return CONTINUOUS_RETRY_DEFAULT_MAX_DURATION_SECONDS
+  }
+  return Math.min(900, Math.max(1, Math.trunc(value)))
 }
