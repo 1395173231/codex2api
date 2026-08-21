@@ -1570,6 +1570,59 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	}
 }
 
+func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	previousInterval := downstreamSSEKeepaliveInterval
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+		downstreamSSEKeepaliveInterval = previousInterval
+	})
+
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	nextSettings.CodexContinueThinking = false
+	ApplyRuntimeSettings(nextSettings)
+	downstreamSSEKeepaliveInterval = 5 * time.Millisecond
+
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write([]byte(`data: {"type":"response.output_text.delta","delta":"started"}` + "\n\n"))
+			time.Sleep(30 * time.Millisecond)
+			_, _ = pw.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+			_ = pw.Close()
+		}()
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: pr}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.6-sol"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := recorder.Body.String()
+	for _, want := range []string{`"delta":"started"`, downstreamSSEKeepaliveComment, `"type":"response.completed"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stream missing %q; body=%q", want, got)
+		}
+	}
+}
+
 func TestResponsesSkipsWebsocketWhenBodyReachesLearnedTooBigThreshold(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

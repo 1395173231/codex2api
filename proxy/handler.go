@@ -2541,6 +2541,9 @@ func (h *Handler) effectiveMaxRateLimitRetries(account *auth.Account, fallback i
 const (
 	logStatusClientClosed        = 499
 	logStatusUpstreamStreamBreak = 598
+	// AccessLogStatusContextKey 允许流处理器在 HTTP 200 header 已提交后，
+	// 把最终的内部结果（如客户端断开的 499）提供给访问日志中间件。
+	AccessLogStatusContextKey = "x-access-log-status"
 )
 
 // upstreamStreamBreakMessage 是断流反馈给下游的稳定可读消息；机器识别用
@@ -3845,6 +3848,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 并发方,锁零竞争。
 			var downstreamMu sync.Mutex
 			var pendingFirstTokenEvents bytes.Buffer
+			contEnabled, contMaxRounds := codexContinueThinkingSettings()
 			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
 			// 热更新对新请求生效，流转发中途不切换缓冲策略。
 			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
@@ -3853,6 +3857,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				downstreamMu.Lock()
 				defer downstreamMu.Unlock()
+				// 上游 context 为了提取 usage 会在客户端断开后再排空最多 5 秒；
+				// 但下游 context 一旦取消，绝不能再尝试写 SSE，否则下一帧必然
+				// 变成 broken pipe。继续解析帧只用于拿 response.completed/usage。
+				if c.Request.Context().Err() != nil {
+					clientGone = true
+				}
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
@@ -3951,7 +3961,35 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 思考截断自动续想（默认关闭）：开启时用折叠状态机包裹 forward，
 			// 命中 518n-2 截断指纹则用同一账号续发上游并折叠成单响应；
 			// 关闭时保持原有逐事件透传路径，字节级零变化。
-			contEnabled, contMaxRounds := codexContinueThinkingSettings()
+			// 默认（未启用自动续想）路径也可能在 xhigh/max 的长推理阶段数十秒
+			// 没有可转发帧。定期写标准 SSE 注释，避免本机反代/Tailscale
+			// 把健康长流误判为空闲连接。自动续想路径已有自己的隐藏轮保活，
+			// 不重复启动第二个 ticker。
+			stopDownstreamKeepalive := func() {}
+			if !contEnabled {
+				stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
+					downstreamMu.Lock()
+					defer downstreamMu.Unlock()
+					if c.Request.Context().Err() != nil {
+						clientGone = true
+						return false
+					}
+					if clientGone {
+						return false
+					}
+					// 首个真实字节前不能写注释，否则会提前提交 HTTP 200，
+					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
+					if !wroteAnyBody {
+						return true
+					}
+					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
+						writeErr = err
+						clientGone = true
+						return false
+					}
+					return true
+				})
+			}
 			if contEnabled {
 				fold := &continueFold{
 					baseBody:  upstreamBody,
@@ -4032,6 +4070,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			} else {
 				readErr = ReadSSEStream(resp.Body, forward)
 			}
+			stopDownstreamKeepalive()
 			// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 			// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
 			if writeErr == nil && wroteAnyBody {
@@ -4173,6 +4212,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
+		if logStatusCode != http.StatusOK {
+			c.Set(AccessLogStatusContextKey, logStatusCode)
+		}
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
