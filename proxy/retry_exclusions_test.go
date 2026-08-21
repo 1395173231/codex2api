@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -400,6 +401,52 @@ func TestWaitForContinuousPoolRetryCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("canceled pool wait returned too slowly: %v", elapsed)
+	}
+}
+
+func TestNextContinuousRetryAccountReleasesSelectionAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	account := &auth.Account{DBID: 41, AccessToken: "token", Status: auth.StatusReady}
+	released := 0
+
+	got, _ := nextContinuousRetryAccount(ctx, newRetryAccountExclusions(), func(map[int64]bool) (*auth.Account, string) {
+		cancel()
+		return account, ""
+	}, func(got *auth.Account) {
+		if got == account {
+			released++
+		}
+	})
+
+	if got != nil {
+		t.Fatalf("nextContinuousRetryAccount returned account %d after cancellation", got.ID())
+	}
+	if released != 1 {
+		t.Fatalf("canceled selection release count = %d, want 1", released)
+	}
+}
+
+func TestNextBoundedRetryAccountReleasesSelectedAccountForCanceledContext(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
+	account := &auth.Account{DBID: 42, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(account)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	got, _ := nextBoundedRetryAccountWithContext(ctx, store.Release, newRetryAccountExclusions(), func(exclude map[int64]bool) (*auth.Account, string) {
+		selected := store.NextExcludingWithDispatch(0, exclude, nil, auth.DispatchPolicyStandard)
+		cancel()
+		if selected == nil {
+			return nil, ""
+		}
+		return selected, selected.GetProxyURL()
+	})
+	if got != nil {
+		t.Fatalf("nextBoundedRetryAccount returned account %d for canceled context", got.ID())
+	}
+	if active := atomic.LoadInt64(&account.ActiveRequests); active != 0 {
+		t.Fatalf("ActiveRequests after canceled selection = %d, want 0", active)
 	}
 }
 

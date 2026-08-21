@@ -1476,9 +1476,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var account *auth.Account
 		var stickyProxyURL string
 		if continuousRetryActive {
-			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount)
+			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount, h.store.Release)
 		} else {
-			account, stickyProxyURL = nextBoundedRetryAccount(retryExclusions, selectAccount)
+			account, stickyProxyURL = nextBoundedRetryAccountWithContext(c.Request.Context(), h.store.Release, retryExclusions, selectAccount)
+		}
+		if account != nil && c.Request.Context().Err() != nil {
+			h.store.Release(account)
+			if continuousRetryDeadlineExceeded(c.Request.Context()) {
+				continuousRetryCommitExpired(c, continuousRetryProtocolResponses)
+			}
+			return
 		}
 		if account == nil {
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -1486,6 +1493,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			}
 			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
 			account, stickyProxyURL = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
+			if account != nil && c.Request.Context().Err() != nil {
+				h.store.Release(account)
+				if continuousRetryDeadlineExceeded(c.Request.Context()) {
+					continuousRetryCommitExpired(c, continuousRetryProtocolResponses)
+				}
+				return
+			}
 			if account == nil {
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) || c.Request.Context().Err() != nil {
 					return

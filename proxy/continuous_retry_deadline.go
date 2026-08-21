@@ -148,7 +148,7 @@ func continuousRetryDeadlineActive(ctx context.Context) bool {
 	}
 	deadline.mu.Lock()
 	defer deadline.mu.Unlock()
-	return deadline.timer != nil && !deadline.succeeded
+	return deadline.timer != nil && !deadline.stopped && !deadline.fired && !deadline.succeeded
 }
 
 func settleContinuousRetryDeadline(ctx context.Context) bool {

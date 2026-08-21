@@ -542,9 +542,16 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		var account *auth.Account
 		var stickyProxyURL string
 		if continuousRetryActive {
-			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount)
+			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount, h.store.Release)
 		} else {
-			account, stickyProxyURL = nextBoundedRetryAccount(retryExclusions, selectAccount)
+			account, stickyProxyURL = nextBoundedRetryAccountWithContext(c.Request.Context(), h.store.Release, retryExclusions, selectAccount)
+		}
+		if account != nil && c.Request.Context().Err() != nil {
+			h.store.Release(account)
+			if continuousRetryDeadlineExceeded(c.Request.Context()) {
+				continuousRetryCommitExpired(c, continuousRetryProtocolOpenAI)
+			}
+			return
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolOpenAI) || c.Request.Context().Err() != nil {
@@ -897,9 +904,16 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 		var account *auth.Account
 		var stickyProxyURL string
 		if continuousRetryActive {
-			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount)
+			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount, h.store.Release)
 		} else {
-			account, stickyProxyURL = nextBoundedRetryAccount(retryExclusions, selectAccount)
+			account, stickyProxyURL = nextBoundedRetryAccountWithContext(c.Request.Context(), h.store.Release, retryExclusions, selectAccount)
+		}
+		if account != nil && c.Request.Context().Err() != nil {
+			h.store.Release(account)
+			if continuousRetryDeadlineExceeded(c.Request.Context()) {
+				continuousRetryCommitExpired(c, continuousRetryProtocolOpenAI)
+			}
+			return
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolOpenAI) || c.Request.Context().Err() != nil {

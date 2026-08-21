@@ -148,6 +148,34 @@ func TestContinuousRetryDeadlineSuccessClaimAndTimerHaveSingleWinner(t *testing.
 	}
 }
 
+func TestContinuousRetryDeadlineActiveEndsAfterStopOrFire(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	deadline := &continuousRetryDeadline{duration: time.Hour, cancel: cancel}
+	ctx = context.WithValue(ctx, continuousRetryDeadlineContextKey{}, deadline)
+	deadline.Activate()
+	if !continuousRetryDeadlineActive(ctx) {
+		t.Fatal("active deadline reported inactive before stop")
+	}
+	deadline.Stop()
+	if continuousRetryDeadlineActive(ctx) {
+		t.Fatal("stopped deadline still reported active")
+	}
+
+	firedCtx, firedCancel := context.WithCancelCause(context.Background())
+	firedDeadline := &continuousRetryDeadline{duration: time.Millisecond, cancel: firedCancel}
+	firedCtx = context.WithValue(firedCtx, continuousRetryDeadlineContextKey{}, firedDeadline)
+	firedDeadline.Activate()
+	select {
+	case <-firedCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("deadline timer did not fire")
+	}
+	if continuousRetryDeadlineActive(firedCtx) {
+		t.Fatal("fired deadline still reported active")
+	}
+}
+
 func TestContinuousRetryHTTPTimeoutWritesStableProtocols(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {

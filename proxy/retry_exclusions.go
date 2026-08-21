@@ -344,23 +344,39 @@ func (r *retryAccountExclusions) ForSelection() map[int64]bool {
 // pool pass after every policy-selected transient candidate has been tried.
 // It never waits and never changes the caller's total-attempt cap.
 func nextBoundedRetryAccount(exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string)) (*auth.Account, string) {
+	return nextBoundedRetryAccountWithContext(context.Background(), nil, exclusions, selectAccount)
+}
+
+func guardRetryAccountContext(ctx context.Context, releaseAccount func(*auth.Account), account *auth.Account, proxyURL string) (*auth.Account, string) {
+	if account != nil && ctx != nil && ctx.Err() != nil {
+		if releaseAccount != nil {
+			releaseAccount(account)
+		}
+		return nil, ""
+	}
+	return account, proxyURL
+}
+
+func nextBoundedRetryAccountWithContext(ctx context.Context, releaseAccount func(*auth.Account), exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string)) (*auth.Account, string) {
 	if selectAccount == nil {
 		return nil, ""
 	}
 	account, proxyURL := selectAccount(exclusions.ForSelection())
+	account, proxyURL = guardRetryAccountContext(ctx, releaseAccount, account, proxyURL)
 	if account != nil || !exclusions.ResetTransient() {
 		return account, proxyURL
 	}
-	return selectAccount(exclusions.ForSelection())
+	account, proxyURL = selectAccount(exclusions.ForSelection())
+	return guardRetryAccountContext(ctx, releaseAccount, account, proxyURL)
 }
 
 // nextContinuousRetryAccount preserves the endpoint's normal bounded account
 // selection until a policy-selected failure has marked at least one account as
 // recoverable. From that point it keeps polling the pool until an account is
 // available or the downstream request is canceled.
-func nextContinuousRetryAccount(ctx context.Context, exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string)) (*auth.Account, string) {
+func nextContinuousRetryAccount(ctx context.Context, exclusions *retryAccountExclusions, selectAccount func(map[int64]bool) (*auth.Account, string), releaseAccount func(*auth.Account)) (*auth.Account, string) {
 	for {
-		account, proxyURL := nextBoundedRetryAccount(exclusions, selectAccount)
+		account, proxyURL := nextBoundedRetryAccountWithContext(ctx, releaseAccount, exclusions, selectAccount)
 		if account != nil || exclusions == nil || !exclusions.CanContinueTransientCycle() {
 			return account, proxyURL
 		}
@@ -417,7 +433,8 @@ func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey 
 	}
 	const maximumWait = 30 * time.Second
 	if !continuousRetryKeepaliveActive(ctx) || continuousRetryKeepaliveInterval <= 0 {
-		return waitForAccount(ctx, maximumWait)
+		account, proxyURL := waitForAccount(ctx, maximumWait)
+		return guardRetryAccountContext(ctx, h.store.Release, account, proxyURL)
 	}
 
 	deadline := time.Now().Add(maximumWait)
@@ -452,6 +469,10 @@ func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey 
 		account, proxyURL := waitForAccount(waitCtx, maximumWait)
 		waitErr := waitCtx.Err()
 		cancel()
+		if account != nil && ctx != nil && ctx.Err() != nil {
+			h.store.Release(account)
+			return nil, ""
+		}
 		if account != nil || (ctx != nil && ctx.Err() != nil) {
 			return account, proxyURL
 		}
@@ -509,11 +530,19 @@ func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiK
 			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
 		}
 		if account != nil {
+			if ctx.Err() != nil {
+				h.store.Release(account)
+				return nil, ""
+			}
 			return account, stickyProxyURL
 		}
 		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
 		account, stickyProxyURL = h.waitForRetryAccountAvailable(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, policy)
 		if account != nil {
+			if ctx.Err() != nil {
+				h.store.Release(account)
+				return nil, ""
+			}
 			return account, stickyProxyURL
 		}
 		if reconcileDone == nil {
