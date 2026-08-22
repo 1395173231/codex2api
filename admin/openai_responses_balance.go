@@ -19,6 +19,13 @@ import (
 )
 
 const openAIResponsesBalanceQueryURLCredential = "balance_query_url"
+const openAIResponsesBalanceCacheTTL = 30 * time.Second
+const openAIResponsesBalanceAttemptTimeout = 8 * time.Second
+
+type openAIResponsesBalanceCacheEntry struct {
+	Response  openAIResponsesBalanceResponse
+	ExpiresAt time.Time
+}
 
 type openAIResponsesBalanceResponse struct {
 	Balance   float64 `json:"balance"`
@@ -40,6 +47,7 @@ func (h *Handler) GetOpenAIResponsesBalance(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
+	forceRefresh := c.Query("refresh") == "1" || strings.EqualFold(c.Query("refresh"), "true")
 	row, err := h.db.GetAccountByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -52,6 +60,15 @@ func (h *Handler) GetOpenAIResponsesBalance(c *gin.Context) {
 	if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
 		writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持查询平台余额")
 		return
+	}
+	if !forceRefresh {
+		h.openAIResponsesBalanceMu.RLock()
+		cached, ok := h.openAIResponsesBalanceCache[id]
+		h.openAIResponsesBalanceMu.RUnlock()
+		if ok && time.Now().Before(cached.ExpiresAt) {
+			c.JSON(http.StatusOK, cached.Response)
+			return
+		}
 	}
 
 	result, err := queryOpenAIResponsesBalance(
@@ -67,6 +84,15 @@ func (h *Handler) GetOpenAIResponsesBalance(c *gin.Context) {
 		return
 	}
 	result.QueriedAt = time.Now().Format(time.RFC3339)
+	h.openAIResponsesBalanceMu.Lock()
+	if h.openAIResponsesBalanceCache == nil {
+		h.openAIResponsesBalanceCache = make(map[int64]openAIResponsesBalanceCacheEntry)
+	}
+	h.openAIResponsesBalanceCache[id] = openAIResponsesBalanceCacheEntry{
+		Response:  result,
+		ExpiresAt: time.Now().Add(openAIResponsesBalanceCacheTTL),
+	}
+	h.openAIResponsesBalanceMu.Unlock()
 	c.JSON(http.StatusOK, result)
 }
 
@@ -201,7 +227,9 @@ func fetchOpenAIResponsesBalancePayload(
 	endpoint, apiKey string,
 	customHeaders map[string]string,
 ) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	attemptCtx, cancel := context.WithTimeout(ctx, openAIResponsesBalanceAttemptTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建余额请求失败: %w", err)
 	}
@@ -276,6 +304,7 @@ func queryNewAPIBalance(
 	if err != nil {
 		return openAIResponsesBalanceResponse{}, err
 	}
+	tokenAttempt := ""
 	if tokenBody, tokenErr := fetchOpenAIResponsesBalancePayload(ctx, client, tokenURL, apiKey, customHeaders); tokenErr == nil {
 		if result, parseErr := parseOpenAIResponsesBalancePayload(tokenBody); parseErr == nil {
 			result.Source = "new-api"
@@ -283,29 +312,33 @@ func queryNewAPIBalance(
 				result.Unit = "quota"
 			}
 			return result, nil
+		} else {
+			tokenAttempt = "token: " + parseErr.Error()
 		}
+	} else {
+		tokenAttempt = "token: " + tokenErr.Error()
 	}
 
 	subscriptionURL, err := openAIResponsesOriginEndpoint(baseURL, "/v1/dashboard/billing/subscription")
 	if err != nil {
-		return openAIResponsesBalanceResponse{}, err
+		return openAIResponsesBalanceResponse{}, fmt.Errorf("%s; subscription endpoint: %w", tokenAttempt, err)
 	}
 	usageURL, err := openAIResponsesOriginEndpoint(baseURL, "/v1/dashboard/billing/usage")
 	if err != nil {
-		return openAIResponsesBalanceResponse{}, err
+		return openAIResponsesBalanceResponse{}, fmt.Errorf("%s; usage endpoint: %w", tokenAttempt, err)
 	}
 	subscriptionBody, err := fetchOpenAIResponsesBalancePayload(ctx, client, subscriptionURL, apiKey, customHeaders)
 	if err != nil {
-		return openAIResponsesBalanceResponse{}, err
+		return openAIResponsesBalanceResponse{}, fmt.Errorf("%s; subscription: %w", tokenAttempt, err)
 	}
 	usageBody, err := fetchOpenAIResponsesBalancePayload(ctx, client, usageURL, apiKey, customHeaders)
 	if err != nil {
-		return openAIResponsesBalanceResponse{}, err
+		return openAIResponsesBalanceResponse{}, fmt.Errorf("%s; usage: %w", tokenAttempt, err)
 	}
 	hardLimit := gjson.GetBytes(subscriptionBody, "hard_limit_usd")
 	totalUsage := gjson.GetBytes(usageBody, "total_usage")
 	if !hardLimit.Exists() || !totalUsage.Exists() {
-		return openAIResponsesBalanceResponse{}, fmt.Errorf("账单响应缺少 hard_limit_usd 或 total_usage")
+		return openAIResponsesBalanceResponse{}, fmt.Errorf("%s; 账单响应缺少 hard_limit_usd 或 total_usage", tokenAttempt)
 	}
 	balance := hardLimit.Float() - totalUsage.Float()/100
 	if balance < 0 {

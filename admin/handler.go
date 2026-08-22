@@ -103,6 +103,9 @@ type Handler struct {
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
+	// 余额查询短缓存避免账号列表重新渲染或多管理员同时打开页面时重复探测上游。
+	openAIResponsesBalanceMu    sync.RWMutex
+	openAIResponsesBalanceCache map[int64]openAIResponsesBalanceCacheEntry
 
 	// 账号请求统计缓存,按渠道分键(codex/grok 各自刷新互不牵连;旧全量路径
 	// 用 "all" 键)。分页路径 stale-while-revalidate,TTL 见 requestCountCacheTTL。

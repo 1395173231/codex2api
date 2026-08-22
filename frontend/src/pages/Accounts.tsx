@@ -231,26 +231,35 @@ function loadAPIAccountBalance(
   if (cached && cached.expiresAt > Date.now()) {
     return Promise.resolve(cached.state);
   }
-  const inflight = apiBalanceInflight.get(accountId);
-  if (inflight) return inflight;
+  if (!force) {
+    const inflight = apiBalanceInflight.get(accountId);
+    if (inflight) return inflight;
+  }
 
-  const promise = api
-    .getOpenAIResponsesBalance(accountId)
+  let promise: Promise<APIBalanceLoadState>;
+  promise = api
+    .getOpenAIResponsesBalance(accountId, undefined, force)
     .then<APIBalanceLoadState>((data) => ({ loading: false, data }))
     .catch<APIBalanceLoadState>((error) => ({
       loading: false,
       error: getErrorMessage(error),
     }))
     .then((state) => {
-      apiBalanceCache.set(accountId, {
-        expiresAt:
-          Date.now() +
-          (state.data ? API_BALANCE_CACHE_TTL_MS : API_BALANCE_ERROR_CACHE_TTL_MS),
-        state,
-      });
+      if (apiBalanceInflight.get(accountId) === promise) {
+        apiBalanceCache.set(accountId, {
+          expiresAt:
+            Date.now() +
+            (state.data ? API_BALANCE_CACHE_TTL_MS : API_BALANCE_ERROR_CACHE_TTL_MS),
+          state,
+        });
+      }
       return state;
     })
-    .finally(() => apiBalanceInflight.delete(accountId));
+    .finally(() => {
+      if (apiBalanceInflight.get(accountId) === promise) {
+        apiBalanceInflight.delete(accountId);
+      }
+    });
   apiBalanceInflight.set(accountId, promise);
   return promise;
 }
@@ -14581,7 +14590,7 @@ function UsageWindowStat({
       {(accountBilledText || userBilledText) && (
         <div
           className={cn(
-            "pl-[34px] text-[10px]",
+            "pl-[46px] text-[10px]",
             apiAccount
               ? "flex flex-col items-start gap-0.5 font-medium"
               : "flex items-center gap-1.5 text-muted-foreground/80",
@@ -14955,8 +14964,10 @@ function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
   const [state, setState] = useState<APIBalanceLoadState>(() =>
     cached && cached.expiresAt > Date.now()
       ? cached.state
-      : { loading: true },
+      : { loading: false },
   );
+  const [visible, setVisible] = useState(false);
+  const badgeRef = useRef<HTMLButtonElement>(null);
 
   const refresh = useCallback((force = false) => {
     setState({ loading: true });
@@ -14964,14 +14975,35 @@ function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
   }, [accountId]);
 
   useEffect(() => {
+    const element = badgeRef.current;
+    if (!element || typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "120px" },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return;
     let active = true;
+    setState((current) => (current.data || current.error ? current : { loading: true }));
     void loadAPIAccountBalance(accountId).then((next) => {
       if (active) setState(next);
     });
     return () => {
       active = false;
     };
-  }, [accountId]);
+  }, [accountId, visible]);
 
   const title = state.data
     ? t("accounts.apiBalanceTooltip", {
@@ -14985,6 +15017,7 @@ function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
   return (
     <button
       type="button"
+      ref={badgeRef}
       onClick={(event) => {
         event.stopPropagation();
         refresh(true);
