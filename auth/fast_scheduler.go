@@ -666,7 +666,10 @@ func (a *Account) fastSchedulerSnapshotForSpark(baseLimit int64, now time.Time) 
 		baseConcurrencyEffective = a.effectiveBaseConcurrencyLocked(baseLimit)
 	}
 	limit := concurrencyLimitForTier(baseConcurrencyEffective, tier)
-	available := a.sparkDispatchEligibleLocked(now)
+	// sparkDispatchEligibleLocked 与 isAvailableLocked 一样只看锁内状态;
+	// DispatchPaused 是锁外原子标志,标准快照在这里显式补一道门,spark 必须
+	// 对齐,否则运维手动停调度或过载熔断置位的账号仍会被 spark 请求选中。
+	available := a.sparkDispatchEligibleLocked(now) && atomic.LoadInt32(&a.DispatchPaused) == 0
 	return tier, score, limit, proven, available
 }
 
