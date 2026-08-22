@@ -25,6 +25,7 @@ EOF
 }
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly release_branch='codex/production-main'
 version=${CODEX2API_RELEASE_VERSION:-}
 output_dir=$repo_root/dist/releases
 
@@ -51,6 +52,20 @@ done
 [[ -n "$version" ]] || { usage >&2; exit 2; }
 [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fr-[0-9]{8}\.[0-9]+$ ]] ||
   die "version must match vX.Y.Z-fr-YYYYMMDD.N: $version"
+
+current_branch=$(git -C "$repo_root" symbolic-ref --quiet --short HEAD || true)
+[[ "$current_branch" == "$release_branch" ]] ||
+  die "release must run from $release_branch (current: ${current_branch:-detached})"
+
+tracked_changes=$(git -C "$repo_root" diff --name-only && git -C "$repo_root" diff --cached --name-only)
+if [[ -n "$tracked_changes" ]]; then
+  while IFS= read -r changed_path; do
+    [[ -z "$changed_path" ]] && continue
+    [[ "$changed_path" == docs/*.md || "$changed_path" == scripts/build-release.sh ]] ||
+      die "tracked code change blocks release: $changed_path"
+  done <<< "$tracked_changes"
+  echo "release_check=docs-only-local-changes-allowed"
+fi
 
 command -v go >/dev/null || die "go is required"
 command -v npm >/dev/null || die "npm is required"
