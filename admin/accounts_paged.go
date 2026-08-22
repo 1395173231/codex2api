@@ -96,6 +96,7 @@ type accountListSnapshotItem struct {
 	CooldownUntil       time.Time
 	Window7dSeconds     int64
 	ActiveRequests      int64
+	OccupiedRequests    int64
 	DynamicConcurrency  int64
 	OpenAIResponses     bool
 	SearchText          string
@@ -736,6 +737,7 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			item.LastRateLimitedAt = runtimeSnapshot.LastRateLimitedAt
 			item.LastTimeoutAt = runtimeSnapshot.LastTimeoutAt
 			item.ActiveRequests = runtimeSnapshot.ActiveRequests
+			item.OccupiedRequests = runtimeSnapshot.OccupiedRequests
 			item.DynamicConcurrency = runtimeSnapshot.DynamicConcurrencyLimit
 			item.Reset5hAt = runtimeSnapshot.Reset5hAt
 			item.Reset7dAt = runtimeSnapshot.Reset7dAt
