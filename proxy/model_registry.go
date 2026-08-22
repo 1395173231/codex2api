@@ -82,6 +82,7 @@ var builtinModelInfos = []ModelInfo{
 	// Pricing: gpt-5.4 standard ($2.50/$15.00), priority ($5.00/$30.00).
 	// Ref: codex_client_models.json via CLIProxyAPI model registry.
 	modelInfoForID("codex-auto-review", ModelSourceBuiltin),
+	modelInfoForID("gpt-reserve", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-2k", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-4k", ModelSourceBuiltin),
