@@ -606,7 +606,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				// 提取 usage
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -671,7 +671,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					if shouldDefer {
 						pendingFirstTokenEvents.WriteString(payloadString)
 						if pendingFirstTokenEvents.Len() <= 1024*1024 {
-							return eventType != "response.completed" && eventType != "response.failed"
+							return !isResponsesTerminalEvent(eventType)
 						}
 						payloadString = pendingFirstTokenEvents.String()
 						pendingFirstTokenEvents.Reset()
@@ -686,7 +686,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					wroteAnyBody = true
 				}
 
-				return eventType != "response.completed" && eventType != "response.failed"
+				return !isResponsesTerminalEvent(eventType)
 			})
 			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
 			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
@@ -726,7 +726,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier

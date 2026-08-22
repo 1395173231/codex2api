@@ -2,10 +2,18 @@ name: Security Scan
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
   push:
     branches:
       - main
       - codex/**
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
   schedule:
     - cron: '0 3 * * 1'
 
@@ -22,29 +30,37 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Create frontend dist placeholder
         run: mkdir -p frontend/dist && touch frontend/dist/placeholder
 
+      # PR/push 钉死扫描器版本,避免工具本身行为漂移。漏洞库仍是实时的。
+      # 周一定时任务改用 @latest,专门抓新 advisory。
       - name: Run govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            go install golang.org/x/vuln/cmd/govulncheck@latest
+          else
+            go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          fi
           govulncheck ./...
 
   frontend-security:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm

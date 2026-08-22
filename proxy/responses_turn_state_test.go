@@ -20,6 +20,22 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func readResponsesWSTerminalEvent(t *testing.T, conn *websocket.Conn) []byte {
+	t.Helper()
+	for i := 0; i < 16; i++ {
+		_, event, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read websocket event: %v", err)
+		}
+		switch gjson.GetBytes(event, "type").String() {
+		case "response.completed", "response.failed", "error":
+			return event
+		}
+	}
+	t.Fatal("did not receive a terminal websocket event")
+	return nil
+}
+
 func newUsageLimitedRelayStore(upstreamURL string) (*auth.Store, *auth.Account) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:         2,
@@ -462,14 +478,30 @@ func TestResponsesWebSocketUpgradeTurnStateDoesNotAuthorizeFreshFrame(t *testing
 	}
 }
 
-func TestResponsesWebSocketPinnedTurnForwardsPreviousResponseFailure(t *testing.T) {
+func TestResponsesWebSocketPinnedTurnDegradesPreviousResponseFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousExec := WebsocketExecuteFunc
 	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+	prevSettings := CurrentRuntimeSettings()
+	nextSettings := prevSettings
+	nextSettings.FirstTokenMode = FirstTokenModeLoose
+	nextSettings.CodexPreflightSSEPassthrough = true
+	ApplyRuntimeSettings(nextSettings)
+	t.Cleanup(func() { ApplyRuntimeSettings(prevSettings) })
 
+	var attempts atomic.Int32
+	var retriedWithoutContinuation atomic.Bool
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
-		body := `data: {"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}` + "\n\n"
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		attempts.Add(1)
+		if gjson.GetBytes(requestBody, "previous_response_id").String() != "" {
+			body := `data: {"type":"codex.rate_limits","plan_type":"plus"}` + "\n\n" +
+				`data: {"type":"codex.response.metadata","headers":{"x-codex-turn-state":"turn"}}` + "\n\n" +
+				`data: {"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}` + "\n\n"
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
+		retriedWithoutContinuation.Store(true)
+		completed := `data: {"type":"response.completed","response":{"id":"resp_new","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(completed))}, nil
 	}
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, IgnoreUsageLimitStatus: true})
@@ -495,15 +527,15 @@ func TestResponsesWebSocketPinnedTurnForwardsPreviousResponseFailure(t *testing.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-	_, event, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read pinned-turn failure: %v", err)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	event := readResponsesWSTerminalEvent(t, conn)
+	if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+		t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
 	}
-	if eventType := gjson.GetBytes(event, "type").String(); eventType != "error" {
-		t.Fatalf("event type = %q, want error; body=%s", eventType, event)
+	if !retriedWithoutContinuation.Load() {
+		t.Fatal("pinned turn-state still forwarded previous_response_not_found instead of degrading")
 	}
-	if code := gjson.GetBytes(event, "error.code").String(); code != "previous_response_not_found" {
-		t.Fatalf("error.code = %q, want previous_response_not_found; body=%s", code, event)
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("upstream attempts = %d, want 2 (rejected + degraded retry)", got)
 	}
 }

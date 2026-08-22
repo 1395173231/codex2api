@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -35,10 +36,14 @@ func TestParseOpenAIResponsesBalancePayload(t *testing.T) {
 func TestQueryOpenAIResponsesBalanceUsesSub2API(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/usage" {
-			t.Fatalf("path = %s, want /v1/usage", r.URL.Path)
+			t.Errorf("path = %s, want /v1/usage", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
-			t.Fatalf("authorization = %q", got)
+			t.Errorf("authorization = %q", got)
+			http.Error(w, "unexpected authorization", http.StatusUnauthorized)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"mode":"unrestricted","balance":8.75,"unit":"USD"}`))
@@ -85,7 +90,9 @@ func TestQueryOpenAIResponsesBalanceUsesNewAPITokenEndpoint(t *testing.T) {
 			return
 		}
 		if r.URL.Path != "/api/usage/token/" {
-			t.Fatalf("path = %s, want /api/usage/token/", r.URL.Path)
+			t.Errorf("path = %s, want /api/usage/token/", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		_, _ = w.Write([]byte(`{"code":true,"data":{"total_available":4500,"unlimited_quota":false}}`))
 	}))
@@ -103,10 +110,14 @@ func TestQueryOpenAIResponsesBalanceUsesNewAPITokenEndpoint(t *testing.T) {
 func TestQueryOpenAIResponsesBalanceUsesConfiguredEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/billing/balance" {
-			t.Fatalf("path = %s, want /billing/balance", r.URL.Path)
+			t.Errorf("path = %s, want /billing/balance", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
-			t.Fatalf("authorization = %q", got)
+			t.Errorf("authorization = %q", got)
+			http.Error(w, "unexpected authorization", http.StatusUnauthorized)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"balance":4.25,"unit":"USD"}`))
@@ -126,6 +137,36 @@ func TestQueryOpenAIResponsesBalanceUsesConfiguredEndpoint(t *testing.T) {
 	}
 	if got.Balance != 4.25 || got.Unit != "USD" || got.Source != "custom" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestQueryOpenAIResponsesBalanceUsesAbsoluteConfiguredEndpoint(t *testing.T) {
+	var hit atomic.Bool
+	absoluteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Store(true)
+		if r.URL.Path != "/absolute/balance" {
+			t.Errorf("path = %s, want /absolute/balance", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":6.5,"unit":"USD"}`))
+	}))
+	defer absoluteServer.Close()
+
+	got, err := queryOpenAIResponsesBalance(
+		context.Background(),
+		"http://base.example/v1",
+		"sk-test",
+		"",
+		nil,
+		absoluteServer.URL+"/absolute/balance",
+	)
+	if err != nil {
+		t.Fatalf("query balance: %v", err)
+	}
+	if !hit.Load() || got.Balance != 6.5 || got.Unit != "USD" || got.Source != "custom" {
+		t.Fatalf("hit=%v got %#v", hit.Load(), got)
 	}
 }
 

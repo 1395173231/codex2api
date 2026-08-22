@@ -170,7 +170,14 @@
     "editTitle": "Edit Grok account",
     "editSaved": "Grok account updated",
     "modelsQuickAdd": "Common models",
-    "editModelsEmptyHint": "No models declared: usable only by grok-channel keys. Declare grok models here (e.g. grok-4.6) to also allow auto-channel keys.",
+    "editModelsEmptyHint": "No explicit whitelist: routing uses the account's visible catalog, or conservative Grok defaults before the first catalog sync.",
+    "modelMapping": "GPT-compatible model aliases",
+    "modelMappingHint": "Map client-facing model names to Grok on this account. Exact aliases such as gpt-5.4 are recommended; * wildcards are supported. A target must remain visible in the account catalog and explicit whitelist.",
+    "modelMappingFromPlaceholder": "Client model, e.g. gpt-5.4",
+    "modelMappingToPlaceholder": "Grok target, e.g. grok-4.5",
+    "modelMappingAdd": "Add mapping",
+    "modelMappingRemove": "Remove mapping",
+    "modelMappingInvalid": "Each mapping needs both model names, and source models must be unique.",
     "productUsage": "{{product}} usage",
     "payAsYouGo": "Pay-as-you-go",
     "paygDisabled": "Not enabled",
@@ -4090,7 +4097,7 @@
       "upstreamChannelHint": {
         "auto": "No restriction: requests are routed by model to Codex or Grok accounts.",
         "codex": "This key only dispatches to Codex accounts; Grok accounts are excluded.",
-        "grok": "This key only dispatches to Grok accounts. The requested model is passed through; accounts without a declared model list accept all models."
+        "grok": "This key only dispatches to Grok accounts. Account mappings are applied first, then the target must be in the visible catalog or conservative defaults; an explicit model list narrows that set."
       },
       "upstreamChannelAutoTab": "Auto",
       "sectionScope": "Group / account budgets",

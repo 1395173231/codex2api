@@ -591,8 +591,11 @@ export const api = {
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
-  getOpenAIResponsesBalance: (id: number, signal?: AbortSignal) =>
-    request<OpenAIResponsesBalanceResponse>(`/accounts/${id}/openai-responses/balance`, { signal }),
+  getOpenAIResponsesBalance: (id: number, signal?: AbortSignal, force = false) =>
+    request<OpenAIResponsesBalanceResponse>(
+      `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
+      { signal, timeoutMs: 25_000 },
+    ),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -667,8 +670,10 @@ export const api = {
       refreshed: boolean
       usage_percent_5h?: number
       usage_percent_7d?: number
+      usage_percent_spark?: number
       reset_5h_at?: string
       reset_7d_at?: string
+      reset_spark_at?: string
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
