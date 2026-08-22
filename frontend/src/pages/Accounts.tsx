@@ -176,7 +176,9 @@ import RequestCountPills, {
 import { buildModelCountBreakdown } from "../lib/requestErrorStatus";
 import {
   accountStateSurfaceClass,
+  accountStateTableRowClass,
   renderAccountStateOverlay,
+  resolveAccountOverlayKind,
 } from "../components/AccountStateOverlay";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
@@ -1031,6 +1033,13 @@ const AccountTableRow = memo(function AccountTableRow({
   t: ReturnType<typeof useTranslation>["t"];
   actions: AccountRowActions;
 }) {
+  const tableOverlayKind = resolveAccountOverlayKind(account);
+  const tableOverlay = renderAccountStateOverlay(account, t, {
+    compact: true,
+    markerOnly: true,
+    onRecover: () => actions.resetStatus(account),
+  });
+
   return (
                           <TableRow
                             key={account.id}
@@ -1041,11 +1050,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                 : selected
                                   ? "bg-primary/5"
                                   : ""
-                            }${
-                              // 禁用 / 过载暂停用独立遮罩层淡化内容，徽章保持清晰。relative 让遮罩以整行为定位基准。
-                              // 不用 grayscale / 行级 opacity：filter 会破坏定位包含块，opacity 会把徽章一起冲淡。
-                              accountStateSurfaceClass(account, " relative")
-                            }`}
+                            }${accountStateTableRowClass(account)}`}
                             onClick={(event) => {
                               const target = event.target as HTMLElement | null;
                               if (
@@ -1059,17 +1064,38 @@ const AccountTableRow = memo(function AccountTableRow({
                             }}
                           >
                             <TableCell>
-                              {renderAccountStateOverlay(account, t, {
-                                compact: true,
-                                onRecover: () => actions.resetStatus(account),
-                              })}
-                              <input
-                                type="checkbox"
-                                className="size-4 cursor-pointer accent-primary"
-                                checked={selected}
-                                onChange={() => actions.toggleSelect(account.id)}
-                                onClick={(event) => event.stopPropagation()}
-                              />
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="checkbox"
+                                  className="size-4 cursor-pointer accent-primary"
+                                  checked={selected}
+                                  onChange={() => actions.toggleSelect(account.id)}
+                                  onClick={(event) => event.stopPropagation()}
+                                />
+                                {!visibleColumns.status && tableOverlayKind ? (
+                                  <span className="sr-only">
+                                    {tableOverlayKind === "disabled"
+                                      ? t("accounts.disabledOverlay")
+                                      : t("accounts.overloadOverlay")}
+                                  </span>
+                                ) : null}
+                                {!visibleColumns.status &&
+                                tableOverlayKind === "overload" ? (
+                                  <button
+                                    type="button"
+                                    className="inline-flex size-7 items-center justify-center rounded-md text-orange-700 transition-colors hover:bg-orange-500/10 dark:text-orange-300"
+                                    title={t("accounts.overloadRecover")}
+                                    aria-label={t("accounts.overloadRecover")}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      void actions.resetStatus(account);
+                                    }}
+                                  >
+                                    <RotateCcw className="size-3.5" />
+                                  </button>
+                                ) : null}
+                              </div>
                             </TableCell>
                             {visibleColumns.sequence && (
                               <TableCell
@@ -1271,66 +1297,68 @@ const AccountTableRow = memo(function AccountTableRow({
                               </TableCell>
                             )}
                             {visibleColumns.status && (
-                              <TableCell>
-                                <div
-                                  className="min-w-[168px] max-w-[240px] space-y-1.5"
-                                  title={[
-                                    t("accounts.healthSummary", {
-                                      health: formatHealthTier(
-                                        account.health_tier,
-                                        t,
-                                      ),
-                                      score: Math.round(
-                                        getDispatchScore(account),
-                                      ),
-                                      concurrency:
-                                        account.dynamic_concurrency_limit ?? "-",
-                                    }),
-                                    account.status === "error" &&
-                                    account.error_message
-                                      ? account.error_message
-                                      : "",
-                                    (account.model_cooldowns?.length ?? 0) > 0
-                                      ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
-                                      : "",
-                                  ]
-                                    .filter(Boolean)
-                                    .join("\n")}
-                                >
-                                  <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                                    <StatusBadge
-                                      status={getAccountStatusBadgeStatus(account)}
-                                      detail={
-                                        account.status === "overload_paused"
-                                          ? undefined
-                                          : getAccountRateLimitWindow(account) ??
-                                            undefined
-                                      }
-                                      errorMessage={account.error_message}
-                                    />
-                                    <UsingCreditsBadge account={account} />
-                                    {account.status !== "overload_paused" && (
-                                      <AccountStatusCountdown account={account} />
-                                    )}
-                                    {(account.active_requests ?? 0) > 0 && (
-                                      <span
-                                        className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                                        title={t("accounts.activeRequestsTooltip", {
-                                          count: account.active_requests ?? 0,
-                                        })}
-                                      >
+                              <TableCell data-account-state-cell="status">
+                                {tableOverlay ?? (
+                                  <div
+                                    className="min-w-[168px] max-w-[240px] space-y-1.5"
+                                    title={[
+                                      t("accounts.healthSummary", {
+                                        health: formatHealthTier(
+                                          account.health_tier,
+                                          t,
+                                        ),
+                                        score: Math.round(
+                                          getDispatchScore(account),
+                                        ),
+                                        concurrency:
+                                          account.dynamic_concurrency_limit ?? "-",
+                                      }),
+                                      account.status === "error" &&
+                                      account.error_message
+                                        ? account.error_message
+                                        : "",
+                                      (account.model_cooldowns?.length ?? 0) > 0
+                                        ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
+                                        : "",
+                                    ]
+                                      .filter(Boolean)
+                                      .join("\n")}
+                                  >
+                                    <div className="flex min-h-6 flex-wrap items-center gap-1.5">
+                                      <StatusBadge
+                                        status={getAccountStatusBadgeStatus(account)}
+                                        detail={
+                                          account.status === "overload_paused"
+                                            ? undefined
+                                            : getAccountRateLimitWindow(account) ??
+                                              undefined
+                                        }
+                                        errorMessage={account.error_message}
+                                      />
+                                      <UsingCreditsBadge account={account} />
+                                      {account.status !== "overload_paused" && (
+                                        <AccountStatusCountdown account={account} />
+                                      )}
+                                      {(account.active_requests ?? 0) > 0 && (
                                         <span
-                                          className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                                          aria-hidden
-                                        />
-                                        {account.active_requests}
-                                      </span>
-                                    )}
+                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                                          title={t("accounts.activeRequestsTooltip", {
+                                            count: account.active_requests ?? 0,
+                                          })}
+                                        >
+                                          <span
+                                            className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                                            aria-hidden
+                                          />
+                                          {account.active_requests}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <AccountHealthBar
+                                      buckets={healthBuckets}
+                                    />
                                   </div>
-                                  <AccountHealthBar
-                                    buckets={healthBuckets}
-                                  />
-                                </div>
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.today && (
@@ -11951,6 +11979,10 @@ function isActiveAutoPauseWindowReached(
 
 // Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
 // k12/edu are paid education workspaces with 5h limits (issue #307/#309).
+function isSparkUsagePlan(planType?: string): boolean {
+  return normalizePlanType(planType) === "pro";
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return [
     "plus",
@@ -13286,7 +13318,10 @@ function AccountMobileCard({
                   })}
                 </div>
               </div>
-              <div className="shrink-0">
+              <div
+                className="shrink-0"
+                aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+              >
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <StatusBadge
                     status={getAccountStatusBadgeStatus(account)}
@@ -13575,7 +13610,10 @@ function AccountMobileCard({
                 )}
               </div>
               {(!visibleColumns || visibleColumns.status) && (
-                <div className="flex min-w-[112px] shrink-0 flex-col items-end">
+                <div
+                  className="flex min-w-[112px] shrink-0 flex-col items-end"
+                  aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+                >
                   <StatusBadge
                     status={getAccountStatusBadgeStatus(account)}
                     detail={
@@ -14461,6 +14499,14 @@ function usageBarColor(pct: number): string {
   return "bg-emerald-500";
 }
 
+// 标签 / 条 / 百分比 三列固定，避免 7d 与 spark 把进度条拉成不同长度。
+const USAGE_BAR_LABEL_CLASS =
+  "w-10 shrink-0 text-[11px] font-medium text-muted-foreground";
+const USAGE_BAR_TRACK_CLASS =
+  "h-1.5 w-[88px] shrink-0 rounded-full bg-muted overflow-hidden";
+const USAGE_BAR_META_CLASS =
+  "text-[11px] font-medium text-muted-foreground mt-0.5 pl-[46px]";
+
 // 单行用量进度条
 function UsageBar({
   label,
@@ -14481,29 +14527,20 @@ function UsageBar({
   return (
     <div>
       <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-7 shrink-0">
-          {label}
-        </span>
-        <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
+        <div className={USAGE_BAR_TRACK_CLASS}>
           <div
             className={`h-full rounded-full transition-all ${usageBarColor(pct)}`}
             style={{ width: `${Math.min(100, pct)}%` }}
           />
         </div>
-        <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">
+        <span className="w-[42px] shrink-0 text-right text-[12px] font-semibold tabular-nums">
           {pct.toFixed(1)}%
         </span>
       </div>
-      {detailText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]">
-          {detailText}
-        </div>
-      )}
+      {detailText && <div className={USAGE_BAR_META_CLASS}>{detailText}</div>}
       {resetTime && (
-        <div
-          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]"
-          title={resetTime.title}
-        >
+        <div className={USAGE_BAR_META_CLASS} title={resetTime.title}>
           ⏱ {resetTime.label}
         </div>
       )}
@@ -14533,7 +14570,7 @@ function UsageWindowStat({
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="w-7 shrink-0">{label}</span>
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
         <span>
           {formatCompactUsageNumber(detail?.requests)}{" "}
           {t("accounts.usageReqUnit")} /{" "}
@@ -14774,6 +14811,10 @@ function UsageCell({
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
+  const hasSparkPct =
+    account.usage_percent_spark !== null &&
+    account.usage_percent_spark !== undefined;
+  const showSpark = isSparkUsagePlan(account.plan_type);
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
@@ -14785,12 +14826,28 @@ function UsageCell({
   // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
   const showFiveHour = fiveHourPresent;
 
+  const sparkBar = showSpark ? (
+    hasSparkPct ? (
+      <UsageBar
+        label="spark"
+        pct={account.usage_percent_spark!}
+        resetAt={account.reset_spark_at}
+      />
+    ) : (
+      <UsageBar
+        label="spark"
+        pct={0}
+        resetAt={account.reset_spark_at}
+      />
+    )
+  ) : null;
+
   if (showFiveHour) {
-    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset && !showSpark)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
-      <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
-        <div className="flex-1 space-y-1.5">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
           {has5h ? (
             <UsageBar
               label="5h"
@@ -14805,6 +14862,28 @@ function UsageCell({
               apiAccount={account.openai_responses_api}
             />
           )}
+          {sparkBar}
+          {has7d ? (
+            <UsageBar
+              label={longWindowLabel}
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+          )}
+        </div>
+        {refreshButton}
+      </div>
+    );
+  }
+
+  if (showSpark) {
+    return (
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
+          {sparkBar}
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14827,8 +14906,8 @@ function UsageCell({
 
   if (sevenDayPresent) {
     return (
-      <div className={`${wide ? "w-full" : "w-48"} flex items-start gap-1`}>
-        <div className="flex-1">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px]">
           {has7d ? (
             <UsageBar
               label={longWindowLabel}

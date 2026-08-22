@@ -546,7 +546,14 @@ func TestPromptRiskProfileAggregationStaysBoundedWithManyClearedEvents(t *testin
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// 性能界限门:30k 事件的聚合必须在 2s 内完成。-race 构建的开销是
+	// 5-20 倍(CI 的 2 核 runner 上实测超过 40s 也跑不完 2s 门),竞争
+	// 检测跑的是正确性不是性能,按倍率放宽。
+	deadline := 2 * time.Second
+	if raceDetectorEnabled {
+		deadline = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 	profiles, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{
 		Page: 1, PageSize: 20, SubjectType: PromptRiskSubjectNewAPIUser,

@@ -1491,6 +1491,7 @@ type accountResponse struct {
 	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
+	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -1512,6 +1513,7 @@ type accountResponse struct {
 	Usage7dDetail                 *accountUsageWindow         `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                     string                      `json:"reset_5h_at,omitempty"`
 	Reset7dAt                     string                      `json:"reset_7d_at,omitempty"`
+	ResetSparkAt                  string                      `json:"reset_spark_at,omitempty"`
 	Window7dKind                  string                      `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
 	Window7dSeconds               *int64                      `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
 	Billed5h                      *float64                    `json:"billed_5h"`
@@ -5450,11 +5452,17 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 	if pct, ok := account.GetUsagePercent7d(); ok {
 		resp["usage_percent_7d"] = pct
 	}
+	if pct, ok := account.GetUsagePercentSpark(); ok {
+		resp["usage_percent_spark"] = pct
+	}
 	if t := account.GetReset5hAt(); !t.IsZero() {
 		resp["reset_5h_at"] = t.Format(time.RFC3339)
 	}
 	if t := account.GetReset7dAt(); !t.IsZero() {
 		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetResetSparkAt(); !t.IsZero() {
+		resp["reset_spark_at"] = t.Format(time.RFC3339)
 	}
 	c.JSON(http.StatusOK, resp)
 }

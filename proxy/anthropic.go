@@ -1012,7 +1012,9 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.output_item.done":
 		return t.handleOutputItemDone(eventData)
 
-	case "response.completed":
+	// response.incomplete 是 max_output_tokens 截断的正常终态，走同一条收尾：
+	// handleCompleted 已按 response.status/incomplete_details 推导 stop_reason。
+	case "response.completed", "response.incomplete":
 		return t.handleCompleted(eventData)
 
 	case "response.failed":
