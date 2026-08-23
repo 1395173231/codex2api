@@ -131,7 +131,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok";
+type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -182,6 +182,33 @@ const DEFAULT_GROK_MODEL_OPTIONS = [
   "grok-3",
   "grok-2",
 ];
+
+const DEFAULT_ANTIGRAVITY_MODEL_OPTIONS = [
+  "gemini-3-pro-preview",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+];
+
+function accountGroupsForUpstreamChannel(
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): AccountGroup[] {
+  return channel === "auto"
+    ? groups
+    : groups.filter((group) => group.channel === channel);
+}
+
+function compatibleGroupIdsForUpstreamChannel(
+  ids: number[],
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): number[] {
+  if (channel === "auto") return ids;
+  const compatibleIds = new Set(
+    accountGroupsForUpstreamChannel(groups, channel).map((group) => group.id),
+  );
+  return ids.filter((id) => compatibleIds.has(id));
+}
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -295,6 +322,7 @@ export default function APIKeys() {
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
         grok_models?: string[];
+        antigravity_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
     ]);
@@ -303,6 +331,7 @@ export default function APIKeys() {
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
       grokModelOptions: modelsResponse.grok_models ?? [],
+      antigravityModelOptions: modelsResponse.antigravity_models ?? [],
       settings: settingsResponse,
     };
   }, []);
@@ -312,6 +341,7 @@ export default function APIKeys() {
     groups: AccountGroup[];
     modelOptions: string[];
     grokModelOptions: string[];
+    antigravityModelOptions: string[];
     settings: SystemSettings | null;
   }>({
     initialData: {
@@ -319,6 +349,7 @@ export default function APIKeys() {
       groups: [],
       modelOptions: [],
       grokModelOptions: [],
+      antigravityModelOptions: [],
       settings: null,
     },
     load: loadKeys,
@@ -355,17 +386,42 @@ export default function APIKeys() {
     data.grokModelOptions.length > 0
       ? data.grokModelOptions
       : DEFAULT_GROK_MODEL_OPTIONS;
+  const antigravityModelOptions =
+    data.antigravityModelOptions.length > 0
+      ? data.antigravityModelOptions
+      : DEFAULT_ANTIGRAVITY_MODEL_OPTIONS;
   const modelOptionsForChannel = useCallback(
     (channel: UpstreamChannel): string[] => {
       if (channel === "grok") return grokModelOptions;
+      if (channel === "antigravity") return antigravityModelOptions;
       if (channel === "codex") return modelOptions;
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
-      return [
-        ...modelOptions,
-        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
-      ];
+      const merged = [...modelOptions];
+      for (const candidate of [...grokModelOptions, ...antigravityModelOptions]) {
+        if (!seen.has(candidate.toLowerCase())) {
+          seen.add(candidate.toLowerCase());
+          merged.push(candidate);
+        }
+      }
+      return merged;
     },
-    [modelOptions, grokModelOptions],
+    [modelOptions, grokModelOptions, antigravityModelOptions],
+  );
+  const createSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        createForm.limits.upstreamChannel,
+      ),
+    [createForm.limits.upstreamChannel, groups],
+  );
+  const editSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        editForm.limits.upstreamChannel,
+      ),
+    [editForm.limits.upstreamChannel, groups],
   );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
   const publicImageStudioPageEnabled =
@@ -515,6 +571,25 @@ export default function APIKeys() {
 
   const updateCreateForm = (patch: Partial<CreateKeyFormState>) => {
     setCreateForm((current) => ({ ...current, ...patch }));
+  };
+
+  const updateCreateUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setCreateForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
   };
 
   const closeCreateDialog = () => {
@@ -858,6 +933,7 @@ export default function APIKeys() {
   };
 
   const startEditing = (keyRow: APIKeyRow) => {
+    const limits = limitsFromAPIKey(keyRow.limits);
     setEditingKey(keyRow);
     setScopeUsage([]);
     if ((keyRow.limits?.scope_limits?.length ?? 0) > 0) {
@@ -871,8 +947,19 @@ export default function APIKeys() {
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
-      allowedGroupIds: keyRow.allowed_group_ids ?? [],
-      limits: limitsFromAPIKey(keyRow.limits),
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        keyRow.allowed_group_ids ?? [],
+        groups,
+        limits.upstreamChannel,
+      ),
+      limits: {
+        ...limits,
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          limits.noAffinityGroupIds,
+          groups,
+          limits.upstreamChannel,
+        ),
+      },
     });
     setEditDirty(false);
     setEditTab("basic");
@@ -924,6 +1011,26 @@ export default function APIKeys() {
 
   const updateEditForm = (patch: Partial<EditKeyFormState>) => {
     setEditForm((current) => ({ ...current, ...patch }));
+    setEditDirty(true);
+  };
+
+  const updateEditUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setEditForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
     setEditDirty(true);
   };
 
@@ -1993,14 +2100,7 @@ export default function APIKeys() {
             >
               <UpstreamChannelPicker
                 value={createForm.limits.upstreamChannel}
-                onChange={(upstreamChannel) =>
-                  updateCreateForm({
-                    limits: applyUpstreamChannel(
-                      createForm.limits,
-                      upstreamChannel,
-                    ),
-                  })
-                }
+                onChange={updateCreateUpstreamChannel}
               />
             </FormField>
             {createForm.limits.upstreamChannel === "codex" ? (
@@ -2064,7 +2164,7 @@ export default function APIKeys() {
               as="div"
             >
               <GroupMultiSelect
-                groups={groups}
+                groups={createSelectableGroups}
                 value={createForm.allowedGroupIds}
                 onChange={(allowedGroupIds) =>
                   updateCreateForm({ allowedGroupIds })
@@ -2185,14 +2285,7 @@ export default function APIKeys() {
                   >
                     <UpstreamChannelPicker
                       value={editForm.limits.upstreamChannel}
-                      onChange={(upstreamChannel) =>
-                        updateEditForm({
-                          limits: applyUpstreamChannel(
-                            editForm.limits,
-                            upstreamChannel,
-                          ),
-                        })
-                      }
+                      onChange={updateEditUpstreamChannel}
                     />
                   </FormField>
                   {editForm.limits.upstreamChannel === "codex" ? (
@@ -2249,7 +2342,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.allowedGroupIds}
                       onChange={(allowedGroupIds) =>
                         updateEditForm({ allowedGroupIds })
@@ -2269,7 +2362,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.limits.noAffinityGroupIds}
                       onChange={(noAffinityGroupIds) =>
                         updateEditForm({
@@ -2470,7 +2563,9 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     allowLive: Boolean(limits.allow_live),
     upstreamChannel:
-      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+      limits.upstream_channel === "codex" ||
+      limits.upstream_channel === "grok" ||
+      limits.upstream_channel === "antigravity"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2525,7 +2620,7 @@ function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
   ].some((value) => Number(value.trim()) > 0);
 }
 
-// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道选择。
 // 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
 function UpstreamChannelPicker({
   value,
@@ -2555,10 +2650,15 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelGrok"),
       icon: <ChannelLogo channel="grok" size={18} />,
     },
+    {
+      key: "antigravity",
+      label: t("apiKeys.limits.upstreamChannelAntigravity"),
+      icon: <ChannelLogo channel="antigravity" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-4 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -2899,6 +2999,18 @@ function KeyChannelBadge({
       >
         <ChannelLogo channel="grok" size={12} />
         Grok
+      </Badge>
+    );
+  }
+  if (channel === "antigravity") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelAntigravity")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="antigravity" size={12} />
+        Antigravity
       </Badge>
     );
   }

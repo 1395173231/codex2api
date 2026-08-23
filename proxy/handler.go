@@ -319,6 +319,9 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
+		if account.IsAntigravityAPI() {
+			return false
+		}
 		if account.IsRelayStyle() {
 			return false
 		}
@@ -344,19 +347,26 @@ func requestUpstreamChannel(c *gin.Context) string {
 	return row.Limits.ResolveUpstreamChannel()
 }
 
-// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
-// grok 渠道换成 Grok 专属过滤（账号未声明模型时按可见目录或保守默认集准入）；
-// codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
+// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定收窄既有过滤器。
+// 保留既有端点能力约束很重要：compact / Messages / Chat 等路径可能显式排除
+// 某类账号，渠道选择不能把这些硬门覆盖掉。
 func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	combine := func(channelFilter auth.AccountFilter) auth.AccountFilter {
+		return func(account *auth.Account) bool {
+			return channelFilter(account) && (filter == nil || filter(account))
+		}
+	}
 	switch requestUpstreamChannel(c) {
 	case database.UpstreamChannelGrok:
-		return grokChannelAccountFilter(effectiveModel)
+		return combine(grokChannelAccountFilter(effectiveModel))
+	case database.UpstreamChannelAntigravity:
+		return combine(antigravityChannelAccountFilter(effectiveModel))
 	case database.UpstreamChannelCodex:
 		return func(account *auth.Account) bool {
-			if account == nil || account.IsGrokAPI() {
+			if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() {
 				return false
 			}
-			return filter(account)
+			return filter == nil || filter(account)
 		}
 	}
 	return filter
@@ -381,6 +391,23 @@ func grokChannelAccountFilter(model string) auth.AccountFilter {
 	}
 }
 
+func antigravityChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsAntigravityAPI() || !account.AntigravityDispatchEnabled() {
+			return false
+		}
+		wireModel, supported := antigravityResolvePublicModelForAccount(account, model)
+		if !supported {
+			return false
+		}
+		if account.IsModelRateLimited(model) || account.IsModelRateLimited(wireModel) {
+			return false
+		}
+		return true
+	}
+}
+
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
 	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
 }
@@ -395,8 +422,9 @@ func accountFilterForCompactResponsesModelWithOriginal(originalModel string, eff
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	})
 	return func(account *auth.Account) bool {
-		// Grok 上游没有 /responses/compact 端点，compact 请求不路由到 Grok 账号
-		if account.IsGrokAPI() {
+		// Grok/Antigravity 上游都没有 Responses compact 适配器。尤其不能让
+		// Antigravity Google bearer 落入官方 Codex executor。
+		if account.IsGrokAPI() || account.IsAntigravityAPI() {
 			return false
 		}
 		return inner(account)
@@ -416,12 +444,21 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
+		if account.IsAntigravityAPI() {
+			if !account.AntigravityDispatchEnabled() {
+				return false
+			}
+			wireModel, supported := antigravityResolvePublicModelForAccount(account, effectiveModel)
+			return supported && !account.IsModelRateLimited(effectiveModel) && !account.IsModelRateLimited(wireModel)
+		}
 		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
-			return relayAccountSupportsModel(account, routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
+			supported := relayAccountSupportsModel(account, routedModel)
+			rateLimited := routedModel != "" && account.IsModelRateLimited(routedModel)
+			return supported && !rateLimited
 		}
 		if !allowCodexAccounts {
 			return false
@@ -438,6 +475,13 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	if account == nil {
 		return false
+	}
+	if account.IsAntigravityAPI() {
+		if !account.AntigravityDispatchEnabled() {
+			return false
+		}
+		_, ok := antigravityResolvePublicModelForAccount(account, model)
+		return ok
 	}
 	if account.IsGrokAPI() {
 		return grokAccountSupportsVisibleModel(account, model)
@@ -485,6 +529,12 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 	}
 	for _, account := range h.store.Accounts() {
 		if account == nil || !account.IsRelayStyle() {
+			continue
+		}
+		if account.IsAntigravityAPI() {
+			if _, ok := antigravityResolvePublicModelForAccount(account, model); ok {
+				return true
+			}
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
@@ -1187,8 +1237,13 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if input.Channel == "" && h.store != nil {
 		input.Channel = database.UpstreamChannelCodex
 		if input.AccountID > 0 {
-			if acc := h.store.FindByID(input.AccountID); acc != nil && acc.IsGrokAPI() {
-				input.Channel = database.UpstreamChannelGrok
+			if acc := h.store.FindByID(input.AccountID); acc != nil {
+				switch {
+				case acc.IsGrokAPI():
+					input.Channel = database.UpstreamChannelGrok
+				case acc.IsAntigravityAPI():
+					input.Channel = database.UpstreamChannelAntigravity
+				}
 			}
 		}
 	}
@@ -1598,6 +1653,15 @@ func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
+func excludeAntigravityAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || account.IsAntigravityAPI() {
+			return false
+		}
+		return inner == nil || inner(account)
+	}
+}
+
 func responseCachePreparationFailure(prepared responsesBodyPreparation) (status int, reason string, unavailable bool) {
 	if prepared.PreviousResponseID == "" || prepared.Bypassed || prepared.CacheLookup.Kind == responseCacheLookupHit {
 		return 0, "", false
@@ -1755,6 +1819,30 @@ func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsoc
 
 func classifyTransportFailure(err error) string {
 	if err == nil {
+		return ""
+	}
+
+	// Structured proxy errors already carry their retry semantics. Treating
+	// every non-nil error as a transport failure turns deterministic adapter
+	// errors (for example an invalid Responses feature) into account failures,
+	// retries them against the whole pool, and can leave the caller with a
+	// misleading "no available account" 503. Only unwrap errors that actually
+	// describe an upstream transport failure; ordinary structured 4xx errors
+	// are not transport incidents.
+	var apiErr *Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case ErrorCodeUpstreamTimeout:
+			return "timeout"
+		case ErrorCodeUpstreamStreamBreak:
+			return "transport"
+		}
+		if !apiErr.Retryable || (apiErr.HTTPStatus >= 400 && apiErr.HTTPStatus < 500) {
+			return ""
+		}
+		if apiErr.Cause != nil {
+			return classifyTransportFailure(apiErr.Cause)
+		}
 		return ""
 	}
 
@@ -2843,9 +2931,17 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	upstreamChannel := requestUpstreamChannel(c)
 	var requestModel, mappedModel string
 	var mappingApplied bool
-	if nativeRemoteCompactionV2 {
+	if upstreamChannel == database.UpstreamChannelAntigravity {
+		// Antigravity is a native, fixed public surface. Do not let global Codex
+		// aliases or synthesized reasoning aliases rewrite an Antigravity-only
+		// request before validation; the adapter performs the sole public->wire
+		// translation after an account proves it owns the required backing model.
+		requestModel = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+		mappedModel = requestModel
+	} else if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -2856,8 +2952,14 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
-		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+	switch upstreamChannel {
+	case database.UpstreamChannelGrok:
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单。
+	case database.UpstreamChannelAntigravity:
+		// Antigravity 专用 Key 公开稳定的逻辑模型，同时继续接受旧的固定
+		// effort 别名；raw backing 与 account model_mapping 不是下游模型名。
+		rules["model"] = append(rules["model"], api.ModelValidator(antigravityAcceptedModelIDs()))
+	default:
 		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	}
 	result := validator.ValidateRequest(rules)
@@ -2987,9 +3089,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	var lastRetryAfter string
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	antigravityRefreshRetried := map[int64]bool{}
 	relayContinuationAttempted := false
 	overflowCompactRetried := false
 	overflowCompactEnabled := autoCompactOverflowEnabled(c)
@@ -3022,7 +3126,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 		if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+			if lastStatusCode > 0 && len(lastBody) > 0 {
+				if lastRetryAfter != "" {
+					c.Header("Retry-After", lastRetryAfter)
+				}
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
@@ -3113,10 +3220,21 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			upstreamEndpoint := relayUpstreamEndpointForProtocol(account, GrokProtocolResponses, attemptEffectiveModel)
 			upstreamBody := getOpenAIResponsesBody()
+			if account.IsAntigravityAPI() {
+				// Antigravity has no upstream previous_response_id store. Use the
+				// owner-scoped, locally expanded body so a later function_call_output
+				// still carries the matching function_call/name history.
+				upstreamBody = codexBody
+			}
 			var mappedBody []byte
 			var mappedModel string
 			var accountMappingApplied bool
-			if nativeRemoteCompactionV2 {
+			if account.IsAntigravityAPI() {
+				// Antigravity exposes only native public model IDs. Account-level
+				// OpenAI aliases are deliberately ignored so the adapter receives
+				// the public ID once and performs the single public->wire mapping.
+				mappedBody = upstreamBody
+			} else if nativeRemoteCompactionV2 {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
 			} else {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
@@ -3126,7 +3244,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			var resp *http.Response
+			var reqErr error
+			if account.IsAntigravityAPI() {
+				resp, reqErr = ExecuteAntigravityResponsesRequest(upstreamCtx, account, attemptEffectiveModel, upstreamBody, isStream, proxyURL)
+				if reqErr != nil {
+					log.Printf("[antigravity] forwarding failed account=%d: %v", account.ID(), reqErr)
+				}
+				upstreamEndpoint = "/v1internal:" + map[bool]string{true: "streamGenerateContent", false: "generateContent"}[isStream]
+			} else {
+				resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			}
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -3159,7 +3287,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 					continue
 				}
-				if !timedOut && !stickyRetry {
+				if retryable && !timedOut && !stickyRetry {
 					retryExclusions.MarkHard(account.ID())
 				}
 
@@ -3190,8 +3318,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				if wsHTTPFallback.ForceHTTP() {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 				}
+				retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				antigravityRefreshFailed := false
+				if resp.StatusCode == http.StatusUnauthorized && account.IsAntigravityAPI() && account.AntigravityAuthKind() == auth.AntigravityAuthKindOAuth && !antigravityRefreshRetried[account.ID()] {
+					antigravityRefreshRetried[account.ID()] = true
+					if refreshErr := h.store.RefreshAntigravityAccount(c.Request.Context(), account); refreshErr == nil {
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						log.Printf("Antigravity OAuth token refreshed after upstream 401 (account=%d)", account.ID())
+						continue
+					} else {
+						antigravityRefreshFailed = true
+						log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d): %v", account.ID(), refreshErr)
+					}
+				}
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -3213,7 +3355,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -3255,12 +3397,16 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					lastRetryAfter = retryAfter
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
 					continue
 				}
 
+				if retryAfter != "" {
+					c.Header("Retry-After", retryAfter)
+				}
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
@@ -3697,6 +3843,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
+			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			accountReleasedForOverflow := false
@@ -3783,12 +3930,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastRetryAfter = retryAfter
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
 				continue
 			}
 
+			if retryAfter != "" {
+				c.Header("Retry-After", retryAfter)
+			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
@@ -5132,6 +5283,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = excludeAntigravityAccountsFilter(accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -6292,6 +6444,15 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	if account.IsGrokAPI() {
 		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
 	}
+	// Antigravity 401 is recovered by RefreshAntigravityAccount. Do not apply
+	// Codex subscription/payment semantics, but retain relay-style model
+	// cooldowns for real 429s so repeated requests cannot hammer Google.
+	if account.IsAntigravityAPI() {
+		if statusCode == http.StatusTooManyRequests {
+			return Apply429Cooldown(h.store, account, body, resp, model)
+		}
+		return codex429Decision{}
+	}
 	if IsUsageLimitReachedError(body) {
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
@@ -6635,6 +6796,27 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 	})
 }
 
+func normalizedRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	digits := true
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			digits = false
+			break
+		}
+	}
+	if digits {
+		return value
+	}
+	if _, err := http.ParseTime(value); err == nil {
+		return value
+	}
+	return ""
+}
+
 // sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
 func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
 	if details, ok := parseUsageLimitDetails(body); ok {
@@ -6728,7 +6910,8 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 
 // ListModels 列出可用模型
 // listModelsOrManifest 按客户端形态分发模型列表：带 client_version 查询参数的是
-// Codex 客户端在刷新模型选单（期望 manifest 格式，解析失败会静默冻结在本地缓存），
+// Codex 客户端在刷新模型选单（期望 manifest 格式，解析失败会静默冻结在本地缓存）。
+// Antigravity 渠道或没有 ChatGPT 账号时，把 Cockpit 同一份目录改写成 manifest。
 // 其余客户端返回 OpenAI 兼容列表。
 func (h *Handler) listModelsOrManifest(c *gin.Context) {
 	if strings.TrimSpace(c.Query("client_version")) != "" {
@@ -6773,6 +6956,12 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 	if h != nil && h.store != nil {
 		for _, account := range h.store.Accounts() {
 			declared := account.OpenAIResponsesModels()
+			if account.IsAntigravityAPI() {
+				if !account.AntigravityDispatchEnabled() {
+					continue
+				}
+				declared = antigravityPublicModelsForAccount(account)
+			}
 			// 未声明 models 白名单的 Grok 账号：补默认 Grok 模型集，让 grok-4.5 等
 			// 出现在 /v1/models（否则下游客户端拉不到可用的 Grok 模型名）。
 			if len(declared) == 0 && account.IsGrokAPI() {
@@ -6793,7 +6982,11 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				seen[key] = struct{}{}
 				models = append(models, model)
 			}
-			for _, alias := range accountModelMappingAliases(account) {
+			aliases := accountModelMappingAliases(account)
+			if account.IsAntigravityAPI() {
+				aliases = nil
+			}
+			for _, alias := range aliases {
 				key := strings.ToLower(strings.TrimSpace(alias))
 				if key == "" {
 					continue

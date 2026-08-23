@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Antigravity becomes a dedicated Google upstream channel with OAuth account management, browser authorization, credential import, scheduling, scoped models, API-key channel restrictions, usage attribution, and an account UI.** OAuth traffic uses the Cloud Code `v1internal` adapter and can refresh once after an upstream 401. Antigravity account groups and model backing remain isolated from Codex and Grok.
+- **Google API Key accounts can declare Gemini models and model mappings and target the Generative Language `v1beta/interactions` endpoint.** This path is explicitly experimental: local tests cover endpoint/header/body construction, but the complete Google request, SSE/JSON response, tool-call, usage, and error wire contract still requires authoritative real-upstream verification.
+- **Antigravity gains dedicated admin credential export and a sanitized management plane.** One account downloads as secret-bearing JSON and multiple accounts as a sanitized-member ZIP; state reads are side-effect free, OAuth sync refreshes Google control-plane snapshots, API-key sync remains explicitly local/unverified, and bounded capability probes persist generation-fenced protocol observations.
+- **An opt-in real Google Interactions integration test now exercises the production executor.** It is gated by `ANTIGRAVITY_INTERACTIONS_TEST_API_KEY`, supports safe model/input/SSE controls, validates native status/content types and bounded envelopes, and skips explicitly when no key is supplied. Production certification still requires a successful real run.
+
+### Fixes
+
+- **Antigravity API Key accounts no longer enter OAuth unauthorized-refresh recovery, and API Key rotation rejects a duplicate credential family.** Account responses expose only the credential kind and never return the key itself.
+- **The OAuth Responses-to-Gemini converter rejects empty unsupported input, converts OpenAI function declarations into Gemini `functionDeclarations`, and rejects unsupported tool types instead of forwarding malformed objects.**
+
+### Security
+
+- **Antigravity documentation now calls out plaintext API Key persistence, database/admin protection requirements, Google terms and suspension risk, preview pricing uncertainty, and the experimental Interactions contract.**
+- **Antigravity credential downloads are admin-authenticated attachment responses with no-store/no-cache and nosniff headers.** Filenames and ZIP members are sanitized, while ordinary list/state responses remain secret-free.
+
 ## v2.8.3 - 2026-08-21
 
 ### Features

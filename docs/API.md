@@ -753,6 +753,54 @@ Grok 账号编辑页支持账号级模型映射，可让只请求 GPT 模型名�
 }
 ```
 
+### Antigravity credential and state administration
+
+Every endpoint in this section is registered under the existing `/api/admin` authentication middleware and requires the configured admin secret.
+
+#### GET /api/admin/accounts/antigravity/export
+
+Downloads active Antigravity credentials. Optional `ids=1,2` selects accounts; omitting it exports all active Antigravity accounts. A single match returns `application/json; charset=utf-8`; multiple matches return `application/zip`, one sanitized-name JSON member per account. Responses set `Content-Disposition: attachment`, `X-Export-Count` to the actual number of exported credentials, `Cache-Control: no-store, max-age=0`, `Pragma: no-cache`, and `X-Content-Type-Options: nosniff`. No match (including a wrong-channel-only selection) returns `404`.
+
+The response is intentionally secret-bearing and is accepted by the Antigravity batch importer for backup restoration. OAuth JSON includes usable access/refresh/ID tokens and OAuth client metadata. API-key JSON explicitly includes `auth_kind: "api_key"`, `api_key`, declared models, model mapping, and the exported enabled state. Never log, cache, or expose this download to non-admin callers.
+
+#### GET /api/admin/accounts/:id/antigravity/state
+
+Returns persisted sanitized state without an upstream call:
+
+```json
+{
+  "account_id": 42,
+  "credential_generation": 3,
+  "credential_kind": "api_key",
+  "catalog": {
+    "models": ["gemini-2.5-flash"],
+    "source": "declared",
+    "verified": false,
+    "synchronized": true
+  },
+  "identity": {
+    "status": "not_applicable",
+    "email_verified": false,
+    "subject_known": false,
+    "project_status": "not_applicable"
+  },
+  "capabilities": [],
+  "warnings": ["API-key catalog is local and unverified; run an explicit capability probe before claiming Interactions compatibility"]
+}
+```
+
+OAuth state can additionally include sanitized `permissions`, `quota`, project status/ID, synchronization timestamps, and explicit capability observations. Tokens, client secrets, and API keys are never returned.
+
+#### POST /api/admin/accounts/:id/antigravity/sync
+
+OAuth accounts refresh/synchronize the read-only Google identity, project, entitlement, quota, and model control plane. API-key accounts perform no remote catalog/control-plane verification; the response uses `remote: false`, `verified: false`, and `catalog_source: "declared"` or `"default"`.
+
+#### POST /api/admin/accounts/:id/antigravity/capabilities/probe
+
+Explicitly performs one bounded non-stream generation request against the first configured/default model and persists the result under the current credential generation. This action consumes minimal generation quota and never runs during ordinary state reads or sync. API-key Interactions compatibility is `verified: true` only after a successful HTTP response with a valid JSON content type/envelope. Error responses return a sanitized observation/warning without tokens or keys.
+
+Wrong-channel accounts return `400`; missing accounts return `404`; a concurrent credential generation change returns `409`.
+
 #### POST /api/admin/accounts
 
 添加 Refresh Token 账号（支持批量）。

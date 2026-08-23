@@ -509,6 +509,12 @@ func resolveUpstreamSessionID(apiKeyID int64, upstreamSeed, explicitSessionID st
 // useWebsocket 可选：未传时遵循全局强制 WS；传 true/false 时由调用方显式控制。
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+	// Defense in depth: this executor sends account.AccessToken to ChatGPT.
+	// Relay/Grok/Antigravity credentials must never cross that provider boundary,
+	// even if a future routing regression selects the wrong account type.
+	if account == nil || account.IsRelayStyle() {
+		return nil, ErrNoAvailableAccount()
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -881,6 +887,9 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 
 // ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
 func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	if account == nil || account.IsRelayStyle() {
+		return nil, ErrNoAvailableAccount()
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

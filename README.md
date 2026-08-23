@@ -186,12 +186,17 @@ Notes:
 
 ---
 
+## Antigravity channel (experimental API Key path)
+
+Antigravity accounts are managed as a dedicated Google channel with browser/imported OAuth credentials and an optional Google API Key credential shape. Admin tooling includes secret-bearing JSON/ZIP credential export plus sanitized state, explicit control-plane sync, and bounded capability probing. OAuth requests use the Cloud Code `v1internal` adapter. API Key requests target the Generative Language `v1beta/interactions` endpoint, but ordinary API-key dispatch is fail-closed by default and requires `ANTIGRAVITY_ENABLE_EXPERIMENTAL_INTERACTIONS=true`. The opt-in real-upstream integration test has not succeeded in this environment, so this path remains experimental rather than production-certified. See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) for endpoints, test instructions, models, channel restrictions, plaintext credential-storage risk, and the certification checklist.
+
 ## Documentation
 
 | Document | Description | Path |
 | --- | --- | --- |
 | [Chinese README](README.zh-CN.md) | Main Chinese project overview | `README.zh-CN.md` |
 | [API Documentation](docs/API.md) | API endpoints, request and response examples, error codes | `docs/API.md` |
+| [Antigravity Integration](docs/ANTIGRAVITY.md) | Google OAuth and experimental API Key channel, models, risks, and protocol status | `docs/ANTIGRAVITY.md` |
 | [Deployment Guide](docs/DEPLOYMENT.md) | Deployment modes, upgrade guide, backup and restore | `docs/DEPLOYMENT.md` |
 | [Configuration Guide](docs/CONFIGURATION.md) | Environment variables, system settings, configuration priority | `docs/CONFIGURATION.md` |
 | [Architecture](docs/ARCHITECTURE.md) | System architecture, scheduling algorithm, storage design | `docs/ARCHITECTURE.md` |

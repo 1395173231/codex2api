@@ -11,6 +11,7 @@ import ModelLogo from "../components/ModelLogo";
 import OperationResultsModal from "../components/OperationResultsModal";
 import { cn } from "@/lib/utils";
 import GrokAccounts from "./GrokAccounts";
+import AntigravityAccounts from "./AntigravityAccounts";
 import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import PageHeader from "../components/PageHeader";
 import { CompactStat } from "../components/CompactStat";
@@ -47,6 +48,7 @@ import type {
   AccountOperationSelector,
   AccountPageStatsItem,
   AccountLiveStateResponse,
+  UpstreamChannel,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -312,7 +314,7 @@ type AccountGroupDraft = {
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
   proxyURLsInput: string;
-  channel: "codex" | "grok";
+  channel: UpstreamChannel;
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -1530,8 +1532,7 @@ export default function Accounts() {
   const { t, i18n } = useTranslation();
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
-  // providerView 决定账号管理页顶部展示哪一套上游：codex(现有页) 或 grok(独立黑白视图)。
-  // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
+  // providerView 由路由驱动，刷新浏览器后停留在当前上游视图。
   const location = useLocation();
   const navigate = useNavigate();
   // ?groupManager=1 深链直接打开分组管理器(Grok 页的「管理分组」跳转入口,issue #487)。
@@ -1549,12 +1550,20 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.search]);
   const normalizedPath = location.pathname.replace(/\/+$/, "");
-  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
+  const providerView: UpstreamChannel = normalizedPath.endsWith("/accounts/grok")
     ? "grok"
-    : "codex";
+    : normalizedPath.endsWith("/accounts/antigravity")
+      ? "antigravity"
+      : "codex";
   const setProviderView = useCallback(
-    (view: "codex" | "grok") => {
-      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    (view: UpstreamChannel) => {
+      navigate(
+        view === "grok"
+          ? "/accounts/grok"
+          : view === "antigravity"
+            ? "/accounts/antigravity"
+            : "/accounts",
+      );
     },
     [navigate],
   );
@@ -1867,7 +1876,7 @@ export default function Accounts() {
   // 分组按渠道隔离(issue #487):Codex 页的所有分组选择器只出 codex 渠道分组;
   // 管理器仍显示全部渠道(带徽标),徽标解析也用全量以兼容迁移前的跨渠道成员。
   const codexGroups = useMemo(
-    () => allGroups.filter((group) => group.channel !== "grok"),
+    () => allGroups.filter((group) => group.channel === "codex"),
     [allGroups],
   );
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([]);
@@ -5513,7 +5522,7 @@ export default function Accounts() {
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
       proxyURLsInput: (group.proxy_urls ?? []).join("\n"),
-      channel: group.channel === "grok" ? "grok" : "codex",
+      channel: group.channel,
     });
   };
 
@@ -5645,21 +5654,23 @@ export default function Accounts() {
     [],
   );
 
-  // Codex/Grok 顶部段控切换：两套账号视图共用同一切换器（Grok 通过 headerSlot 注入）。
+  // 三个账号视图共用同一切换器（独立页面通过 headerSlot 注入）。
   // 滑块动画 + 品牌 logo，与仪表盘渠道过滤器视觉一致。
-  // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
-  // useMemo 保持引用稳定,否则每轮渲染的新元素会击穿 GrokAccounts 的 memo 边界。
+  // useMemo 保持引用稳定,否则每轮渲染的新元素会击穿独立账号页的 memo 边界。
   const providerSwitcher = useMemo(() => (
-    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+    <div className="relative grid w-full max-w-[480px] grid-cols-3 items-center rounded-lg border border-border bg-muted/40 p-0.5">
       <span
         aria-hidden
-        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
-        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/3)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{
+          transform: `translateX(${providerView === "grok" ? 100 : providerView === "antigravity" ? 200 : 0}%)`,
+        }}
       />
       {(
         [
           ["codex", t("accounts.providerViewCodex")],
           ["grok", t("accounts.providerViewGrok")],
+          ["antigravity", t("accounts.providerViewAntigravity")],
         ] as const
       ).map(([key, label]) => (
         <button
@@ -5668,14 +5679,14 @@ export default function Accounts() {
           onClick={() => setProviderView(key)}
           aria-pressed={providerView === key}
           className={cn(
-            "relative z-10 inline-flex items-center justify-center gap-2 rounded-md px-5 py-2 text-base font-semibold transition-all duration-200 active:scale-[0.97]",
+            "relative z-10 inline-flex min-w-0 items-center justify-center gap-1 rounded-md px-1.5 py-2 text-xs font-semibold transition-all duration-200 active:scale-[0.97] sm:gap-2 sm:px-3 sm:text-sm",
             providerView === key
               ? "text-foreground"
               : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
           )}
         >
-          <ChannelLogo channel={key} size={20} />
-          {label}
+          <ChannelLogo channel={key} size={18} />
+          <span className="min-w-0 truncate">{label}</span>
         </button>
       ))}
     </div>
@@ -5692,6 +5703,14 @@ export default function Accounts() {
             handleOperationResultsVisibilityChange
           }
         />
+      </div>
+    );
+  }
+
+  if (providerView === "antigravity") {
+    return (
+      <div key="provider-antigravity" className="animate-channel-switch-in">
+        <AntigravityAccounts headerSlot={providerSwitcher} />
       </div>
     );
   }
@@ -10055,13 +10074,20 @@ export default function Accounts() {
                                 {group.name}
                               </span>
                               <span
-                                className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ${
+                                className={`inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ${
                                   group.channel === "grok"
                                     ? "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300"
-                                    : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+                                    : group.channel === "antigravity"
+                                      ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+                                      : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
                                 }`}
                               >
-                                {group.channel === "grok" ? "Grok" : "Codex"}
+                                <ChannelLogo channel={group.channel} size={11} />
+                                {group.channel === "grok"
+                                  ? t("accounts.providerViewGrok")
+                                  : group.channel === "antigravity"
+                                    ? t("accounts.providerViewAntigravity")
+                                    : t("accounts.providerViewCodex")}
                               </span>
                               <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
                                 {t("accounts.groupMembers")}{" "}
@@ -10155,12 +10181,12 @@ export default function Accounts() {
                       return (
                         <>
                           <div className="flex gap-2">
-                            {(["codex", "grok"] as const).map((channel) => (
+                            {(["codex", "grok", "antigravity"] as const).map((channel) => (
                               <button
                                 key={channel}
                                 type="button"
                                 disabled={channelLocked}
-                                className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                                   groupDraft.channel === channel
                                     ? "border-primary bg-primary/10 text-primary"
                                     : "border-border text-muted-foreground hover:bg-muted/50"
@@ -10172,7 +10198,12 @@ export default function Accounts() {
                                   }))
                                 }
                               >
-                                {channel === "grok" ? "Grok" : "Codex"}
+                                <ChannelLogo channel={channel} size={14} />
+                                {channel === "grok"
+                                  ? t("accounts.providerViewGrok")
+                                  : channel === "antigravity"
+                                    ? t("accounts.providerViewAntigravity")
+                                    : t("accounts.providerViewCodex")}
                               </button>
                             ))}
                           </div>

@@ -2,12 +2,15 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,6 +42,141 @@ func TestListModelsOrManifest_DispatchesByClientVersion(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"object":"list"`) && !strings.Contains(rec.Body.String(), `"object": "list"`) {
 		t.Errorf("list body = %s, want OpenAI list shape", rec.Body.String())
+	}
+}
+
+func TestListModelsOrManifestServesAntigravityAsCodexManifest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store.AddAccount(&auth.Account{
+		DBID: 9, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "project-id",
+		Models: []string{"gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high", "claude-sonnet-4-6"},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	row := &database.APIKeyRow{ID: 3, Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelAntigravity}}
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(contextAPIKeyRow, row)
+		c.Next()
+	})
+	router.GET("/v1/models", handler.listModelsOrManifest)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.140.0", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("antigravity Codex manifest status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Models []struct {
+			Slug             string `json:"slug"`
+			PreferWebsockets bool   `json:"prefer_websockets"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("manifest JSON: %v body=%s", err, rec.Body.String())
+	}
+	got := map[string]bool{}
+	for _, model := range payload.Models {
+		got[model.Slug] = true
+		if model.PreferWebsockets {
+			t.Fatalf("slug %s prefer_websockets=true, Antigravity must stay on HTTP", model.Slug)
+		}
+	}
+	if !got["gemini-3.6-flash"] || !got["claude-sonnet-4-6"] || len(got) != 2 {
+		t.Fatalf("manifest slugs = %v, want cockpit Antigravity models", got)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"object":"list"`) {
+		t.Fatalf("cockpit list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "gemini-3.6-flash") || strings.Contains(rec.Body.String(), "gemini-3.6-flash-low") {
+		t.Fatalf("cockpit list has wrong Antigravity surface: %s", rec.Body.String())
+	}
+}
+
+func TestMergeCodexManifestModelsAppendsMissingRelaySlugs(t *testing.T) {
+	merged, err := mergeCodexManifestModels(
+		[]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT"}],"future":true}`),
+		[]api.Model{{ID: "gpt-5.4"}, {ID: "gemini-2.5-flash"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+		Future bool `json:"future"`
+	}
+	if err := json.Unmarshal(merged, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Future || len(payload.Models) != 2 || payload.Models[0].Slug != "gpt-5.4" || payload.Models[1].Slug != "gemini-2.5-flash" {
+		t.Fatalf("merged = %s", merged)
+	}
+}
+
+func TestScopedAntigravityManifestPublishesModelSpecificReasoningLevels(t *testing.T) {
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "gemini-3.7-flash", OwnedBy: "google"},
+		{ID: "gemini-3.6-flash", OwnedBy: "google"},
+		{ID: "gemini-3.5-flash", OwnedBy: "google"},
+		{ID: "gemini-3.1-pro", OwnedBy: "google"},
+		{ID: "claude-sonnet-4-6", OwnedBy: "google"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	levels := map[string][]string{}
+	for _, item := range payload.Models {
+		levels[item.Slug] = item.SupportedReasoningLevels
+	}
+	assertLevels := func(model string, want ...string) {
+		t.Helper()
+		got := levels[model]
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s levels = %v, want %v", model, got, want)
+		}
+	}
+	assertLevels("gemini-3.7-flash", "low", "medium", "high")
+	assertLevels("gemini-3.6-flash", "low", "medium", "high")
+	assertLevels("gemini-3.5-flash", "low", "medium", "high")
+	assertLevels("gemini-3.1-pro", "low", "high")
+	assertLevels("claude-sonnet-4-6")
+	assertLevels("claude-opus-4-6-thinking")
+	assertLevels("gpt-oss-120b-medium")
+}
+
+func TestAntigravityManifestDoesNotInferReasoningFromNonGeminiNames(t *testing.T) {
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "claude-opus-4-6-thinking", OwnedBy: "google"},
+		{ID: "claude-sonnet-4-6", OwnedBy: "google"},
+		{ID: "gpt-oss-120b-medium", OwnedBy: "google"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range payload.Models {
+		if len(model.SupportedReasoningLevels) != 0 {
+			t.Fatalf("%s unexpectedly advertises reasoning levels: %v", model.Slug, model.SupportedReasoningLevels)
+		}
 	}
 }
 
