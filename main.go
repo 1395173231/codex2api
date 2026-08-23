@@ -429,6 +429,7 @@ func main() {
 				// 带 hash 的静态资源不存在时必须返回 404。若回退到 index.html，
 				// 浏览器会把 HTML 当成 JS/CSS 解析并反复触发 chunk load error。
 				if strings.HasPrefix(trimmed, "assets/") {
+					c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 					c.Status(http.StatusNotFound)
 					return
 				}
@@ -436,6 +437,10 @@ func main() {
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
 			c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 			c.Header("Pragma", "no-cache")
+			if c.Query("refresh-assets") == "1" {
+				// 仅清理 HTTP cache，不影响登录态、localStorage 或站点配置。
+				c.Header("Clear-Site-Data", `"cache"`)
+			}
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
 		serveKeyUsageFrontend := func(c *gin.Context) {
