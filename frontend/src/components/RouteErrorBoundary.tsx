@@ -22,6 +22,22 @@ function reloadWithCacheBust() {
   window.location.replace(url.toString())
 }
 
+async function clearRuntimeCachesAndReload() {
+  try {
+    if ('caches' in window) {
+      const cacheNames = await window.caches.keys()
+      await Promise.all(cacheNames.map((cacheName) => window.caches.delete(cacheName)))
+    }
+    if ('serviceWorker' in navigator) {
+      const registrations = await navigator.serviceWorker.getRegistrations()
+      await Promise.all(registrations.map((registration) => registration.unregister()))
+    }
+  } catch {
+    // Cache APIs may be unavailable; the cache-busted navigation is still useful.
+  }
+  reloadWithCacheBust()
+}
+
 function isChunkLoadError(error: unknown): boolean {
   if (!error) return false
   const message = error instanceof Error ? `${error.name} ${error.message}` : String(error)
@@ -43,7 +59,7 @@ export default class RouteErrorBoundary extends Component<Props, State> {
         const lastReload = Number(sessionStorage.getItem(CHUNK_RELOAD_FLAG) || 0)
         if (!lastReload || Date.now() - lastReload > CHUNK_RELOAD_COOLDOWN_MS) {
           sessionStorage.setItem(CHUNK_RELOAD_FLAG, String(Date.now()))
-          reloadWithCacheBust()
+          void clearRuntimeCachesAndReload()
           return
         }
       } catch {
@@ -72,7 +88,7 @@ export default class RouteErrorBoundary extends Component<Props, State> {
     } catch {
       // ignore
     }
-    reloadWithCacheBust()
+    void clearRuntimeCachesAndReload()
   }
 
   render() {
