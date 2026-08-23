@@ -14,6 +14,13 @@ interface State {
 }
 
 const CHUNK_RELOAD_FLAG = 'codex2api:chunk-reloaded'
+const CHUNK_RELOAD_COOLDOWN_MS = 10_000
+
+function reloadWithCacheBust() {
+  const url = new URL(window.location.href)
+  url.searchParams.set('_reload', Date.now().toString())
+  window.location.replace(url.toString())
+}
 
 function isChunkLoadError(error: unknown): boolean {
   if (!error) return false
@@ -33,10 +40,10 @@ export default class RouteErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, info: ErrorInfo) {
     if (isChunkLoadError(error)) {
       try {
-        const reloaded = sessionStorage.getItem(CHUNK_RELOAD_FLAG)
-        if (!reloaded) {
-          sessionStorage.setItem(CHUNK_RELOAD_FLAG, '1')
-          window.location.reload()
+        const lastReload = Number(sessionStorage.getItem(CHUNK_RELOAD_FLAG) || 0)
+        if (!lastReload || Date.now() - lastReload > CHUNK_RELOAD_COOLDOWN_MS) {
+          sessionStorage.setItem(CHUNK_RELOAD_FLAG, String(Date.now()))
+          reloadWithCacheBust()
           return
         }
       } catch {
@@ -50,7 +57,10 @@ export default class RouteErrorBoundary extends Component<Props, State> {
 
   componentDidMount() {
     try {
-      sessionStorage.removeItem(CHUNK_RELOAD_FLAG)
+      const lastReload = Number(sessionStorage.getItem(CHUNK_RELOAD_FLAG) || 0)
+      if (lastReload && Date.now() - lastReload > CHUNK_RELOAD_COOLDOWN_MS) {
+        sessionStorage.removeItem(CHUNK_RELOAD_FLAG)
+      }
     } catch {
       // ignore
     }
@@ -62,7 +72,7 @@ export default class RouteErrorBoundary extends Component<Props, State> {
     } catch {
       // ignore
     }
-    window.location.reload()
+    reloadWithCacheBust()
   }
 
   render() {

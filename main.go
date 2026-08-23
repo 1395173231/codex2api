@@ -417,12 +417,25 @@ func main() {
 					fi, statErr := f.Stat()
 					f.Close()
 					if statErr == nil && !fi.IsDir() {
+						if strings.HasPrefix(trimmed, "assets/") {
+							c.Header("Cache-Control", "public, max-age=31536000, immutable")
+						} else {
+							c.Header("Cache-Control", "no-cache")
+						}
 						c.FileFromFS(fp, httpFS)
 						return
 					}
 				}
+				// 带 hash 的静态资源不存在时必须返回 404。若回退到 index.html，
+				// 浏览器会把 HTML 当成 JS/CSS 解析并反复触发 chunk load error。
+				if strings.HasPrefix(trimmed, "assets/") {
+					c.Status(http.StatusNotFound)
+					return
+				}
 			}
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
+			c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+			c.Header("Pragma", "no-cache")
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
 		serveKeyUsageFrontend := func(c *gin.Context) {
