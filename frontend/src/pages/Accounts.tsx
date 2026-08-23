@@ -267,6 +267,32 @@ function loadAPIAccountBalance(
 const formatMB = (bytes: number): string =>
   `${Math.round(bytes / (1024 * 1024))}MB`;
 
+function AccountConcurrencyBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  const active = Math.max(0, account.active_requests ?? 0);
+  const occupied = Math.max(active, account.occupied_requests ?? active);
+  if (occupied === 0) return null;
+
+  const buffered = occupied - active;
+  const showOccupied = account.session_slot_buffer_enabled === true;
+  const title = showOccupied
+    ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
+    : t("accounts.activeRequestsTooltip", { count: active });
+
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+      title={title}
+    >
+      <span
+        className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+        aria-hidden
+      />
+      {showOccupied ? `${active}/${occupied}` : active}
+    </span>
+  );
+}
+
 // splitFilesIntoBatches 按累计字节大小把文件分批。单个文件即便超过 batchMax
 // 也自成一批(交由后端上限兜底),保证每个文件都被投递。
 function splitFilesIntoBatches(files: File[], batchMax: number): File[][] {
@@ -1348,20 +1374,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                       {account.status !== "overload_paused" && (
                                         <AccountStatusCountdown account={account} />
                                       )}
-                                      {(account.active_requests ?? 0) > 0 && (
-                                        <span
-                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                                          title={t("accounts.activeRequestsTooltip", {
-                                            count: account.active_requests ?? 0,
-                                          })}
-                                        >
-                                          <span
-                                            className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                                            aria-hidden
-                                          />
-                                          {account.active_requests}
-                                        </span>
-                                      )}
+                                      <AccountConcurrencyBadge account={account} />
                                     </div>
                                     <AccountHealthBar
                                       buckets={healthBuckets}
@@ -13341,20 +13354,7 @@ function AccountMobileCard({
                     }
                     errorMessage={account.error_message}
                   />
-                  {(account.active_requests ?? 0) > 0 && (
-                    <span
-                      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                      title={t("accounts.activeRequestsTooltip", {
-                        count: account.active_requests ?? 0,
-                      })}
-                    >
-                      <span
-                        className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                        aria-hidden
-                      />
-                      {account.active_requests}
-                    </span>
-                  )}
+                  <AccountConcurrencyBadge account={account} />
                 </div>
               </div>
             </div>
@@ -13696,20 +13696,9 @@ function AccountMobileCard({
               <AccountHealthBar buckets={healthBuckets} />
             </div>
           )}
-          {(account.active_requests ?? 0) > 0 && (
+          {Math.max(account.active_requests ?? 0, account.occupied_requests ?? 0) > 0 && (
             <div className="mt-1">
-              <span
-                className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                title={t("accounts.activeRequestsTooltip", {
-                  count: account.active_requests ?? 0,
-                })}
-              >
-                <span
-                  className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                  aria-hidden
-                />
-                {account.active_requests}
-              </span>
+              <AccountConcurrencyBadge account={account} />
             </div>
           )}
         </div>
