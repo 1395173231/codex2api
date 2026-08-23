@@ -30,10 +30,6 @@ import { cn } from '@/lib/utils'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
 import type { ModelPricingOverride, OfficialPricingSyncConfig } from '@/types'
-import {
-  buildModelPricingPreview,
-  type PricingPreviewRate,
-} from '../lib/modelPricingPreview'
 
 type Row = {
   model: string
@@ -113,6 +109,25 @@ function getOutputMultiplier(input: number, output: number): string | null {
   if (input <= 0 || output <= 0) return null
   const ratio = output / input
   return `${ratio.toFixed(1).replace(/\.0$/, '')}x`
+}
+
+function pricingExpressionPreview(pricing: ModelPricingOverride): string {
+  const input = formatPriceDisplay(normalizePrice(pricing.input))
+  const cached = formatPriceDisplay(normalizePrice(pricing.cached_input))
+  const output = formatPriceDisplay(normalizePrice(pricing.output))
+  const threshold = Math.max(
+    0,
+    Math.round(normalizePrice(pricing.long_context_threshold_tokens)),
+  )
+  const longInput = normalizePrice(pricing.input_long)
+  const longCached = normalizePrice(pricing.cached_input_long)
+  const longOutput = normalizePrice(pricing.output_long)
+  const standard = `tier("standard", p × ${input} + cr × ${cached} + c × ${output})`
+  if (threshold <= 0 || (longInput <= 0 && longCached <= 0 && longOutput <= 0)) {
+    return standard
+  }
+  const long = `tier("long_context", p × ${formatPriceDisplay(longInput)} + cr × ${formatPriceDisplay(longCached)} + c × ${formatPriceDisplay(longOutput)})`
+  return `len < ${threshold.toLocaleString()} ? ${standard} : ${long}`
 }
 
 const PREFERRED_MODEL_ORDER = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const
@@ -311,106 +326,6 @@ function ContextThresholdField({
       />
       <span className="text-[10px] font-medium text-muted-foreground/70">tokens</span>
     </label>
-  )
-}
-
-function formatPreviewRate(rate: PricingPreviewRate) {
-  return `$${formatPriceDisplay(rate.input)} / $${formatPriceDisplay(rate.cached)} / $${formatPriceDisplay(rate.output)}`
-}
-
-function BillingRulePreview({ pricing }: { pricing: ModelPricingOverride }) {
-  const { t } = useTranslation()
-  const preview = buildModelPricingPreview(pricing)
-  const badge =
-    preview.mode === 'tiered'
-      ? t('settings.pricing.tiered')
-      : t('settings.pricing.singleTier')
-
-  return (
-    <section className='mt-4 rounded-xl border border-border/80 bg-muted/[0.18] p-3.5 sm:p-4'>
-      <div className='flex flex-wrap items-center justify-between gap-2'>
-        <div className='flex items-center gap-2'>
-          <span className='size-1.5 rounded-full bg-primary' aria-hidden />
-          <h5 className='text-[12px] font-semibold text-foreground'>
-            {t('settings.pricing.billingPreview')}
-          </h5>
-          <span className='rounded-full bg-background px-2 py-0.5 text-[10px] font-bold text-muted-foreground ring-1 ring-inset ring-border/70'>
-            {badge}
-          </span>
-        </div>
-        {preview.long ? (
-          <span className='text-[10px] font-medium text-muted-foreground'>
-            {t('settings.pricing.thresholdSummary', {
-              value: preview.threshold.toLocaleString(),
-            })}
-          </span>
-        ) : null}
-      </div>
-
-      <div className='mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4'>
-        <div className='rounded-lg border border-border/70 bg-background/70 px-3 py-2.5'>
-          <div className='text-[10px] font-semibold uppercase tracking-wide text-muted-foreground'>
-            {t('settings.pricing.standardRate')}
-          </div>
-          <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
-            {formatPreviewRate(preview.standard)}
-          </div>
-          <div className='mt-0.5 text-[10px] text-muted-foreground'>
-            in / cached / out · USD/M
-          </div>
-        </div>
-        {preview.long ? (
-          <div className='rounded-lg border border-primary/20 bg-primary/[0.04] px-3 py-2.5'>
-            <div className='text-[10px] font-semibold uppercase tracking-wide text-primary'>
-              {t('settings.pricing.longRate')}
-            </div>
-            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
-              {formatPreviewRate(preview.long)}
-            </div>
-            <div className='mt-0.5 text-[10px] text-muted-foreground'>
-              {t('settings.pricing.fromTokens', {
-                value: preview.threshold.toLocaleString(),
-              })}
-            </div>
-          </div>
-        ) : null}
-        {preview.priority ? (
-          <div className='rounded-lg border border-amber-500/20 bg-amber-500/[0.04] px-3 py-2.5'>
-            <div className='text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300'>
-              {t('settings.pricing.priorityRate')}
-            </div>
-            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
-              {formatPreviewRate(preview.priority)}
-            </div>
-            <div className='mt-0.5 text-[10px] text-muted-foreground'>
-              {t('settings.pricing.priorityHint')}
-            </div>
-          </div>
-        ) : null}
-        {preview.flexMultiplier ? (
-          <div className='rounded-lg border border-sky-500/20 bg-sky-500/[0.04] px-3 py-2.5'>
-            <div className='text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300'>
-              {t('settings.pricing.flexRate')}
-            </div>
-            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
-              ×{preview.flexMultiplier}
-            </div>
-            <div className='mt-0.5 text-[10px] text-muted-foreground'>
-              {t('settings.pricing.flexHint')}
-            </div>
-          </div>
-        ) : null}
-      </div>
-
-      <div className='mt-3 rounded-lg border border-dashed border-border/80 bg-background/55 px-3 py-2.5'>
-        <div className='text-[10px] font-semibold uppercase tracking-wide text-muted-foreground'>
-          {t('settings.pricing.expressionPreview')}
-        </div>
-        <code className='mt-1 block break-all font-mono text-[10px] leading-relaxed text-muted-foreground'>
-          {preview.expression}
-        </code>
-      </div>
-    </section>
   )
 }
 
@@ -1090,8 +1005,6 @@ export default function ModelPricing() {
                         ))}
                       </div>
 
-                      <BillingRulePreview pricing={draft} />
-
                       {/* Advanced rates */}
                       <div className="mt-3">
                         <button
@@ -1164,6 +1077,21 @@ export default function ModelPricing() {
                                 />
                               ) : null}
                             </div>
+                            {r.is_alias ? (
+                              <div className="mt-3 rounded-xl border border-dashed border-violet-500/25 bg-violet-500/[0.04] p-3">
+                                <div className="text-[11px] font-semibold text-violet-700 dark:text-violet-300">
+                                  {t('settings.pricing.expressionPreview')}
+                                </div>
+                                <code className="mt-1.5 block break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                                  {pricingExpressionPreview(draft)}
+                                </code>
+                                <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground/80">
+                                  {t('settings.pricing.aliasHint', {
+                                    model: r.canonical_model,
+                                  })}
+                                </p>
+                              </div>
+                            ) : null}
                           </div>
                         </div>
                       </div>
