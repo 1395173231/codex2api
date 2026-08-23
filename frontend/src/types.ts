@@ -2642,10 +2642,10 @@ export interface ModelPricingOverride {
   input_long?: number
   cached_input_long?: number
   output_long?: number
-	input_long_priority?: number
-	cached_input_long_priority?: number
-	output_long_priority?: number
-	long_context_threshold_tokens?: number
+  input_long_priority?: number
+  cached_input_long_priority?: number
+  output_long_priority?: number
+  long_context_threshold_tokens?: number
 }
 
 export interface OfficialPricingSyncConfig {

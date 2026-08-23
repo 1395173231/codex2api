@@ -74,6 +74,25 @@ func TestModelPricingOverride_ExactCodexAliasPrecedesCanonicalOverride(t *testin
 	}
 }
 
+func TestPricingManagementModelKeyPreservesIndependentAlias(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{model: "codex-auto-review", want: "codex-auto-review"},
+		{model: "CODEX_AUTO_REVIEW", want: "codex-auto-review"},
+		{model: "gpt-5.4", want: "gpt-5.4"},
+		{model: "gpt-5.4-openai-compact", want: "gpt-5.4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := PricingManagementModelKey(tt.model); got != tt.want {
+				t.Fatalf("PricingManagementModelKey(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseModelPricingOverridesJSON(t *testing.T) {
 	m, err := ParseModelPricingOverridesJSON(`{"gpt-5.4":{"source":"custom","input":3,"output":20},"gpt-x":{}}`)
 	if err != nil {

@@ -1193,7 +1193,13 @@ export const api = {
     }>('/codex-cli-version/sync', { method: 'POST' }),
   listModelPricing: () =>
     request<{
-      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      models: Array<{
+        model: string
+        source: string
+        pricing: ModelPricingOverride
+        canonical_model?: string
+        is_alias?: boolean
+      }>
       sync_url: string
       default_sync_url: string
       models_dev_url: string

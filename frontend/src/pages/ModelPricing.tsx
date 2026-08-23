@@ -31,7 +31,13 @@ import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
 import type { ModelPricingOverride, OfficialPricingSyncConfig } from '@/types'
 
-type Row = { model: string; source: string; pricing: ModelPricingOverride }
+type Row = {
+  model: string
+  source: string
+  pricing: ModelPricingOverride
+  canonical_model?: string
+  is_alias?: boolean
+}
 type SourceFilter = 'all' | 'custom' | 'synced' | 'default' | 'unsaved'
 
 type FieldDef = {
@@ -75,6 +81,10 @@ function isDirty(draft: ModelPricingOverride | undefined, saved: ModelPricingOve
   for (const field of ALL_FIELDS) {
     if (normalizePrice(draft?.[field.key]) !== normalizePrice(saved?.[field.key])) return true
   }
+  if (
+    normalizePrice(draft?.long_context_threshold_tokens) !==
+    normalizePrice(saved?.long_context_threshold_tokens)
+  ) return true
   return false
 }
 
@@ -82,6 +92,10 @@ function isAdvancedDirty(draft: ModelPricingOverride | undefined, saved: ModelPr
   for (const field of ADVANCED_FIELDS) {
     if (normalizePrice(draft?.[field.key]) !== normalizePrice(saved?.[field.key])) return true
   }
+  if (
+    normalizePrice(draft?.long_context_threshold_tokens) !==
+    normalizePrice(saved?.long_context_threshold_tokens)
+  ) return true
   return false
 }
 
@@ -95,6 +109,25 @@ function getOutputMultiplier(input: number, output: number): string | null {
   if (input <= 0 || output <= 0) return null
   const ratio = output / input
   return `${ratio.toFixed(1).replace(/\.0$/, '')}x`
+}
+
+function pricingExpressionPreview(pricing: ModelPricingOverride): string {
+  const input = formatPriceDisplay(normalizePrice(pricing.input))
+  const cached = formatPriceDisplay(normalizePrice(pricing.cached_input))
+  const output = formatPriceDisplay(normalizePrice(pricing.output))
+  const threshold = Math.max(
+    0,
+    Math.round(normalizePrice(pricing.long_context_threshold_tokens)),
+  )
+  const longInput = normalizePrice(pricing.input_long)
+  const longCached = normalizePrice(pricing.cached_input_long)
+  const longOutput = normalizePrice(pricing.output_long)
+  const standard = `tier("standard", p × ${input} + cr × ${cached} + c × ${output})`
+  if (threshold <= 0 || (longInput <= 0 && longCached <= 0 && longOutput <= 0)) {
+    return standard
+  }
+  const long = `tier("long_context", p × ${formatPriceDisplay(longInput)} + cr × ${formatPriceDisplay(longCached)} + c × ${formatPriceDisplay(longOutput)})`
+  return `len < ${threshold.toLocaleString()} ? ${standard} : ${long}`
 }
 
 const PREFERRED_MODEL_ORDER = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const
@@ -237,6 +270,61 @@ function PriceField({
         />
       </div>
       <span className="text-[10px] font-medium text-muted-foreground/70">/ 1M tok</span>
+    </label>
+  )
+}
+
+function ContextThresholdField({
+  value,
+  savedValue,
+  changed,
+  onChange,
+  onRevert,
+}: {
+  value: number
+  savedValue: number
+  changed: boolean
+  onChange: (next: string) => void
+  onRevert: () => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <label
+      className={cn(
+        'group relative flex min-w-0 flex-col gap-1.5 rounded-xl border bg-background/80 p-2.5 transition-all sm:p-3',
+        changed
+          ? 'border-amber-500/40 bg-amber-500/5 ring-1 ring-amber-500/30'
+          : 'border-border/80 hover:bg-card',
+        'focus-within:border-primary/40 focus-within:ring-[3px] focus-within:ring-primary/15',
+      )}
+    >
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="truncate text-[11px] font-semibold tracking-wide text-muted-foreground">
+          {t('settings.pricing.contextThreshold')}
+        </span>
+        {changed ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault()
+              onRevert()
+            }}
+            title={t('settings.pricing.revertThreshold', { value: savedValue })}
+            className="flex size-5 items-center justify-center rounded-md text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+          >
+            <Undo2 className="size-3" />
+          </button>
+        ) : null}
+      </div>
+      <input
+        type="number"
+        step={1}
+        min={0}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-7 w-full border-0 bg-transparent font-mono text-[15px] font-semibold tabular-nums text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+      />
+      <span className="text-[10px] font-medium text-muted-foreground/70">tokens</span>
     </label>
   )
 }
@@ -797,6 +885,11 @@ export default function ModelPricing() {
                 const inputVal = normalizePrice(draft.input)
                 const outputVal = normalizePrice(draft.output)
                 const multiplier = getOutputMultiplier(inputVal, outputVal)
+                const hasLongContextPricing =
+                  normalizePrice(draft.long_context_threshold_tokens) > 0 ||
+                  normalizePrice(draft.input_long) > 0 ||
+                  normalizePrice(draft.cached_input_long) > 0 ||
+                  normalizePrice(draft.output_long) > 0
 
                 return (
                   <article
@@ -816,6 +909,13 @@ export default function ModelPricing() {
                               <h4 className="truncate font-mono text-[15px] font-semibold tracking-tight text-foreground sm:text-base">
                                 {r.model}
                               </h4>
+                              {r.is_alias && r.canonical_model ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] font-bold text-violet-700 ring-1 ring-inset ring-violet-500/20 dark:text-violet-300">
+                                  {t('settings.pricing.aliasOf', {
+                                    model: r.canonical_model,
+                                  })}
+                                </span>
+                              ) : null}
                               <span
                                 className={cn(
                                   'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ring-1 ring-inset',
@@ -960,7 +1060,38 @@ export default function ModelPricing() {
                                   onRevert={() => revertField(r.model, field.key)}
                                 />
                               ))}
+                              {hasLongContextPricing ? (
+                                <ContextThresholdField
+                                  value={Math.round(normalizePrice(draft.long_context_threshold_tokens))}
+                                  savedValue={Math.round(normalizePrice(r.pricing.long_context_threshold_tokens))}
+                                  changed={
+                                    normalizePrice(draft.long_context_threshold_tokens) !==
+                                    normalizePrice(r.pricing.long_context_threshold_tokens)
+                                  }
+                                  onChange={(next) =>
+                                    setField(r.model, 'long_context_threshold_tokens', next)
+                                  }
+                                  onRevert={() =>
+                                    revertField(r.model, 'long_context_threshold_tokens')
+                                  }
+                                />
+                              ) : null}
                             </div>
+                            {r.is_alias ? (
+                              <div className="mt-3 rounded-xl border border-dashed border-violet-500/25 bg-violet-500/[0.04] p-3">
+                                <div className="text-[11px] font-semibold text-violet-700 dark:text-violet-300">
+                                  {t('settings.pricing.expressionPreview')}
+                                </div>
+                                <code className="mt-1.5 block break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                                  {pricingExpressionPreview(draft)}
+                                </code>
+                                <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground/80">
+                                  {t('settings.pricing.aliasHint', {
+                                    model: r.canonical_model,
+                                  })}
+                                </p>
+                              </div>
+                            ) : null}
                           </div>
                         </div>
                       </div>
