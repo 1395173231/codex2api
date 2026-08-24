@@ -169,6 +169,53 @@ func TestConversationLockIdentityFallsBackWithoutNewAPISignature(t *testing.T) {
 	}
 }
 
+func TestCodexLocalFallbackSessionHashMatchesAuditAndLockLookup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := promptRequestBody(t, blatantIntentBlockedByLocalRegex)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Session-ID", "codex-local-session-hash")
+	c.Set(contextAPIKeyID, int64(999)) // 未绑定 NewAPI，走 codex-local 降级身份。
+	setIngressRequestBodyIfAbsent(c, body)
+
+	if blocked := handler.inspectPromptFilterOpenAI(c, body, "/v1/responses", "gpt-5.5"); !blocked {
+		t.Fatal("本地规则未拦截测试输入")
+	}
+	identity, ok := promptConversationLockFallbackIdentity(c)
+	if !ok {
+		t.Fatal("无法解析 codex-local 降级身份")
+	}
+	audit := handler.capturePromptFilterAuditContext(c)
+	if audit.NewAPIPolicyStatus != "unbound" {
+		t.Fatalf("audit policy status = %q, want unbound", audit.NewAPIPolicyStatus)
+	}
+	if identity.SessionHash == "" || audit.SessionHash == "" || identity.SessionHash != audit.SessionHash {
+		t.Fatalf("codex-local session hash mismatch: lock=%q audit=%q", identity.SessionHash, audit.SessionHash)
+	}
+	lock, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), audit.SessionHash)
+	if err != nil {
+		t.Fatalf("后台按审计 session_hash 查询不到本地锁: %v", err)
+	}
+	if lock.Platform != promptConversationLockFallbackPlatform || lock.SessionHash != audit.SessionHash {
+		t.Fatalf("stored codex-local lock = %#v", lock)
+	}
+
+	windowOnly, _ := gin.CreateTestContext(httptest.NewRecorder())
+	windowOnly.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	windowOnly.Request.Header.Set("X-Codex-Window-Id", "codex-local-window-only")
+	windowOnly.Set(contextAPIKeyID, int64(999))
+	windowIdentity, ok := promptConversationLockFallbackIdentity(windowOnly)
+	if !ok {
+		t.Fatal("仅有 X-Codex-Window-Id 时无法解析 codex-local 降级身份")
+	}
+	windowAudit := handler.capturePromptFilterAuditContext(windowOnly)
+	if windowIdentity.SessionHash == "" || windowIdentity.SessionHash != windowAudit.SessionHash {
+		t.Fatalf("window-only codex-local session hash mismatch: lock=%q audit=%q", windowIdentity.SessionHash, windowAudit.SessionHash)
+	}
+}
+
 // WebSocket 入口有一份独立的 block 逻辑(inspectPromptFilterOpenAIForWebSocket
 // 不复用 inspectPromptFilterOpenAIWithBlockWriter)。它会检查已有的会话锁,但
 // 必须同样在本地 block 时**建立**锁,否则 Codex 的 WS 会话只需第二条改写请求
