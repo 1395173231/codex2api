@@ -38,8 +38,9 @@ func TestAntigravityModelsForPersistenceExpandsLogicalModelsButKeepsAliasesFixed
 	if !reflect.DeepEqual(aliases, wantAliases) {
 		t.Fatalf("alias persisted models = %v, want %v", aliases, wantAliases)
 	}
-	if published := antigravityPublishedModels(aliases); len(published) != 0 {
-		t.Fatalf("partial alias backings unexpectedly published logical models: %v", published)
+	wantPublished := []string{"gemini-3.5-flash-low", "gemini-3.6-flash-high", "gemini-3.1-pro-high"}
+	if published := antigravityPublishedModels(aliases); !reflect.DeepEqual(published, wantPublished) {
+		t.Fatalf("fixed-tier backings published = %v, want %v", published, wantPublished)
 	}
 }
 
@@ -86,10 +87,10 @@ func TestAntigravityAccountResponseProjectsRawModelsAndQuota(t *testing.T) {
 	t.Cleanup(store.Stop)
 	response := (&Handler{store: store}).buildAccountResponse(row, nil, nil, nil, nil, true)
 	wantModels := []string{
-		"gemini-3.5-flash",
-		"gemini-3.6-flash",
-		"gemini-3.7-flash",
-		"gemini-3.1-pro",
+		"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high",
+		"gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high",
+		"gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high",
+		"gemini-3.1-pro-low", "gemini-3.1-pro-high",
 		"claude-opus-4-6-thinking",
 		"claude-sonnet-4-6",
 		"gpt-oss-120b-medium",
@@ -115,7 +116,7 @@ func TestAntigravityAccountResponseProjectsRawModelsAndQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, raw := range rawModels[:9] {
+	for _, raw := range []string{"gemini-3.5-flash-extra-low", "gemini-3-flash-agent", "gemini-3.7-flash-tiered", "gemini-pro-agent"} {
 		if bytes.Contains(encoded, []byte(raw)) {
 			t.Fatalf("account response leaked raw model %q: %s", raw, encoded)
 		}
@@ -195,7 +196,7 @@ func TestAntigravityAPIKeyAdminModelWritesPersistWireIDs(t *testing.T) {
 	if err := json.Unmarshal(batch.Body.Bytes(), &batchPayload); err != nil {
 		t.Fatal(err)
 	}
-	wantPublished := []string{"gemini-3.7-flash", "claude-sonnet-4-6"}
+	wantPublished := []string{"gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high", "claude-sonnet-4-6"}
 	if !reflect.DeepEqual(batchPayload.Models, wantPublished) {
 		t.Fatalf("batch public models = %v, want %v", batchPayload.Models, wantPublished)
 	}
@@ -225,7 +226,7 @@ func TestFetchAntigravityModelsProjectsWireCatalog(t *testing.T) {
 			t.Fatalf("model selection leaked raw model %q: %s", raw, recorder.Body.String())
 		}
 	}
-	for _, publicID := range []string{"gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-pro", "claude-sonnet-4-6"} {
+	for _, publicID := range []string{"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high", "gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high", "gemini-3.1-pro-low", "gemini-3.1-pro-high", "claude-sonnet-4-6"} {
 		if !strings.Contains(recorder.Body.String(), publicID) {
 			t.Fatalf("model selection missing %q: %s", publicID, recorder.Body.String())
 		}

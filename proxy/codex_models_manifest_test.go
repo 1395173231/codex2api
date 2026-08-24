@@ -84,7 +84,7 @@ func TestListModelsOrManifestServesAntigravityAsCodexManifest(t *testing.T) {
 			t.Fatalf("slug %s prefer_websockets=true, Antigravity must stay on HTTP", model.Slug)
 		}
 	}
-	if !got["gemini-3.6-flash"] || !got["claude-sonnet-4-6"] || len(got) != 2 {
+	if !got["gemini-3.6-flash-low"] || !got["gemini-3.6-flash-medium"] || !got["gemini-3.6-flash-high"] || !got["claude-sonnet-4-6"] || len(got) != 4 {
 		t.Fatalf("manifest slugs = %v, want cockpit Antigravity models", got)
 	}
 
@@ -94,7 +94,7 @@ func TestListModelsOrManifestServesAntigravityAsCodexManifest(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"object":"list"`) {
 		t.Fatalf("cockpit list status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "gemini-3.6-flash") || strings.Contains(rec.Body.String(), "gemini-3.6-flash-low") {
+	if !strings.Contains(rec.Body.String(), "gemini-3.6-flash-low") || strings.Contains(rec.Body.String(), `"id":"gemini-3.6-flash"`) {
 		t.Fatalf("cockpit list has wrong Antigravity surface: %s", rec.Body.String())
 	}
 }
@@ -121,12 +121,12 @@ func TestMergeCodexManifestModelsAppendsMissingRelaySlugs(t *testing.T) {
 	}
 }
 
-func TestScopedAntigravityManifestPublishesModelSpecificReasoningLevels(t *testing.T) {
+func TestScopedAntigravityManifestPublishesFixedTierModelsWithoutReasoningLevels(t *testing.T) {
 	body, err := buildScopedCodexManifest([]api.Model{
-		{ID: "gemini-3.7-flash", OwnedBy: "google"},
-		{ID: "gemini-3.6-flash", OwnedBy: "google"},
-		{ID: "gemini-3.5-flash", OwnedBy: "google"},
-		{ID: "gemini-3.1-pro", OwnedBy: "google"},
+		{ID: "gemini-3.7-flash-high", OwnedBy: "google"},
+		{ID: "gemini-3.6-flash-medium", OwnedBy: "google"},
+		{ID: "gemini-3.5-flash-low", OwnedBy: "google"},
+		{ID: "gemini-3.1-pro-high", OwnedBy: "google"},
 		{ID: "claude-sonnet-4-6", OwnedBy: "google"},
 	})
 	if err != nil {
@@ -138,24 +138,11 @@ func TestScopedAntigravityManifestPublishesModelSpecificReasoningLevels(t *testi
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	levels := map[string][]string{}
 	for _, item := range payload.Models {
-		levels[item.Slug] = item.SupportedReasoningLevels
-	}
-	assertLevels := func(model string, want ...string) {
-		t.Helper()
-		got := levels[model]
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Fatalf("%s levels = %v, want %v", model, got, want)
+		if len(item.SupportedReasoningLevels) != 0 {
+			t.Fatalf("%s unexpectedly advertises reasoning levels: %v", item.Slug, item.SupportedReasoningLevels)
 		}
 	}
-	assertLevels("gemini-3.7-flash", "low", "medium", "high")
-	assertLevels("gemini-3.6-flash", "low", "medium", "high")
-	assertLevels("gemini-3.5-flash", "low", "medium", "high")
-	assertLevels("gemini-3.1-pro", "low", "high")
-	assertLevels("claude-sonnet-4-6")
-	assertLevels("claude-opus-4-6-thinking")
-	assertLevels("gpt-oss-120b-medium")
 }
 
 func TestAntigravityManifestDoesNotInferReasoningFromNonGeminiNames(t *testing.T) {

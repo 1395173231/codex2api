@@ -737,8 +737,12 @@ func antigravityGeminiThinkingBudget(requestedModel, wireModel string, reasoning
 			return 0, false
 		}
 		budget = variant.thinkingBudget
-	} else if alias, ok := antigravityCompatibilityAlias(requestedModel); ok {
-		budget = alias.thinkingBudget
+	} else if logical, ok := antigravityLogicalCompatibilityModel(requestedModel); ok {
+		variant, resolved := antigravityResolvedVariant(logical.id, reasoning)
+		if !resolved {
+			return 0, false
+		}
+		budget = variant.thinkingBudget
 	} else {
 		// Raw backing IDs remain accepted for internal/account mappings, but
 		// only an explicit reasoning request enables a tiered raw model.

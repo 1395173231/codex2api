@@ -220,13 +220,11 @@ func TestScopedModelsIncludeAntigravityAccounts(t *testing.T) {
 	})
 	handler := NewHandler(store, nil, nil, nil)
 	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 7})
-	found := false
+	found := map[string]bool{}
 	for _, model := range models {
-		if model.ID == "gemini-3.7-flash" {
-			found = true
-		}
+		found[model.ID] = true
 	}
-	if !found {
+	if !found["gemini-3.7-flash-low"] || !found["gemini-3.7-flash-medium"] || !found["gemini-3.7-flash-high"] {
 		t.Fatal("projected Antigravity public model missing from /v1/models")
 	}
 }

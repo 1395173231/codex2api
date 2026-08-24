@@ -20,68 +20,61 @@ type antigravityPublicModelDefinition struct {
 	variants              []antigravityReasoningVariant
 }
 
-// antigravityPublicModelCatalog is the stable logical surface advertised to
-// downstream clients. Gemini backing IDs and the former per-effort model names
-// are transport details and compatibility aliases, never catalog entries.
+// antigravityPublicModelCatalog is the exact fixed-tier surface advertised to
+// downstream clients. Codex clients do not consistently render provider-local
+// supported_reasoning_levels metadata, so every real Antigravity tier is a
+// separate public model ID.
 var antigravityPublicModelCatalog = []antigravityPublicModelDefinition{
 	{
-		id:                    "gemini-3.5-flash",
-		reasoningLevels:       []string{"low", "medium", "high"},
-		defaultReasoningLevel: "medium",
-		variants: []antigravityReasoningVariant{
-			{level: "low", wireModel: "gemini-3.5-flash-extra-low", thinkingBudget: 1000},
-			{level: "medium", wireModel: "gemini-3.5-flash-low", thinkingBudget: 4000},
-			{level: "high", wireModel: "gemini-3-flash-agent", thinkingBudget: 10000},
-		},
+		id: "gemini-3.5-flash-low", wireModel: "gemini-3.5-flash-extra-low",
+		variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.5-flash-extra-low", thinkingBudget: 1000}},
 	},
 	{
-		id:                    "gemini-3.6-flash",
-		reasoningLevels:       []string{"low", "medium", "high"},
-		defaultReasoningLevel: "medium",
-		variants: []antigravityReasoningVariant{
-			{level: "low", wireModel: "gemini-3.6-flash-low", thinkingBudget: 4096},
-			{level: "medium", wireModel: "gemini-3.6-flash-medium", thinkingBudget: 8192},
-			{level: "high", wireModel: "gemini-3.6-flash-high", thinkingBudget: 24576},
-		},
+		id: "gemini-3.5-flash-medium", wireModel: "gemini-3.5-flash-low",
+		variants: []antigravityReasoningVariant{{level: "medium", wireModel: "gemini-3.5-flash-low", thinkingBudget: 4000}},
 	},
 	{
-		id:                    "gemini-3.7-flash",
-		reasoningLevels:       []string{"low", "medium", "high"},
-		defaultReasoningLevel: "medium",
-		variants: []antigravityReasoningVariant{
-			{level: "low", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 4096},
-			{level: "medium", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 8192},
-			{level: "high", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 24576},
-		},
+		id: "gemini-3.5-flash-high", wireModel: "gemini-3-flash-agent",
+		variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-3-flash-agent", thinkingBudget: 10000}},
 	},
 	{
-		id:                    "gemini-3.1-pro",
-		reasoningLevels:       []string{"low", "high"},
-		defaultReasoningLevel: "high",
-		variants: []antigravityReasoningVariant{
-			{level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001},
-			{level: "high", wireModel: "gemini-pro-agent", thinkingBudget: 10001},
-		},
+		id: "gemini-3.6-flash-low", wireModel: "gemini-3.6-flash-low",
+		variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.6-flash-low", thinkingBudget: 4096}},
 	},
+	{id: "gemini-3.6-flash-medium", wireModel: "gemini-3.6-flash-medium", variants: []antigravityReasoningVariant{{level: "medium", wireModel: "gemini-3.6-flash-medium", thinkingBudget: 8192}}},
+	{id: "gemini-3.6-flash-high", wireModel: "gemini-3.6-flash-high", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-3.6-flash-high", thinkingBudget: 24576}}},
+	{id: "gemini-3.7-flash-low", wireModel: "gemini-3.7-flash-tiered", variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 4096}}},
+	{id: "gemini-3.7-flash-medium", wireModel: "gemini-3.7-flash-tiered", variants: []antigravityReasoningVariant{{level: "medium", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 8192}}},
+	{id: "gemini-3.7-flash-high", wireModel: "gemini-3.7-flash-tiered", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 24576}}},
+	{id: "gemini-3.1-pro-low", wireModel: "gemini-3.1-pro-low", variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001}}},
+	{id: "gemini-3.1-pro-high", wireModel: "gemini-pro-agent", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-pro-agent", thinkingBudget: 10001}}},
 	{id: "claude-opus-4-6-thinking", wireModel: "claude-opus-4-6-thinking"},
 	{id: "claude-sonnet-4-6", wireModel: "claude-sonnet-4-6"},
 	{id: "gpt-oss-120b-medium", wireModel: "gpt-oss-120b-medium"},
 }
 
-// antigravityCompatibilityAliases preserves the old fixed-tier model names.
-// An alias always wins over a conflicting reasoning.effort in the request.
-var antigravityCompatibilityAliases = map[string]antigravityReasoningVariant{
-	"gemini-3.5-flash-low":    {level: "low", wireModel: "gemini-3.5-flash-extra-low", thinkingBudget: 1000},
-	"gemini-3.5-flash-medium": {level: "medium", wireModel: "gemini-3.5-flash-low", thinkingBudget: 4000},
-	"gemini-3.5-flash-high":   {level: "high", wireModel: "gemini-3-flash-agent", thinkingBudget: 10000},
-	"gemini-3.6-flash-low":    {level: "low", wireModel: "gemini-3.6-flash-low", thinkingBudget: 4096},
-	"gemini-3.6-flash-medium": {level: "medium", wireModel: "gemini-3.6-flash-medium", thinkingBudget: 8192},
-	"gemini-3.6-flash-high":   {level: "high", wireModel: "gemini-3.6-flash-high", thinkingBudget: 24576},
-	"gemini-3.7-flash-low":    {level: "low", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 4096},
-	"gemini-3.7-flash-medium": {level: "medium", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 8192},
-	"gemini-3.7-flash-high":   {level: "high", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 24576},
-	"gemini-3.1-pro-low":      {level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001},
-	"gemini-3.1-pro-high":     {level: "high", wireModel: "gemini-pro-agent", thinkingBudget: 10001},
+// antigravityLogicalCompatibilityCatalog keeps the former logical model names
+// callable for existing clients. They are deliberately not advertised.
+var antigravityLogicalCompatibilityCatalog = []antigravityPublicModelDefinition{
+	{id: "gemini-3.5-flash", defaultReasoningLevel: "medium", variants: []antigravityReasoningVariant{
+		{level: "low", wireModel: "gemini-3.5-flash-extra-low", thinkingBudget: 1000},
+		{level: "medium", wireModel: "gemini-3.5-flash-low", thinkingBudget: 4000},
+		{level: "high", wireModel: "gemini-3-flash-agent", thinkingBudget: 10000},
+	}},
+	{id: "gemini-3.6-flash", defaultReasoningLevel: "medium", variants: []antigravityReasoningVariant{
+		{level: "low", wireModel: "gemini-3.6-flash-low", thinkingBudget: 4096},
+		{level: "medium", wireModel: "gemini-3.6-flash-medium", thinkingBudget: 8192},
+		{level: "high", wireModel: "gemini-3.6-flash-high", thinkingBudget: 24576},
+	}},
+	{id: "gemini-3.7-flash", defaultReasoningLevel: "medium", variants: []antigravityReasoningVariant{
+		{level: "low", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 4096},
+		{level: "medium", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 8192},
+		{level: "high", wireModel: "gemini-3.7-flash-tiered", thinkingBudget: 24576},
+	}},
+	{id: "gemini-3.1-pro", defaultReasoningLevel: "high", variants: []antigravityReasoningVariant{
+		{level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001},
+		{level: "high", wireModel: "gemini-pro-agent", thinkingBudget: 10001},
+	}},
 }
 
 func antigravityPublicModel(model string) (antigravityPublicModelDefinition, bool) {
@@ -97,9 +90,25 @@ func antigravityPublicModel(model string) (antigravityPublicModelDefinition, boo
 	return antigravityPublicModelDefinition{}, false
 }
 
+func antigravityLogicalCompatibilityModel(model string) (antigravityPublicModelDefinition, bool) {
+	name := strings.ToLower(strings.TrimSpace(model))
+	for _, definition := range antigravityLogicalCompatibilityCatalog {
+		if definition.id == name {
+			return definition, true
+		}
+	}
+	return antigravityPublicModelDefinition{}, false
+}
+
+// antigravityCompatibilityAlias is retained for internal/test compatibility
+// with older callers that treated fixed-tier IDs as aliases. They are now
+// first-class public IDs, but still resolve to the same fixed variant.
 func antigravityCompatibilityAlias(model string) (antigravityReasoningVariant, bool) {
-	variant, ok := antigravityCompatibilityAliases[strings.ToLower(strings.TrimSpace(model))]
-	return variant, ok
+	definition, ok := antigravityPublicModel(model)
+	if !ok || len(definition.variants) != 1 {
+		return antigravityReasoningVariant{}, false
+	}
+	return definition.variants[0], true
 }
 
 func antigravityPublicModelIDs() []string {
@@ -112,20 +121,18 @@ func antigravityPublicModelIDs() []string {
 
 func antigravityAcceptedModelIDs() []string {
 	models := antigravityPublicModelIDs()
-	aliases := []string{
-		"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high",
-		"gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high",
-		"gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high",
-		"gemini-3.1-pro-low", "gemini-3.1-pro-high",
+	for _, definition := range antigravityLogicalCompatibilityCatalog {
+		models = append(models, definition.id)
 	}
-	return append(models, aliases...)
+	return models
 }
 
 func antigravityPublicModelWireID(model string) (string, bool) {
 	definition, ok := antigravityPublicModel(model)
 	if !ok {
-		if alias, aliasOK := antigravityCompatibilityAlias(model); aliasOK {
-			return alias.wireModel, true
+		if logical, logicalOK := antigravityLogicalCompatibilityModel(model); logicalOK {
+			variant, variantOK := antigravityVariantForDefinition(logical, nil)
+			return variant.wireModel, variantOK
 		}
 		return "", false
 	}
@@ -146,12 +153,12 @@ func AntigravityWireModelID(model string) (string, bool) {
 // advertised reasoning levels of a logical model. Admin persistence uses this
 // to avoid creating an account that advertises tiers it cannot route.
 func AntigravityWireModelIDs(model string) []string {
-	if alias, ok := antigravityCompatibilityAlias(model); ok {
-		return []string{alias.wireModel}
-	}
 	definition, ok := antigravityPublicModel(model)
 	if !ok {
-		return nil
+		definition, ok = antigravityLogicalCompatibilityModel(model)
+		if !ok {
+			return nil
+		}
 	}
 	if definition.wireModel != "" {
 		return []string{definition.wireModel}
@@ -169,8 +176,8 @@ func AntigravityWireModelIDs(model string) []string {
 }
 
 // AntigravityPublishedModelIDs projects a synchronized raw/wire catalog into
-// logical downstream models. A logical model is published only when all of its
-// distinct backing IDs are present, so every advertised reasoning level works.
+// fixed-tier downstream model IDs. Multiple public tiers may intentionally use
+// one wire model with different thinking budgets (Gemini 3.7).
 func AntigravityPublishedModelIDs(rawModels []string) []string {
 	available := make(map[string]struct{}, len(rawModels))
 	for _, model := range rawModels {
@@ -258,6 +265,9 @@ func antigravityVariantForDefinition(definition antigravityPublicModelDefinition
 	if len(definition.variants) == 0 {
 		return antigravityReasoningVariant{}, false
 	}
+	if len(definition.variants) == 1 {
+		return definition.variants[0], true
+	}
 	level := definition.defaultReasoningLevel
 	if len(reasoning) > 0 {
 		level = antigravityGeminiReasoningTier(reasoning)
@@ -278,12 +288,12 @@ func antigravityVariantForDefinition(definition antigravityPublicModelDefinition
 }
 
 func antigravityResolvedVariant(model string, reasoning map[string]any) (antigravityReasoningVariant, bool) {
-	if alias, ok := antigravityCompatibilityAlias(model); ok {
-		return alias, true
-	}
 	definition, ok := antigravityPublicModel(model)
 	if !ok {
-		return antigravityReasoningVariant{}, false
+		definition, ok = antigravityLogicalCompatibilityModel(model)
+		if !ok {
+			return antigravityReasoningVariant{}, false
+		}
 	}
 	return antigravityVariantForDefinition(definition, reasoning)
 }

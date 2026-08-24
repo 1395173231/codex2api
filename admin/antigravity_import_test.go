@@ -1377,7 +1377,7 @@ func TestFetchAndBatchUpdateAntigravityModels(t *testing.T) {
 	fetchContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/antigravity/models", bytes.NewBufferString(`{}`))
 	fetchContext.Request.Header.Set("Content-Type", "application/json")
 	handler.FetchAntigravityModels(fetchContext)
-	if fetch.Code != http.StatusOK || !strings.Contains(fetch.Body.String(), "gemini-3.7-flash") || !strings.Contains(fetch.Body.String(), "gpt-oss-120b-medium") || strings.Contains(fetch.Body.String(), "gemini-3.7-flash-high") {
+	if fetch.Code != http.StatusOK || !strings.Contains(fetch.Body.String(), "gemini-3.7-flash-low") || !strings.Contains(fetch.Body.String(), "gemini-3.7-flash-high") || !strings.Contains(fetch.Body.String(), "gpt-oss-120b-medium") || strings.Contains(fetch.Body.String(), `"gemini-3.7-flash"`) {
 		t.Fatalf("fetch response = %d %s", fetch.Code, fetch.Body.String())
 	}
 

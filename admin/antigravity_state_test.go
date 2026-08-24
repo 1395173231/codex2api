@@ -76,8 +76,8 @@ func TestAntigravityStateIsSanitizedAndReadDoesNotProbe(t *testing.T) {
 	if state.CredentialKind != auth.AntigravityAuthKindOAuth || state.Identity.Status != "verified" || !state.Catalog.Verified || state.Permissions == nil || state.Quota == nil {
 		t.Fatalf("sanitized state = %+v", state)
 	}
-	if len(state.Catalog.Models) != 1 || state.Catalog.Models[0] != "gemini-3.5-flash" ||
-		len(state.Quota.Models) != 1 || state.Quota.Models[0].ModelID != "gemini-3.5-flash" ||
+	if !reflect.DeepEqual(state.Catalog.Models, []string{"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high"}) ||
+		len(state.Quota.Models) != 3 || state.Quota.Models[0].ModelID != "gemini-3.5-flash-low" ||
 		state.Quota.ModelForwardingRules != nil || strings.Contains(recorder.Body.String(), "gemini-3.5-flash-extra-low") || strings.Contains(recorder.Body.String(), "gemini-pro-agent") {
 		t.Fatalf("state exposed raw model facts: %s", recorder.Body.String())
 	}
@@ -138,7 +138,7 @@ func TestAntigravityCapabilityProbePersistsSuccessfulInteractionsObservation(t *
 		"upstream_type": auth.UpstreamAntigravity, "api_key": "api-secret", "models": []string{"gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3-flash-agent"},
 	})
 	handler.antigravityCapabilityProbe = func(_ context.Context, account *auth.Account, model string, body []byte, stream bool, _ string) (*http.Response, error) {
-		if account.AntigravityAPIKey() != "api-secret" || model != "gemini-3.5-flash" || stream || !strings.Contains(string(body), `"max_output_tokens":1`) {
+		if account.AntigravityAPIKey() != "api-secret" || model != "gemini-3.5-flash-low" || stream || !strings.Contains(string(body), `"max_output_tokens":1`) {
 			t.Fatalf("probe args account=%+v model=%q body=%s stream=%v", account, model, body, stream)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}, Body: io.NopCloser(strings.NewReader(`{"id":"interaction-1","outputs":[]}`))}, nil
@@ -222,7 +222,7 @@ func TestAntigravityStateCapabilityTimestampRoundTrip(t *testing.T) {
 	state := antigravityStateFromRow(&database.AccountRow{ID: 1, CredentialGeneration: 3, Credentials: map[string]any{
 		"upstream_type": auth.UpstreamAntigravity, "api_key": "secret", "antigravity_capabilities": string(encoded),
 	}})
-	if len(state.Capabilities) != 1 || !state.Capabilities[0].ObservedAt.Equal(observed) || state.Capabilities[0].ModelID != "gemini-3.1-pro" {
+	if len(state.Capabilities) != 1 || !state.Capabilities[0].ObservedAt.Equal(observed) || state.Capabilities[0].ModelID != "gemini-3.1-pro-high" {
 		t.Fatalf("state capabilities = %+v", state.Capabilities)
 	}
 }
@@ -233,7 +233,7 @@ func TestAntigravityStateProjectsAmbiguousWireCapabilityAgainstCatalog(t *testin
 	state := antigravityStateFromRow(&database.AccountRow{ID: 1, CredentialGeneration: 4, Credentials: map[string]any{
 		"upstream_type": auth.UpstreamAntigravity, "api_key": "secret", "models": []string{"gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3-flash-agent"}, "antigravity_capabilities": string(encoded),
 	}})
-	if !reflect.DeepEqual(state.Catalog.Models, []string{"gemini-3.5-flash"}) || len(state.Capabilities) != 1 || state.Capabilities[0].ModelID != "gemini-3.5-flash" {
+	if !reflect.DeepEqual(state.Catalog.Models, []string{"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high"}) || len(state.Capabilities) != 1 || state.Capabilities[0].ModelID != "gemini-3.5-flash-low" {
 		t.Fatalf("ambiguous raw capability projection = catalog %v capabilities %+v", state.Catalog.Models, state.Capabilities)
 	}
 }

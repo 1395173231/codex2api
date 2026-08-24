@@ -271,16 +271,16 @@ func TestMixedCodexManifestIncludesAntigravityModels(t *testing.T) {
 	})
 	handler := &Handler{store: store}
 	extras := handler.extraRelayManifestModels(context.Background(), &database.APIKeyRow{ID: 1})
-	gotModel := false
+	gotModels := map[string]bool{}
 	for _, model := range extras {
-		if model.ID == "gemini-3.6-flash" && model.OwnedBy == "google" {
-			gotModel = true
+		if model.OwnedBy == "google" {
+			gotModels[model.ID] = true
 		}
 		if model.ID == "flash-alias" {
 			t.Fatal("Antigravity alias leaked into the native manifest")
 		}
 	}
-	if !gotModel {
+	if !gotModels["gemini-3.6-flash-low"] || !gotModels["gemini-3.6-flash-medium"] || !gotModels["gemini-3.6-flash-high"] {
 		t.Fatalf("mixed manifest extras omitted Antigravity public model: %#v", extras)
 	}
 }

@@ -9,10 +9,10 @@ import (
 
 func TestAntigravityPublicModelCatalogIsExact(t *testing.T) {
 	want := []string{
-		"gemini-3.5-flash",
-		"gemini-3.6-flash",
-		"gemini-3.7-flash",
-		"gemini-3.1-pro",
+		"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high",
+		"gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high",
+		"gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high",
+		"gemini-3.1-pro-low", "gemini-3.1-pro-high",
 		"claude-opus-4-6-thinking",
 		"claude-sonnet-4-6",
 		"gpt-oss-120b-medium",
@@ -21,39 +21,23 @@ func TestAntigravityPublicModelCatalogIsExact(t *testing.T) {
 		t.Fatalf("public catalog = %v, want %v", got, want)
 	}
 
-	for _, alias := range []string{
-		"gemini-3.5-flash-low", "gemini-3.5-flash-medium", "gemini-3.5-flash-high",
-		"gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high",
-		"gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high",
-		"gemini-3.1-pro-low", "gemini-3.1-pro-high",
+	for _, logical := range []string{
+		"gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.1-pro",
 	} {
-		if _, ok := antigravityPublicModel(alias); ok {
-			t.Fatalf("compatibility alias %q leaked into the public catalog", alias)
+		if _, ok := antigravityPublicModel(logical); ok {
+			t.Fatalf("logical compatibility model %q leaked into the public catalog", logical)
 		}
-		if _, ok := antigravityCompatibilityAlias(alias); !ok {
-			t.Fatalf("compatibility alias %q is not accepted", alias)
+		if _, ok := antigravityLogicalCompatibilityModel(logical); !ok {
+			t.Fatalf("logical compatibility model %q is not accepted", logical)
 		}
 	}
 }
 
-func TestAntigravityLogicalModelsExposeReasoningLevels(t *testing.T) {
-	for _, test := range []struct {
-		model  string
-		levels []string
-	}{
-		{model: "gemini-3.5-flash", levels: []string{"low", "medium", "high"}},
-		{model: "gemini-3.6-flash", levels: []string{"low", "medium", "high"}},
-		{model: "gemini-3.7-flash", levels: []string{"low", "medium", "high"}},
-		{model: "gemini-3.1-pro", levels: []string{"low", "high"}},
-		{model: "claude-opus-4-6-thinking"},
-		{model: "claude-sonnet-4-6"},
-		{model: "gpt-oss-120b-medium"},
-	} {
-		t.Run(test.model, func(t *testing.T) {
-			if got := antigravityCodexReasoningLevels(test.model); !reflect.DeepEqual(got, test.levels) {
-				t.Fatalf("reasoning levels = %v, want %v", got, test.levels)
-			}
-		})
+func TestAntigravityFixedTierModelsDoNotExposeReasoningLevels(t *testing.T) {
+	for _, model := range antigravityPublicModelIDs() {
+		if got := antigravityCodexReasoningLevels(model); len(got) != 0 {
+			t.Fatalf("%s reasoning levels = %v, want none", model, got)
+		}
 	}
 }
 
@@ -119,7 +103,7 @@ func TestAntigravityPublishedModelsProjectCompleteRawCatalog(t *testing.T) {
 
 func TestAntigravityPublishedModelsRequireCompleteLogicalFamily(t *testing.T) {
 	raw := []string{"gemini-3.5-flash-low", "gemini-3.7-flash-tiered"}
-	want := []string{"gemini-3.7-flash"}
+	want := []string{"gemini-3.5-flash-medium", "gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high"}
 	if got := AntigravityPublishedModelIDs(raw); !reflect.DeepEqual(got, want) {
 		t.Fatalf("partial raw projection = %v, want %v", got, want)
 	}
