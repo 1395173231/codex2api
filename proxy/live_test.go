@@ -366,6 +366,26 @@ func TestLiveSidebandForwardsTextAndBinary(t *testing.T) {
 	t.Fatal("sideband did not finalize the call")
 }
 
+func TestLiveSidebandProxyURLUsesResinForwardProxy(t *testing.T) {
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	account := &auth.Account{DBID: 19, ProxyURL: "http://legacy-proxy.example:8080"}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, nil, nil)
+
+	resinCfg.Store(nil)
+	if got := handler.liveSidebandProxyURL(account); got != account.ProxyURL {
+		t.Fatalf("proxy without Resin = %q, want legacy proxy %q", got, account.ProxyURL)
+	}
+
+	SetResinConfig(&ResinConfig{BaseURL: "http://127.0.0.1:2260/resin-token", PlatformName: "codex2api"})
+	if got, want := handler.liveSidebandProxyURL(account), "http://codex2api.19:resin-token@127.0.0.1:2260"; got != want {
+		t.Fatalf("proxy with Resin = %q, want %q", got, want)
+	}
+}
+
 func TestScopedModelsExposesLiveWhenAllowed(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus"})

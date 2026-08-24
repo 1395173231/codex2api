@@ -296,10 +296,11 @@ func isCloudflareChallenge(status int, body []byte) bool {
 // useTestTransport 供 httptest（明文 HTTP）用，uTLS 无法对明文端口拨号。
 func inviteHTTPClient(account *auth.Account, proxyURL string, useTestTransport bool) *http.Client {
 	jar := inviteCookieJarFor(account)
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 	if useTestTransport {
-		return &http.Client{Transport: newCodexStandardTransport(proxyURL), Jar: jar}
+		return &http.Client{Transport: newCodexStandardTransport(effectiveProxyURL), Jar: jar}
 	}
-	pooled := getMaintenanceClient(account, proxyURL, maintenancePurposeInvite, true)
+	pooled := getMaintenanceClient(account, effectiveProxyURL, maintenancePurposeInvite, true)
 	return &http.Client{Transport: pooled.Transport, Jar: jar}
 }
 

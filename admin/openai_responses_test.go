@@ -2,14 +2,18 @@ package admin
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
+	"github.com/gin-gonic/gin"
 )
 
 func TestFetchOpenAIResponsesModelIDsSupportsV1BaseURL(t *testing.T) {
@@ -68,6 +72,87 @@ func TestFetchOpenAIResponsesModelIDsAppliesCustomHeadersLast(t *testing.T) {
 	}
 	if !reflect.DeepEqual(models, []string{"gpt-5.6"}) {
 		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestFetchOpenAIResponsesModelIDsUsesResinForwardProxyForSavedAccount(t *testing.T) {
+	oldCfg := proxy.GetResinConfig()
+	t.Cleanup(func() { proxy.SetResinConfig(oldCfg) })
+
+	requests := make(chan *http.Request, 1)
+	resinServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer resinServer.Close()
+
+	proxy.SetResinConfig(&proxy.ResinConfig{
+		BaseURL:      resinServer.URL + "/my-token",
+		PlatformName: "codex2api",
+	})
+
+	_, err := fetchOpenAIResponsesModelIDs(
+		context.Background(),
+		"https://resin-model-discovery.test/v1",
+		"sk-test",
+		"http://legacy-proxy.example:8080",
+		nil,
+		"123",
+	)
+	if err == nil {
+		t.Fatal("expected capture proxy to reject the request")
+	}
+
+	select {
+	case req := <-requests:
+		if req.Method != http.MethodConnect {
+			t.Fatalf("proxy method = %q, want CONNECT", req.Method)
+		}
+		wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("codex2api.123:my-token"))
+		if got := req.Header.Get("Proxy-Authorization"); got != wantAuth {
+			t.Fatalf("Proxy-Authorization = %q, want %q", got, wantAuth)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
+	}
+}
+
+func TestFetchOpenAIResponsesModelsUsesTemporaryResinIdentity(t *testing.T) {
+	oldCfg := proxy.GetResinConfig()
+	t.Cleanup(func() { proxy.SetResinConfig(oldCfg) })
+
+	requests := make(chan *http.Request, 1)
+	resinServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer resinServer.Close()
+	proxy.SetResinConfig(&proxy.ResinConfig{
+		BaseURL:      resinServer.URL + "/my-token",
+		PlatformName: "codex2api",
+	})
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/openai-responses/models", strings.NewReader(`{"base_url":"https://resin-model-discovery.test/v1","api_key":"sk-test"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	(&Handler{}).FetchOpenAIResponsesModels(c)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+
+	select {
+	case req := <-requests:
+		if req.Method != http.MethodConnect {
+			t.Fatalf("proxy method = %q, want CONNECT", req.Method)
+		}
+		identity := proxy.TemporaryResinIdentity("openai-responses-models", "sk-test")
+		wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("codex2api."+identity+":my-token"))
+		if got := req.Header.Get("Proxy-Authorization"); got != wantAuth {
+			t.Fatalf("Proxy-Authorization = %q, want %q", got, wantAuth)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
 	}
 }
 

@@ -230,7 +230,9 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	// 复用网关同款 transport（支持 uTLS Chrome 指纹），与 /responses、wham 一致。
 	// 池化而非每次新建：Codex 客户端会周期性拉取清单，一次性 uTLS transport
 	// 会把连接与 goroutine 持续泄漏到进程结束（issue #446）。
-	client := getCodexMaintenanceClient(account, proxyURL)
+	// 清单携带账号 Bearer token，必须与实际流量使用同一个 Resin 粘性出口。
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := getCodexMaintenanceClient(account, effectiveProxyURL)
 
 	resp, err := client.Do(req)
 	if err != nil {

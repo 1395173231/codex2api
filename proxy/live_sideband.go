@@ -114,11 +114,9 @@ func (h *Handler) dialLiveSideband(ctx context.Context, record *liveCallRecord) 
 	account := h.liveAccountForRecord(record)
 	target := strings.TrimRight(chatGPTLiveSidebandBaseURL, "/") + "/" + url.PathEscape(record.CallID)
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
-	if account != nil && h.store != nil {
-		if proxyURL := strings.TrimSpace(h.store.ResolveProxyForAccount(account)); proxyURL != "" {
-			if parsed, parseErr := url.Parse(proxyURL); parseErr == nil {
-				dialer.Proxy = http.ProxyURL(parsed)
-			}
+	if proxyURL := h.liveSidebandProxyURL(account); proxyURL != "" {
+		if parsed, parseErr := url.Parse(proxyURL); parseErr == nil {
+			dialer.Proxy = http.ProxyURL(parsed)
 		}
 	}
 	conn, resp, err := dialer.DialContext(ctx, target, headers)
@@ -129,6 +127,16 @@ func (h *Handler) dialLiveSideband(ctx context.Context, record *liveCallRecord) 
 		return nil, err
 	}
 	return conn, nil
+}
+
+// liveSidebandProxyURL resolves the legacy account proxy first, then lets Resin
+// override it with the account-scoped forward proxy when enabled.
+func (h *Handler) liveSidebandProxyURL(account *auth.Account) string {
+	var proxyURL string
+	if h != nil && h.store != nil && account != nil {
+		proxyURL = h.store.ResolveProxyForAccount(account)
+	}
+	return EffectiveProxyURLForAccount(account, proxyURL)
 }
 
 func (h *Handler) liveSidebandHeaders(ctx context.Context, record *liveCallRecord) (http.Header, error) {

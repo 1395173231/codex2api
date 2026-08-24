@@ -36,7 +36,7 @@ func newAnthropicStreamFailureTestHandler(t *testing.T, serve func(call int32, w
 		serve(call, w)
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	settings := &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 2}
 	store := auth.NewStore(nil, nil, settings)
@@ -245,7 +245,7 @@ func TestMessagesUpstreamErrorBodyIsBoundedAndUnstructuredBodyIsNotLeaked(t *tes
 		_, _ = io.WriteString(w, "<html><body>"+secret+strings.Repeat("x", upstreamErrorBodyReadMaxBytes+1024)+"</body></html>")
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 0, MaxRateLimitRetries: 0})
 	defer store.Stop()
@@ -280,7 +280,7 @@ func TestMessagesUpstreamHTMLMessageIsNotLeaked(t *testing.T) {
 		_, _ = io.WriteString(w, "<html>request-id=private-123</html>")
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 0, MaxRateLimitRetries: 0})
 	defer store.Stop()
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})

@@ -112,7 +112,8 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 			ctx, cancel := context.WithTimeout(context.Background(), grokSSOImportPerToken)
 			defer cancel()
 
-			result, convErr := auth.ConvertGrokSSOToBuild(ctx, s.Token, req.ProxyURL)
+			resinTempID, effectiveProxyURL := temporaryResinProxy("grok-sso", req.ProxyURL, s.Token)
+			result, convErr := auth.ConvertGrokSSOToBuild(ctx, s.Token, effectiveProxyURL)
 			if convErr != nil {
 				item.Error = convErr.Error()
 				items[idx] = item
@@ -149,6 +150,7 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 				Email:         email,
 				TokenEndpoint: auth.GrokDefaultTokenURL,
 				Source:        "sso_import",
+				ResinTempID:   resinTempID,
 			})
 			if createErr != nil {
 				item.Error = createErr.Error()
@@ -293,9 +295,10 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 			ctx, cancel := context.WithTimeout(context.Background(), grokRefreshImportPerToken)
 			defer cancel()
 
+			resinTempID, effectiveProxyURL := temporaryResinProxy("grok-refresh", req.ProxyURL, refreshToken)
 			td, refreshErr := auth.RefreshGrokAccessToken(ctx, auth.GrokRefreshParams{
 				RefreshToken: refreshToken,
-				ProxyURL:     req.ProxyURL,
+				ProxyURL:     effectiveProxyURL,
 			})
 			if refreshErr != nil {
 				item.Error = refreshErr.Error()
@@ -330,6 +333,7 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 				Email:         email,
 				TokenEndpoint: auth.GrokDefaultTokenURL,
 				Source:        "refresh_import",
+				ResinTempID:   resinTempID,
 			})
 			if createErr != nil {
 				item.Error = createErr.Error()

@@ -210,7 +210,12 @@ func FetchGrokBilling(ctx context.Context, account *auth.Account, proxyURL strin
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
-	client := getPooledClient(account, proxyURL)
+	// Billing carries the account bearer token and must use the same sticky
+	// Resin identity as the primary Grok request. Do this immediately before
+	// constructing the pooled transport so legacy/global proxy overrides cannot
+	// bypass Resin.
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	client := getPooledClient(account, effectiveProxyURL)
 	weekly, weeklyErr := fetchGrokBillingOnce(ctx, client, account, bearer, baseURL+grokBillingWeeklyPath)
 	monthly, monthlyErr := fetchGrokBillingOnce(ctx, client, account, bearer, baseURL+grokBillingMonthlyPath)
 	if weeklyErr != nil && monthlyErr != nil {

@@ -996,6 +996,29 @@ func TestWhamResetCreditItemEffectiveConsumableUntilPrefersCanonicalField(t *tes
 	}
 }
 
+func TestQueryWhamResetCreditsUsesResinForwardProxy(t *testing.T) {
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
+
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{
+		BaseURL:      proxyServer.urlWithToken("my-token"),
+		PlatformName: "codex2api",
+	})
+
+	account := &auth.Account{DBID: 123, AccessToken: "at-123"}
+	_, _, err := queryWhamResetCreditsWithURL(
+		context.Background(),
+		account,
+		"http://legacy-proxy.example:8080",
+		"https://resin-reset-credits.test/backend-api/wham/rate-limit-reset-credits",
+	)
+	if err == nil {
+		t.Fatal("expected capture proxy to reject the request")
+	}
+	assertResinProxyConnect(t, proxyServer, "resin-reset-credits.test:443", "123", "my-token")
+}
+
 func TestConsumeResetCredit_PostsRedeemRequestID(t *testing.T) {
 	var gotMethod, gotAuth, gotAccountID, gotRedeemID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1205,88 +1228,51 @@ func TestConsumeResetCreditParsed_NonOKReturnsRespForCaller(t *testing.T) {
 	}
 }
 
-// Resin 启用时，wham 用量查询必须经 Resin 反代并携带 X-Resin-Account，
+// Resin 启用时，wham 用量查询必须经 Resin 正向 CONNECT 代理，
 // 而不是直连 chatgpt.com（issue #372：账号维护请求漏接 Resin，
 // 大量账号会共享本机出口 IP）。
 func TestQueryWhamUsageRoutesThroughResin(t *testing.T) {
-	var gotPath, gotResinAccount string
-	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotResinAccount = r.Header.Get("X-Resin-Account")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"plan_type":"plus"}`))
-	}))
-	defer fakeResin.Close()
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
 
-	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
-	t.Cleanup(func() { SetResinConfig(nil) })
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{BaseURL: proxyServer.urlWithToken("my-token"), PlatformName: "codex2api"})
 
 	account := &auth.Account{DBID: 7, AccessToken: "at-7"}
-	usage, _, err := QueryWhamUsage(context.Background(), account, "")
-	if err != nil {
-		t.Fatalf("QueryWhamUsage error: %v", err)
+	if _, _, err := QueryWhamUsage(context.Background(), account, ""); err == nil {
+		t.Fatal("expected capture proxy to reject the usage request")
 	}
-	if usage == nil || usage.PlanType != "plus" {
-		t.Fatalf("unexpected usage result: %+v", usage)
-	}
-	if want := "/test/https/chatgpt.com/backend-api/wham/usage"; gotPath != want {
-		t.Fatalf("resin path = %q, want %q", gotPath, want)
-	}
-	if gotResinAccount != "7" {
-		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "7")
-	}
+	assertResinProxyConnect(t, proxyServer, "chatgpt.com:443", "7", "my-token")
 }
 
 // 重置券列表/消费与 wham 查询同一套请求形态，同样必须走 Resin。
 func TestConsumeResetCreditRoutesThroughResin(t *testing.T) {
-	var gotPath, gotResinAccount string
-	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotResinAccount = r.Header.Get("X-Resin-Account")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer fakeResin.Close()
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
 
-	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
-	t.Cleanup(func() { SetResinConfig(nil) })
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{BaseURL: proxyServer.urlWithToken("my-token"), PlatformName: "codex2api"})
 
 	account := &auth.Account{DBID: 9, AccessToken: "at-9"}
-	if _, _, err := ConsumeResetCreditParsed(context.Background(), account, "", "req-1"); err != nil {
-		t.Fatalf("ConsumeResetCreditParsed error: %v", err)
+	if _, _, err := ConsumeResetCreditParsed(context.Background(), account, "", "req-1"); err == nil {
+		t.Fatal("expected capture proxy to reject the reset credit request")
 	}
-	if want := "/test/https/chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"; gotPath != want {
-		t.Fatalf("resin path = %q, want %q", gotPath, want)
-	}
-	if gotResinAccount != "9" {
-		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "9")
-	}
+	assertResinProxyConnect(t, proxyServer, "chatgpt.com:443", "9", "my-token")
 }
 
 // 重置券列表端点同样必须走 Resin（与用量查询/消费保持三端点全覆盖）。
 func TestQueryWhamResetCreditsRoutesThroughResin(t *testing.T) {
-	var gotPath, gotResinAccount string
-	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotResinAccount = r.Header.Get("X-Resin-Account")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"credits":[]}`))
-	}))
-	defer fakeResin.Close()
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
 
-	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
-	t.Cleanup(func() { SetResinConfig(nil) })
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{BaseURL: proxyServer.urlWithToken("my-token"), PlatformName: "codex2api"})
 
 	account := &auth.Account{DBID: 13, AccessToken: "at-13"}
-	if _, _, err := QueryWhamResetCredits(context.Background(), account, ""); err != nil {
-		t.Fatalf("QueryWhamResetCredits error: %v", err)
+	if _, _, err := QueryWhamResetCredits(context.Background(), account, ""); err == nil {
+		t.Fatal("expected capture proxy to reject the reset credits request")
 	}
-	if want := "/test/https/chatgpt.com/backend-api/wham/rate-limit-reset-credits"; gotPath != want {
-		t.Fatalf("resin path = %q, want %q", gotPath, want)
-	}
-	if gotResinAccount != "13" {
-		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "13")
-	}
+	assertResinProxyConnect(t, proxyServer, "chatgpt.com:443", "13", "my-token")
 }
 
 func TestApplyWhamUsage_PersistsIndependentSparkSnapshot(t *testing.T) {

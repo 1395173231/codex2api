@@ -214,6 +214,7 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 
 	// 投递前一次性归一化：namespace 分组工具展平成子 function 并记录别名（响应流里再
 	// 反解回 {name, namespace}）、web_search 降级为最小形态、历史项按 Grok 原生契约重建、
@@ -240,10 +241,10 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 		if model != "" {
 			req.Header.Set("x-grok-model-override", model)
 		}
-		resp, err := getPooledClient(account, proxyURL).Do(req)
+		resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
 		if err != nil {
 			if shouldRecyclePooledClient(err) {
-				recyclePooledClient(account, proxyURL)
+				recyclePooledClient(account, effectiveProxyURL)
 			}
 			return nil, ErrUpstream(0, "请求 Grok 上游失败", err)
 		}

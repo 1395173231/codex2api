@@ -198,7 +198,7 @@ func TestExecuteRequestGateStripsLiteOnBothTransports(t *testing.T) {
 		t.Fatalf("WS handshake headers carried %s = %q, want stripped", codexResponsesLiteHeader, got)
 	}
 
-	// HTTP 路径（Resin 反代指向测试服务器）
+	// HTTP 路径
 	liteHeader := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		liteHeader <- r.Header.Get(codexResponsesLiteHeader)
@@ -206,8 +206,14 @@ func TestExecuteRequestGateStripsLiteOnBothTransports(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
 	}))
 	t.Cleanup(server.Close)
-	SetResinConfig(&ResinConfig{BaseURL: server.URL, PlatformName: "test"})
-	t.Cleanup(func() { SetResinConfig(nil) })
+	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
+	SetResinConfig(nil)
+	codexBaseURLForRequest = server.URL + "/backend-api/codex"
+	t.Cleanup(func() {
+		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
+	})
 
 	resp, err = ExecuteRequest(context.Background(), account, []byte(`{"model":"gpt-5.5","input":"hi"}`), "", "", "sk-test", nil, downstream, false)
 	if err != nil {

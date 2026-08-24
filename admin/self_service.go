@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -217,7 +219,8 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 		name = "self-service-account"
 	}
 
-	if _, err := h.upsertSelfServiceAccount(ctx, name, proxyURL, seed, sess.ContactEmail); err != nil {
+	id, err := h.upsertSelfServiceAccount(ctx, name, proxyURL, seed, sess.ContactEmail)
+	if err != nil {
 		if err == errDuplicateOAuthIdentity {
 			// 已在池中（或已提交待审核）：对提交者返回中性的成功语义，避免探测账号是否存在。
 			c.JSON(http.StatusOK, gin.H{"message": "该账号已在系统中，无需重复提交"})
@@ -225,6 +228,12 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 		}
 		writeError(c, http.StatusInternalServerError, "提交失败，请稍后重试")
 		return
+	}
+	// The account is intentionally disabled pending review, but it already has
+	// a stable DBID. Preserve the temporary OAuth lease for when an administrator
+	// enables it later.
+	if proxy.IsResinEnabled() {
+		go proxy.InheritLease("oauth-"+req.SessionID, fmt.Sprintf("%d", id))
 	}
 
 	email := seed.email

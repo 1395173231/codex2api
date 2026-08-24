@@ -10424,8 +10424,12 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		}
 	}
 
-	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
-	resinID := fmt.Sprintf("%d", dbID)
+	// 3. 执行 RT 刷新（Resin 启用时传入有效 DBID 用于粘性代理）。
+	// 未入库的临时账号不能伪装成身份 "0"。
+	resinID := ""
+	if dbID > 0 {
+		resinID = fmt.Sprintf("%d", dbID)
+	}
 	proxy := s.ResolveProxyForAccount(acc)
 	if strings.TrimSpace(proxy) == "" && s.GetProxyPoolEnabled() {
 		return fmt.Errorf("账号 %d 代理池已启用但无可用代理，已拒绝直连刷新", dbID)

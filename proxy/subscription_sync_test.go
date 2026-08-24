@@ -194,32 +194,18 @@ func TestMaybeSyncSubscriptionExpiry_SkipsPastActiveUntil(t *testing.T) {
 	}
 }
 
-// Resin 启用时订阅到期查询也必须经反代（issue #372），指纹由 Resin 侧承担。
+// Resin 启用时订阅到期查询也必须经正向 CONNECT 代理（issue #372），
+// TLS 指纹由本地 transport 保持。
 func TestQueryChatGPTSubscriptionRoutesThroughResin(t *testing.T) {
-	var gotPath, gotResinAccount, gotAccountIDQuery string
-	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotResinAccount = r.Header.Get("X-Resin-Account")
-		gotAccountIDQuery = r.URL.Query().Get("account_id")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer fakeResin.Close()
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
 
-	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
-	t.Cleanup(func() { SetResinConfig(nil) })
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{BaseURL: proxyServer.urlWithToken("my-token"), PlatformName: "codex2api"})
 
 	account := &auth.Account{DBID: 11, AccessToken: "at-11", AccountID: testWorkspaceUUID}
-	if _, err := QueryChatGPTSubscription(context.Background(), account, ""); err != nil {
-		t.Fatalf("QueryChatGPTSubscription error: %v", err)
+	if _, err := QueryChatGPTSubscription(context.Background(), account, ""); err == nil {
+		t.Fatal("expected capture proxy to reject the subscription request")
 	}
-	if want := "/test/https/chatgpt.com/backend-api/subscriptions"; gotPath != want {
-		t.Fatalf("resin path = %q, want %q", gotPath, want)
-	}
-	if gotResinAccount != "11" {
-		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "11")
-	}
-	if gotAccountIDQuery != testWorkspaceUUID {
-		t.Fatalf("account_id query = %q, want workspace uuid", gotAccountIDQuery)
-	}
+	assertResinProxyConnect(t, proxyServer, "chatgpt.com:443", "11", "my-token")
 }

@@ -100,22 +100,21 @@ func QueryChatGPTSubscription(ctx context.Context, account *auth.Account, proxyU
 		endpoint = subscriptionsURLForTest
 		useTestTransport = true
 	}
-	// Resin 启用时经反代访问（指纹由 Resin 侧承担），与其他账号维护请求一致，
-	// 避免全部账号共享本机出口 IP 直连（issue #372）。
-	finalURL, resinClient, viaResin := resinMaintenanceTarget(account, endpoint)
+	// Resin 启用时通过正向 CONNECT 代理访问；保留原始目标 URL，让本地
+	// transport（含 uTLS Chrome 指纹）完成 TLS 握手，避免反向代理改变指纹。
+	finalURL := endpoint
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 
 	// 网页端点必须用 uTLS Chrome 指纹，与网关的 transport 模式配置无关。
 	// 池化持有（按账号+代理隔离）：一次性 uTLS transport 用完即弃，其名下的
 	// HTTP/2 连接没有任何持有者去关闭，会持续泄漏（issue #446）。
 	var client *http.Client
 	switch {
-	case resinClient != nil:
-		client = resinClient
 	case useTestTransport:
 		// 测试用 httptest（明文 HTTP），uTLS 拨号无法使用，回退标准 transport。
-		client = &http.Client{Transport: newCodexStandardTransport(proxyURL)}
+		client = &http.Client{Transport: newCodexStandardTransport(effectiveProxyURL)}
 	default:
-		client = getMaintenanceClient(account, proxyURL, maintenancePurposeSubscription, true)
+		client = getMaintenanceClient(account, effectiveProxyURL, maintenancePurposeSubscription, true)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL+"?account_id="+url.QueryEscape(accountID), nil)
@@ -127,9 +126,6 @@ func QueryChatGPTSubscription(ctx context.Context, account *auth.Account, proxyU
 	req.Header.Set("Origin", "https://chatgpt.com")
 	req.Header.Set("Referer", "https://chatgpt.com/")
 	req.Header.Set("User-Agent", subscriptionsBrowserUserAgent)
-	if viaResin {
-		req.Header.Set("X-Resin-Account", ResinAccountID(account))
-	}
 
 	resp, err := client.Do(req)
 	if err != nil {

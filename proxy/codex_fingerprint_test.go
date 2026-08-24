@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -603,11 +602,13 @@ func TestExecuteCompactRequestConvergesBodyAndHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 经 Resin 反代把出站请求引到本地服务器，从而断言真实发出的字节。
+	// 直接连接测试服务器，从而断言真实发出的字节。
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() { resinCfg.Store(previousResin) })
-	SetResinConfig(&ResinConfig{BaseURL: server.URL, PlatformName: "test"})
-	clientPool.Delete(fmt.Sprintf("resin|%d", account.ID()))
+	t.Cleanup(func() { codexBaseURLForRequest = previousCodexBaseURL })
+	SetResinConfig(nil)
+	codexBaseURLForRequest = server.URL + "/backend-api/codex"
 
 	body := []byte(`{"model":"gpt-5.6-codex","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","thread_id":"client-thread","x-codex-window-id":"client-window:0"}}`)
 	resp, err := ExecuteCompactRequest(context.Background(), account, body, "", "", "api-key-1", nil, downstream)

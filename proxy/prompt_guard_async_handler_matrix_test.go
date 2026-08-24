@@ -80,7 +80,7 @@ func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
 		}
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "prompt-guard-handler-matrix"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
 	if err != nil {
@@ -325,7 +325,7 @@ func TestAsyncShadowImageEditsMultipartRealHandler(t *testing.T) {
 		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_multipart_matrix","status":"completed","usage":{"input_tokens":5,"output_tokens":9,"total_tokens":14},"output":[{"type":"image_generation_call","result":"`+tinyPNGBase64+`","output_format":"png"}]}}`+"\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "prompt-guard-multipart-matrix"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	cfg := promptGuardTestConfig()
 	cfg.Advanced.Guard.Performance.AsyncShadowAuxiliaryEnabled = true

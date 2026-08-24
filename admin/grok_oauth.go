@@ -29,6 +29,7 @@ type grokDeviceSession struct {
 	UserCode      string
 	TokenEndpoint string
 	ProxyURL      string
+	ResinTempID   string
 	Name          string
 	BaseURL       string
 	Models        []string
@@ -129,19 +130,21 @@ func (h *Handler) StartGrokDeviceAuth(c *gin.Context) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
-	defer cancel()
-	device, err := auth.StartGrokDeviceFlow(ctx, req.ProxyURL)
-	if err != nil {
-		writeError(c, http.StatusBadGateway, "启动 Device 授权失败: "+err.Error())
-		return
-	}
-
 	sessionID, err := grokOAuthRandomHex(16)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "生成 session_id 失败")
 		return
 	}
+	resinTempID, effectiveProxyURL := temporaryResinProxy("grok-device", req.ProxyURL, sessionID)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	device, err := auth.StartGrokDeviceFlow(ctx, effectiveProxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "启动 Device 授权失败: "+err.Error())
+		return
+	}
+
 	interval := device.Interval
 	if interval < 5 {
 		interval = 5
@@ -155,6 +158,7 @@ func (h *Handler) StartGrokDeviceAuth(c *gin.Context) {
 		UserCode:      device.UserCode,
 		TokenEndpoint: device.TokenEndpoint,
 		ProxyURL:      strings.TrimSpace(req.ProxyURL),
+		ResinTempID:   resinTempID,
 		Name:          strings.TrimSpace(req.Name),
 		BaseURL:       baseURL,
 		Models:        models,
@@ -212,7 +216,8 @@ func (h *Handler) PollGrokDeviceAuth(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	result, err := auth.PollGrokDeviceToken(ctx, sess.DeviceCode, sess.TokenEndpoint, proxyURL)
+	effectiveProxyURL := effectiveTemporaryResinProxy(sess.ResinTempID, proxyURL)
+	result, err := auth.PollGrokDeviceToken(ctx, sess.DeviceCode, sess.TokenEndpoint, effectiveProxyURL)
 	if err != nil {
 		errText := err.Error()
 		if strings.Contains(errText, "过期") || strings.Contains(errText, "拒绝") {
@@ -249,6 +254,7 @@ func (h *Handler) PollGrokDeviceAuth(c *gin.Context) {
 		Source:        "oauth_device",
 		// 交互式重授权命中既有账号(含回收站)时更新凭据而非报"已存在"。
 		ReauthorizeExisting: true,
+		ResinTempID:         sess.ResinTempID,
 	})
 	if err != nil {
 		writeInternalError(c, err)
@@ -298,6 +304,7 @@ type createGrokOAuthAccountInput struct {
 	// 更新该账号的凭据(回收站账号顺带复活),而不是报"已存在"。
 	// 仅交互式授权路径打开;批量导入保持"重复即跳过"。
 	ReauthorizeExisting bool
+	ResinTempID         string
 }
 
 type createGrokOAuthAccountResult struct {
@@ -399,6 +406,7 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 		ExpiresAt:         in.Token.ExpiresAt,
 	}
 	h.store.AddAccount(acc)
+	inheritTemporaryResinLease(in.ResinTempID, id)
 
 	security.SecurityAuditLog("GROK_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d auth_kind=oauth source=%s", id, source))
 	return createGrokOAuthAccountResult{ID: id, Email: email}, nil
@@ -439,6 +447,9 @@ func (h *Handler) reauthorizeGrokOAuthAccount(ctx context.Context, accountID int
 		event = "restored"
 	}
 	h.db.InsertAccountEventAsync(accountID, event, source)
+	// Reauthorization can hit an existing account, so the temporary device/SSO
+	// identity must be inherited here as well as on the new-account path.
+	inheritTemporaryResinLease(in.ResinTempID, accountID)
 	security.SecurityAuditLog("GROK_ACCOUNT_REAUTHORIZED", fmt.Sprintf("account_id=%d revived=%t source=%s", accountID, reauth.Revived, source))
 	return createGrokOAuthAccountResult{ID: accountID, Email: email, Updated: true, Revived: reauth.Revived}, nil
 }

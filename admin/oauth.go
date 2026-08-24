@@ -29,12 +29,15 @@ import (
 
 const (
 	oauthAuthorizeURL       = "https://auth.openai.com/oauth/authorize"
-	oauthTokenURL           = "https://auth.openai.com/oauth/token"
+	oauthTokenURL           = "https://authproxy.eqing.tech/oauth/token"
 	oauthClientID           = "app_EMoamEEZ73f0CkXaXp7hrann"
 	oauthDefaultRedirectURI = "http://localhost:1455/auth/callback"
 	oauthDefaultScopes      = "openid profile email offline_access"
 	oauthSessionTTL         = 30 * time.Minute
 )
+
+var oauthTokenURLForRequest = oauthTokenURL
+var oauthHTTPClientBuilder = auth.BuildHTTPClient
 
 // ==================== 内存 Session 存储 ====================
 
@@ -274,7 +277,11 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "账号写入数据库失败: "+err.Error())
 		return
 	}
-	if proxy.IsResinEnabled() && !updated {
+	// A reauthorization can resolve to an existing DB account. In both the
+	// insert and update cases, move the temporary OAuth lease to that stable
+	// account identity so the exchange and the first post-login request keep
+	// the same Resin exit.
+	if proxy.IsResinEnabled() {
 		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
 	}
 
@@ -607,14 +614,10 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", codeVerifier)
 
-	// Resin 反代模式：改写 URL
-	targetURL := oauthTokenURL
+	targetURL := oauthTokenURLForRequest
 	tempID := ""
 	if len(resinTempID) > 0 {
 		tempID = resinTempID[0]
-	}
-	if proxy.IsResinEnabled() && tempID != "" {
-		targetURL = proxy.BuildReverseProxyURL(oauthTokenURL)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(form.Encode()))
@@ -625,17 +628,11 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex-cli/0.91.0")
 
-	// Resin 反代：注入临时账号身份头
+	effectiveProxyURL := proxyURL
 	if proxy.IsResinEnabled() && tempID != "" {
-		req.Header.Set("X-Resin-Account", tempID)
+		effectiveProxyURL = proxy.EffectiveProxyURLForIdentity(tempID, proxyURL)
 	}
-
-	var client *http.Client
-	if proxy.IsResinEnabled() && tempID != "" {
-		client = &http.Client{Timeout: 30 * time.Second}
-	} else {
-		client = auth.BuildHTTPClient(proxyURL)
-	}
+	client := oauthHTTPClientBuilder(effectiveProxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("请求失败: %w", err)
@@ -737,7 +734,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		return
 	}
 
-	if proxy.IsResinEnabled() && !updated {
+	if proxy.IsResinEnabled() {
 		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
 	}
 

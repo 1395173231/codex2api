@@ -646,7 +646,7 @@ func TestForwardImagesResponseFailedCyberPolicyEntersUnifiedAuditAndCandidateQue
 		_, _ = fmt.Fprint(w, `data: {"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"cyber security risk detected"}}}`+"\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-cyber-test"})
+	useDirectCodexUpstream(t, upstream.URL)
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "images-cyber.db"))
 	if err != nil {
 		t.Fatalf("database.New(sqlite): %v", err)

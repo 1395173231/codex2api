@@ -133,9 +133,9 @@ func queryWhamDailyUsageWithURL(ctx context.Context, account *auth.Account, prox
 	query.Set("workspace_user", "true")
 	requestURL := base + "?" + query.Encode()
 
-	// resinMaintenanceTarget 经 RequestURI() 重建目标，query 会被保留。
-	finalURL, resinClient, viaResin := resinMaintenanceTarget(account, requestURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
+	// Resin is a forward CONNECT proxy. Keep the original target URL so the
+	// local transport performs the TLS handshake and preserves its fingerprint.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build daily usage request: %w", err)
 	}
@@ -148,7 +148,7 @@ func queryWhamDailyUsageWithURL(ctx context.Context, account *auth.Account, prox
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
-	client := whamHTTPClient(req, account, resinClient, viaResin, proxyURL)
+	client := whamHTTPClient(account, proxyURL)
 
 	resp, err := client.Do(req)
 	if err != nil {

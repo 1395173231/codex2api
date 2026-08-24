@@ -33,6 +33,18 @@ type errReadCloser struct {
 	err error
 }
 
+func useDirectCodexUpstream(t *testing.T, upstreamURL string) {
+	t.Helper()
+	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstreamURL + "/backend-api/codex"
+	t.Cleanup(func() {
+		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
+	})
+}
+
 func (r errReadCloser) Read([]byte) (int, error) {
 	return 0, r.err
 }
@@ -563,7 +575,7 @@ func TestResponsesWebSocket1009FallbackStripsEnvelopeType(t *testing.T) {
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
@@ -678,7 +690,7 @@ func TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache(t *testi
 		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
@@ -1326,9 +1338,11 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 
 	previousExec := WebsocketExecuteFunc
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		WebsocketExecuteFunc = previousExec
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 
 	wsCalls := 0
@@ -1357,8 +1371,8 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 		httpLiteHeaders <- r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite")
 		requestBody, _ := io.ReadAll(r.Body)
 		httpNamespaces <- gjson.GetBytes(requestBody, "input.0.namespace").String()
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses" && !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -1367,7 +1381,8 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	primary := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -1433,10 +1448,9 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 	if got := <-httpNamespaces; got != "code_tools" {
 		t.Fatalf("HTTP fallback namespace = %q, want code_tools", got)
 	}
-	wsAccountID := <-wsAccountIDs
-	httpAccountID := <-httpAccountIDs
-	if httpAccountID != fmt.Sprint(wsAccountID) {
-		t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
+	<-wsAccountIDs
+	if httpAccountID := <-httpAccountIDs; httpAccountID != "" {
+		t.Fatalf("direct HTTP fallback unexpectedly sent X-Resin-Account = %q", httpAccountID)
 	}
 	deadline := time.Now().Add(time.Second)
 	for atomic.LoadInt64(&primary.ActiveRequests) != 0 && time.Now().Before(deadline) {
@@ -1459,10 +1473,12 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	previousExec := WebsocketExecuteFunc
 	previousSettings := CurrentRuntimeSettings()
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		WebsocketExecuteFunc = previousExec
 		ApplyRuntimeSettings(previousSettings)
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 	nextSettings := previousSettings
 	nextSettings.CodexForceWebsocket = true
@@ -1495,8 +1511,8 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 		httpLiteHeaders <- r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite")
 		requestBody, _ := io.ReadAll(r.Body)
 		httpCacheKeys <- gjson.GetBytes(requestBody, "prompt_cache_key").String()
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses" && !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -1505,7 +1521,8 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	primary := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -1554,10 +1571,9 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	if localAffinityID := resolveDownstreamAffinityID(req.Header); httpSessionID == localAffinityID || httpCacheKey == localAffinityID {
 		t.Fatalf("local affinity id leaked into HTTP fallback: local=%q header=%q body=%q", localAffinityID, httpSessionID, httpCacheKey)
 	}
-	wsAccountID := <-wsAccountIDs
-	httpAccountID := <-httpAccountIDs
-	if httpAccountID != fmt.Sprint(wsAccountID) {
-		t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
+	<-wsAccountIDs
+	if httpAccountID := <-httpAccountIDs; httpAccountID != "" {
+		t.Fatalf("direct HTTP fallback unexpectedly sent X-Resin-Account = %q", httpAccountID)
 	}
 	if got := atomic.LoadInt64(&primary.ActiveRequests); got != 0 {
 		t.Fatalf("primary ActiveRequests after fallback = %d, want 0", got)
@@ -1655,7 +1671,7 @@ func TestResponsesSkipsWebsocketWhenBodyReachesLearnedTooBigThreshold(t *testing
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -1719,7 +1735,7 @@ func TestResponsesHTTPIngressRetainsAccountWhenWebsocketRequestReturnsMessageToo
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -1742,8 +1758,8 @@ func TestResponsesHTTPIngressRetainsAccountWhenWebsocketRequestReturnsMessageToo
 	if wsCalls != 1 || httpCalls != 1 {
 		t.Fatalf("upstream calls = WS %d HTTP %d, want 1 each", wsCalls, httpCalls)
 	}
-	if got := <-httpAccountIDs; got != "1" {
-		t.Fatalf("HTTP fallback account = %q, want retained account 1", got)
+	if got := <-httpAccountIDs; got != "" {
+		t.Fatalf("direct HTTP fallback unexpectedly sent X-Resin-Account = %q", got)
 	}
 	if got := atomic.LoadInt64(&account.TotalRequests); got != 1 {
 		t.Fatalf("TotalRequests = %d, want one logical dispatch", got)
@@ -1822,7 +1838,7 @@ func TestCompatibilityEndpointsRetainAccountForWebsocketMessageTooBigHTTPFallbac
 				}
 			}))
 			t.Cleanup(upstream.Close)
-			SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+			useDirectCodexUpstream(t, upstream.URL)
 
 			settings := &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"}
 			store := auth.NewStore(nil, nil, settings)
@@ -1853,10 +1869,9 @@ func TestCompatibilityEndpointsRetainAccountForWebsocketMessageTooBigHTTPFallbac
 			if got := httpCalls.Load(); got != 1 {
 				t.Fatalf("HTTP upstream calls = %d, want 1", got)
 			}
-			wsAccountID := <-wsAccountIDs
-			httpAccountID := <-httpAccountIDs
-			if httpAccountID != fmt.Sprint(wsAccountID) {
-				t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
+			<-wsAccountIDs
+			if httpAccountID := <-httpAccountIDs; httpAccountID != "" {
+				t.Fatalf("direct HTTP fallback unexpectedly sent X-Resin-Account = %q", httpAccountID)
 			}
 			if got := atomic.LoadInt64(&primary.ActiveRequests); got != 0 {
 				t.Fatalf("primary ActiveRequests after fallback = %d, want 0", got)
@@ -1916,7 +1931,7 @@ func TestResponsesHTTPFallbackRetryKeepsCorrelationThroughRelaySuccess(t *testin
 		))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	primary := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -1997,7 +2012,7 @@ func TestResponsesDoesNotFallbackOrPenalizeAfterWebSocketContent(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
@@ -2510,15 +2525,17 @@ func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *te
 	gin.SetMode(gin.TestMode)
 
 	previousResin := resinCfg.Load()
+	previousCodexBaseURL := codexBaseURLForRequest
 	t.Cleanup(func() {
 		resinCfg.Store(previousResin)
+		codexBaseURLForRequest = previousCodexBaseURL
 	})
 
 	var upstreamMu sync.Mutex
 	var liteHeaders []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses/compact") {
-			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses/compact", r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/responses/compact" {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses/compact", r.URL.Path)
 		}
 		upstreamMu.Lock()
 		liteHeaders = append(liteHeaders, r.Header.Get(codexResponsesLiteHeader))
@@ -2531,7 +2548,8 @@ func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *te
 		_, _ = w.Write([]byte(`{"id":"truncated"}`))
 	}))
 	defer upstream.Close()
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	SetResinConfig(nil)
+	codexBaseURLForRequest = upstream.URL + "/backend-api/codex"
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:      1,

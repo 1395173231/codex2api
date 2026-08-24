@@ -3698,6 +3698,11 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		Email:                   baseURL,
 		PlanType:                "api",
 	})
+	// 如果添加前的模型探测已经为同一个 API key 租用了临时 Resin 身份，
+	// 将该租约平滑转移到新建的稳定 DBID；没有预探测时 Resin 会安全忽略未知父身份。
+	if resinTempID := proxy.TemporaryResinIdentity("openai-responses-models", req.APIKey); resinTempID != "" {
+		inheritTemporaryResinLease(resinTempID, id)
+	}
 
 	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
 	c.JSON(http.StatusOK, gin.H{
@@ -3715,6 +3720,7 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 
 	req.APIKey = strings.TrimSpace(req.APIKey)
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	resinAccountID := ""
 	if req.AccountID > 0 && req.APIKey == "" {
 		row, err := h.db.GetAccountByID(c.Request.Context(), req.AccountID)
 		if err != nil {
@@ -3740,6 +3746,14 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 			req.CustomHeaders = row.GetCredentialStringMap("custom_headers")
 		}
 	}
+	if req.AccountID > 0 {
+		resinAccountID = strconv.FormatInt(req.AccountID, 10)
+	}
+	// 模型预探测发生在账号入库前，不能把 API key 直接放入 Proxy-Auth。
+	// 使用稳定派生的临时身份，让同一 key 的后续探测复用同一 Resin 租约。
+	if resinAccountID == "" && strings.TrimSpace(req.APIKey) != "" {
+		resinAccountID, _ = temporaryResinProxy("openai-responses-models", req.ProxyURL, req.APIKey)
+	}
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -3761,7 +3775,7 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders, resinAccountID)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -3894,12 +3908,16 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string, resinAccountID ...string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
+	effectiveProxyURL := proxyURL
+	if len(resinAccountID) > 0 && strings.TrimSpace(resinAccountID[0]) != "" {
+		effectiveProxyURL = proxy.EffectiveProxyURLForIdentity(resinAccountID[0], proxyURL)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport.DialContext = baseDialer.DialContext
-	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+	if err := auth.ConfigureTransportProxy(transport, effectiveProxyURL, baseDialer); err != nil {
 		return nil, fmt.Errorf("代理URL无效: %w", err)
 	}
 	client := &http.Client{
@@ -10430,16 +10448,21 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: resin_platform_name")
 	}
 	if req.ResinURL != nil || req.ResinPlatformName != nil {
-		proxy.SetResinConfig(&proxy.ResinConfig{
+		resinConfig := &proxy.ResinConfig{
 			BaseURL:      resinURL,
 			PlatformName: resinPlatformName,
-		})
-		if strings.TrimSpace(resinURL) != "" && strings.TrimSpace(resinPlatformName) != "" {
-			auth.ResinRequestDecorator = func(targetURL, accountID string) string {
-				return proxy.BuildReverseProxyURL(targetURL)
-			}
+		}
+		if err := proxy.ValidateResinConfig(resinConfig); err != nil {
+			writeError(c, http.StatusBadRequest, "Resin 配置无效: "+err.Error())
+			return
+		}
+		proxy.SetResinConfig(resinConfig)
+		if proxy.IsResinEnabled() {
+			auth.SetResinRequestDecorator(func(proxyURL, accountID string) string {
+				return proxy.EffectiveProxyURLForIdentity(accountID, proxyURL)
+			})
 		} else {
-			auth.ResinRequestDecorator = nil
+			auth.SetResinRequestDecorator(nil)
 		}
 	}
 

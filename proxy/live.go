@@ -358,7 +358,11 @@ func (h *Handler) createUpstreamLiveCall(
 	if h.store != nil {
 		proxyURL = h.store.ResolveProxyForAccount(account)
 	}
-	resp, err := getCodexMaintenanceClient(account, proxyURL).Do(req)
+	// Live call creation carries the account access token.  Resolve the
+	// account-scoped Resin forward proxy before constructing the client so the
+	// local TLS handshake (and its fingerprint) still reaches the real target.
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	resp, err := getCodexMaintenanceClient(account, effectiveProxyURL).Do(req)
 	if err != nil {
 		return nil, 0, "", nil, err
 	}

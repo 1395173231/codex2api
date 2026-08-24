@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -165,4 +166,35 @@ func TestCodexAlphaSearchHandler_RelayOnlyPoolFastFails(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestForwardCodexAlphaSearchUsesResinForwardProxy(t *testing.T) {
+	oldCfg := GetResinConfig()
+	oldURL := codexAlphaSearchURLForTest
+	t.Cleanup(func() {
+		SetResinConfig(oldCfg)
+		codexAlphaSearchURLForTest = oldURL
+	})
+
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{
+		BaseURL:      proxyServer.urlWithToken("my-token"),
+		PlatformName: "codex2api",
+	})
+	codexAlphaSearchURLForTest = "https://resin-alpha-search.test/backend-api/codex/alpha/search"
+
+	account := &auth.Account{DBID: 123, AccessToken: "at-123"}
+	_, err := ForwardCodexAlphaSearch(
+		context.Background(),
+		account,
+		"http://legacy-proxy.example:8080",
+		[]byte(`{"id":"search_1"}`),
+		nil,
+		nil,
+		"",
+	)
+	if err == nil {
+		t.Fatal("expected capture proxy to reject the request")
+	}
+	assertResinProxyConnect(t, proxyServer, "resin-alpha-search.test:443", "123", "my-token")
 }

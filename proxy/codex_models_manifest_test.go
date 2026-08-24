@@ -164,3 +164,28 @@ func TestFetchCodexModelsManifest_UsesCustomHeaderAccountIDOverride(t *testing.T
 		t.Errorf("chatgpt-account-id = %q, want acc-override", gotAccountID)
 	}
 }
+
+func TestFetchCodexModelsManifestUsesResinForwardProxy(t *testing.T) {
+	oldCfg := GetResinConfig()
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
+
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{
+		BaseURL:      proxyServer.urlWithToken("my-token"),
+		PlatformName: "codex2api",
+	})
+
+	account := &auth.Account{DBID: 123, AccessToken: "at-123"}
+	_, err := fetchCodexModelsManifestWithURL(
+		context.Background(),
+		account,
+		"http://legacy-proxy.example:8080",
+		"https://resin-manifest.test/backend-api/codex/models",
+		"0.140.0",
+		"",
+	)
+	if err == nil {
+		t.Fatal("expected capture proxy to reject the request")
+	}
+	assertResinProxyConnect(t, proxyServer, "resin-manifest.test:443", "123", "my-token")
+}

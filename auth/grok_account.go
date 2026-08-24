@@ -863,6 +863,10 @@ type GrokExchangeCodeParams struct {
 	TokenEndpoint string
 	OIDCIssuer    string
 	ProxyURL      string
+	// ResinAccountID is a stable account/temporary identity for this
+	// account-bound OAuth exchange. It is optional for compatibility with
+	// callers that already pass a fully decorated proxy URL.
+	ResinAccountID string
 }
 
 // ExchangeGrokAuthorizationCode 用 authorization_code + PKCE verifier 兑换 token。
@@ -884,8 +888,12 @@ func ExchangeGrokAuthorizationCode(ctx context.Context, params GrokExchangeCodeP
 		redirectURI = GrokDefaultOAuthRedirectURI
 	}
 
+	effectiveProxyURL := params.ProxyURL
+	if strings.TrimSpace(params.ResinAccountID) != "" {
+		effectiveProxyURL = decorateResinRequestProxy(effectiveProxyURL, params.ResinAccountID)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if err := ConfigureTransportProxy(transport, params.ProxyURL, nil); err != nil {
+	if err := ConfigureTransportProxy(transport, effectiveProxyURL, nil); err != nil {
 		return nil, fmt.Errorf("grok 授权兑换代理配置失败: %w", err)
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
@@ -1371,6 +1379,12 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 	if strings.TrimSpace(proxyURL) == "" && s.GetProxyPoolEnabled() {
 		return fmt.Errorf("账号 %d 代理池已启用但无可用代理，已拒绝直连刷新", dbID)
 	}
+	// Saved Grok refreshes carry account credentials and therefore use the same
+	// stable DBID Resin identity as Grok inference and billing traffic.
+	effectiveProxyURL := s.ResolveProxyForAccount(acc)
+	if dbID > 0 {
+		effectiveProxyURL = decorateResinRequestProxy(effectiveProxyURL, fmt.Sprintf("%d", dbID))
+	}
 	td, err := RefreshGrokAccessToken(ctx, GrokRefreshParams{
 		RefreshToken:  rt,
 		ClientID:      clientID,
@@ -1378,7 +1392,7 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		OIDCIssuer:    oidcIssuer,
 		PrincipalType: principalType,
 		PrincipalID:   principalID,
-		ProxyURL:      proxyURL,
+		ProxyURL:      effectiveProxyURL,
 	})
 	if err != nil {
 		if IsGrokRefreshPermanentError(err) {

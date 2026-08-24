@@ -283,16 +283,21 @@ func main() {
 		log.Printf("图片存储后端: %s", imgCfg.Backend)
 	}
 
-	// 4c. 初始化 Resin 粘性代理池
-	if settings.ResinURL != "" && settings.ResinPlatformName != "" {
-		proxy.SetResinConfig(&proxy.ResinConfig{
+	// 4c. 初始化 Resin 粘性代理池。部分或无效配置必须在启动前失败，
+	// 不能让携带账号凭据的请求悄然回退直连。
+	if strings.TrimSpace(settings.ResinURL) != "" || strings.TrimSpace(settings.ResinPlatformName) != "" {
+		resinConfig := &proxy.ResinConfig{
 			BaseURL:      settings.ResinURL,
 			PlatformName: settings.ResinPlatformName,
-		})
-		// 注入 Resin URL 装饰器到 auth 包（避免 auth → proxy 循环依赖）
-		auth.ResinRequestDecorator = func(targetURL, accountID string) string {
-			return proxy.BuildReverseProxyURL(targetURL)
 		}
+		if err := proxy.ValidateResinConfig(resinConfig); err != nil {
+			log.Fatalf("Resin 配置无效，拒绝启动以避免账号流量绕过代理: %v", err)
+		}
+		proxy.SetResinConfig(resinConfig)
+		// 注入 Resin 正向代理装饰器到 auth 包（避免 auth → proxy 循环依赖）
+		auth.SetResinRequestDecorator(func(proxyURL, accountID string) string {
+			return proxy.EffectiveProxyURLForIdentity(accountID, proxyURL)
+		})
 	}
 
 	// 5. 初始化账号管理器

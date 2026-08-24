@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -87,11 +88,12 @@ func TestRefreshAccessTokenRejectsEmptyAccessToken(t *testing.T) {
 	defer server.Close()
 
 	oldDecorator := ResinRequestDecorator
-	ResinRequestDecorator = func(targetURL, accountID string) string {
-		return server.URL
-	}
+	oldTokenURL := tokenURLForRequest
+	tokenURLForRequest = server.URL
+	ResinRequestDecorator = func(proxyURL, accountID string) string { return proxyURL }
 	defer func() {
 		ResinRequestDecorator = oldDecorator
+		tokenURLForRequest = oldTokenURL
 	}()
 
 	_, _, err := RefreshAccessToken(context.Background(), "rt-old", "", "account-1")
@@ -128,8 +130,8 @@ func TestRefreshWithSessionToken(t *testing.T) {
 		},
 	})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("X-Resin-Account"); got != "account-1" {
-			t.Fatalf("X-Resin-Account = %q, want account-1", got)
+		if got := r.Header.Get("X-Resin-Account"); got != "" {
+			t.Fatalf("X-Resin-Account = %q, want empty in forward proxy mode", got)
 		}
 		cookie, err := r.Cookie("__Secure-next-auth.session-token")
 		if err != nil {
@@ -144,11 +146,12 @@ func TestRefreshWithSessionToken(t *testing.T) {
 	defer server.Close()
 
 	oldDecorator := ResinRequestDecorator
-	ResinRequestDecorator = func(targetURL, accountID string) string {
-		return server.URL
-	}
+	oldSessionURL := sessionURLForRequest
+	sessionURLForRequest = server.URL
+	ResinRequestDecorator = func(proxyURL, accountID string) string { return proxyURL }
 	defer func() {
 		ResinRequestDecorator = oldDecorator
+		sessionURLForRequest = oldSessionURL
 	}()
 
 	td, info, err := RefreshWithSessionToken(context.Background(), "st-old", "", "account-1")
@@ -163,8 +166,53 @@ func TestRefreshWithSessionToken(t *testing.T) {
 	}
 }
 
-// 个人账号 JWT 可能没有 chatgpt_account_id，只有 user_id；解析仍需保留元数据，
-// 但 user_id 不参与 workspace 身份去重。
+func TestResinRequestDecoratorCanUpdateDuringLookup(t *testing.T) {
+	oldDecorator := ResinRequestDecorator
+	t.Cleanup(func() { SetResinRequestDecorator(oldDecorator) })
+
+	const iterations = 500
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	unexpected := make(chan string, 1)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			if i%2 == 0 {
+				SetResinRequestDecorator(func(_ string, accountID string) string { return "resin://" + accountID })
+			} else {
+				SetResinRequestDecorator(nil)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			got := decorateResinRequestProxy("fallback://proxy", "123")
+			if got != "fallback://proxy" && got != "resin://123" {
+				select {
+				case unexpected <- got:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	select {
+	case got := <-unexpected:
+		t.Fatalf("unexpected decorator result %q", got)
+	default:
+	}
+}
+
+// 个人账号 JWT 可能没有 chatgpt_account_id，只有 user_id；解析必须带出它，
+// 供 AT 导入按 email+user_id 做身份去重（重复导入问题）。
 func TestParseAccessTokenExtractsUserID(t *testing.T) {
 	jwt := makeTestJWT(map[string]interface{}{
 		"exp": 9999999999,

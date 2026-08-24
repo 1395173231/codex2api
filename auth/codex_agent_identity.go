@@ -283,6 +283,11 @@ func (s *Store) EnsureCodexAgentIdentityTask(ctx context.Context, account *Accou
 	if !forceRefresh && existingTask != "" {
 		return nil
 	}
+	// Task registration is an account-authenticated upstream request. Keep it
+	// on the same DBID Resin lease as the subsequent signed /responses calls.
+	if account.DBID > 0 {
+		proxyURL = decorateResinRequestProxy(proxyURL, fmt.Sprintf("%d", account.DBID))
+	}
 
 	taskID, err := registerAgentIdentityTask(ctx, key, proxyURL)
 	if err != nil {

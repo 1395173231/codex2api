@@ -30,7 +30,7 @@ func newChatStreamTerminalTestHandler(t *testing.T, events []string) (*Handler, 
 		}
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 1})
 	t.Cleanup(store.Stop)

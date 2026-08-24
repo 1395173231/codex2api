@@ -412,7 +412,8 @@ func FetchGrokModelCatalog(ctx context.Context, account *auth.Account, proxyURL,
 	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {
 		req.Header.Set("If-None-Match", ifNoneMatch)
 	}
-	resp, err := getPooledClient(account, proxyURL).Do(req)
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
 	if err != nil {
 		return result, fmt.Errorf("请求 Grok 模型列表失败: %w", err)
 	}

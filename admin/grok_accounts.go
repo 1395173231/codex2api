@@ -237,6 +237,8 @@ func (h *Handler) AddGrokAccount(c *gin.Context) {
 	acc.BaseURL = strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	acc.Email = email
 	h.store.AddAccount(acc)
+	// 模型探测/凭据预校验发生在入库前时，沿用同一稳定凭据身份的 Resin 租约。
+	inheritTemporaryResinLease(grokCredentialResinIdentity(credentials), id)
 
 	// 异步 billing 探针：拉取套餐/周月额度，避免被 ChatGPT wham 误封
 	h.triggerGrokUsageProbe(id)
@@ -416,6 +418,11 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
 
 	credentials, _, err := grokCredentialsFromRequest(&req)
 	if err != nil {
@@ -426,7 +433,7 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 	probe := &auth.Account{
 		UpstreamType:      auth.UpstreamGrok,
 		BaseURL:           strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"),
-		ProxyURL:          security.SanitizeInput(req.ProxyURL),
+		ProxyURL:          req.ProxyURL,
 		APIKey:            credentialStringValue(credentials, "api_key"),
 		AccessToken:       credentialStringValue(credentials, "access_token"),
 		RefreshToken:      credentialStringValue(credentials, "refresh_token"),
@@ -437,6 +444,12 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 		GrokPrincipalID:   credentialStringValue(credentials, "grok_principal_id"),
 		AccountID:         credentialStringValue(credentials, "account_id"),
 	}
+	resinTempID := grokCredentialResinIdentity(credentials)
+	fallbackProxyURL := probe.ProxyURL
+	if h.store != nil {
+		fallbackProxyURL = h.store.ResolveProxyForAccount(probe)
+	}
+	effectiveProxyURL := effectiveTemporaryResinProxy(resinTempID, fallbackProxyURL)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
@@ -449,7 +462,7 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 			OIDCIssuer:    probe.GrokOIDCIssuer,
 			PrincipalType: probe.GrokPrincipalType,
 			PrincipalID:   probe.GrokPrincipalID,
-			ProxyURL:      probe.ProxyURL,
+			ProxyURL:      effectiveProxyURL,
 		})
 		if refreshErr != nil {
 			writeError(c, http.StatusBadGateway, fmt.Sprintf("Grok 凭据刷新失败: %s", refreshErr.Error()))
@@ -458,7 +471,7 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 		probe.AccessToken = td.AccessToken
 	}
 
-	models, err := proxy.FetchGrokModelIDs(ctx, probe, h.store.ResolveProxyForAccount(probe))
+	models, err := proxy.FetchGrokModelIDs(ctx, probe, effectiveProxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

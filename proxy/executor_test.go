@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +29,45 @@ func (r *maxChunkReader) Read(p []byte) (int, error) {
 		p = p[:r.size]
 	}
 	return r.reader.Read(p)
+}
+
+type captureConnectProxy struct {
+	listener net.Listener
+	requests chan *http.Request
+}
+
+func newCaptureConnectProxy(t *testing.T) *captureConnectProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen capture proxy: %v", err)
+	}
+	p := &captureConnectProxy{
+		listener: ln,
+		requests: make(chan *http.Request, 4),
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err == nil {
+					p.requests <- req
+					_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return p
+}
+
+func (p *captureConnectProxy) urlWithToken(token string) string {
+	return "http://" + p.listener.Addr().String() + "/" + token
 }
 
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
@@ -172,6 +214,66 @@ func TestWebsocketMessageTooBigSource(t *testing.T) {
 	}
 	if got := websocketMessageTooBigSource("websocket read error: websocket: close 1009 (message too big)"); got != "peer_close" {
 		t.Fatalf("peer close source = %q", got)
+	}
+}
+
+func TestExecuteRequestUsesResinForwardProxyWithoutReverseHeaders(t *testing.T) {
+	oldCfg := GetResinConfig()
+	SetResinConfig(nil)
+	t.Cleanup(func() { SetResinConfig(oldCfg) })
+	clientPool = sync.Map{}
+
+	proxyServer := newCaptureConnectProxy(t)
+	SetResinConfig(&ResinConfig{
+		BaseURL:      proxyServer.urlWithToken("my-token"),
+		PlatformName: "codex2api",
+	})
+
+	account := &auth.Account{
+		DBID:        123,
+		AccessToken: "access-token",
+	}
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+
+	resp, err := ExecuteRequest(context.Background(), account, body, "", "", "api-key", nil, nil, false)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	_ = err
+
+	assertResinProxyConnect(t, proxyServer, "chatgpt.com:443", "123", "my-token")
+}
+
+func assertResinProxyConnect(t *testing.T, proxyServer *captureConnectProxy, wantHost, accountID, token string) {
+	t.Helper()
+	select {
+	case req := <-proxyServer.requests:
+		if req.Method != http.MethodConnect {
+			t.Fatalf("proxy method = %s, want CONNECT", req.Method)
+		}
+		if req.URL.Host != wantHost {
+			t.Fatalf("CONNECT host = %q, want %q", req.URL.Host, wantHost)
+		}
+		rawAuth := strings.TrimSpace(req.Header.Get("Proxy-Authorization"))
+		if !strings.HasPrefix(rawAuth, "Basic ") {
+			t.Fatal("CONNECT missing Proxy-Authorization basic credentials")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(rawAuth, "Basic "))
+		if err != nil {
+			t.Fatalf("invalid proxy authorization: %v", err)
+		}
+		username, password, ok := strings.Cut(string(decoded), ":")
+		if !ok {
+			t.Fatalf("proxy authorization missing password separator: %q", decoded)
+		}
+		if username != "codex2api."+accountID || password != token {
+			t.Fatalf("proxy credentials = %q/%q, want codex2api.%s/%s", username, password, accountID, token)
+		}
+		if got := req.Header.Get("X-Resin-Account"); got != "" {
+			t.Fatalf("CONNECT should not include X-Resin-Account, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
 	}
 }
 
@@ -1663,9 +1765,6 @@ func TestResolveUpstreamSessionID(t *testing.T) {
 // （native WS ingress 的 1009 降级 / 生图强制 HTTP / Agent Identity 强制 HTTP
 // 都会带信封 body 走到这里）；嵌套 type 不受影响 (issue #548)。
 func TestExecuteRequestHTTPStripsTopLevelEnvelopeType(t *testing.T) {
-	previousResin := resinCfg.Load()
-	t.Cleanup(func() { resinCfg.Store(previousResin) })
-
 	bodyCh := make(chan []byte, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1674,7 +1773,7 @@ func TestExecuteRequestHTTPStripsTopLevelEnvelopeType(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	useDirectCodexUpstream(t, upstream.URL)
 
 	raw := []byte(`{"type":"response.create","model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
 	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, raw, "", "", "sk-local", nil, http.Header{}, false)

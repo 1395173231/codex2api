@@ -1328,7 +1328,8 @@ func ExecuteGrokNativeProtocolProbeAtOriginWithHeaders(ctx context.Context, acco
 	if protocol == GrokProtocolMessages {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
-	resp, err := getPooledClient(account, proxyURL).Do(req)
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
+	resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
 	if err != nil {
 		return nil, ErrUpstream(0, "请求 Grok 原生协议探针失败", err)
 	}
@@ -1539,6 +1540,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 	logGrokPrefixFingerprint(preflight.Body, preflight.TurnIndex, preflight.Model)
 	send := func(payload []byte, clientVersion string) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, route.Endpoint, bytes.NewReader(payload))
@@ -1571,10 +1573,10 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 		if route.Protocol == GrokProtocolMessages && req.Header.Get("anthropic-version") == "" {
 			req.Header.Set("anthropic-version", "2023-06-01")
 		}
-		resp, doErr := getPooledClient(account, proxyURL).Do(req)
+		resp, doErr := getPooledClient(account, effectiveProxyURL).Do(req)
 		if doErr != nil {
 			if shouldRecyclePooledClient(doErr) {
-				recyclePooledClient(account, proxyURL)
+				recyclePooledClient(account, effectiveProxyURL)
 			}
 			return nil, ErrUpstream(0, "请求 Grok 上游失败", doErr)
 		}
