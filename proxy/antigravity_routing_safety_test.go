@@ -320,50 +320,24 @@ func TestAntigravityResponsesHandlerPreservesRetryAfter(t *testing.T) {
 	}
 }
 
-func TestAntigravityAdapterBadRequestStays400AndDoesNotFenceAccount(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	var upstreamHits atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamHits.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer upstream.Close()
-	previous := antigravityOAuthEndpointBases
-	antigravityOAuthEndpointBases = []string{upstream.URL}
-	t.Cleanup(func() { antigravityOAuthEndpointBases = previous })
-
-	account := &auth.Account{
-		DBID: 86, UpstreamType: auth.UpstreamAntigravity,
-		AccessToken: "google-token", RefreshToken: "google-refresh", AntigravityProjectID: "google-project",
-		Models: []string{"gemini-3.6-flash-low"}, HealthTier: auth.HealthTierHealthy, Status: auth.StatusReady,
-	}
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, MaxRetries: 2})
-	store.AddAccount(account)
-	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
-	router := gin.New()
-	handler.RegisterRoutes(router)
-
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+func TestAntigravityAdapterConvertsStructuredTextOutput(t *testing.T) {
+	payload, err := responsesToGeminiInternal([]byte(`{
 		"model":"gemini-3.6-flash-low",
 		"input":"hello",
 		"stream":false,
-		"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}}
-	}`))
-	request.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s, want 400", recorder.Code, recorder.Body.String())
+		"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}
+	}`), "google-project", "gemini-3.6-flash-low")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(recorder.Body.String(), "antigravity_feature_unsupported") {
-		t.Fatalf("body = %s, want adapter error code", recorder.Body.String())
+	request, _ := payload["request"].(map[string]any)
+	generation, _ := request["generationConfig"].(map[string]any)
+	if generation["responseMimeType"] != "application/json" {
+		t.Fatalf("generation config = %#v", generation)
 	}
-	if hits := upstreamHits.Load(); hits != 0 {
-		t.Fatalf("upstream hits = %d, deterministic adapter error must fail before network", hits)
-	}
-	if !account.IsAvailable() || !account.ModelCatalogEligible() {
-		t.Fatal("deterministic downstream request error fenced the Antigravity account")
+	schema, _ := generation["responseSchema"].(map[string]any)
+	if schema["type"] != "OBJECT" {
+		t.Fatalf("response schema = %#v", schema)
 	}
 }
 

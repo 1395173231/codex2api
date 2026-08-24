@@ -395,9 +395,7 @@ func responsesToGeminiInternal(raw []byte, project, model string) (map[string]an
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fmt.Errorf("decode Responses request: %w", err)
 	}
-	if textConfig, ok := in["text"].(map[string]any); ok && antigravityStructuredTextRequested(textConfig) {
-		return nil, antigravityOAuthUnsupported("structured text output")
-	}
+	textConfig, _ := in["text"].(map[string]any)
 	reasoning, _ := in["reasoning"].(map[string]any)
 	wireModel := antigravityGeminiResolvedModel(model, reasoning)
 	contents := make([]any, 0)
@@ -528,6 +526,13 @@ func responsesToGeminiInternal(raw []byte, project, model string) (map[string]an
 		}
 	}
 	generationConfig := map[string]any{}
+	if structuredConfig, structuredErr := antigravityGeminiStructuredTextConfig(textConfig); structuredErr != nil {
+		return nil, structuredErr
+	} else {
+		for key, value := range structuredConfig {
+			generationConfig[key] = value
+		}
+	}
 	isGeminiModel := strings.HasPrefix(strings.ToLower(strings.TrimSpace(wireModel)), "gemini-")
 	if n, ok := in["max_output_tokens"].(float64); ok && !isGeminiModel {
 		maxOutputTokens := int(n)
@@ -619,6 +624,50 @@ func antigravityStructuredTextRequested(textConfig map[string]any) bool {
 		return formatType != "" && formatType != "text"
 	default:
 		return true
+	}
+}
+
+func antigravityGeminiStructuredTextConfig(textConfig map[string]any) (map[string]any, error) {
+	if !antigravityStructuredTextRequested(textConfig) {
+		return nil, nil
+	}
+	format, ok := textConfig["format"].(map[string]any)
+	if !ok {
+		return nil, antigravityOAuthUnsupported("structured text output format")
+	}
+	formatType := lowerStringField(format, "type")
+	switch formatType {
+	case "json_object":
+		return map[string]any{"responseMimeType": "application/json"}, nil
+	case "json_schema":
+		schema := format["schema"]
+		if schema == nil {
+			if nested, nestedOK := format["json_schema"].(map[string]any); nestedOK {
+				schema = nested["schema"]
+			}
+		}
+		root, rootOK := schema.(map[string]any)
+		if !rootOK {
+			return nil, antigravityOAuthUnsupported("json_schema output without a schema")
+		}
+		definitions := map[string]any{}
+		for _, key := range []string{"$defs", "definitions"} {
+			if defs, defsOK := root[key].(map[string]any); defsOK {
+				for name, definition := range defs {
+					definitions[name] = definition
+				}
+			}
+		}
+		cleaned, cleanedOK := antigravityCleanGeminiSchema(root, definitions, map[string]bool{}, 0).(map[string]any)
+		if !cleanedOK || len(cleaned) == 0 {
+			return nil, antigravityOAuthUnsupported("json_schema output with an unusable schema")
+		}
+		return map[string]any{
+			"responseMimeType": "application/json",
+			"responseSchema":   cleaned,
+		}, nil
+	default:
+		return nil, antigravityOAuthUnsupported("structured text output type " + formatType)
 	}
 }
 
