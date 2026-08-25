@@ -27,6 +27,7 @@ const newAPIIdentityContextKey = "prompt_filter_verified_newapi_identity"
 const newAPIPolicyMetaContextKey = "prompt_filter_verified_newapi_policy_meta"
 const newAPIBindingContextKey = "prompt_filter_newapi_binding"
 const newAPIUpstreamCyberDecisionContextKey = "prompt_filter_newapi_upstream_cyber_decision"
+const sub2APIHeaderConflictContextKey = "prompt_filter_sub2api_header_conflict"
 
 const (
 	newAPISignatureVersionV1               = "1"
@@ -90,6 +91,47 @@ type resolvedPromptFilterNewAPIBinding struct {
 	Bound    bool
 }
 
+// normalizeSub2APIHeaders lets a Sub2API caller use a self-describing header
+// namespace while reusing the exact NewAPI V1 verification contract. The
+// binding remains the trust boundary: aliases are accepted only for a binding
+// whose platform code is `sub2api`, and conflicting canonical/alias values are
+// rejected instead of choosing one silently.
+func normalizeSub2APIHeaders(c *gin.Context, binding database.PromptFilterNewAPIBinding, bound bool) {
+	if c == nil || !bound || !isSub2APIPlatform(binding.PlatformCode) || c.Request == nil {
+		return
+	}
+	for _, suffix := range []string{
+		"User-ID", "Client-IP", "Request-ID", "Timestamp", "Method", "Path",
+		"Body-SHA256", "Signature-Version", "Signature", "Policy-Meta", "Policy-Meta-Signature",
+	} {
+		canonicalName := "X-NewAPI-" + suffix
+		aliasName := "X-Sub2API-" + suffix
+		canonical := strings.TrimSpace(c.GetHeader(canonicalName))
+		alias := strings.TrimSpace(c.GetHeader(aliasName))
+		if canonical != "" && alias != "" && canonical != alias {
+			c.Set(sub2APIHeaderConflictContextKey, true)
+			return
+		}
+		if canonical == "" && alias != "" {
+			c.Request.Header.Set(canonicalName, alias)
+		}
+	}
+}
+
+func isSub2APIPlatform(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "sub2api" || strings.HasPrefix(value, "sub2api-") || strings.HasPrefix(value, "sub2api_")
+}
+
+func sub2APIHeaderConflict(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, _ := c.Get(sub2APIHeaderConflictContextKey)
+	conflict, _ := value.(bool)
+	return conflict
+}
+
 func (h *Handler) resolvePromptFilterNewAPIBinding(c *gin.Context) (database.PromptFilterNewAPIBinding, bool) {
 	if c == nil || h == nil || h.store == nil {
 		return database.PromptFilterNewAPIBinding{}, false
@@ -97,10 +139,12 @@ func (h *Handler) resolvePromptFilterNewAPIBinding(c *gin.Context) (database.Pro
 	apiKeyID := requestAPIKeyID(c)
 	if cached, ok := c.Get(newAPIBindingContextKey); ok {
 		if resolved, valid := cached.(resolvedPromptFilterNewAPIBinding); valid && resolved.APIKeyID == apiKeyID {
+			normalizeSub2APIHeaders(c, resolved.Binding, resolved.Bound)
 			return resolved.Binding, resolved.Bound
 		}
 	}
 	binding, bound := h.store.GetPromptFilterNewAPIBinding(apiKeyID)
+	normalizeSub2APIHeaders(c, binding, bound)
 	c.Set(newAPIBindingContextKey, resolvedPromptFilterNewAPIBinding{APIKeyID: apiKeyID, Binding: binding, Bound: bound})
 	return binding, bound
 }
@@ -209,6 +253,10 @@ func (h *Handler) verifyNewAPIIdentityContext(c *gin.Context, cfg promptfilter.N
 	if c == nil || !cfg.Enabled {
 		return verifiedNewAPIIdentityContext{}, false
 	}
+	_, _ = h.resolvePromptFilterNewAPIBinding(c)
+	if sub2APIHeaderConflict(c) {
+		return verifiedNewAPIIdentityContext{}, false
+	}
 	_, actualBodyDigest := promptRequestBodyDigest(c, body)
 	if cached, exists := c.Get(newAPIIdentityContextKey); exists {
 		if identityContext, ok := cached.(verifiedNewAPIIdentityContext); ok && identityContext.BodySHA256 == actualBodyDigest {
@@ -288,6 +336,10 @@ func (h *Handler) verifyNewAPIIdentityContext(c *gin.Context, cfg promptfilter.N
 
 func (h *Handler) verifyNewAPIPolicyContext(c *gin.Context, cfg promptfilter.NewAPIConfig, body []byte) (verifiedNewAPIPolicyContext, bool) {
 	if c == nil || !cfg.Enabled {
+		return verifiedNewAPIPolicyContext{}, false
+	}
+	_, _ = h.resolvePromptFilterNewAPIBinding(c)
+	if sub2APIHeaderConflict(c) {
 		return verifiedNewAPIPolicyContext{}, false
 	}
 	_, actualBodyDigest := promptRequestBodyDigest(c, body)

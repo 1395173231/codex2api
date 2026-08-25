@@ -70,6 +70,7 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, signedBody) {
 		return true
 	}
+	h.observePromptRiskSession(c, cfg, signedBody, endpoint, model)
 	if h.rejectLockedPromptConversation(c, cfg, signedBody, rawBody, endpoint, model) {
 		return true
 	}
@@ -110,9 +111,11 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	signedBody := ingressRequestBody(c, nil)
 	if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil)) {
 		return true
 	}
+	h.observePromptRiskSession(c, cfg, signedBody, endpoint, model)
 	if h.rejectLockedPromptConversation(c, cfg, ingressRequestBody(c, nil), []byte(text), endpoint, model) {
 		return true
 	}
@@ -150,6 +153,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		sendAnthropicError(c, http.StatusUnauthorized, "authentication_error", apiErr.Message)
 		return true
 	}
+	h.observePromptRiskSession(c, cfg, signedBody, endpoint, model)
 	if h.rejectLockedPromptConversation(c, cfg, signedBody, rawBody, endpoint, model) {
 		return true
 	}

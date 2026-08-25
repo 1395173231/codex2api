@@ -1174,6 +1174,7 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 		return false, false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	h.observePromptRiskSession(c, cfg, nil, endpoint, model)
 	if item, locked := h.activePromptConversationLock(c, cfg, nil); locked {
 		restriction := promptCyberRestrictionDecision(item, cfg)
 		profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))

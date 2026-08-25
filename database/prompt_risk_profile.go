@@ -32,11 +32,13 @@ const (
 
 	promptRiskSourceLog      = "prompt_filter_log"
 	promptRiskSourceIncident = "prompt_policy_incident"
+	promptRiskSourceSession  = "prompt_session_observation"
 
 	promptRiskEventReviewCleared        = "review_cleared"
 	promptRiskEventLocalBlock           = "local_block"
 	promptRiskEventLocalBlockUnverified = "local_block_unverified"
 	promptRiskEventLocalBlockCleared    = "local_block_cleared"
+	promptRiskEventSessionObserved      = "session_observed"
 )
 
 type PromptRiskProfile struct {
@@ -150,6 +152,27 @@ type PromptRiskIdentityInput struct {
 	UserEmail      string
 	UserGroup      string
 	Source         string
+}
+
+// PromptRiskSessionObservation records a verified gateway session without
+// treating an ordinary clean request as risk evidence. It creates the user,
+// session, API-key, and client-IP profile rows used by the admin view while
+// contributing zero risk score. Raw session IDs and client IPs never cross
+// this boundary; callers provide the existing privacy-preserving hashes.
+type PromptRiskSessionObservation struct {
+	RequestCorrelationID string
+	Platform             string
+	ExternalUserID       string
+	UserName             string
+	UserEmail            string
+	UserGroup            string
+	SessionHash          string
+	ClientIPHash         string
+	APIKeyID             int64
+	APIKeyName           string
+	APIKeyMasked         string
+	Endpoint             string
+	Model                string
 }
 
 type promptRiskIdentity struct {
@@ -560,6 +583,60 @@ func (db *DB) UpsertPromptRiskIdentities(ctx context.Context, inputs []PromptRis
 		}
 	}
 	return tx.Commit()
+}
+
+// RecordPromptRiskSessionObservation materializes a verified request as a
+// zero-score risk event. This keeps clean Sub2API/NewAPI users and sessions
+// visible in the same profile list as flagged traffic without turning
+// observation into positive risk evidence.
+func (db *DB) RecordPromptRiskSessionObservation(ctx context.Context, observation PromptRiskSessionObservation) error {
+	if db == nil {
+		return nil
+	}
+	requestID := truncateCandidateRunes(strings.TrimSpace(observation.RequestCorrelationID), 64)
+	if requestID == "" {
+		return nil
+	}
+	platform := strings.ToLower(truncateCandidateRunes(strings.TrimSpace(observation.Platform), 100))
+	userID := truncateCandidateRunes(strings.TrimSpace(observation.ExternalUserID), 255)
+	if platform == "" || userID == "" {
+		return nil
+	}
+	signal := promptRiskSignal{
+		SourceType:           promptRiskSourceSession,
+		SourceID:             requestID,
+		RequestCorrelationID: requestID,
+		CreatedAt:            time.Now().UTC(),
+		EventKind:            promptRiskEventSessionObserved,
+		RequestRiskScore:     0,
+		EvidenceConfidence:   100,
+		ReasonCode:           "signed_session_observed",
+		Action:               "allow",
+		Endpoint:             observation.Endpoint,
+		Model:                observation.Model,
+		APIKeyID:             observation.APIKeyID,
+		APIKeyName:           observation.APIKeyName,
+		APIKeyMasked:         observation.APIKeyMasked,
+		NewAPIPolicyStatus:   "verified",
+		NewAPIPlatform:       platform,
+		NewAPIUserID:         userID,
+		NewAPIUserName:       observation.UserName,
+		NewAPIUserEmail:      observation.UserEmail,
+		NewAPIUserGroup:      observation.UserGroup,
+		SessionHash:          observation.SessionHash,
+		ClientIPHash:         observation.ClientIPHash,
+	}
+	return db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := insertPromptRiskSignal(ctx, tx, signal); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 func promptRiskSubjects(signal promptRiskSignal) []promptRiskSubject {

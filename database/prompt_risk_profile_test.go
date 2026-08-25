@@ -155,6 +155,48 @@ func TestPromptRiskIdentityDirectoryListsPeopleBeforeFirstRiskEvent(t *testing.T
 	}
 }
 
+func TestPromptRiskSessionObservationCreatesZeroScoreProfiles(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	observation := PromptRiskSessionObservation{
+		RequestCorrelationID: "sub2api-observation-1",
+		Platform:             "sub2api-prod",
+		ExternalUserID:       "user-100",
+		UserName:             "pool-user",
+		UserEmail:            "pool@example.com",
+		UserGroup:            "paid",
+		SessionHash:          promptRiskHash("session", "session-100"),
+		ClientIPHash:         promptRiskHash("client-ip", "203.0.113.100"),
+		APIKeyID:             100,
+		APIKeyName:           "sub2api-key",
+		APIKeyMasked:         "sk-***100",
+		Endpoint:             "/v1/responses",
+		Model:                "gpt-5.5",
+	}
+	if err := db.RecordPromptRiskSessionObservation(ctx, observation); err != nil {
+		t.Fatalf("RecordPromptRiskSessionObservation: %v", err)
+	}
+	if err := db.RecordPromptRiskSessionObservation(ctx, observation); err != nil {
+		t.Fatalf("idempotent RecordPromptRiskSessionObservation: %v", err)
+	}
+	profiles, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{Page: 1, PageSize: 20, Platform: "sub2api-prod"})
+	if err != nil || total != 4 || len(profiles) != 4 {
+		t.Fatalf("observation profiles total=%d items=%#v err=%v", total, profiles, err)
+	}
+	user := findPromptRiskProfile(profiles, PromptRiskSubjectNewAPIUser)
+	if user == nil || user.EventCount != 1 || user.RiskScore != 0 || user.LocalBlockCount != 0 || user.UpstreamCYCount != 0 || user.NewAPIUserEmail != observation.UserEmail {
+		t.Fatalf("observed user profile=%#v", user)
+	}
+	session := findPromptRiskProfile(profiles, PromptRiskSubjectSession)
+	if session == nil || session.EventCount != 1 || session.RiskScore != 0 {
+		t.Fatalf("observed session profile=%#v", session)
+	}
+	events, eventTotal, err := db.ListPromptRiskEvents(ctx, user.SubjectType, user.SubjectKey, PromptRiskEventQuery{Page: 1, PageSize: 10})
+	if err != nil || eventTotal != 1 || len(events) != 1 || events[0].EventKind != promptRiskEventSessionObserved {
+		t.Fatalf("observation events total=%d items=%#v err=%v", eventTotal, events, err)
+	}
+}
+
 func TestPromptRiskUnsignedIdentityNeverCreatesPersonProfile(t *testing.T) {
 	db := newPromptPolicySQLiteTestDB(t)
 	input := &PromptFilterLogInput{
