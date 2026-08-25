@@ -1059,9 +1059,10 @@ export const api = {
     }
     return request<PromptFilterLogsResponse>(`/prompt-filter/logs?${search.toString()}`)
   },
-  clearPromptFilterLogs: (params: { reviewed?: boolean } = {}) => {
+  clearPromptFilterLogs: (params: { reviewed?: boolean; source?: 'local_filter' } = {}) => {
     const search = new URLSearchParams()
     if (typeof params.reviewed === 'boolean') search.set('reviewed', String(params.reviewed))
+    if (params.source) search.set('source', params.source)
     const suffix = search.size > 0 ? `?${search.toString()}` : ''
     return request<MessageResponse>(`/prompt-filter/logs${suffix}`, { method: 'DELETE' })
   },

@@ -3750,7 +3750,6 @@ function LogsView({ onPromptLogsChanged }: { onPromptLogsChanged: () => Promise<
         model: localFilters.model,
         apiKeyId: localFilters.apiKeyId,
         q: localFilters.q,
-        reviewed: false,
       })
       setLogs(result.logs ?? [])
       setTotal(result.total ?? 0)
@@ -3847,7 +3846,7 @@ function LogsView({ onPromptLogsChanged }: { onPromptLogsChanged: () => Promise<
         return
       }
 
-      await api.clearPromptFilterLogs({ reviewed: section === 'review' })
+      await api.clearPromptFilterLogs(section === 'review' ? { reviewed: true } : { source: 'local_filter' })
       if (section === 'review') {
         setReviewLogs([])
         setReviewTotal(0)

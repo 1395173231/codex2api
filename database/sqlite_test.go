@@ -3870,6 +3870,7 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 		ReviewFlagged:        false,
 		ReviewError:          "temporary failure",
 		RequestCorrelationID: "298ee1bb-ad0f-4e96-8924-d34066def71e",
+		SessionHash:          "cb74e520ed6af73b8a9564cc",
 	}); err != nil {
 		t.Fatalf("InsertPromptFilterLog 返回错误: %v", err)
 	}
@@ -3909,6 +3910,14 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if auditReferenceTotal != 1 || len(byAuditReference) != 1 || byAuditReference[0].RequestCorrelationID != "298ee1bb-ad0f-4e96-8924-d34066def71e" {
 		t.Fatalf("audit reference search total=%d logs=%+v", auditReferenceTotal, byAuditReference)
+	}
+
+	bySessionHash, sessionHashTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "cb74e520ed6af73b8a9564cc"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(session hash) 返回错误: %v", err)
+	}
+	if sessionHashTotal != 1 || len(bySessionHash) != 1 || bySessionHash[0].SessionHash != "cb74e520ed6af73b8a9564cc" {
+		t.Fatalf("session hash search total=%d logs=%+v", sessionHashTotal, bySessionHash)
 	}
 
 	nearest, err := db.FindNearestPromptFilterLog(ctx, got.CreatedAt, "local_filter", "/v1/messages", 0, 5)
@@ -3986,6 +3995,23 @@ func TestPromptFilterReviewHistorySeparatesIntelligenceAndNullableScores(t *test
 	}
 	if localTotal != 1 || len(local) != 1 || local[0].Endpoint != "/v1/messages" {
 		t.Fatalf("local logs total=%d logs=%+v", localTotal, local)
+	}
+	allLocal, allLocalTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "local_filter", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(all local logs): %v", err)
+	}
+	if allLocalTotal != 4 || len(allLocal) != 4 {
+		t.Fatalf("all local logs total=%d len=%d, want 4", allLocalTotal, len(allLocal))
+	}
+	var foundReviewedBlock bool
+	for _, log := range allLocal {
+		if log.Action == "block" && log.Reviewed {
+			foundReviewedBlock = true
+			break
+		}
+	}
+	if !foundReviewedBlock {
+		t.Fatalf("all local logs did not include reviewed local block: %+v", allLocal)
 	}
 
 	intelligence, intelligenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "intel_run", ExcludeIntelligence: true})
