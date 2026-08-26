@@ -106,6 +106,13 @@ func promptConversationSessionSignal(c *gin.Context) string {
 	return ""
 }
 
+// promptConversationLockFallbackSessionHash 统一 codex-local 降级身份的 session
+// hash 派生。锁表和审计日志必须使用同一条信号提取与指纹链路，后台才能用审计
+// 记录里的 session_hash 定位并解锁对应会话。
+func promptConversationLockFallbackSessionHash(c *gin.Context) string {
+	return hashRiskIdentity(promptSessionFingerprint32(promptConversationSessionSignal(c)))
+}
+
 func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifiedNewAPIPolicyContext) (promptConversationLockIdentity, bool) {
 	if c == nil || !policyContext.MetaVerified {
 		return promptConversationLockIdentity{}, false
@@ -311,7 +318,7 @@ func promptConversationLockFallbackIdentity(c *gin.Context) (promptConversationL
 		Platform:           promptConversationLockFallbackPlatform,
 		NewAPIUserID:       subject,
 		SessionFingerprint: fingerprint,
-		SessionHash:        hashRiskIdentity(fingerprint),
+		SessionHash:        promptConversationLockFallbackSessionHash(c),
 	}, true
 }
 

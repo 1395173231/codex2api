@@ -286,7 +286,7 @@ func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAu
 		newAPIUserEmail = policyContext.Meta.UserEmail
 		newAPIUserGroup = policyContext.Meta.UserGroup
 	} else if newAPIStatus == "unbound" {
-		sessionHash = hashRiskIdentity(promptSessionID(c))
+		sessionHash = promptConversationLockFallbackSessionHash(c)
 	}
 	clientIP := input.ClientIP
 	if (newAPIStatus == "verified" || newAPIStatus == "signed_response") && strings.TrimSpace(policyContext.Identity.ClientIP) != "" {
