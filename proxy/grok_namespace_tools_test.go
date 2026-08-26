@@ -780,3 +780,81 @@ func TestGrokAllOfRootMergeWrapsConflictingPropertiesInNestedAllOf(t *testing.T)
 		t.Fatalf("allOf required union must keep n: %s", schema.Get("required").Raw)
 	}
 }
+
+// 纯 $ref 联合分支(Pydantic/Zod 常见形态)必须先解析到根级 $defs 再合并,
+// 不能当作非 object 分支丢弃——那会丢掉整个对象定义。
+func TestGrokUnionRootMergeResolvesLocalRefBranches(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"ref_branch","parameters":{
+			"$defs":{"Task":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+			"anyOf":[
+				{"$ref":"#/$defs/Task"},
+				{"type":"null"}
+			]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	if schema.Get("anyOf").Exists() {
+		t.Fatalf("anyOf must not survive at root: %s", schema.Raw)
+	}
+	if !schema.Get("properties.name").Exists() {
+		t.Fatalf("$ref branch must be resolved and merged, not dropped: %s", schema.Raw)
+	}
+	if !schema.Get("$defs.Task").Exists() {
+		t.Fatalf("root $defs must be preserved alongside resolution: %s", schema.Raw)
+	}
+	// null 分支被丢弃 → 分支侧 required 放宽,和内联 object 分支的行为一致。
+	if schema.Get("required").Exists() {
+		t.Fatalf("required must be dropped when null branch was discarded: %s", schema.Get("required").Raw)
+	}
+}
+
+// JSON Schema 布尔形态(parameters:true/false)不能原样透传——上游同样按
+// "root must be an object type" 拒绝。true 降级为宽松 object,false 给空封闭 object。
+func TestGrokFunctionToolBooleanRootSchemaNormalized(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[
+			{"type":"function","name":"always","parameters":true},
+			{"type":"function","name":"never","parameters":false}
+		],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	always := gjson.GetBytes(result.Body, `tools.#(name=="always").parameters`)
+	if always.Get("type").String() != "object" || !always.Get("additionalProperties").Bool() {
+		t.Fatalf("parameters:true must degrade to a permissive object: %s", always.Raw)
+	}
+	never := gjson.GetBytes(result.Body, `tools.#(name=="never").parameters`)
+	if never.Get("type").String() != "object" || never.Get("additionalProperties").Bool() {
+		t.Fatalf("parameters:false must degrade to an empty closed object: %s", never.Raw)
+	}
+}
+
+// type:["object","null"] 与 anyOf:[object,{type:"null"}] 语义等价,required 的
+// 处理必须一致:null 选项折叠丢弃后放弃 required 强制,保住原本合法的空参调用。
+func TestGrokTypeArrayNullableRootDropsRequiredLikeUnion(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"nullable_typearray","parameters":{
+			"type":["object","null"],
+			"properties":{"x":{"type":"string"}},
+			"required":["x"]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	if schema.Get("type").String() != "object" {
+		t.Fatalf("type array must collapse to object: %s", schema.Raw)
+	}
+	if !schema.Get("properties.x").Exists() {
+		t.Fatalf("properties must survive the collapse: %s", schema.Raw)
+	}
+	if schema.Get("required").Exists() {
+		t.Fatalf("required must be dropped to match the equivalent anyOf-null form: %s", schema.Get("required").Raw)
+	}
+}
