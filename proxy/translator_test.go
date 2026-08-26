@@ -2581,7 +2581,7 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":[
-			{"type":"reasoning","id":"rs_123","encrypted_content":"opaque"},
+			{"type":"reasoning","id":"rs_123","encrypted_content":"gAAAAopaque"},
 			{"type":"message","id":"msg_123","role":"user","content":"continue"},
 			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","namespace":"code_tools","arguments":"{}"}
 		]
@@ -2597,7 +2597,7 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 			t.Fatalf("expanded input[%d].id should be stripped for cache replay, got %s; expanded=%s", i, id.Raw, expandedInputRaw)
 		}
 	}
-	if encrypted := gjson.GetBytes(got, "input.0.encrypted_content").String(); encrypted != "opaque" {
+	if encrypted := gjson.GetBytes(got, "input.0.encrypted_content").String(); encrypted != "gAAAAopaque" {
 		t.Fatalf("reasoning encrypted_content should be preserved, got %q; body=%s", encrypted, got)
 	}
 	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
@@ -2835,7 +2835,7 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 			{"type":"message","role":"user","content":"hello"},
 			{"type":"reasoning","summary":[{"type":"summary_text","text":"stale"}]},
 			{"type":"reasoning"},
-			{"type":"reasoning","encrypted_content":"opaque"},
+			{"type":"reasoning","encrypted_content":"gAAAAopaque"},
 			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
 		]
 	}`)
@@ -2851,7 +2851,7 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
 		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
 	}
-	if encrypted := gjson.GetBytes(got, "input.1.encrypted_content").String(); encrypted != "opaque" {
+	if encrypted := gjson.GetBytes(got, "input.1.encrypted_content").String(); encrypted != "gAAAAopaque" {
 		t.Fatalf("encrypted reasoning should be preserved, got %q; body=%s", encrypted, got)
 	}
 	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call" {
@@ -2862,6 +2862,45 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 	}
 	if strings.Contains(expandedInputRaw, `"summary_text"`) {
 		t.Fatalf("expanded input cache should use cleaned input, got %s", expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBodyDropsForeignReasoningAndStripsStatus(t *testing.T) {
+	// 跨渠道会话（issue #565）：Grok 轮输出的 reasoning 项带外渠道密文
+	// （裸 base64，非 Fernet gAAAA 前缀）与 status 字段，裸回灌给 Codex 上游
+	// 会依次触发 400 unknown_parameter(input[N].status) 与
+	// invalid_encrypted_content。前者须剥离、后者须整项丢弃。
+	raw := []byte(`{
+		"model":"gpt-5.6",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"plan"}]},
+			{"id":"rs_grok","type":"reasoning","summary":[{"type":"summary_text","text":"grok thoughts"}],"encrypted_content":"uFvR4+NBforeign","status":"completed"},
+			{"id":"msg_grok","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"the plan"}]},
+			{"id":"rs_codex","type":"reasoning","summary":[],"encrypted_content":"gAAAABnative","status":"completed"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"execute"}]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("expected foreign reasoning to be dropped, got %d items: %s", len(items), got)
+	}
+	for i, item := range items {
+		if item.Get("type").String() == "reasoning" && item.Get("status").Exists() {
+			t.Fatalf("input[%d] reasoning status should be stripped: %s", i, item.Raw)
+		}
+		if strings.Contains(item.Raw, "uFvR4+NBforeign") {
+			t.Fatalf("foreign encrypted_content should not survive: %s", item.Raw)
+		}
+	}
+	if encrypted := gjson.GetBytes(got, "input.2.encrypted_content").String(); encrypted != "gAAAABnative" {
+		t.Fatalf("codex-native reasoning should be preserved, got %q; body=%s", encrypted, got)
+	}
+	// 非 reasoning 项的 status 上游可接受，保持原样不做多余改写。
+	if status := gjson.GetBytes(got, "input.1.status").String(); status != "completed" {
+		t.Fatalf("assistant message status should be untouched, got %q; body=%s", status, got)
 	}
 }
 
