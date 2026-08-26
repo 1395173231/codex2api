@@ -231,23 +231,36 @@ func GetModelPricing(model string) *ModelPricing {
 
 	// custom / synced 覆盖：以代码默认为底，合并非 0 字段（部分覆盖）。
 	// 覆盖表拷贝到本地副本再改，绝不改动共享的默认 pricing 指针。
+	//
 	// An explicit alias entry is more specific than the canonical model entry.
 	// This matters for internal aliases such as codex-auto-review: it maps to
-	// gpt-5.4 for fallback pricing, but its own synced/custom price must not be
-	// shadowed by a stale gpt-5.4 override.
+	// gpt-5.4 for fallback pricing, but its own price must not be shadowed by a
+	// stale gpt-5.4 override. 两条护栏维持文档化的 custom > synced > 默认次序:
+	//   - synced 别名条目不得压过 custom canonical 条目,否则同步价会在升级后
+	//     静默替换管理员手填价;
+	//   - 别名条目未填的字段回退 canonical 生效价而不是代码默认价,部分覆盖
+	//     不会悄悄丢掉管理员在 canonical 上配好的其余字段。
+	canonicalOv, hasCanonical := lookupModelPricingOverride(canonical)
+	var aliasOv ModelPricingOverride
+	hasAlias := false
 	if normalized != canonical {
 		if ov, ok := lookupModelPricingOverride(normalized); ok {
-			merged := *base
-			ov.applyNonZero(&merged)
-			return &merged
+			if ov.Source == ModelPricingSourceCustom || !hasCanonical || canonicalOv.Source != ModelPricingSourceCustom {
+				aliasOv, hasAlias = ov, true
+			}
 		}
 	}
-	if ov, ok := lookupModelPricingOverride(canonical); ok {
-		merged := *base
-		ov.applyNonZero(&merged)
-		return &merged
+	if !hasCanonical && !hasAlias {
+		return base
 	}
-	return base
+	merged := *base
+	if hasCanonical {
+		canonicalOv.applyNonZero(&merged)
+	}
+	if hasAlias {
+		aliasOv.applyNonZero(&merged)
+	}
+	return &merged
 }
 
 // baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
