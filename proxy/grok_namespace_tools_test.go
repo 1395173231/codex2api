@@ -910,3 +910,41 @@ func TestGrokToolSearchAvoidsReservedUpstreamFunctionName(t *testing.T) {
 		t.Fatalf("habitual tool_search call type = %q; body=%s", got, habitual)
 	}
 }
+
+// 历史 function_call 的保留名必须跟声明侧一起改名:声明被挪到 tool_search_fn
+// 而历史仍引用 tool_search 时,上游按保留名/未声明名拒绝,或与内置 tool_search
+// 混淆。多轮工具会话是常态形态,声明与历史必须始终同名。
+func TestGrokReservedFunctionNameRenamedInHistoryCalls(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"tool_search","parameters":{"type":"object"}}],
+		"input":[
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"c1","name":"tool_search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":"ok"}
+		]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	declared := gjson.GetBytes(result.Body, `tools.0.name`).String()
+	historical := gjson.GetBytes(result.Body, `input.1.name`).String()
+	if declared == "tool_search" {
+		t.Fatalf("reserved declaration leaked upstream: %s", result.Body)
+	}
+	if historical != declared {
+		t.Fatalf("history call name %q diverged from declaration %q: %s", historical, declared, result.Body)
+	}
+
+	// 本轮未再声明该工具(如工具被裁剪)时,历史里的保留名同样不能原样出站,
+	// 且纯历史改名必须触发重新序列化。
+	historyOnly := []byte(`{
+		"model":"grok-4.6",
+		"input":[
+			{"type":"function_call","call_id":"c2","name":"tool_search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c2","output":"ok"}
+		]
+	}`)
+	historyResult := prepareGrokUpstreamBody(historyOnly)
+	if got := gjson.GetBytes(historyResult.Body, `input.0.name`).String(); got == "tool_search" {
+		t.Fatalf("reserved history call name leaked upstream without declaration: %s", historyResult.Body)
+	}
+}

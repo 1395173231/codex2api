@@ -598,9 +598,21 @@ func rebuildGrokHistoryItem(item map[string]any, register grokAliasRegister) (ma
 		return item, false
 	}
 	// function_call 的 namespace 引用改写成扁平名，匹配已展平的工具声明。
+	renamed := false
 	if itemType == "function_call" {
 		if ns := strings.TrimSpace(grokNsStringField(item, "namespace")); ns != "" {
 			item["name"] = register(ns, strings.TrimSpace(grokNsStringField(item, "name")), false, false)
+		} else if name := strings.TrimSpace(grokNsStringField(item, "name")); name != "" {
+			if _, reserved := grokReservedUpstreamFunctionNames[name]; reserved {
+				// 声明侧把保留名挪到 _fn 别名(见 newGrokAliasRegister),历史
+				// 调用必须跟着改名:否则声明是 tool_search_fn、历史却引用
+				// tool_search,上游按保留名/未声明名拒绝,或与内置 tool_search
+				// 混淆。桥接工具的历史走 tool_search_call 分支,不会进到这里。
+				if alias := register("", name, false, false); alias != name {
+					item["name"] = alias
+					renamed = true
+				}
+			}
 		}
 	}
 	allowed := make(map[string]struct{}, len(fields))
@@ -615,7 +627,7 @@ func rebuildGrokHistoryItem(item map[string]any, register grokAliasRegister) (ma
 		}
 	}
 	if !changed {
-		return item, false
+		return item, renamed
 	}
 	rebuilt := make(map[string]any, len(fields))
 	for _, f := range fields {
