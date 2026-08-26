@@ -79,6 +79,7 @@
     "modelCooldownCleared": "已清除 {{model}} 的模型冷卻",
     "allModelCooldownsCleared": "已清除 {{count}} 條模型冷卻",
     "planWorkspaceId": "空間 ID：{{id}}",
+    "todayModelAvgFirstToken": "平均首字時長",
     "apiBalanceLabel": "餘額",
     "apiBalanceLoading": "正在查詢 API 平台餘額",
     "apiBalanceFailed": "餘額查詢失敗：{{error}}。點擊重試，或在帳號設定中配置查詢介面。",
@@ -98,6 +99,23 @@
     }
   },
   "settings": {
+    "pricing": {
+      "contextThreshold": "長上下文閾值",
+      "revertThreshold": "還原為 {{value}} tokens",
+      "tiered": "階梯計費",
+      "singleTier": "單檔計費",
+      "billingPreview": "計費規則預覽",
+      "thresholdSummary": "{{value}} tokens 後切換長檔",
+      "standardRate": "標準檔",
+      "longRate": "長上下文檔",
+      "fromTokens": "從 {{value}} tokens 起",
+      "priorityRate": "Priority 檔",
+      "priorityHint": "按 Priority 單價",
+      "flexRate": "Flex 檔",
+      "flexHint": "標準價格 × 0.5",
+      "expressionPreview": "階梯運算式預覽",
+      "aliasOf": "獨立別名 · 回退 {{model}}"
+    },
     "modelCooldownTitle": "模型 429 冷卻策略",
     "modelCooldownDesc": "分別控制 API 直連上游與 OAuth 帳號池的模型級 429 冷卻。",
     "relayModelCooldownTitle": "API 計畫 / 直連上游",
