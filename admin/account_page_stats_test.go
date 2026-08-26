@@ -71,7 +71,7 @@ func TestGetAccountPageStatsBackfillsMissingOfficialUsage(t *testing.T) {
 	ctx := context.Background()
 	codexID, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
 		"refresh_token": "rt-codex",
-		"access_token":  "at-codex",
+		"access_token":  "oauth-codex",
 		"email":         "codex@example.com",
 	}, "")
 	if err != nil {
@@ -295,7 +295,7 @@ func TestGetAccountPageStatsSkipsOfficialBackfillForNewAccounts(t *testing.T) {
 	ctx := context.Background()
 	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
 		"refresh_token": "rt-new",
-		"access_token":  "at-new",
+		"access_token":  "oauth-new",
 		"email":         "new@example.com",
 	}, "")
 	if err != nil {
@@ -317,6 +317,45 @@ func TestGetAccountPageStatsSkipsOfficialBackfillForNewAccounts(t *testing.T) {
 
 	invokeAccountPageStats(t, handler, []int64{id})
 	time.Sleep(80 * time.Millisecond)
+}
+
+func TestGetAccountPageStatsSkipsOfficialBackfillForCodexAT(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "codex-at", map[string]interface{}{
+		"access_token":      "at-opaque",
+		"access_token_type": accessTokenTypeCodexAT,
+	}, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+	ageAccountForOfficialUsage(t, store, id)
+	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
+		t.Fatal("codex_at account must not hit official usage upstream")
+		return nil, nil, nil
+	}
+
+	stats := invokeAccountPageStats(t, handler, []int64{id})
+	item := stats[strconv.FormatInt(id, 10)]
+	if item.OfficialUSD7d != nil || item.OfficialUsageSynced {
+		t.Fatalf("codex_at page-stats = %+v, want no official usage fields", item)
+	}
+	handler.whamDailyBackfillMu.Lock()
+	_, scheduled := handler.whamDailyBackfillLast[id]
+	handler.whamDailyBackfillMu.Unlock()
+	if scheduled {
+		t.Fatal("codex_at account was scheduled for official usage backfill")
+	}
 }
 
 func TestGetAccountPageStatsSkipsOfficialBackfillWhenSnapshotExists(t *testing.T) {
@@ -366,7 +405,7 @@ func TestGetAccountPageStatsIncludesTodayModelCounts(t *testing.T) {
 	ctx := context.Background()
 	id, err := db.InsertAccountWithCredentials(ctx, "codex", map[string]interface{}{
 		"refresh_token": "rt-today-models",
-		"access_token":  "at-today-models",
+		"access_token":  "oauth-today-models",
 		"email":         "today-models@example.com",
 	}, "")
 	if err != nil {

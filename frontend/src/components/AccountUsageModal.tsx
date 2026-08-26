@@ -23,7 +23,7 @@ import {
 import Modal from './Modal'
 import { api } from '../api'
 import type { AccountKeyStat, AccountModelStat, AccountRow, AccountUsageDayStat, AccountUsageDetail, ResetCreditItem, WhamDailyUsageItem, WhamDailyUsageResponse, WhamDailyUsageSplit } from '../types'
-import { formatUsageNumber } from '../lib/usageFormat'
+import { formatUsageNumber, supportsOfficialUsage } from '../lib/usageFormat'
 import { useShowFullUsageNumbers } from '../hooks/useShowFullUsageNumbers'
 import { getErrorMessage } from '../utils/error'
 import { formatBeijingTime } from '../utils/time'
@@ -89,8 +89,8 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
   const requestSeq = useRef(0)
 
   // 官方结算统计只有 ChatGPT OAuth 账号能查（wham 端点属于 ChatGPT 后端）。
-  // 中转账号（Responses API / Grok）没有这条链路，不显示这个 tab。
-  const supportsOfficialUsage = !account.openai_responses_api && !account.grok_api
+  // codex_at、Responses API 中转和 Grok 没有这条链路，不显示这个 tab。
+  const showOfficialUsage = supportsOfficialUsage(account)
 
   const [creditEnabled, setCreditEnabled] = useState(account.credit_enabled ?? false)
   const [creditSkipWindow, setCreditSkipWindow] = useState(account.credit_skip_usage_window ?? false)
@@ -187,7 +187,7 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
           accountLabel={accountLabel}
           data={data}
           // 中转账号没有官方统计 tab，深链进来时退回概览而不是停在空白页。
-          page={page === 'official' && !supportsOfficialUsage ? 'overview' : page}
+          page={page === 'official' && !showOfficialUsage ? 'overview' : page}
           range={range}
           dataRange={dataRange || range}
           refreshing={loading}
@@ -195,7 +195,7 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
           onPageChange={setPage}
           onRangeChange={setRange}
           onViewLogs={handleViewLogs}
-          showOfficialUsage={supportsOfficialUsage}
+          showOfficialUsage={showOfficialUsage}
           onOfficialUsageRefreshed={onOfficialUsageRefreshed}
         />
       )}

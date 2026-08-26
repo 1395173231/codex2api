@@ -137,7 +137,7 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 			item.OfficialUSD7d = &usd
 		} else if h.whamDailySyncedOnceFor(id) {
 			item.OfficialUsageSynced = true
-		} else {
+		} else if h.store != nil && whamDailyUsageBackfillEligible(h.store.FindByID(id)) {
 			missingOfficial = append(missingOfficial, id)
 		}
 		stats[id] = item

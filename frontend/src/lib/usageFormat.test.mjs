@@ -8,6 +8,7 @@ import {
   isUnsampledQuotaAccount,
   needsOfficialCostReload,
   needsUsageReload,
+  supportsOfficialUsage,
 } from "./usageFormat.ts";
 
 test("usage reload accepts either optional usage window as sampled", () => {
@@ -65,6 +66,10 @@ test("official cost reload only retries Codex accounts missing the snapshot", ()
   assert.equal(needsOfficialCostReload({ official_usd_7d: 12.5 }), false);
   assert.equal(needsOfficialCostReload({ openai_responses_api: true }), false);
   assert.equal(needsOfficialCostReload({ grok_api: true }), false);
+  assert.equal(
+    needsOfficialCostReload({ access_token_type: "codex_at" }),
+    false,
+  );
   assert.equal(needsOfficialCostReload({ status: "error" }), false);
   assert.equal(needsOfficialCostReload({ status: "unauthorized" }), false);
   assert.equal(
@@ -79,6 +84,11 @@ test("official cost reload only retries Codex accounts missing the snapshot", ()
     }),
     true,
   );
+  assert.equal(supportsOfficialUsage({}), true);
+  assert.equal(supportsOfficialUsage({ access_token_type: "codex_at" }), false);
+  assert.equal(supportsOfficialUsage({ access_token_type: " CODEX_AT " }), false);
+  assert.equal(supportsOfficialUsage({ openai_responses_api: true }), false);
+  assert.equal(supportsOfficialUsage({ grok_api: true }), false);
   assert.equal(isOfficialCostHiddenAccount({ status: "error" }), true);
   assert.equal(isOfficialCostHiddenAccount({ status: "active" }), false);
   assert.equal(

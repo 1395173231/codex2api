@@ -73,6 +73,7 @@ import {
   isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
+  supportsOfficialUsage,
 } from "../lib/usageFormat";
 import {
   applyOptionalWorkspaceRouteHeader,
@@ -14893,7 +14894,7 @@ function BilledCell({
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
   const showOfficial =
-    isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
+    supportsOfficialUsage(account) && !isOfficialCostHiddenAccount(account);
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
   // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
