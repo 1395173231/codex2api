@@ -1530,6 +1530,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		IgnoreUsageLimitStatus:            true,
 		AutoResetCreditsEnabled:           true,
 		AutoResetCreditsBeforeExpiryMin:   75,
+		AutoActivate5hWindowEnabled:       true,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1561,6 +1562,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.AutoResetCreditsBeforeExpiryMin != 75 {
 		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 75", settings.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !settings.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
@@ -1707,6 +1711,7 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	settings := &SystemSettings{
 		AutoResetCreditsEnabled:         true,
 		AutoResetCreditsBeforeExpiryMin: 90,
+		AutoActivate5hWindowEnabled:     true,
 		ModelPricingOverrides:           `{"old":{"input":1}}`,
 		ModelPricingSyncURL:             "https://old.example/pricing.json",
 	}
@@ -1745,6 +1750,9 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	}
 	if !got.AutoResetCreditsEnabled || got.AutoResetCreditsBeforeExpiryMin != 90 {
 		t.Fatalf("auto reset settings = (%v,%d), want (true,90)", got.AutoResetCreditsEnabled, got.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !got.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if got.CodexSyncedCLIVersion != "9.9.9" {
 		t.Fatalf("CodexSyncedCLIVersion = %q, want 9.9.9", got.CodexSyncedCLIVersion)

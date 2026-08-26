@@ -190,6 +190,9 @@ type Account struct {
 	Reset5hAt           time.Time // 5h 窗口重置时间
 	UsageUpdatedAt      time.Time // 7d 用量快照刷新时间
 	UsageUpdatedAt5h    time.Time // 5h 用量快照刷新时间
+	// activated5hResetAt 是已经为其发送过「开窗」最小 /responses 的那个 Reset5hAt。
+	// 每个观测到的 5h 窗口最多激活一次（issue #581）。
+	activated5hResetAt time.Time
 	// Spark 是 Pro/Prolite 账号上独立于主 5h/7d 的用量窗口。
 	UsagePercentSpark      float64
 	UsagePercentSparkValid bool
@@ -2182,6 +2185,71 @@ func (a *Account) GetUsagePercent5h() (float64, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.UsagePercent5h, a.UsagePercent5hValid
+}
+
+// Mark5hWindowActivated 记录已经为哪个 Reset5hAt 发送过开窗请求。
+func (a *Account) Mark5hWindowActivated(resetAt time.Time) {
+	if a == nil || resetAt.IsZero() {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.activated5hResetAt = resetAt
+}
+
+// GetActivated5hResetAt 返回最近一次 5h 开窗请求对应的 Reset5hAt。
+func (a *Account) GetActivated5hResetAt() time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.activated5hResetAt
+}
+
+// ShouldActivate5hWindow 判断账号是否需要发送一次真实最小 /responses 来启动下一轮 5h 窗口。
+// 只认上游观测到的 5h + reset 时间，不按套餐写死；每个 Reset5hAt 最多一次。
+func (a *Account) ShouldActivate5hWindow(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.AccessToken == "" && !a.isCodexAgentIdentityLocked() {
+		return false
+	}
+	if a.isRelayStyleLocked() {
+		return false
+	}
+	if a.Status == StatusError {
+		return false
+	}
+	if a.healthTierLocked() == HealthTierBanned {
+		return false
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return false
+	}
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
+	if a.rawUsageExhaustedLocked() || a.rawUsageWindow7dExhaustedLocked(now) {
+		return false
+	}
+	if !a.UsagePercent5hValid || a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
+		return false
+	}
+	if !a.activated5hResetAt.IsZero() && a.activated5hResetAt.Unix() == a.Reset5hAt.Unix() {
+		return false
+	}
+	return true
 }
 
 // SetRateLimitResetCredits 记录账号剩余的「主动重置次数」。
@@ -5195,6 +5263,13 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 				}
 			}
 			account.SetUsageSnapshot5hAt(parsed, resetAt, updatedAt)
+		}
+	}
+	if activatedResetAt := row.GetCredential("codex_5h_window_activated_reset_at"); activatedResetAt != "" {
+		if t, err := time.Parse(time.RFC3339, activatedResetAt); err == nil {
+			account.Mark5hWindowActivated(t)
+		} else {
+			log.Printf("[账号 %d] 解析 codex_5h_window_activated_reset_at 失败: %v", row.ID, err)
 		}
 	}
 	if usagePctSpark := row.GetCredential("codex_spark_used_percent"); usagePctSpark != "" {

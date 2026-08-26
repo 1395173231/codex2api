@@ -1382,6 +1382,7 @@ export default function Settings() {
     scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
+    auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
     codex_request_compression: true,
     codex_ws_weak_network_mode: false,
@@ -2619,6 +2620,23 @@ export default function Settings() {
                 </div>
               </div>
             </div>
+          </SettingsCard>
+
+          <SettingsCard
+            title={t('settings.autoActivate5hTitle')}
+            description={t('settings.autoActivate5hDesc')}
+            icon={<Timer className="size-4" />}
+          >
+            <SettingField
+              label={t('settings.autoActivate5hEnabled')}
+              description={t('settings.autoActivate5hEnabledDesc')}
+              layout="switch"
+            >
+              <Switch
+                checked={Boolean(settingsForm.auto_activate_5h_window_enabled)}
+                onCheckedChange={(checked) => autoSaveBooleanField('auto_activate_5h_window_enabled', checked)}
+              />
+            </SettingField>
           </SettingsCard>
 
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>

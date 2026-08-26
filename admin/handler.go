@@ -54,6 +54,7 @@ type Handler struct {
 	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
+	activate5hWindow       func(context.Context, *auth.Account) error
 	executeUsageProbe      usageProbeRequestFunc
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
@@ -145,6 +146,9 @@ type Handler struct {
 	autoResetCreditsWake      chan struct{}
 	autoResetCreditsStartOnce sync.Once
 	autoResetCreditsWG        sync.WaitGroup
+	autoActivate5hWake        chan struct{}
+	autoActivate5hStartOnce   sync.Once
+	autoActivate5hWG          sync.WaitGroup
 	resetCreditPostMu         sync.Mutex
 	resetCreditPostWG         sync.WaitGroup
 	resetCreditPostCtx        context.Context
@@ -959,6 +963,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
 	handler.whamDailySyncedOnce = make(map[int64]struct{})
 	handler.autoResetCreditsWake = make(chan struct{}, 1)
+	handler.autoActivate5hWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
@@ -8347,6 +8352,7 @@ type settingsResponse struct {
 	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
 	SchedulerEngine                     string `json:"scheduler_engine"`
@@ -8514,6 +8520,7 @@ type updateSettingsReq struct {
 	AutoCleanExpired                    *bool     `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             *bool     `json:"auto_reset_credits_enabled"`
 	AutoResetCreditsBeforeExpiryMin     *int      `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         *bool     `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool     `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                *bool     `json:"fast_scheduler_enabled"`
 	SchedulerEngine                     *string   `json:"scheduler_engine"`
@@ -9207,11 +9214,13 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
 	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
 	if dbSettings != nil {
 		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
 		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
+		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
 		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
 	}
 	imgCfg := imagestore.CurrentConfig()
@@ -9263,6 +9272,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),
@@ -9654,6 +9664,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
+	persistedAutoActivate5hWindowEnabled := false
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
 	modelsListReadMaxBytes := database.DefaultModelsListReadMaxBytes
 	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
@@ -9676,6 +9687,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
+		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
 		modelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(existingSettings.ModelsListReadMaxBytes)
 		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
@@ -9745,10 +9757,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
 	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
 	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
+	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
 	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
@@ -9764,6 +9778,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
 	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
+	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
 	usageLogMode := h.db.GetUsageLogMode()
 	usageLogBatchSize := h.db.GetUsageLogBatchSize()
 	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
@@ -10394,13 +10409,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.AutoResetCreditsBeforeExpiryMin = *req.AutoResetCreditsBeforeExpiryMin
 		log.Printf("设置已更新: auto_reset_credits_before_expiry_min = %d", *req.AutoResetCreditsBeforeExpiryMin)
 	}
-	// 自动消费属于不可逆操作。先归一化待保存值，但在数据库确认保存成功前，
-	// 运行态继续使用旧的自动消费配置，避免持久化失败后后台任务仍然开始消费。
+	if req.AutoActivate5hWindowEnabled != nil {
+		runtimeCfg.AutoActivate5hWindowEnabled = *req.AutoActivate5hWindowEnabled
+		log.Printf("设置已更新: auto_activate_5h_window_enabled = %t", *req.AutoActivate5hWindowEnabled)
+	}
+	// 自动消费/自动开窗属于不可逆或有额度成本的操作。先归一化待保存值，但在数据库
+	// 确认保存成功前，运行态继续使用旧配置，避免持久化失败后后台任务仍然开始执行。
 	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
 	effectiveRuntimeCfg := runtimeCfg
 	if autoResetCreditsChanged {
 		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
 		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
+	}
+	if autoActivate5hChanged {
+		effectiveRuntimeCfg.AutoActivate5hWindowEnabled = previousAutoActivate5hWindowEnabled
 	}
 	effectiveRuntimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
@@ -10648,6 +10670,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),
@@ -10773,6 +10796,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
 			return
 		}
+		if autoActivate5hChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存 5h 窗口自动激活设置失败，设置未生效")
+			return
+		}
 		if continuousRetryChanged {
 			writeError(c, http.StatusInternalServerError, "保存持续重试策略失败，设置未生效")
 			return
@@ -10834,6 +10862,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
+		}
+		if autoActivate5hChanged {
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				return runtimeCfg
+			})
+			h.triggerAutoActivate5hScan()
 		}
 		if modelsListReadLimitChanged {
 			if updateErr := h.db.UpdateModelsListReadMaxBytes(c.Request.Context(), *req.ModelsListReadMaxBytes); updateErr != nil {
@@ -10944,6 +10979,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),

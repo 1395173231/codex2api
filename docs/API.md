@@ -1513,6 +1513,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "auto_clean_rate_limited": false,
   "auto_clean_full_usage": false,
   "auto_clean_error": false,
+  "auto_activate_5h_window_enabled": false,
   "proxy_pool_enabled": false,
   "fast_scheduler_enabled": false,
   "max_retries": 2,

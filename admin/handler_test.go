@@ -1550,6 +1550,64 @@ func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T
 	}
 }
 
+func TestUpdateSettingsPersistsAutoActivate5hWindow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	update := func(body string) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+	}
+
+	if proxy.CurrentRuntimeSettings().AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = true before explicit enable")
+	}
+	update(`{"auto_activate_5h_window_enabled":true}`)
+	select {
+	case <-handler.autoActivate5hWake:
+	default:
+		t.Fatal("enable change did not queue an immediate scan")
+	}
+	if !proxy.CurrentRuntimeSettings().AutoActivate5hWindowEnabled {
+		t.Fatal("runtime AutoActivate5hWindowEnabled = false, want true")
+	}
+	update(`{"site_name":"Codex2API Test"}`)
+	select {
+	case <-handler.autoActivate5hWake:
+		t.Fatal("unrelated partial update queued another 5h activation scan")
+	default:
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled was not preserved across partial update")
+	}
+}
+
 func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

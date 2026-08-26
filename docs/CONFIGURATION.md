@@ -277,6 +277,12 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `AutoCleanFullUsage` | bool | false | 自动清理满用量账号 |
 | `AutoCleanError` | bool | false | 自动清理错误状态账号 |
 
+### 5h 窗口自动激活
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `AutoActivate5hWindowEnabled` | bool | false | 5h 窗口重置后自动发送一次最小真实 `/responses`，用于启动下一轮 5h 计时（issue #581）。默认关闭，开启会消耗少量真实额度。只对上游明确返回 5h 窗口和重置时间的账号生效；每个窗口最多一次。账号不可用、被自动暂停或没有 5h 窗口时跳过。不调用 `rate-limit-reset-credits/consume`，也不同于零成本 `wham/usage` 到点探针。 |
+
 ### 安全设置
 
 | 字段 | 类型 | 默认值 | 说明 |

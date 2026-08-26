@@ -137,6 +137,8 @@ type RuntimeSettings struct {
 	AutoResetCreditsEnabled bool
 	// AutoResetCreditsBeforeExpiryMin 是进入自动消费窗口的提前分钟数（默认 60）。
 	AutoResetCreditsBeforeExpiryMin int
+	// AutoActivate5hWindowEnabled 控制 5h 窗口重置后是否发送一次最小真实 /responses 启动下一轮窗口（默认 false，issue #581）。
+	AutoActivate5hWindowEnabled bool
 	// UTLSShutdownTimeoutMin 是 uTLS（CODEX_TRANSPORT_MODE=utls_chrome）连接被摘出
 	// 连接池后，等待其上在途 stream 收尾的上限（分钟，默认 30，范围 1-240）。
 	// 超时则强制关闭，保证异常挂死的 stream 不会把连接永久留住（issue #446）。
@@ -374,6 +376,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
 		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
 		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
+		next.AutoActivate5hWindowEnabled = settings.AutoActivate5hWindowEnabled
 		next.UTLSShutdownTimeoutMin = settings.UTLSShutdownTimeoutMinutes
 		// Payload 重写规则不进 RuntimeSettings（编译后独立存放），此处顺带完成启动种子。
 		if err := SetPayloadRulesJSON(settings.PayloadRules); err != nil {
