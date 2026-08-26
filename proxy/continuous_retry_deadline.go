@@ -209,14 +209,21 @@ func withContinuousRetryDeadlinePendingCleanup(ctx context.Context, action, clea
 }
 
 func bindContinuousRetrySessionAffinity(ctx context.Context, store *auth.Store, key string, account *auth.Account, proxyURL string) bool {
+	return bindContinuousRetrySessionAffinityWithGuard(ctx, store, key, account, proxyURL, auth.SessionAffinityGuard{})
+}
+
+func bindContinuousRetrySessionAffinityWithGuard(ctx context.Context, store *auth.Store, key string, account *auth.Account, proxyURL string, guard auth.SessionAffinityGuard) bool {
 	if store == nil || account == nil {
 		return false
+	}
+	if guard.PreservesExisting() {
+		return withContinuousRetryDeadlinePendingCleanup(ctx, func() {}, nil)
 	}
 	preserveExisting := false
 	return withContinuousRetryDeadlinePendingCleanup(ctx, func() {
 		boundID, bound := store.SessionAffinityAccountID(key)
 		preserveExisting = bound && boundID == account.ID()
-		store.BindSessionAffinity(key, account, proxyURL)
+		store.BindSessionAffinityWithGuard(key, account, proxyURL, guard)
 	}, func() {
 		if !preserveExisting {
 			store.UnbindSessionAffinity(key, account.ID())

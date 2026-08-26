@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -275,10 +276,12 @@ func (h *Handler) Messages(c *gin.Context) {
 	}()
 
 	capacityShedRetries := map[int64]int{}
+	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			affinityGuard = auth.SessionAffinityGuard{}
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
@@ -314,7 +317,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-			if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
+			if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 				h.store.Release(account)
 				return
 			}
@@ -629,7 +632,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			_ = streamAttempt.Close()
 			if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-				h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+				h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 			}
 			nativeHTTPError := !downstreamWrote && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil
 			if outcome.terminalLocal && c.Request.Context().Err() == nil {
@@ -662,7 +665,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
-				h.store.ReleaseForSession(account, affinityKey)
+				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
 			}
@@ -913,7 +916,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		// 断流检测 + token 估算
-			totalDuration := int(time.Since(start).Milliseconds())
+		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
 		outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 		terminalFailurePayload, _ = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentStarted, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
@@ -979,7 +982,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			resp.Body.Close()
 			h.store.Release(account)
-			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, proxyURL, outcome, capacityShedRetries, continuousRetryPolicy)
+			h.unbindOrRetainAffinityForCapacityShedWithGuard(retryExclusions, affinityKey, account, proxyURL, affinityGuard, outcome, capacityShedRetries, continuousRetryPolicy)
 			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -1034,7 +1037,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		if !continuousRetryBuffersAttempts(continuousRetryPolicy) || continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+			h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 		}
 
 		logStatusCode := outcome.logStatusCode
@@ -1103,7 +1106,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		if outcome.logStatusCode == http.StatusOK {
-			h.store.ReleaseForSession(account, affinityKey)
+			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		} else {
 			h.store.Release(account)
 		}

@@ -421,6 +421,38 @@ func TestContinuousRetryAffinityTimeoutCleanupPreservesOnlyExistingSameAccount(t
 	}
 }
 
+func TestContinuousRetryBindingKeepsCapacitySpilloverRequestLocal(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	defer store.Stop()
+	bound := &auth.Account{DBID: 1, AccessToken: "bound", Status: auth.StatusReady}
+	fallback := &auth.Account{DBID: 2, AccessToken: "fallback", Status: auth.StatusReady}
+	store.AddAccount(bound)
+	store.AddAccount(fallback)
+	const affinityKey = "continuous-capacity-spillover"
+	store.BindSessionAffinity(affinityKey, bound, "")
+
+	held := store.TakePreferredAccountWithDispatch(bound.ID(), 0, nil, nil, auth.DispatchPolicyStandard)
+	if held != bound {
+		t.Fatalf("held account = %p, want bound account %p", held, bound)
+	}
+	defer store.Release(held)
+
+	selected, proxyURL, guard := store.NextForSessionWithDispatchGuard(affinityKey, 0, nil, nil, auth.DispatchPolicyStandard)
+	if selected != fallback || !guard.PreservesExisting() {
+		if selected != nil {
+			store.Release(selected)
+		}
+		t.Fatalf("selection = %p guard=%v, want fallback %p with preserved binding", selected, guard.PreservesExisting(), fallback)
+	}
+	defer store.Release(selected)
+	if !bindContinuousRetrySessionAffinityWithGuard(context.Background(), store, affinityKey, selected, proxyURL, guard) {
+		t.Fatal("capacity spillover binding was rejected")
+	}
+	if boundID, ok := store.SessionAffinityAccountID(affinityKey); !ok || boundID != bound.ID() {
+		t.Fatalf("binding = (%d, %v), want original account %d", boundID, ok, bound.ID())
+	}
+}
+
 func TestResponsesCompactContinuousRetryDeadlineReturnsLatestFailureAndReleasesState(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousRuntime := CurrentRuntimeSettings()

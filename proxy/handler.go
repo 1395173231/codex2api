@@ -98,10 +98,15 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 }
 
 func (h *Handler) nextAccountForSessionWithDispatch(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	account, proxyURL, _ := h.nextAccountForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, policy)
+	return account, proxyURL
+}
+
+func (h *Handler) nextAccountForSessionWithDispatchGuard(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard) {
 	if h == nil || h.store == nil {
-		return nil, ""
+		return nil, "", auth.SessionAffinityGuard{}
 	}
-	return h.store.NextForSessionWithDispatch(sessionID, apiKeyID, exclude, filter, policy)
+	return h.store.NextForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, policy)
 }
 
 func dispatchPolicyForModel(model string) auth.DispatchPolicy {
@@ -2150,6 +2155,10 @@ func (h *Handler) reportStreamOutcomeFailure(account *auth.Account, outcome stre
 // 满血的账号重新选回并重绑，"耗尽后换号"就名存实亡。软排除在账号池试完后由 ResetSoft
 // 清空，不会永久搁置请求。
 func (h *Handler) unbindOrRetainAffinityForCapacityShed(exclusions *retryAccountExclusions, affinityKey string, account *auth.Account, proxyURL string, outcome streamOutcome, retries map[int64]int, policy database.ContinuousRetryPolicy) {
+	h.unbindOrRetainAffinityForCapacityShedWithGuard(exclusions, affinityKey, account, proxyURL, auth.SessionAffinityGuard{}, outcome, retries, policy)
+}
+
+func (h *Handler) unbindOrRetainAffinityForCapacityShedWithGuard(exclusions *retryAccountExclusions, affinityKey string, account *auth.Account, proxyURL string, guard auth.SessionAffinityGuard, outcome streamOutcome, retries map[int64]int, policy database.ContinuousRetryPolicy) {
 	id := account.ID()
 	// Catch-all promises a real account rotation for every upstream failure.
 	// Keep the legacy same-account capacity backoff only for the normal,
@@ -2160,7 +2169,7 @@ func (h *Handler) unbindOrRetainAffinityForCapacityShed(exclusions *retryAccount
 		// 缓冲 attempt 会把亲和绑定延后到回放完成；这里只为真实上游降载重试绑定，
 		// 以保留同账号退避行为。
 		if continuousRetryBuffersAttempts(policy) {
-			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+			h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, guard)
 		}
 		retries[id]++
 		return
@@ -3629,20 +3638,22 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
+	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
+			affinityGuard = auth.SessionAffinityGuard{}
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
 				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			}
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			} else if turnContinuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
@@ -3706,7 +3717,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-			if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
+			if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 				h.store.Release(account)
 				return
 			}
@@ -4029,7 +4040,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				_ = streamAttempt.Close()
 				if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-					h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+					h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 				}
 				if outcome.terminalLocal && c.Request.Context().Err() == nil {
 					writeContinuousRetryLocalResponsesError(c)
@@ -4063,7 +4074,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 				}
 				if outcome.logStatusCode == http.StatusOK {
-					h.store.ReleaseForSession(account, affinityKey)
+					h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 				} else {
 					h.store.Release(account)
 				}
@@ -4328,7 +4339,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				resp.Body.Close()
 				h.store.Release(account)
-				h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, proxyURL, outcome, capacityShedRetries, continuousRetryPolicy)
+				h.unbindOrRetainAffinityForCapacityShedWithGuard(retryExclusions, affinityKey, account, proxyURL, affinityGuard, outcome, capacityShedRetries, continuousRetryPolicy)
 				if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
 					retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 					retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -4363,7 +4374,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			_ = streamAttempt.Close()
 			if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-				h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+				h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 			}
 			if isStream && outcome.terminalLocal {
 				writeContinuousRetryLocalResponsesError(c)
@@ -4475,7 +4486,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
-				h.store.ReleaseForSession(account, affinityKey)
+				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
 			}
@@ -5210,7 +5221,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			resp.Body.Close()
 			h.store.Release(account)
-			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, proxyURL, outcome, capacityShedRetries, continuousRetryPolicy)
+			h.unbindOrRetainAffinityForCapacityShedWithGuard(retryExclusions, affinityKey, account, proxyURL, affinityGuard, outcome, capacityShedRetries, continuousRetryPolicy)
 			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -5248,7 +5259,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		_ = streamAttempt.Close()
 
 		if !continuousRetryBuffersAttempts(continuousRetryPolicy) || continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+			h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 		}
 		logStatusCode := outcome.logStatusCode
 		if logStatusCode != http.StatusOK {
@@ -5388,7 +5399,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if !accountReleasedForOverflow {
 			if outcome.logStatusCode == http.StatusOK {
-				h.store.ReleaseForSession(account, affinityKey)
+				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
 			}
@@ -5548,6 +5559,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		var account *auth.Account
 		var stickyProxyURL string
+		var affinityGuard auth.SessionAffinityGuard
 		if attempt == 0 && compactionAffinity.Known {
 			account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			if account != nil {
@@ -5555,7 +5567,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -5582,7 +5594,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			if account == nil {
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					return
@@ -5607,7 +5619,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
+		if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 			h.store.Release(account)
 			return
 		}
@@ -5844,7 +5856,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 			})
 
-			h.store.ReleaseForSession(account, affinityKey)
+			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			contentType := resp.Header.Get("Content-Type")
 			if contentType == "" {
 				contentType = "application/json"
@@ -6211,7 +6223,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
-		h.store.ReleaseForSession(account, affinityKey)
+		h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		c.Data(http.StatusOK, "application/json", respBody)
 		h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 		return
@@ -6352,10 +6364,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
+	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			affinityGuard = auth.SessionAffinityGuard{}
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolChat) {
@@ -6391,7 +6405,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-			if !bindContinuousRetrySessionAffinity(c.Request.Context(), h.store, affinityKey, account, proxyURL) {
+			if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 				h.store.Release(account)
 				return
 			}
@@ -6665,7 +6679,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			_ = streamAttempt.Close()
 			if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-				h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+				h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 			}
 			if outcome.terminalLocal && c.Request.Context().Err() == nil {
 				writeContinuousRetryLocalChatError(c)
@@ -6699,7 +6713,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
-				h.store.ReleaseForSession(account, affinityKey)
+				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
 			}
@@ -7040,7 +7054,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			resp.Body.Close()
 			h.store.Release(account)
-			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, proxyURL, outcome, capacityShedRetries, continuousRetryPolicy)
+			h.unbindOrRetainAffinityForCapacityShedWithGuard(retryExclusions, affinityKey, account, proxyURL, affinityGuard, outcome, capacityShedRetries, continuousRetryPolicy)
 			if !isFirstTokenTimeoutOutcome(outcome) && !outcome.capacityShed &&
 				retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
 				retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -7071,7 +7085,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		_ = streamAttempt.Close()
 
 		if !continuousRetryBuffersAttempts(continuousRetryPolicy) || continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
-			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+			h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 		}
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
@@ -7175,7 +7189,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		if outcome.logStatusCode == http.StatusOK {
-			h.store.ReleaseForSession(account, affinityKey)
+			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		} else {
 			h.store.Release(account)
 		}

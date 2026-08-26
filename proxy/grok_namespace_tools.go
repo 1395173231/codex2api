@@ -921,6 +921,41 @@ func stripGrokUndecodableBlobs(body []byte) []byte {
 	return out
 }
 
+var grokResponsesToolCallIDPrefixes = []string{"fc_", "ctc_", "tsc_"}
+
+// retypeGrokResponsesToolCallItemID keeps a restored Responses item ID aligned
+// with its client-visible type. Grok-compatible relays answer the function form
+// with fc_* IDs; replaying that ID on custom_tool_call or tool_search_call is
+// rejected by strict Responses validators.
+func retypeGrokResponsesToolCallItemID(id, itemType string) string {
+	want := ""
+	switch itemType {
+	case "custom_tool_call":
+		want = "ctc_"
+	case "tool_search_call":
+		want = "tsc_"
+	case "function_call":
+		want = "fc_"
+	}
+	trimmed := strings.TrimSpace(id)
+	if want == "" || trimmed == "" || strings.HasPrefix(trimmed, want) {
+		return id
+	}
+	for _, known := range grokResponsesToolCallIDPrefixes {
+		if known != want && strings.HasPrefix(trimmed, known) {
+			return want + strings.TrimPrefix(trimmed, known)
+		}
+	}
+	return id
+}
+
+func retypeGrokResponsesToolCallItem(item map[string]any, itemType string) {
+	id := grokNsStringField(item, "id")
+	if retyped := retypeGrokResponsesToolCallItemID(id, itemType); retyped != id {
+		item["id"] = retyped
+	}
+}
+
 // reverseGrokNamespaceValue 递归把响应里任意 type:"function_call" 对象的扁平名反解回
 // 原始 {name, namespace}。返回是否发生改写。
 func reverseGrokNamespaceValue(value any, aliases map[string]grokNsIdentity) bool {
@@ -948,12 +983,14 @@ func reverseGrokNamespaceValue(value any, aliases map[string]grokNsIdentity) boo
 				}
 				if identity.ToolSearch {
 					typed["type"] = "tool_search_call"
+					retypeGrokResponsesToolCallItem(typed, "tool_search_call")
 					typed["execution"] = "client"
 					typed["arguments"] = grokToolSearchArguments(typed["arguments"])
 					delete(typed, "name")
 					delete(typed, "namespace")
 				} else if identity.Custom {
 					typed["type"] = "custom_tool_call"
+					retypeGrokResponsesToolCallItem(typed, "custom_tool_call")
 					typed["input"] = unwrapGrokCustomToolArguments(grokNsStringField(typed, "arguments"))
 					delete(typed, "arguments")
 				}
@@ -1027,7 +1064,7 @@ func newGrokNamespaceReverser(body io.ReadCloser, streaming bool, aliases map[st
 			_ = pw.Close()
 			return
 		}
-		reverser := &grokStreamReverser{aliases: aliases, customItems: make(map[string]bool), toolSearchItems: make(map[string]bool), inputBytes: make(map[string]int)}
+		reverser := &grokStreamReverser{aliases: aliases, customItems: make(map[string]bool), toolSearchItems: make(map[string]bool), clientItemIDs: make(map[string]string), inputBytes: make(map[string]int)}
 		reader := bufio.NewReader(body)
 		for {
 			line, err := reader.ReadBytes('\n')
@@ -1056,8 +1093,25 @@ type grokStreamReverser struct {
 	aliases         map[string]grokNsIdentity
 	customItems     map[string]bool
 	toolSearchItems map[string]bool
+	clientItemIDs   map[string]string
 	inputBytes      map[string]int
 	failed          bool
+}
+
+func (r *grokStreamReverser) rememberClientItemID(upstreamID, callID, itemType string) {
+	clientID := retypeGrokResponsesToolCallItemID(upstreamID, itemType)
+	if clientID == "" {
+		return
+	}
+	if r.clientItemIDs == nil {
+		r.clientItemIDs = make(map[string]string)
+	}
+	if upstreamID != "" {
+		r.clientItemIDs[upstreamID] = clientID
+	}
+	if callID != "" {
+		r.clientItemIDs[callID] = clientID
+	}
 }
 
 func (r *grokStreamReverser) rewriteLine(line []byte) []byte {
@@ -1093,20 +1147,26 @@ func (r *grokStreamReverser) rewriteLine(line []byte) []byte {
 			name := grokNsStringField(item, "name")
 			identity, bridged := r.aliases[name]
 			if bridged && identity.Custom {
-				if id := grokNsStringField(item, "id"); id != "" {
+				id := grokNsStringField(item, "id")
+				callID := grokNsStringField(item, "call_id")
+				if id != "" {
 					r.customItems[id] = true
 				}
-				if callID := grokNsStringField(item, "call_id"); callID != "" {
+				if callID != "" {
 					r.customItems[callID] = true
 				}
+				r.rememberClientItemID(id, callID, "custom_tool_call")
 			}
 			if bridged && identity.ToolSearch {
-				if id := grokNsStringField(item, "id"); id != "" {
+				id := grokNsStringField(item, "id")
+				callID := grokNsStringField(item, "call_id")
+				if id != "" {
 					r.toolSearchItems[id] = true
 				}
-				if callID := grokNsStringField(item, "call_id"); callID != "" {
+				if callID != "" {
 					r.toolSearchItems[callID] = true
 				}
+				r.rememberClientItemID(id, callID, "tool_search_call")
 			}
 			reverseGrokNamespaceValue(item, r.aliases)
 		}
@@ -1140,6 +1200,9 @@ func (r *grokStreamReverser) rewriteLine(line []byte) []byte {
 		}
 		if r.customItems[itemID] {
 			event["type"] = "response.custom_tool_call_input.done"
+			if clientID := r.clientItemIDs[itemID]; clientID != "" {
+				event["item_id"] = clientID
+			}
 			event["input"] = unwrapGrokCustomToolArguments(grokNsStringField(event, "arguments"))
 			delete(event, "arguments")
 		}
