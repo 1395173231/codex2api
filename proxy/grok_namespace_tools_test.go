@@ -576,7 +576,6 @@ func TestNormalizeGrokUpstreamToolsCleansHistory(t *testing.T) {
 	}
 }
 
-
 // Grok 上游要求函数工具参数 schema 根节点必须是单一 object(联合根会 400
 // "tool parameter root must be an object type")。桥接层必须把联合根合并、
 // 非 object 根降级,且不得改动本就合规的 schema 与嵌套联合。
@@ -682,5 +681,102 @@ func TestGrokFunctionToolObjectTypeWithUnionRootStillNormalized(t *testing.T) {
 	required := schema.Get("required").Array()
 	if len(required) != 1 || required[0].String() != "id" {
 		t.Fatalf("root required must be kept, branch-only keys dropped from union intersection: %s", schema.Get("required").Raw)
+	}
+}
+
+// 联合根合并必须保留根级非联合 sibling 键:分支属性里的 "$ref":"#/$defs/X" 指向
+// 根级 $defs,丢掉定义容器会产生悬空引用,上游拿到不可解析的 schema 照样 400。
+// additionalProperties:false 等对象约束同理不得静默放宽(PR #580 评审)。
+func TestGrokUnionRootMergeKeepsRootSiblingKeys(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"with_defs","parameters":{
+			"$defs":{"Mode":{"type":"string","enum":["fast","slow"]}},
+			"additionalProperties":false,
+			"anyOf":[
+				{"type":"object","properties":{"mode":{"$ref":"#/$defs/Mode"}},"required":["mode"]},
+				{"type":"null"}
+			]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	if schema.Get("anyOf").Exists() {
+		t.Fatalf("anyOf must not survive at root: %s", schema.Raw)
+	}
+	if !schema.Get("$defs.Mode").Exists() {
+		t.Fatalf("root $defs must be preserved (dangling $ref otherwise): %s", schema.Raw)
+	}
+	if schema.Get("properties.mode.$ref").String() != "#/$defs/Mode" {
+		t.Fatalf("branch $ref property must survive merge: %s", schema.Raw)
+	}
+	if !schema.Get("additionalProperties").Exists() || schema.Get("additionalProperties").Bool() {
+		t.Fatalf("root additionalProperties:false must be preserved: %s", schema.Raw)
+	}
+}
+
+// 判别联合(discriminated union):多个分支对同一属性给出不同 schema(如
+// const:"create" 与 const:"update")时不能先到先得——那会让后续分支的合法调用
+// 被上游拒绝。冲突属性必须包成嵌套 anyOf,把每个分支的定义都保住。
+func TestGrokUnionRootMergeWrapsConflictingPropertiesInNestedAnyOf(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"discriminated","parameters":{
+			"anyOf":[
+				{"type":"object","properties":{"kind":{"const":"create"},"payload":{"type":"string"}},"required":["kind"]},
+				{"type":"object","properties":{"kind":{"const":"update"},"id":{"type":"integer"}},"required":["kind"]}
+			]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	kind := schema.Get("properties.kind")
+	variants := kind.Get("anyOf").Array()
+	if len(variants) != 2 {
+		t.Fatalf("conflicting property must become nested anyOf with both variants: %s", kind.Raw)
+	}
+	if variants[0].Get("const").String() != "create" || variants[1].Get("const").String() != "update" {
+		t.Fatalf("both discriminator variants must survive in order: %s", kind.Raw)
+	}
+	if !schema.Get("properties.payload").Exists() || !schema.Get("properties.id").Exists() {
+		t.Fatalf("non-conflicting branch properties must merge: %s", schema.Raw)
+	}
+	// 两个分支都必填 kind 且没有非 object 分支被丢弃,交集应保留 kind。
+	required := schema.Get("required").Array()
+	if len(required) != 1 || required[0].String() != "kind" {
+		t.Fatalf("required intersection must keep kind: %s", schema.Get("required").Raw)
+	}
+	// 分支定义完全相同的属性不包联合,保持单值形态。
+	if schema.Get("properties.payload.anyOf").Exists() {
+		t.Fatalf("identical single-branch property must stay a plain schema: %s", schema.Raw)
+	}
+}
+
+// allOf 根的同名属性冲突包成嵌套 allOf:全部分支约束同时成立,不能丢弃任何一侧。
+func TestGrokAllOfRootMergeWrapsConflictingPropertiesInNestedAllOf(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"conjunction","parameters":{
+			"allOf":[
+				{"type":"object","properties":{"n":{"type":"integer","minimum":1}},"required":["n"]},
+				{"type":"object","properties":{"n":{"type":"integer","maximum":10}}}
+			]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	variants := schema.Get("properties.n.allOf").Array()
+	if len(variants) != 2 {
+		t.Fatalf("allOf property conflict must nest both constraints: %s", schema.Raw)
+	}
+	if variants[0].Get("minimum").Int() != 1 || variants[1].Get("maximum").Int() != 10 {
+		t.Fatalf("both allOf constraints must survive: %s", schema.Raw)
+	}
+	required := schema.Get("required").Array()
+	if len(required) != 1 || required[0].String() != "n" {
+		t.Fatalf("allOf required union must keep n: %s", schema.Get("required").Raw)
 	}
 }

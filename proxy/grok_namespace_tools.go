@@ -131,21 +131,40 @@ func grokObjectishSchemaBranch(branch map[string]any) bool {
 }
 
 // mergeGrokUnionRootSchema 把 anyOf/oneOf/allOf 根合并成单一 object:
-// properties 取各 object 分支的并集(先到先得),required 按语义收敛——
+// properties 取各 object 分支的并集,同名属性 schema 不一致时按联合语义包成
+// 嵌套 anyOf(联合)或 allOf(交),不丢弃任何分支定义;required 按语义收敛——
 // 联合(任一分支成立)取交集,allOf(全部成立)取并集;非 object 分支丢弃。
-// 没有任何 object 分支时整体降级为宽松 object。
+// 根上的非联合 sibling 键($defs/definitions/additionalProperties 等)原样保留:
+// 分支属性里的 "$ref":"#/$defs/X" 依赖根级定义容器,丢掉会产生悬空引用,上游拿到
+// 不可解析的 schema 照样 400(PR #580 评审)。没有任何 object 分支时整体降级为
+// 宽松 object。
 func mergeGrokUnionRootSchema(root map[string]any, branches []any, requireAll bool) map[string]any {
-	merged := map[string]any{"type": "object"}
-	if description, ok := root["description"].(string); ok && strings.TrimSpace(description) != "" {
-		merged["description"] = description
+	merged := make(map[string]any, len(root)+1)
+	for key, value := range root {
+		switch key {
+		case "anyOf", "oneOf", "allOf", "type", "properties", "required":
+			// 联合关键字被消解;type/properties/required 由下方合并逻辑重建。
+			continue
+		}
+		merged[key] = value
+	}
+	merged["type"] = "object"
+	// 同名属性收集所有互异的分支定义(根定义在前),合并时再决定单值还是嵌套联合。
+	propertyVariants := map[string][]any{}
+	appendPropertyVariant := func(key string, value any) {
+		for _, existing := range propertyVariants[key] {
+			if reflect.DeepEqual(existing, value) {
+				return
+			}
+		}
+		propertyVariants[key] = append(propertyVariants[key], value)
 	}
 	// 根自身可能就是 object schema(type:"object" 且额外挂了 anyOf/oneOf):它的
 	// properties/required 在任何分支下都成立,作为合并基底且 required 恒保留。
-	properties := map[string]any{}
 	rootRequired := map[string]bool{}
 	if rootProps, ok := root["properties"].(map[string]any); ok {
 		for key, value := range rootProps {
-			properties[key] = value
+			appendPropertyVariant(key, value)
 		}
 	}
 	if list, ok := root["required"].([]any); ok {
@@ -172,9 +191,7 @@ func mergeGrokUnionRootSchema(root map[string]any, branches []any, requireAll bo
 		}
 		if props, ok := branch["properties"].(map[string]any); ok {
 			for key, value := range props {
-				if _, exists := properties[key]; !exists {
-					properties[key] = value
-				}
+				appendPropertyVariant(key, value)
 			}
 		}
 		branchRequired := map[string]bool{}
@@ -199,10 +216,27 @@ func mergeGrokUnionRootSchema(root map[string]any, branches []any, requireAll bo
 			}
 		}
 	}
-	if objectBranches == 0 && len(properties) == 0 {
+	if objectBranches == 0 && len(propertyVariants) == 0 {
 		return grokPermissiveObjectSchema(root)
 	}
-	if len(properties) > 0 {
+	if len(propertyVariants) > 0 {
+		// 冲突属性按联合类型包成嵌套联合(嵌套联合 Grok 接受,只有根联合被拒):
+		// anyOf/oneOf 用 anyOf 保住每个判别分支(如 const:"create"/const:"update"),
+		// 不能先到先得地排除后续分支;allOf 用 allOf 保留全部约束。根定义在
+		// anyOf 场景下随之从"恒成立"放宽为"任一成立",符合本文件宁可放宽、
+		// 不禁止原本合法调用的降级方针。
+		unionKeyword := "anyOf"
+		if requireAll {
+			unionKeyword = "allOf"
+		}
+		properties := make(map[string]any, len(propertyVariants))
+		for key, variants := range propertyVariants {
+			if len(variants) == 1 {
+				properties[key] = variants[0]
+				continue
+			}
+			properties[key] = map[string]any{unionKeyword: variants}
+		}
 		merged["properties"] = properties
 	}
 	finalRequired := map[string]bool{}
