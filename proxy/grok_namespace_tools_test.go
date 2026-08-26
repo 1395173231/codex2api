@@ -575,3 +575,55 @@ func TestNormalizeGrokUpstreamToolsCleansHistory(t *testing.T) {
 		t.Fatalf("function_call_output status not stripped: %s", gjson.GetBytes(out, "input.2").Raw)
 	}
 }
+
+// Grok 上游把 "tool_search" 保留给内置工具,同名 function 声明会被
+// 400 拒绝。代理别名与用户自带的同名 function 都必须避开保留名,
+// 且模型按声明名或习惯名回调时都能反解。
+func TestGrokToolSearchAvoidsReservedUpstreamFunctionName(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[
+			{"type":"tool_search"},
+			{"type":"function","name":"tool_search","parameters":{"type":"object"}}
+		],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	for _, tool := range gjson.GetBytes(result.Body, "tools").Array() {
+		if tool.Get("type").String() == "function" && tool.Get("name").String() == "tool_search" {
+			t.Fatalf("reserved function name leaked upstream: %s", result.Body)
+		}
+	}
+
+	proxyName := ""
+	userAlias := ""
+	for alias, metadata := range result.Aliases {
+		if alias == "tool_search" {
+			continue
+		}
+		if metadata.ToolSearch {
+			proxyName = alias
+		} else if metadata.Name == "tool_search" {
+			userAlias = alias
+		}
+	}
+	if proxyName == "" || proxyName == "tool_search" {
+		t.Fatalf("tool_search proxy alias not remapped: aliases=%#v", result.Aliases)
+	}
+	if userAlias == "" || userAlias == "tool_search" {
+		t.Fatalf("user function named tool_search not remapped: aliases=%#v", result.Aliases)
+	}
+
+	restored := reverseGrokNamespaceJSON([]byte(`{"output":[{"type":"function_call","call_id":"fc_1","name":"`+userAlias+`","arguments":"{}"}]}`), result.Aliases)
+	if got := gjson.GetBytes(restored, "output.0.name").String(); got != "tool_search" {
+		t.Fatalf("user tool_search function name = %q; body=%s", got, restored)
+	}
+	if got := gjson.GetBytes(restored, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("user tool_search call type = %q; body=%s", got, restored)
+	}
+
+	habitual := reverseGrokNamespaceJSON([]byte(`{"output":[{"type":"function_call","call_id":"fc_2","name":"tool_search","arguments":"{\"query\":\"x\"}"}]}`), result.Aliases)
+	if got := gjson.GetBytes(habitual, "output.0.type").String(); got != "tool_search_call" {
+		t.Fatalf("habitual tool_search call type = %q; body=%s", got, habitual)
+	}
+}

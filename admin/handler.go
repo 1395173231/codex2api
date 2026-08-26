@@ -1128,6 +1128,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.GET("/prompt-policy/incidents", h.ListPromptPolicyIncidents)
 	api.DELETE("/prompt-policy/incidents", h.ClearPromptPolicyIncidents)
+	api.DELETE("/prompt-policy/incidents/:incident_id", h.DeletePromptPolicyIncident)
 	api.GET("/prompt-policy/incidents/health", h.GetPromptPolicyAuditHealth)
 	api.GET("/prompt-policy/incidents/:incident_id", h.GetPromptPolicyIncident)
 	api.GET("/prompt-policy/risk-profiles", h.ListPromptRiskProfiles)

@@ -32,6 +32,11 @@ func newGrokAliasRegister() (grokAliasRegister, map[string]grokNsIdentity) {
 	registered := make(map[string]grokNsIdentity)
 	register := func(namespace, name string, custom, toolSearch bool) string {
 		alias := grokNamespaceAliasName(namespace, name)
+		// Grok 上游保留的内置名不能作为 function 声明名出站(会 400
+		// "The function name … is reserved"),统一挪到带后缀的别名上。
+		if _, reserved := grokReservedUpstreamFunctionNames[alias]; reserved {
+			alias += grokReservedAliasSuffix
+		}
 		if existing, ok := registered[alias]; ok && (existing.Namespace != namespace || existing.Name != name || existing.Custom != custom || existing.ToolSearch != toolSearch) {
 			alias = grokDisambiguatedAlias(alias, namespace, name)
 		}
@@ -40,13 +45,28 @@ func newGrokAliasRegister() (grokAliasRegister, map[string]grokNsIdentity) {
 		if custom || toolSearch || namespace != "" || alias != name {
 			aliases[alias] = identity
 		}
+		if toolSearch {
+			// 模型可能凭习惯直接回调 "tool_search",补一条反解映射,
+			// 保证这种回调仍能恢复成 tool_search_call。
+			if _, taken := aliases["tool_search"]; !taken {
+				aliases["tool_search"] = identity
+			}
+		}
 		return alias
 	}
 	return register, aliases
 }
 
-const grokToolSearchProxyName = "tool_search"
+// grokToolSearchProxyName 是 tool_search 桥接 function 的出站名。不能叫
+// "tool_search":Grok 上游把该名保留给内置 tool_search 工具,同名声明会被
+// 400 拒绝;响应侧靠别名映射把它反解回 tool_search_call,客户端无感知。
+const grokToolSearchProxyName = "codex_tool_search"
 const grokToolCallHardLimitBytes = 128 * 1024
+
+// grokReservedUpstreamFunctionNames 是 Grok 上游保留、拒绝同名 function 声明的名字。
+var grokReservedUpstreamFunctionNames = map[string]struct{}{"tool_search": {}}
+
+const grokReservedAliasSuffix = "_fn"
 
 func grokFunctionToolForToolSearch(name string) map[string]any {
 	return map[string]any{

@@ -71,6 +71,11 @@ func (h *Handler) ListPromptRiskProfiles(c *gin.Context) {
 	if minScore > 100 {
 		minScore = 100
 	}
+	activityState := strings.ToLower(strings.TrimSpace(c.Query("activity_state")))
+	if activityState != "" && activityState != "all" && activityState != "active" && activityState != "identity_only" {
+		writeError(c, http.StatusBadRequest, "activity_state 必须为 all、active 或 identity_only")
+		return
+	}
 	// 生产画像列表需要聚合近 30 天事件。高流量实例可能包含数十万条记录，
 	// 5 秒会在 SQLite 正常计算完成前主动取消，表现为稳定的 500。
 	ctx, cancel := context.WithTimeout(c.Request.Context(), promptRiskProfileListTimeout)
@@ -85,6 +90,7 @@ func (h *Handler) ListPromptRiskProfiles(c *gin.Context) {
 	profiles, total, err := h.db.ListPromptRiskProfiles(ctx, database.PromptRiskProfileQuery{
 		Page: page, PageSize: pageSize, SubjectType: c.Query("subject_type"), Platform: c.Query("platform"),
 		RiskLevel: c.Query("risk_level"), APIKeyID: apiKeyID, AccountID: accountID, MinScore: minScore, Query: c.Query("q"),
+		UpstreamCYOnly: c.Query("cy_only") == "true", ActivityState: activityState,
 		PrioritizeActiveLocks: true, ActiveLocksOnly: c.Query("locked_only") == "true",
 		ConversationLockTTL: lockTTL, UserCyberCooldownTTL: userCooldownTTL,
 	})
@@ -254,9 +260,20 @@ func (h *Handler) attachPromptConversationLocks(ctx context.Context, profiles []
 			if strings.TrimSpace(profile.SubjectKey) == "" {
 				continue
 			}
-			item, err := h.db.GetActivePromptConversationLockBySessionHashWithTTL(ctx, profile.SubjectKey, lockTTL)
+			item, err := h.db.GetActivePromptConversationLockBySessionHash(ctx, profile.SubjectKey)
 			if err == nil {
-				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeConversation, lockTTL)
+				effectiveTTL := lockTTL
+				if item != nil && item.IdentityKind == database.PromptConversationLockIdentityFingerprintReplay {
+					effectiveTTL = userCooldownTTL
+				}
+				if effectiveTTL > 0 && (item == nil || !item.LockedAt.After(time.Now().UTC().Add(-effectiveTTL))) {
+					item = nil
+				}
+				scope := database.PromptConversationRestrictionScopeConversation
+				if item != nil && item.IdentityKind == database.PromptConversationLockIdentityFingerprintReplay {
+					scope = database.PromptConversationRestrictionScopeFingerprintReplay
+				}
+				decoratePromptConversationRestriction(item, scope, effectiveTTL)
 				profile.ConversationLock = item
 			}
 		case database.PromptRiskSubjectNewAPIUser:

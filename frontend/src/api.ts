@@ -1100,7 +1100,9 @@ export const api = {
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
-	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean } = {}) => {
+	deletePromptPolicyIncident: (incidentId: string) =>
+		request<MessageResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`, { method: 'DELETE' }),
+	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean; cyOnly?: boolean; activityState?: string } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
 		search.set('page_size', String(params.pageSize || 20))
@@ -1112,6 +1114,8 @@ export const api = {
 		if (params.minScore) search.set('min_score', params.minScore)
 		if (params.q) search.set('q', params.q)
 		if (params.lockedOnly) search.set('locked_only', 'true')
+		if (params.cyOnly) search.set('cy_only', 'true')
+		if (params.activityState) search.set('activity_state', params.activityState)
 		return request<import('./types').PromptRiskProfilesResponse>(`/prompt-policy/risk-profiles?${search.toString()}`)
 	},
 	getPromptRiskProfile: (subjectType: string, subjectKey: string, eventPage = 1, eventPageSize = 20, trustEventPage = 1, trustEventPageSize = 20) =>

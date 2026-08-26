@@ -1823,6 +1823,7 @@ export interface PromptConversationLock {
   id: number
   lock_key: string
   status: 'active' | 'unlocked'
+  identity_kind: 'newapi' | 'codex_session' | 'fingerprint_replay' | string
   platform: string
   newapi_user_id: string
   session_fingerprint: string
@@ -1838,7 +1839,7 @@ export interface PromptConversationLock {
   locked_at: ISODateString
   unlocked_at?: ISODateString
   unlock_reason?: string
-  restriction_scope?: 'conversation' | 'user_cooldown'
+	restriction_scope?: 'conversation' | 'user_cooldown' | 'fingerprint_replay'
   expires_at?: ISODateString
   remaining_seconds?: number
   created_at: ISODateString

@@ -132,6 +132,8 @@ type PromptRiskProfileQuery struct {
 	AccountID             int64
 	MinScore              int
 	Query                 string
+	UpstreamCYOnly        bool
+	ActivityState         string
 	PrioritizeActiveLocks bool
 	ActiveLocksOnly       bool
 	ConversationLockTTL   time.Duration
@@ -944,7 +946,7 @@ func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversat
 	// The lock table is created once during database startup. Do not run DDL
 	// from this read path: repeated CREATE/ALTER checks on a busy SQLite instance
 	// can contend with OAuth and usage-log writers even when the schema is stable.
-	rows, err := db.conn.QueryContext(ctx, `SELECT session_hash, platform, newapi_user_id, reason_code, locked_at
+	rows, err := db.conn.QueryContext(ctx, `SELECT session_hash, platform, newapi_user_id, identity_kind, reason_code, locked_at
 		FROM prompt_conversation_locks WHERE status='active'`)
 	if err != nil {
 		return nil, err
@@ -952,17 +954,21 @@ func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversat
 	defer rows.Close()
 	now := time.Now().UTC()
 	for rows.Next() {
-		var sessionHash, platform, userID, reasonCode string
+		var sessionHash, platform, userID, identityKind, reasonCode string
 		var lockedRaw any
-		if err := rows.Scan(&sessionHash, &platform, &userID, &reasonCode, &lockedRaw); err != nil {
+		if err := rows.Scan(&sessionHash, &platform, &userID, &identityKind, &reasonCode, &lockedRaw); err != nil {
 			return nil, err
 		}
 		lockedAt, err := parsePromptRiskTimeValue(lockedRaw)
 		if err != nil {
 			return nil, err
 		}
+		effectiveTTL := conversationTTL
+		if identityKind == PromptConversationLockIdentityFingerprintReplay {
+			effectiveTTL = userCooldownTTL
+		}
 		if sessionHash = strings.ToLower(strings.TrimSpace(sessionHash)); sessionHash != "" &&
-			(conversationTTL <= 0 || lockedAt.After(now.Add(-conversationTTL))) {
+			(effectiveTTL <= 0 || lockedAt.After(now.Add(-effectiveTTL))) {
 			key := PromptRiskSubjectSession + "\x00" + sessionHash
 			if current, ok := result[key]; !ok || lockedAt.After(current) {
 				result[key] = lockedAt
@@ -1074,6 +1080,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 	}
 	defer rows.Close()
 	aggregates := make([]promptRiskAggregate, 0)
+	aggregateKeys := make(map[string]struct{})
 	for rows.Next() {
 		var item promptRiskAggregate
 		var latestRaw any
@@ -1094,7 +1101,21 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		if err != nil {
 			return nil, 0, err
 		}
+		aggregateKeys[item.Profile.SubjectType+"\x00"+item.Profile.SubjectKey] = struct{}{}
 		finalizePromptRiskAggregate(&item)
+		if query.UpstreamCYOnly && item.Profile.UpstreamCYCount == 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(query.ActivityState)) {
+		case "active":
+			if !item.Profile.HasActivity {
+				continue
+			}
+		case "identity_only":
+			if item.Profile.HasActivity {
+				continue
+			}
+		}
 		if query.MinScore > 0 && item.Profile.RiskScore < query.MinScore {
 			continue
 		}
@@ -1122,7 +1143,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 	for i := range aggregates {
 		applyPromptRiskIdentityToProfile(&aggregates[i].Profile, identities[aggregates[i].Profile.SubjectKey])
 	}
-	includeIdentityDirectory := query.APIKeyID == 0 && query.AccountID == 0 &&
+	includeIdentityDirectory := !query.UpstreamCYOnly && query.ActivityState != "active" && query.APIKeyID == 0 && query.AccountID == 0 &&
 		(strings.TrimSpace(query.SubjectType) == "" || strings.TrimSpace(query.SubjectType) == "all" || strings.TrimSpace(query.SubjectType) == PromptRiskSubjectNewAPIUser) &&
 		query.MinScore == 0 && (strings.TrimSpace(query.RiskLevel) == "" || strings.TrimSpace(query.RiskLevel) == "all" || strings.TrimSpace(query.RiskLevel) == PromptRiskLevelLow)
 	if includeIdentityDirectory {
@@ -1130,10 +1151,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		if listErr != nil {
 			return nil, 0, listErr
 		}
-		existing := make(map[string]struct{}, len(aggregates))
-		for i := range aggregates {
-			existing[aggregates[i].Profile.SubjectType+"\x00"+aggregates[i].Profile.SubjectKey] = struct{}{}
-		}
+		existing := aggregateKeys
 		platformFilter := strings.TrimSpace(query.Platform)
 		subjectKeyFilter := strings.TrimSpace(query.SubjectKey)
 		queryFilter := strings.ToLower(strings.TrimSpace(query.Query))
