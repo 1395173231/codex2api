@@ -113,6 +113,9 @@ func TestGrokAdditionalToolsAndToolSearchMatrix(t *testing.T) {
 	}
 	proxyName := ""
 	for alias, metadata := range result.Aliases {
+		if alias == "tool_search" {
+			continue // 习惯名反解映射,不是出站声明名(map 迭代顺序随机,不跳过会间歇取错)
+		}
 		if metadata.ToolSearch {
 			proxyName = alias
 			break
