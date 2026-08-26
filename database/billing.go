@@ -243,8 +243,9 @@ func GetModelPricing(model string) *ModelPricing {
 	canonicalOv, hasCanonical := lookupModelPricingOverride(canonical)
 	var aliasOv ModelPricingOverride
 	hasAlias := false
-	if normalized != canonical {
-		if ov, ok := lookupModelPricingOverride(normalized); ok {
+	aliasKey := PricingManagementModelKey(normalized)
+	if aliasKey != "" && aliasKey != canonical {
+		if ov, ok := lookupModelPricingOverride(aliasKey); ok {
 			if ov.Source == ModelPricingSourceCustom || !hasCanonical || canonicalOv.Source != ModelPricingSourceCustom {
 				aliasOv, hasAlias = ov, true
 			}
