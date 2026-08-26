@@ -61,6 +61,10 @@ type Handler struct {
 	scopeUsageMu sync.Mutex
 	scopeUsage   *apiKeyScopeUsageTracker
 	liveStore    *liveCallStore
+	// 指纹重放冷却的存在性闸门缓存(见 hasActiveFingerprintReplayLocks)。
+	fpReplayGateMu     sync.Mutex
+	fpReplayGateAt     time.Time
+	fpReplayGateActive bool
 }
 
 const (
