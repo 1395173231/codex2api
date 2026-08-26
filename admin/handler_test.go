@@ -188,6 +188,32 @@ func TestSummarizeDashboardAccountsExcludesUnsampledFromAvailable(t *testing.T) 
 	}
 }
 
+func TestSummarizeDashboardAccountsUsesAntigravityControlPlaneStatus(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+			"upstream_type": auth.UpstreamAntigravity,
+			"refresh_token": "refresh-1",
+		}},
+		{ID: 2, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+			"upstream_type":          auth.UpstreamAntigravity,
+			"refresh_token":          "refresh-2",
+			"antigravity_sync_error": "quota sync failed",
+		}},
+	}
+	runtimeAccounts := []*auth.Account{
+		{DBID: 1, Status: auth.StatusReady, AccessToken: "access-1", UpstreamType: auth.UpstreamAntigravity},
+		{DBID: 2, Status: auth.StatusReady, AccessToken: "access-2", UpstreamType: auth.UpstreamAntigravity},
+	}
+	got, channels := summarizeDashboardAccounts(rows, runtimeAccounts)
+	if got.total != 2 || got.normal != 1 || got.abnormal != 1 {
+		t.Fatalf("counts = %+v, want total=2 normal=1 abnormal=1", got)
+	}
+	channel := channels[database.UpstreamChannelAntigravity]
+	if channel.total != 2 || channel.normal != 1 || channel.abnormal != 1 {
+		t.Fatalf("Antigravity channel counts = %+v", channel)
+	}
+}
+
 func TestNormalizeBackgroundUploadMedia(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -95,24 +95,31 @@ type Account struct {
 	// grokRuntimeFactsMu serializes inference-response observations for this
 	// account. The sink performs generation-fenced database writes before it
 	// publishes any hard gate or routing invalidation back to memory.
-	grokRuntimeFactsMu      sync.Mutex
-	usageObservedAt         time.Time
-	DBID                    int64 // 数据库 ID
-	RefreshToken            string
-	SessionToken            string
-	AccessToken             string
-	ExpiresAt               time.Time
-	AccountID               string
-	Email                   string
-	PlanType                string
-	ProxyURL                string
-	CustomHeaders           map[string]string
-	UpstreamType            string
-	BaseURL                 string
-	APIKey                  string
-	Models                  []string
-	ModelMapping            string
-	CodexClientMetadataMode string
+	grokRuntimeFactsMu   sync.Mutex
+	usageObservedAt      time.Time
+	DBID                 int64 // 数据库 ID
+	RefreshToken         string
+	SessionToken         string
+	AccessToken          string
+	ExpiresAt            time.Time
+	AccountID            string
+	Email                string
+	PlanType             string
+	ProxyURL             string
+	CustomHeaders        map[string]string
+	UpstreamType         string
+	AntigravityProjectID string
+	// AntigravityHardBlocked is a durable runtime fence restored from Google's
+	// authoritative permission/quota snapshots or a permanent OAuth refresh
+	// failure. It is kept separate from administrative DispatchPaused so a
+	// successful, generation-fenced sync can safely clear the provider fence.
+	AntigravityHardBlocked     bool
+	AntigravityHardBlockReason string
+	BaseURL                    string
+	APIKey                     string
+	Models                     []string
+	ModelMapping               string
+	CodexClientMetadataMode    string
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
@@ -433,6 +440,15 @@ func (a *Account) hasDispatchCredentialLocked() bool {
 	}
 	if a.isOpenAIResponsesAPILocked() {
 		return true
+	}
+	if a.isAntigravityAPILocked() {
+		if a.AntigravityHardBlocked {
+			return false
+		}
+		if strings.TrimSpace(a.APIKey) != "" {
+			return true
+		}
+		return strings.TrimSpace(a.AccessToken) != "" && strings.TrimSpace(a.AntigravityProjectID) != ""
 	}
 	if a.isGrokAPILocked() {
 		// API Key 直接可调度；OAuth 需等 AT 刷出（RT-only 由后台/lazy 刷新补齐）
@@ -1226,6 +1242,12 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if a.premium5hRateLimitedLocked(now) && a.DynamicConcurrencyLimit > 1 {
 		a.DynamicConcurrencyLimit = 1
 	}
+	if a.isAntigravityAPILocked() && a.hasDispatchCredentialLocked() && a.DynamicConcurrencyLimit <= 0 {
+		a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseConcurrencyEffective, HealthTierHealthy)
+		if a.DynamicConcurrencyLimit <= 0 {
+			a.DynamicConcurrencyLimit = 1
+		}
+	}
 }
 
 func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64, float64, int64) {
@@ -1254,6 +1276,16 @@ func (a *Account) IsAvailable() bool {
 func (a *Account) isAvailableLocked(now time.Time) bool {
 	if a.Status == StatusError {
 		return false
+	}
+	if a.isAntigravityAPILocked() {
+		now := time.Now()
+		if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+			return a.antigravityUnauthorizedRecoveryLocked(now)
+		}
+		if a.healthTierLocked() == HealthTierBanned && !a.antigravityUnauthorizedRecoveryLocked(now) {
+			return false
+		}
+		return a.hasDispatchCredentialLocked()
 	}
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
@@ -1897,7 +1929,22 @@ func (a *Account) IsBanned() bool {
 // It intentionally ignores active request count, short cooldowns and transient
 // rate limits so a client model menu does not flicker under load.
 func (a *Account) ModelCatalogEligible() bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+	if a.IsAntigravityAPI() {
+		if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+			return false
+		}
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		if a.Status == StatusError || a.AntigravityHardBlocked ||
+			(a.healthTierLocked() == HealthTierBanned && !a.antigravityUnauthorizedRecoveryLocked(time.Now())) {
+			return false
+		}
+		return a.hasDispatchCredentialLocked()
+	}
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		return false
 	}
 	a.mu.RLock()
@@ -3403,6 +3450,14 @@ func (s *Store) accountHasCachedCooldown(acc *Account) bool {
 		return false
 	}
 	s.applyCachedAccountCooldown(acc, record)
+	if acc.IsAntigravityAPI() {
+		acc.mu.RLock()
+		recoverable := acc.antigravityUnauthorizedRecoveryLocked(time.Now())
+		acc.mu.RUnlock()
+		// Only the narrow OAuth-401 recovery exception may bypass an account
+		// cooldown. Rate-limit, admin, and terminal cooldowns remain hard gates.
+		return !recoverable
+	}
 	return true
 }
 
@@ -4242,29 +4297,76 @@ func (s *Store) NextProxy() string {
 // A pin to a managed proxy that is disabled, test-failed, or deleted does not
 // fall through and does not go direct while the proxy pool is enabled (issue #517).
 func (s *Store) ResolveProxyForAccount(acc *Account) string {
+	proxyURL, _ := s.resolveProxyForAccountSnapshot(acc)
+	return proxyURL
+}
+
+// resolveProxyForAccountSnapshot returns both the selected proxy and whether
+// direct egress is permitted from one proxy-policy snapshot. Holding the store
+// read lock across selection prevents an account pin from being rejected under
+// one pool configuration and then authorized as direct under another.
+func (s *Store) resolveProxyForAccountSnapshot(acc *Account) (string, bool) {
 	if s == nil {
-		return ""
+		return "", false
 	}
 
 	var accountID int64
+	var accountProxy string
+	var groupIDs []int64
 	if acc != nil {
 		acc.mu.RLock()
 		accountID = acc.DBID
-		if proxy := strings.TrimSpace(acc.ProxyURL); proxy != "" {
-			acc.mu.RUnlock()
-			if s.managedProxyUnavailable(proxy) {
-				return ""
-			}
-			return proxy
-		}
+		accountProxy = strings.TrimSpace(acc.ProxyURL)
+		groupIDs = cloneInt64Slice(acc.GroupIDs)
 		acc.mu.RUnlock()
 	}
 
-	if groupProxy := s.resolveGroupProxyForAccount(acc); groupProxy != "" {
-		return groupProxy
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	managedProxyUnavailable := func(proxy string) bool {
+		if !s.proxyPoolEnabled {
+			return false
+		}
+		if _, managed := s.managedProxySet[proxy]; !managed {
+			return false
+		}
+		_, enabled := s.proxyPoolSet[proxy]
+		return !enabled
+	}
+	if accountProxy != "" {
+		if managedProxyUnavailable(accountProxy) {
+			return "", false
+		}
+		return accountProxy, true
 	}
 
-	return s.resolveFallbackProxyForAccount(accountID)
+	for _, groupID := range groupIDs {
+		urls := s.getGroupProxyURLs(groupID)
+		if len(urls) == 0 {
+			continue
+		}
+		start := stickyProxyIndex(accountID, len(urls))
+		for i := 0; i < len(urls); i++ {
+			proxy := strings.TrimSpace(urls[(start+i)%len(urls)])
+			if proxy == "" || managedProxyUnavailable(proxy) {
+				continue
+			}
+			return proxy, true
+		}
+	}
+
+	if s.proxyPoolEnabled && len(s.proxyPool) > 0 {
+		start := stickyProxyIndex(accountID, len(s.proxyPool))
+		for i := 0; i < len(s.proxyPool); i++ {
+			if proxy := strings.TrimSpace(s.proxyPool[(start+i)%len(s.proxyPool)]); proxy != "" {
+				return proxy, true
+			}
+		}
+	}
+
+	proxyURL := strings.TrimSpace(s.globalProxy)
+	return proxyURL, proxyURL != "" || !s.proxyPoolEnabled
 }
 
 // resolveGroupProxyForAccount 返回账号按组继承的代理(issue #479):按 GroupIDs
@@ -4372,20 +4474,25 @@ func (s *Store) ManagedProxyUnavailable(proxyURL string) bool {
 // violating proxy-pool fail-closed: when the pool is on, an empty resolved
 // proxy would have meant direct/dirty-IP, so the account is skipped instead.
 func (s *Store) AccountHasUsableEgress(acc *Account) bool {
-	return s.accountHasUsableEgress(acc)
+	_, usable := s.ResolveUsableProxyForAccount(acc)
+	return usable
 }
 
 func (s *Store) accountHasUsableEgress(acc *Account) bool {
+	_, usable := s.ResolveUsableProxyForAccount(acc)
+	return usable
+}
+
+// ResolveUsableProxyForAccount returns the exact proxy decision a caller must
+// use together with its fail-closed usability result. Proxy selection and the
+// direct-egress decision come from one policy snapshot, so a concurrent pool
+// reconfiguration cannot turn a rejected managed proxy into an empty direct
+// request.
+func (s *Store) ResolveUsableProxyForAccount(acc *Account) (string, bool) {
 	if s == nil || acc == nil {
-		return false
+		return "", false
 	}
-	if strings.TrimSpace(s.ResolveProxyForAccount(acc)) != "" {
-		return true
-	}
-	s.mu.RLock()
-	enabled := s.proxyPoolEnabled
-	s.mu.RUnlock()
-	return !enabled
+	return s.resolveProxyForAccountSnapshot(acc)
 }
 
 func (s *Store) withUsableEgressFilter(filter AccountFilter) AccountFilter {
@@ -4751,6 +4858,50 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	return nil
 }
 
+// antigravityPersistedHardFence projects only authoritative, durable provider
+// facts into runtime availability. Missing or malformed snapshots remain
+// fail-open; an explicit forbidden quota, observed Allowed=false permission,
+// or permanent OAuth failure is a hard fence until a later successful sync
+// replaces the persisted fact.
+func antigravityPersistedHardFence(row *database.AccountRow) (reason string, permanentRefresh bool) {
+	if row == nil || !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamAntigravity) {
+		return "", false
+	}
+	if raw := strings.TrimSpace(row.GetCredential("antigravity_quota")); raw != "" {
+		var quota AntigravityQuotaSnapshot
+		if json.Unmarshal([]byte(raw), &quota) == nil && quota.Forbidden {
+			return "Google quota API denied access", false
+		}
+	}
+	permissionsRaw := strings.TrimSpace(row.GetCredential("antigravity_permissions"))
+	if permissionsRaw == "" {
+		permissionsRaw = strings.TrimSpace(row.GetCredential("antigravity_entitlements"))
+	}
+	if permissionsRaw != "" {
+		var permissions AntigravityEntitlements
+		if json.Unmarshal([]byte(permissionsRaw), &permissions) == nil && !permissions.Allowed &&
+			(strings.TrimSpace(permissions.Reason) != "" || !permissions.UpdatedAt.IsZero()) {
+			reason := strings.TrimSpace(permissions.Reason)
+			if reason == "" {
+				reason = "Google account is not allowed to use Antigravity"
+			}
+			return reason, false
+		}
+	}
+	if syncErr := strings.TrimSpace(row.GetCredential("antigravity_sync_error")); syncErr != "" {
+		if permanentErr := strings.TrimSpace(row.GetCredential(antigravityPermanentRefreshErrorCredentialKey)); permanentErr != "" && permanentErr == syncErr {
+			return syncErr, true
+		}
+		if strings.Contains(strings.ToLower(syncErr), "changed google principal") {
+			return syncErr, false
+		}
+		if strings.HasPrefix(syncErr, antigravityIdentityRevalidationErrorPrefix) {
+			return syncErr, false
+		}
+	}
+	return "", false
+}
+
 // buildAccountFromRow 将数据库账号行转换为运行时账号；凭据缺失或不可用时返回 nil。
 func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRow, modelCooldowns map[int64][]*database.AccountModelCooldownRow) *Account {
 	rt := row.GetCredential("refresh_token")
@@ -4765,11 +4916,12 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	codexFingerprintMode := NormalizeCodexFingerprintMode(row.GetCredential(CodexFingerprintModeCredentialKey))
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
+	isAntigravityAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamAntigravity) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
 	// Agent Identity：无 AT/RT，凭 agent_private_key 动态签名，不能被下面的空凭据 guard 拒绝。
 	isAgentIdentityAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("auth_mode")), CodexAuthModeAgentIdentity) &&
 		strings.TrimSpace(row.GetCredential("agent_runtime_id")) != "" &&
 		strings.TrimSpace(row.GetCredential("agent_private_key")) != ""
-	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAgentIdentityAccount {
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isAgentIdentityAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 		return nil
 	}
@@ -4785,6 +4937,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		HealthTier:              HealthTierWarm,
 		AddedAt:                 row.CreatedAt.UnixNano(),
 		UpstreamType:            upstreamType,
+		AntigravityProjectID:    strings.TrimSpace(row.GetCredential("project_id")),
 		BaseURL:                 strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		APIKey:                  strings.TrimSpace(apiKey),
 		Models:                  models,
@@ -4798,6 +4951,15 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if isOpenAIResponsesAccount {
 		account.HealthTier = HealthTierHealthy
 		if account.PlanType == "" {
+			account.PlanType = "api"
+		}
+	}
+	if isAntigravityAccount {
+		account.AccountID = row.GetCredential("account_id")
+		account.Email = row.GetCredential("email")
+		account.PlanType = row.GetCredential("plan_type")
+		if strings.TrimSpace(apiKey) != "" {
+			account.HealthTier = HealthTierHealthy
 			account.PlanType = "api"
 		}
 	}
@@ -4884,6 +5046,18 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.Status = StatusError
 		account.ErrorMsg = row.ErrorMessage
 		account.HealthTier = HealthTierRisky
+	}
+	if isAntigravityAccount {
+		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
+			account.AntigravityHardBlocked = true
+			account.AntigravityHardBlockReason = reason
+			account.Status = StatusError
+			account.ErrorMsg = reason
+			account.HealthTier = HealthTierRisky
+			if permanentRefresh {
+				account.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
+			}
+		}
 	}
 
 	// Agent Identity：填充签名凭据与身份信息（无 AT/RT，健康档直接置为 healthy）
@@ -5801,7 +5975,10 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 	if acc == nil {
 		return false
 	}
-	if atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&acc.Disabled) != 0 {
+		return false
+	}
+	if atomic.LoadInt32(&acc.DispatchPaused) != 0 {
 		return false
 	}
 
@@ -5813,6 +5990,16 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 func (a *Account) lazySelectableLocked(now time.Time) bool {
 	if a.Status == StatusError {
 		return false
+	}
+	if a.isAntigravityAPILocked() {
+		unauthorizedRecovery := a.antigravityUnauthorizedRecoveryLocked(now)
+		if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !unauthorizedRecovery {
+			return false
+		}
+		if a.healthTierLocked() == HealthTierBanned && !unauthorizedRecovery {
+			return false
+		}
+		return a.hasDispatchCredentialLocked()
 	}
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
@@ -6305,7 +6492,6 @@ func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int
 			weight:            hasher.Sum64(),
 		})
 	}
-
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -8235,7 +8421,7 @@ func (s *Store) SetAPIKeyUpstreamChannel(apiKeyID int64, channel string) {
 		return
 	}
 	channel = strings.ToLower(strings.TrimSpace(channel))
-	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAntigravity {
 		channel = ""
 	}
 	s.apiKeyGroupsMu.Lock()
@@ -8325,7 +8511,11 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 			return false
 		}
 	case database.UpstreamChannelCodex:
-		if acc.IsGrokAPI() {
+		if acc.IsGrokAPI() || acc.IsAntigravityAPI() {
+			return false
+		}
+	case database.UpstreamChannelAntigravity:
+		if !acc.IsAntigravityAPI() {
 			return false
 		}
 	}
@@ -10262,6 +10452,9 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	if target == nil {
 		return fmt.Errorf("账号 %d 不存在", dbID)
 	}
+	if target.IsAntigravityAPI() {
+		return fmt.Errorf("Antigravity 账号请使用专用配额刷新")
+	}
 	return s.refreshAccountForced(ctx, target)
 }
 
@@ -10401,6 +10594,9 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for i, acc := range accounts {
+		if acc.IsAntigravityAPI() {
+			continue
+		}
 		if acc.Status == StatusError {
 			continue
 		}
@@ -10447,6 +10643,15 @@ func (s *Store) refreshAccountForced(ctx context.Context, acc *Account) error {
 
 // refreshAccountWithOptions 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, forceRefresh bool) error {
+	if acc.IsAntigravityAPI() {
+		acc.mu.RLock()
+		apiKey := strings.TrimSpace(acc.APIKey)
+		acc.mu.RUnlock()
+		if apiKey != "" {
+			return nil
+		}
+		return s.RefreshAntigravityAccount(ctx, acc)
+	}
 	// Grok 账号走 auth.x.ai 的 OAuth 刷新流程，与 ChatGPT 的 RT 刷新完全不同。
 	if acc.IsGrokAPI() {
 		return s.refreshGrokAccount(ctx, acc, forceRefresh)
@@ -10746,6 +10951,423 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	}
 
 	return nil
+}
+
+func antigravityCredentialFromStoreRow(row *database.AccountRow) AntigravityCredential {
+	if row == nil {
+		return AntigravityCredential{}
+	}
+	credential := AntigravityCredential{
+		AccessToken: row.GetCredential("access_token"), RefreshToken: row.GetCredential("refresh_token"),
+		IDToken: row.GetCredential("id_token"), Email: row.GetCredential("email"),
+		Name: row.GetCredential("name"), AvatarURL: row.GetCredential("avatar_url"),
+		ProjectID: row.GetCredential("project_id"), OAuthClientKey: row.GetCredential("oauth_client_key"),
+		ClientID: row.GetCredential("antigravity_client_id"), ClientSecret: row.GetCredential("antigravity_client_secret"),
+		Scope: row.GetCredential("oauth_scope"),
+	}
+	credential.ExpiresAt = parseOAuthCredentialExpiry(row.GetCredential("expires_at"))
+	return credential
+}
+
+func antigravityRefreshModels(result AntigravitySyncResult) []string {
+	models := make([]string, 0, len(result.Quota.Models))
+	for _, model := range result.Quota.Models {
+		if id := strings.TrimSpace(model.ModelID); id != "" {
+			models = append(models, id)
+		}
+	}
+	return normalizeModelList(models)
+}
+
+func antigravityCredentialRotated(row *database.AccountRow, credential AntigravityCredential) bool {
+	if row == nil || strings.TrimSpace(credential.AccessToken) == "" {
+		return false
+	}
+	return strings.TrimSpace(credential.AccessToken) != strings.TrimSpace(row.GetCredential("access_token")) ||
+		(strings.TrimSpace(credential.RefreshToken) != "" && strings.TrimSpace(credential.RefreshToken) != strings.TrimSpace(row.GetCredential("refresh_token"))) ||
+		strings.TrimSpace(credential.IDToken) != strings.TrimSpace(row.GetCredential("id_token"))
+}
+
+const (
+	antigravityIdentityRevalidationErrorPrefix    = "Antigravity credential rotated before Google identity could be reverified"
+	antigravityPermanentRefreshErrorCredentialKey = "antigravity_permanent_refresh_error"
+)
+
+func antigravityRefreshCredentialUpdates(row *database.AccountRow, result AntigravitySyncResult, syncErr error) (map[string]any, error) {
+	credential := result.Credential
+	updates := map[string]any{
+		"upstream_type": UpstreamAntigravity,
+		"access_token":  strings.TrimSpace(credential.AccessToken), "refresh_token": strings.TrimSpace(credential.RefreshToken),
+		"id_token": strings.TrimSpace(credential.IDToken), "oauth_client_key": strings.TrimSpace(credential.OAuthClientKey),
+		"antigravity_client_id": strings.TrimSpace(credential.ClientID), "antigravity_client_secret": strings.TrimSpace(credential.ClientSecret),
+		"oauth_scope": strings.TrimSpace(credential.Scope),
+		antigravityPermanentRefreshErrorCredentialKey: "",
+		"antigravity_last_sync_attempt_at":            time.Now().UTC().Format(time.RFC3339),
+	}
+	if credential.ExpiresAt.IsZero() {
+		updates["expires_at"] = ""
+	} else {
+		updates["expires_at"] = credential.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	previousID := strings.TrimSpace(row.GetCredential("account_id"))
+	nextID := strings.TrimSpace(result.Profile.ID)
+	if previousID != "" && nextID != "" && previousID != nextID {
+		// A rotated RT must not be lost, but it is equally unsafe to publish the
+		// new principal under the old project/catalog. Persist the new token
+		// generation in a quarantined shape; the administrative identity sync can
+		// then establish the replacement family and authoritative snapshots.
+		transitionErr := fmt.Sprintf("Antigravity refresh changed Google principal from %s to %s; administrative identity sync required", previousID, nextID)
+		updates["account_id"] = nextID
+		updates["email"] = strings.TrimSpace(result.Profile.Email)
+		updates["name"] = strings.TrimSpace(result.Profile.Name)
+		updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
+		updates["verified_email"] = result.Profile.VerifiedEmail
+		updates["project_id"] = ""
+		updates["plan_type"] = ""
+		updates["models"] = []string{}
+		updates["antigravity_quota"] = ""
+		updates["antigravity_permissions"] = ""
+		updates["antigravity_entitlements"] = ""
+		updates["antigravity_last_synced_at"] = ""
+		updates["antigravity_sync_error"] = transitionErr
+		updates["antigravity_sync_warning"] = result.Warning
+		return updates, nil
+	}
+	if syncErr != nil {
+		profileVerified := result.Profile.VerifiedEmail && strings.TrimSpace(result.Profile.ID) != "" && strings.TrimSpace(result.Profile.Email) != ""
+		if antigravityCredentialRotated(row, credential) && !profileVerified {
+			// A rotating refresh token may belong to a different Google principal.
+			// Keep the newly issued token durable, but never publish it with the
+			// prior subject's project, catalog, quota, or capability proof.
+			quarantineErr := antigravityIdentityRevalidationErrorPrefix + ": " + syncErr.Error()
+			updates["account_id"] = ""
+			updates["email"] = ""
+			updates["name"] = ""
+			updates["avatar_url"] = ""
+			updates["verified_email"] = false
+			updates["project_id"] = ""
+			updates["plan_type"] = ""
+			updates["models"] = []string{}
+			updates["antigravity_quota"] = ""
+			updates["antigravity_permissions"] = ""
+			updates["antigravity_entitlements"] = ""
+			updates["antigravity_capabilities"] = ""
+			updates["antigravity_capability_last_probe_at"] = ""
+			updates["antigravity_catalog_source"] = ""
+			updates["antigravity_catalog_verified"] = false
+			updates["antigravity_last_synced_at"] = ""
+			updates["antigravity_sync_error"] = quarantineErr
+			updates["antigravity_sync_warning"] = result.Warning
+			return updates, nil
+		}
+		updates["antigravity_sync_error"] = syncErr.Error()
+		updates["antigravity_sync_warning"] = result.Warning
+		return updates, nil
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" {
+		return nil, fmt.Errorf("Antigravity refresh returned no access token")
+	}
+	quota, err := json.Marshal(result.Quota)
+	if err != nil {
+		return nil, err
+	}
+	updates["account_id"] = strings.TrimSpace(result.Profile.ID)
+	updates["email"] = strings.TrimSpace(result.Profile.Email)
+	updates["name"] = strings.TrimSpace(result.Profile.Name)
+	updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
+	updates["verified_email"] = result.Profile.VerifiedEmail
+	updates["models"] = antigravityRefreshModels(result)
+	updates["antigravity_quota"] = string(quota)
+	updates["antigravity_sync_error"] = ""
+	updates["antigravity_sync_warning"] = result.Warning
+	lastSyncedAt := result.Quota.UpdatedAt
+	if lastSyncedAt.IsZero() {
+		lastSyncedAt = time.Now().UTC()
+	}
+	updates["antigravity_last_synced_at"] = lastSyncedAt.UTC().Format(time.RFC3339)
+	if result.EntitlementsObserved {
+		permissions, marshalErr := json.Marshal(result.Entitlements)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		updates["project_id"] = strings.TrimSpace(result.Entitlements.ProjectID)
+		updates["plan_type"] = strings.TrimSpace(result.Entitlements.EffectiveTier)
+		updates["antigravity_permissions"] = string(permissions)
+		updates["antigravity_entitlements"] = string(permissions)
+	}
+	return updates, nil
+}
+
+func antigravityRowHasFreshAccess(row *database.AccountRow, previousAccessToken string) bool {
+	if row == nil {
+		return false
+	}
+	accessToken := strings.TrimSpace(row.GetCredential("access_token"))
+	if accessToken == "" || accessToken == strings.TrimSpace(previousAccessToken) || strings.TrimSpace(row.GetCredential("project_id")) == "" {
+		return false
+	}
+	expiresAt := parseOAuthCredentialExpiry(row.GetCredential("expires_at"))
+	return expiresAt.IsZero() || expiresAt.After(time.Now().Add(30*time.Second))
+}
+
+func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.AccountRow) {
+	if s == nil || acc == nil || row == nil {
+		return
+	}
+	credential := antigravityCredentialFromStoreRow(row)
+	models := normalizeModelList(row.GetCredentialStringSlice("models"))
+	hardReason, permanentRefresh := antigravityPersistedHardFence(row)
+	now := time.Now()
+
+	acc.mu.Lock()
+	acc.CredentialGeneration = row.CredentialGeneration
+	acc.CredentialFamilyID = strings.TrimSpace(row.CredentialFamilyID)
+	acc.UpstreamType = strings.TrimSpace(row.GetCredential("upstream_type"))
+	acc.APIKey = strings.TrimSpace(row.GetCredential("api_key"))
+	acc.AccessToken = strings.TrimSpace(credential.AccessToken)
+	acc.RefreshToken = strings.TrimSpace(credential.RefreshToken)
+	acc.SessionToken = strings.TrimSpace(credential.IDToken)
+	acc.ExpiresAt = credential.ExpiresAt
+	acc.AccountID = strings.TrimSpace(row.GetCredential("account_id"))
+	acc.Email = strings.TrimSpace(row.GetCredential("email"))
+	acc.PlanType = strings.TrimSpace(row.GetCredential("plan_type"))
+	acc.AntigravityProjectID = strings.TrimSpace(row.GetCredential("project_id"))
+	acc.Models = models
+	acc.ProxyURL = strings.TrimSpace(row.ProxyURL)
+	acc.AntigravityHardBlocked = hardReason != ""
+	acc.AntigravityHardBlockReason = hardReason
+	if permanentRefresh {
+		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
+	} else if hardReason == "" {
+		acc.PermanentRefreshFailures = 0
+	}
+	switch {
+	case hardReason != "":
+		acc.Status = StatusError
+		acc.ErrorMsg = hardReason
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+		acc.HealthTier = HealthTierRisky
+	case strings.EqualFold(strings.TrimSpace(row.Status), "error"):
+		acc.Status = StatusError
+		acc.ErrorMsg = strings.TrimSpace(row.ErrorMessage)
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+		if acc.HealthTier == HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case row.CooldownUntil.Valid && now.Before(row.CooldownUntil.Time):
+		acc.Status = StatusCooldown
+		acc.CooldownUtil = row.CooldownUntil.Time
+		acc.CooldownReason = strings.TrimSpace(row.CooldownReason)
+		acc.ErrorMsg = strings.TrimSpace(row.ErrorMessage)
+	default:
+		acc.Status = StatusReady
+		acc.ErrorMsg = ""
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+		if acc.HealthTier == HealthTierBanned {
+			acc.HealthTier = HealthTierWarm
+		}
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	atomic.StoreInt32(&acc.Disabled, 0)
+	if row.Enabled {
+		atomic.StoreInt32(&acc.DispatchPaused, 0)
+	} else {
+		atomic.StoreInt32(&acc.DispatchPaused, 1)
+	}
+	s.fastSchedulerUpdate(acc)
+}
+
+// reloadAntigravityRuntimeOrRemove reconciles a runtime account with the
+// durable row after a credential mutation. If the authoritative row cannot be
+// read, keeping the older in-memory credential dispatchable would be unsafe, so
+// the account is removed from the runtime pool until a later reload succeeds.
+func (s *Store) reloadAntigravityRuntimeOrRemove(ctx context.Context, acc *Account, accountID int64) (*database.AccountRow, error) {
+	current, err := s.db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		s.RemoveAccount(accountID)
+		return nil, err
+	}
+	s.publishAntigravityRuntimeRow(acc, current)
+	return current, nil
+}
+
+func (s *Store) persistAntigravityPermanentRefreshFailure(ctx context.Context, acc *Account, row *database.AccountRow, refreshErr error) error {
+	if s == nil || s.db == nil || row == nil || refreshErr == nil {
+		return refreshErr
+	}
+	applied, err := s.db.MergeAccountCredentialsForGeneration(ctx, row.ID, row.CredentialGeneration, map[string]any{
+		"antigravity_sync_error":                      refreshErr.Error(),
+		antigravityPermanentRefreshErrorCredentialKey: refreshErr.Error(),
+		"antigravity_last_sync_attempt_at":            time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		s.RemoveAccount(row.ID)
+		return fmt.Errorf("persist permanent Antigravity refresh failure: %w", err)
+	}
+	_, reloadErr := s.reloadAntigravityRuntimeOrRemove(ctx, acc, row.ID)
+	if reloadErr != nil {
+		return fmt.Errorf("reload Antigravity account after refresh failure: %w", reloadErr)
+	}
+	if !applied {
+		return fmt.Errorf("Antigravity credential generation changed while recording permanent refresh failure")
+	}
+	return refreshErr
+}
+
+// RefreshAntigravityAccount refreshes a Google OAuth credential after a
+// v1internal 401. Refreshes are serialized by the stable credential family,
+// re-read from the database after acquiring the lease, and published to
+// runtime only after a generation-fenced durable write succeeds.
+func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) error {
+	if s == nil || acc == nil || !acc.IsAntigravityAPI() {
+		return fmt.Errorf("account is not an Antigravity account")
+	}
+	if s.db == nil || acc.DBID <= 0 {
+		return fmt.Errorf("Antigravity refresh requires a database-backed account")
+	}
+	acc.mu.RLock()
+	initialAccessToken := strings.TrimSpace(acc.AccessToken)
+	acc.mu.RUnlock()
+
+	for familyAttempt := 0; familyAttempt < 3; familyAttempt++ {
+		before, err := s.db.GetAccountByID(ctx, acc.DBID)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(strings.TrimSpace(before.GetCredential("upstream_type")), UpstreamAntigravity) ||
+			strings.TrimSpace(before.GetCredential("api_key")) != "" {
+			return fmt.Errorf("account is not an Antigravity OAuth account")
+		}
+		familyID := strings.TrimSpace(before.CredentialFamilyID)
+		if familyID == "" {
+			familyID, err = s.db.EnsureAccountCredentialFamilyID(ctx, before.ID, "")
+			if err != nil {
+				return fmt.Errorf("ensure Antigravity credential family: %w", err)
+			}
+		}
+		lease, err := s.acquireOAuthRefreshFamilyLease(ctx, familyID)
+		if err != nil {
+			return fmt.Errorf("acquire Antigravity OAuth refresh lease: %w", err)
+		}
+
+		familyChanged := false
+		refreshErr := func() error {
+			defer lease.Release()
+			lockedRow, reloadErr := s.db.GetAccountByID(lease.Context(), before.ID)
+			if reloadErr != nil {
+				return reloadErr
+			}
+			if strings.TrimSpace(lockedRow.CredentialFamilyID) != familyID {
+				familyChanged = true
+				return nil
+			}
+			if antigravityRowHasFreshAccess(lockedRow, initialAccessToken) {
+				criticalCtx := lease.CriticalContext()
+				cleared, clearErr := s.db.ClearCooldownIfReason(criticalCtx, lockedRow.ID, "unauthorized")
+				if cleared {
+					s.deleteCachedAccountCooldown(lockedRow.ID)
+				}
+				_, currentErr := s.reloadAntigravityRuntimeOrRemove(criticalCtx, acc, lockedRow.ID)
+				if currentErr != nil {
+					if clearErr != nil {
+						return fmt.Errorf("clear Antigravity unauthorized cooldown: %v; reload durable credential: %w", clearErr, currentErr)
+					}
+					return currentErr
+				}
+				if clearErr != nil {
+					return clearErr
+				}
+				return nil
+			}
+
+			credential := antigravityCredentialFromStoreRow(lockedRow)
+			if strings.TrimSpace(credential.RefreshToken) == "" {
+				return fmt.Errorf("Antigravity account has no refresh token")
+			}
+			groupIDs, groupErr := s.db.GetAccountGroupIDs(lease.Context(), lockedRow.ID)
+			if groupErr != nil {
+				return fmt.Errorf("load Antigravity account groups for proxy resolution: %w", groupErr)
+			}
+			routeAccount := &Account{DBID: lockedRow.ID, ProxyURL: strings.TrimSpace(lockedRow.ProxyURL), GroupIDs: groupIDs}
+			proxyURL, usableEgress := s.ResolveUsableProxyForAccount(routeAccount)
+			if !usableEgress {
+				return fmt.Errorf("Antigravity proxy pool is enabled but no usable proxy is available")
+			}
+			client, clientErr := NewAntigravityClient(proxyURL)
+			if clientErr != nil {
+				return clientErr
+			}
+			if err := lease.Context().Err(); err != nil {
+				return err
+			}
+			// The caller reached this path after an upstream 401. Force the token
+			// exchange even when the stored expiry still claims the bearer is fresh.
+			credential.AccessToken = ""
+			criticalCtx := lease.CriticalContext()
+			result, syncErr := client.Sync(criticalCtx, credential)
+			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) {
+				if isNonRetryable(syncErr) {
+					return s.persistAntigravityPermanentRefreshFailure(criticalCtx, acc, lockedRow, syncErr)
+				}
+				return syncErr
+			}
+			updates, updateErr := antigravityRefreshCredentialUpdates(lockedRow, result, syncErr)
+			if updateErr != nil {
+				if antigravityCredentialRotated(lockedRow, result.Credential) {
+					s.RemoveAccount(lockedRow.ID)
+				}
+				return updateErr
+			}
+			_, applied, casErr := s.db.UpdateAccountCredentialsCAS(criticalCtx, lockedRow.ID, lockedRow.CredentialGeneration, updates)
+			if casErr != nil {
+				// The provider may already have consumed and rotated the refresh
+				// token. A failed/ambiguous durable write cannot safely leave the
+				// old credential dispatchable in memory.
+				s.RemoveAccount(lockedRow.ID)
+				return fmt.Errorf("persist Antigravity refreshed credential: %w", casErr)
+			}
+			if !applied {
+				current, currentErr := s.reloadAntigravityRuntimeOrRemove(criticalCtx, acc, lockedRow.ID)
+				if currentErr != nil {
+					return currentErr
+				}
+				if antigravityRowHasFreshAccess(current, lockedRow.GetCredential("access_token")) {
+					return nil
+				}
+				return fmt.Errorf("Antigravity credential generation changed during refresh; discarded stale provider result")
+			}
+			cleared, clearErr := s.db.ClearCooldownIfReason(criticalCtx, lockedRow.ID, "unauthorized")
+			if cleared {
+				s.deleteCachedAccountCooldown(lockedRow.ID)
+			}
+			current, currentErr := s.reloadAntigravityRuntimeOrRemove(criticalCtx, acc, lockedRow.ID)
+			if currentErr != nil {
+				if clearErr != nil {
+					return fmt.Errorf("clear Antigravity unauthorized cooldown: %v; reload durable credential: %w", clearErr, currentErr)
+				}
+				return currentErr
+			}
+			if clearErr != nil {
+				return clearErr
+			}
+			if syncErr != nil {
+				return syncErr
+			}
+			if reason, _ := antigravityPersistedHardFence(current); reason != "" {
+				return errors.New(reason)
+			}
+			return nil
+		}()
+		if familyChanged {
+			continue
+		}
+		return refreshErr
+	}
+	return fmt.Errorf("Antigravity credential family changed repeatedly during refresh")
 }
 
 // propagateSharedOAuthCredentials 将一次成功刷新得到的新凭据同步给使用同一旧 RT

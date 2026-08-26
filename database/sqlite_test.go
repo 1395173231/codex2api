@@ -878,6 +878,13 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount codex 返回错误: %v", err)
 	}
+	relayID, err := db.InsertAccountWithUpstream(ctx, "relay-one", "openai", "relay", map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"api_key":       "relay-key",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithUpstream relay 返回错误: %v", err)
+	}
 	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
 		"upstream_type": "grok",
 		"refresh_token": "rt-grok",
@@ -887,13 +894,22 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)
 	}
+	antigravityID, err := db.InsertAccountWithUpstream(ctx, "antigravity-one", "google", "oauth", map[string]interface{}{
+		"upstream_type": "antigravity",
+		"refresh_token": "rt-antigravity",
+		"access_token":  "at-antigravity",
+		"email":         "antigravity@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithUpstream antigravity 返回错误: %v", err)
+	}
 
 	all, err := db.ListActiveByChannel(ctx, "")
 	if err != nil {
 		t.Fatalf("ListActiveByChannel(\"\") 返回错误: %v", err)
 	}
-	if len(all) != 2 {
-		t.Fatalf("ListActiveByChannel(\"\") len = %d, want 2", len(all))
+	if len(all) != 4 {
+		t.Fatalf("ListActiveByChannel(\"\") len = %d, want 4", len(all))
 	}
 
 	grokRows, err := db.ListActiveByChannel(ctx, UpstreamChannelGrok)
@@ -908,8 +924,16 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActiveByChannel(codex) 返回错误: %v", err)
 	}
-	if len(codexRows) != 1 || codexRows[0].ID != codexID {
-		t.Fatalf("ListActiveByChannel(codex) = %+v, want id %d", codexRows, codexID)
+	if len(codexRows) != 2 || codexRows[0].ID != codexID || codexRows[1].ID != relayID {
+		t.Fatalf("ListActiveByChannel(codex) = %+v, want ids %d and %d", codexRows, codexID, relayID)
+	}
+
+	antigravityRows, err := db.ListActiveByChannel(ctx, UpstreamChannelAntigravity)
+	if err != nil {
+		t.Fatalf("ListActiveByChannel(antigravity) 返回错误: %v", err)
+	}
+	if len(antigravityRows) != 1 || antigravityRows[0].ID != antigravityID {
+		t.Fatalf("ListActiveByChannel(antigravity) = %+v, want id %d", antigravityRows, antigravityID)
 	}
 }
 

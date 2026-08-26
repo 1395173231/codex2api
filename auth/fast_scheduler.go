@@ -815,6 +815,7 @@ func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, now ti
 		available = false
 	}
 
+	tier, limit, available = a.applyAntigravitySchedulerOverrideLocked(baseLimit, tier, limit, available)
 	return tier, score, limit, proven, available
 }
 

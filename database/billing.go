@@ -208,6 +208,11 @@ var (
 		{model: "grok-3", pricing: ModelPricing{InputPricePerMToken: 3.0, OutputPricePerMToken: 15.0, CacheReadPricePerMToken: 0.75}},
 		{model: "grok-2", pricing: ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 10.0}},
 
+		// ===== Google Gemini public API estimates (USD / 1M token) =====
+		{model: "gemini-3-pro-preview", pricing: ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 12.0, CacheReadPricePerMToken: 0.2}},
+		{model: "gemini-2.5-pro", pricing: ModelPricing{InputPricePerMToken: 1.25, OutputPricePerMToken: 10.0, CacheReadPricePerMToken: 0.125}},
+		{model: "gemini-2.5-flash", pricing: ModelPricing{InputPricePerMToken: 0.3, OutputPricePerMToken: 2.5, CacheReadPricePerMToken: 0.03}},
+
 		{model: "gpt-4o-mini", pricing: ModelPricing{InputPricePerMToken: 0.15, OutputPricePerMToken: 0.6}},
 		{model: "gpt-4o", pricing: ModelPricing{InputPricePerMToken: 2.5, OutputPricePerMToken: 10.0}},
 		{model: "gpt-4-turbo", pricing: ModelPricing{InputPricePerMToken: 10.0, OutputPricePerMToken: 30.0}},
@@ -481,6 +486,9 @@ func claudeFamilyPricing(model string) *ModelPricing {
 }
 
 func geminiFamilyPricing(model string) *ModelPricing {
+	if pricing := modelRulePricing(model); pricing != nil && strings.HasPrefix(model, "gemini-") {
+		return pricing
+	}
 	if strings.Contains(model, "gemini-3.1-pro") || strings.Contains(model, "gemini-3-1-pro") {
 		return &ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 12.0}
 	}

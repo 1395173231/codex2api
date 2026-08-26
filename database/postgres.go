@@ -1675,8 +1675,9 @@ type APIKeyLimits struct {
 	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
-	//   - codex:   仅非 Grok 账号（Codex OAuth / OpenAI Responses 中转）
+	//   - codex:   仅 Codex OAuth / OpenAI Responses 中转账号
 	//   - grok:    仅 Grok 账号（此时不再要求账号声明模型，直接透传请求模型）
+	//   - antigravity: 预留的 Antigravity 管理渠道；推理适配完成前 fail closed
 	UpstreamChannel string `json:"upstream_channel,omitempty"`
 	// ScopeLimits 是「该 Key × 某账号分组 / 某账号」维度的用量上限（issue #439）。
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
@@ -1693,9 +1694,10 @@ const (
 
 // 上游渠道限定取值。
 const (
-	UpstreamChannelAuto  = ""
-	UpstreamChannelCodex = "codex"
-	UpstreamChannelGrok  = "grok"
+	UpstreamChannelAuto        = ""
+	UpstreamChannelCodex       = "codex"
+	UpstreamChannelGrok        = "grok"
+	UpstreamChannelAntigravity = "antigravity"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1705,8 +1707,26 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelCodex
 	case UpstreamChannelGrok:
 		return UpstreamChannelGrok
+	case UpstreamChannelAntigravity:
+		return UpstreamChannelAntigravity
 	}
 	return UpstreamChannelAuto
+}
+
+// accountChannelFilterSQL returns the shared account-provider predicate used by
+// both full account reads and the sanitized admin-list projection.
+func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case UpstreamChannelGrok:
+		return ` AND ` + upstreamTypeExpr + ` = 'grok'`
+	case UpstreamChannelAntigravity:
+		return ` AND ` + upstreamTypeExpr + ` = 'antigravity'`
+	case UpstreamChannelCodex:
+		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
+		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity')`
+	default:
+		return ""
+	}
 }
 
 // ResolveImageGenerationPolicy 归一 Key 的图片工具策略，统一新旧两种配置来源：
@@ -6130,27 +6150,15 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return db.ListActiveByChannel(ctx, "")
 }
 
-// ListActiveByChannel 返回未删除账号；channel 为空返回全部，
-// "grok" 仅 Grok 上游，"codex" 为非 Grok（含默认 Codex / OpenAI Responses 等）。
-// 过滤依据 credentials.upstream_type，与管理后台列表的 grok_api 判定一致。
+// ListActiveByChannel 返回未删除账号；channel 为空返回全部，其他已知渠道
+// 按 credentials.upstream_type 显式隔离。缺省 upstream_type 的历史账号归 Codex。
 func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*AccountRow, error) {
-	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
-	switch channel {
-	case UpstreamChannelGrok:
-		if db.isSQLite() {
-			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
-		} else {
-			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) = 'grok'`
-		}
-	case UpstreamChannelCodex:
-		// 非 grok 一律归入 codex 视图（缺省 upstream_type 的历史号也算 codex 侧）。
-		if db.isSQLite() {
-			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) <> 'grok'`
-		} else {
-			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) <> 'grok'`
-		}
+	upstreamTypeExpr := `LOWER(COALESCE(credentials->>'upstream_type', ''))`
+	if db.isSQLite() {
+		upstreamTypeExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 	}
+	where += accountChannelFilterSQL(channel, upstreamTypeExpr)
 
 	query := `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
