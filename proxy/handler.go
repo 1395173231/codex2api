@@ -1906,6 +1906,12 @@ func classifyTransportFailure(err error) string {
 		case ErrorCodeUpstreamStreamBreak:
 			return "transport"
 		}
+		// Executors wrap http.Client.Do failures as ErrUpstream(0, ..., cause).
+		// Those stay outside the legacy Retryable status set, but the cause is
+		// still a transport incident and must keep sticky/same-account retry.
+		if apiErr.Code == ErrorCodeUpstreamError && apiErr.HTTPStatus == 0 && apiErr.Cause != nil {
+			return classifyTransportFailure(apiErr.Cause)
+		}
 		if !apiErr.Retryable || (apiErr.HTTPStatus >= 400 && apiErr.HTTPStatus < 500) {
 			return ""
 		}

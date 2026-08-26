@@ -56,6 +56,16 @@ func TestClassifyTransportFailureKeepsStructuredTransportCauses(t *testing.T) {
 	}
 }
 
+func TestClassifyTransportFailureUnwrapsStatuslessUpstreamDoFailure(t *testing.T) {
+	err := ErrUpstream(0, "请求 OpenAI Responses API 失败", errors.New("EOF"))
+	if got := classifyTransportFailure(err); got != "transport" {
+		t.Fatalf("classifyTransportFailure = %q, want transport for status-less Do failure", got)
+	}
+	if !isRetryableRequestError(err) {
+		t.Fatal("status-less upstream Do failure must remain retryable")
+	}
+}
+
 func TestShouldPenalizeTransportKind(t *testing.T) {
 	if shouldPenalizeTransportKind(upstreamErrorKindWsBusyAcquire) {
 		t.Fatal("busy acquire timeout must not penalize account health (issue #413)")
