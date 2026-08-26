@@ -575,3 +575,112 @@ func TestNormalizeGrokUpstreamToolsCleansHistory(t *testing.T) {
 		t.Fatalf("function_call_output status not stripped: %s", gjson.GetBytes(out, "input.2").Raw)
 	}
 }
+
+
+// Grok 上游要求函数工具参数 schema 根节点必须是单一 object(联合根会 400
+// "tool parameter root must be an object type")。桥接层必须把联合根合并、
+// 非 object 根降级,且不得改动本就合规的 schema 与嵌套联合。
+func TestGrokFunctionToolRootSchemaNormalizedForUpstream(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[
+			{"type":"function","name":"mcp__codex_app__automation_update","parameters":{
+				"description":"update automation",
+				"anyOf":[
+					{"type":"object","properties":{"action":{"type":"string"},"shared":{"type":"integer"}},"required":["action","shared"]},
+					{"type":"object","properties":{"batch":{"type":"array"},"shared":{"type":"integer"}},"required":["batch","shared"]},
+					{"type":"null"}
+				]
+			}},
+			{"type":"function","name":"string_root","parameters":{"type":"string","description":"raw text"}},
+			{"type":"function","name":"type_list_root","parameters":{"type":["object","null"],"properties":{"a":{"type":"string"}}}},
+			{"type":"function","name":"nested_union_ok","parameters":{"type":"object","properties":{"choice":{"anyOf":[{"type":"string"},{"type":"integer"}]}}}}
+		],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+
+	union := gjson.GetBytes(result.Body, `tools.#(name=="mcp__codex_app__automation_update").parameters`)
+	if union.Get("type").String() != "object" {
+		t.Fatalf("union root not normalized to object: %s", union.Raw)
+	}
+	if union.Get("anyOf").Exists() {
+		t.Fatalf("anyOf must not survive at root: %s", union.Raw)
+	}
+	if !union.Get("properties.action").Exists() || !union.Get("properties.batch").Exists() {
+		t.Fatalf("merged properties missing: %s", union.Raw)
+	}
+	// 联合中含被丢弃的 null 分支(可空调用),分支侧 required 不得并入。
+	if union.Get("required").Exists() {
+		t.Fatalf("required must be dropped when a non-object branch was discarded, got %s", union.Get("required").Raw)
+	}
+	if union.Get("description").String() != "update automation" {
+		t.Fatalf("root description lost: %s", union.Raw)
+	}
+
+	stringRoot := gjson.GetBytes(result.Body, `tools.#(name=="string_root").parameters`)
+	if stringRoot.Get("type").String() != "object" {
+		t.Fatalf("non-object root not degraded to object: %s", stringRoot.Raw)
+	}
+	if stringRoot.Get("description").String() != "raw text" {
+		t.Fatalf("degraded schema must keep description: %s", stringRoot.Raw)
+	}
+
+	typeList := gjson.GetBytes(result.Body, `tools.#(name=="type_list_root").parameters`)
+	if typeList.Get("type").String() != "object" {
+		t.Fatalf("type-array root not collapsed to object: %s", typeList.Raw)
+	}
+	if !typeList.Get("properties.a").Exists() {
+		t.Fatalf("type-array root must keep properties: %s", typeList.Raw)
+	}
+
+	nested := gjson.GetBytes(result.Body, `tools.#(name=="nested_union_ok").parameters`)
+	if !nested.Get("properties.choice.anyOf").Exists() {
+		t.Fatalf("nested anyOf must stay untouched: %s", nested.Raw)
+	}
+}
+
+// 合规的纯 object schema 不应被改写(改写会破坏上游缓存前缀稳定性)。
+func TestGrokFunctionToolObjectRootSchemaUntouched(t *testing.T) {
+	body := []byte(`{"model":"grok-4.6","tools":[{"type":"function","name":"plain","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}],"input":[{"type":"message","role":"user","content":"hi"}]}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	if schema.Get("type").String() != "object" || !schema.Get("properties.q").Exists() || schema.Get("required.0").String() != "q" {
+		t.Fatalf("compliant schema was altered: %s", schema.Raw)
+	}
+}
+
+// 真实事故形态(2026-08-26 用户回报):schema 根同时带 type:"object" 与 anyOf,
+// Grok 仍按联合根拒绝。归一必须以"根上出现 anyOf/oneOf/allOf"为准,不能因为
+// type 已是 object 就放行;根自身的 properties/required 要并进合并结果。
+func TestGrokFunctionToolObjectTypeWithUnionRootStillNormalized(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"mcp__codex_app__automation_update","parameters":{
+			"type":"object",
+			"description":"update automation",
+			"properties":{"id":{"type":"string"}},
+			"required":["id"],
+			"anyOf":[
+				{"type":"object","properties":{"action":{"type":"string"}},"required":["action"]},
+				{"type":"null"}
+			]
+		}}],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	schema := gjson.GetBytes(result.Body, `tools.0.parameters`)
+	if schema.Get("anyOf").Exists() || schema.Get("oneOf").Exists() {
+		t.Fatalf("union keyword survived at object-typed root: %s", schema.Raw)
+	}
+	if schema.Get("type").String() != "object" {
+		t.Fatalf("root type must stay object: %s", schema.Raw)
+	}
+	if !schema.Get("properties.id").Exists() || !schema.Get("properties.action").Exists() {
+		t.Fatalf("root and branch properties must both survive: %s", schema.Raw)
+	}
+	required := schema.Get("required").Array()
+	if len(required) != 1 || required[0].String() != "id" {
+		t.Fatalf("root required must be kept, branch-only keys dropped from union intersection: %s", schema.Get("required").Raw)
+	}
+}
