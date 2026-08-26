@@ -146,18 +146,18 @@ func TestBuildGrokVideoBodyProfileFieldNaming(t *testing.T) {
 
 func TestIsTrustedGrokVideoAssetURL(t *testing.T) {
 	for raw, want := range map[string]bool{
-		"https://vidgen.x.ai/video/abc.mp4":        true,
-		"https://cdn.vidgen.x.ai/video/abc.mp4":    true,
-		"https://assets.grok.com/video.mp4":        true,
-		"http://vidgen.x.ai/video.mp4":             false,
-		"https://vidgen.x.ai:8443/video.mp4":       false,
-		"https://user@vidgen.x.ai/video.mp4":       false,
-		"https://evilvidgen.x.ai.example.com/a":    false,
-		"https://example.com/vidgen.x.ai/a.mp4":    false,
-		"":                                         false,
-		"https://notvidgen.x.ai.evil.com/a.mp4":    false,
-		"https://vidgen.x.ai.evil.com/a.mp4":       false,
-		"https://sub.assets.grok.com/video.mp4":    true,
+		"https://vidgen.x.ai/video/abc.mp4":     true,
+		"https://cdn.vidgen.x.ai/video/abc.mp4": true,
+		"https://assets.grok.com/video.mp4":     true,
+		"http://vidgen.x.ai/video.mp4":          false,
+		"https://vidgen.x.ai:8443/video.mp4":    false,
+		"https://user@vidgen.x.ai/video.mp4":    false,
+		"https://evilvidgen.x.ai.example.com/a": false,
+		"https://example.com/vidgen.x.ai/a.mp4": false,
+		"":                                      false,
+		"https://notvidgen.x.ai.evil.com/a.mp4": false,
+		"https://vidgen.x.ai.evil.com/a.mp4":    false,
+		"https://sub.assets.grok.com/video.mp4": true,
 	} {
 		if got := isTrustedGrokVideoAssetURL(raw); got != want {
 			t.Errorf("isTrustedGrokVideoAssetURL(%q) = %v, want %v", raw, got, want)
@@ -167,13 +167,13 @@ func TestIsTrustedGrokVideoAssetURL(t *testing.T) {
 
 func TestValidGrokVideoRequestID(t *testing.T) {
 	for id, want := range map[string]bool{
-		"video_abc-123": true,
-		"":              false,
-		".":             false,
-		"..":            false,
-		"a/b":           false,
-		"a\\b":          false,
-		"a b":           false,
+		"video_abc-123":          true,
+		"":                       false,
+		".":                      false,
+		"..":                     false,
+		"a/b":                    false,
+		"a\\b":                   false,
+		"a b":                    false,
 		strings.Repeat("x", 201): false,
 	} {
 		if got := validGrokVideoRequestID(id); got != want {
@@ -228,7 +228,7 @@ func TestGrokImagesGenerationsPassthrough(t *testing.T) {
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		if got := r.Header.Get("Authorization"); got != "Bearer xai-test" {
 			t.Errorf("Authorization = %q", got)
 		}
@@ -268,7 +268,7 @@ func TestGrokVideoCreateStatusContentFlow(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/videos/generations":
-			body, _ := io.ReadAll(r.Body)
+			body := readUpstreamRequestBody(r)
 			// API Key 账号走 xai profile:1.5 模型名须归一成 -preview。
 			if got := gjson.GetBytes(body, "model").String(); got != grokImagineVideo15Preview {
 				t.Errorf("upstream model = %q", got)
@@ -504,7 +504,7 @@ func TestGrokVideoPendingStatusAndPerOperationDefaultModel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/videos/edits":
-			body, _ := io.ReadAll(r.Body)
+			body := readUpstreamRequestBody(r)
 			editModel = gjson.GetBytes(body, "model").String()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"request_id":"video_pending1"}`))

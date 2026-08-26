@@ -3505,6 +3505,8 @@
     "codexWebsocketDesc": "Controls the persistent WebSocket connection between the proxy and the Codex upstream. All options are off by default and do not affect the existing HTTP request path.",
     "codexForceWebsocket": "Force Codex Upstream WebSocket",
     "codexForceWebsocketDesc": "When enabled, requests to the Codex upstream use a persistent WebSocket (with connection pooling), cutting per-request TLS/handshake overhead to better match the official CLI. Disabled by default; when off, requests use the existing HTTP path.",
+    "codexRequestCompression": "Codex HTTP Request Body Compression",
+    "codexRequestCompressionDesc": "Compresses Codex /responses request bodies sent over HTTP with zstd (Content-Encoding: zstd), matching the real Codex CLI, which compresses by default against the ChatGPT backend — sending plaintext is itself a detectable signal. Enabled by default. Independent of Force WebSocket above: WebSocket uses permessage-deflate, while this setting only affects the HTTP path (1009 size fallback, image generation, Agent Identity accounts), so there is no need to disable WebSocket to use it.",
     "codexWSWeakNetworkMode": "WS Weak-Network Mode",
     "codexWSWeakNetworkModeDesc": "For unstable VPN or residential-proxy links: rotate connections after 15 seconds idle or 3 minutes total, and require a real Ping/Pong before every reuse. Idle keepalive is paused while enabled. Disabled by default.",
     "codexWSKeepaliveEnabled": "WS Keepalive",

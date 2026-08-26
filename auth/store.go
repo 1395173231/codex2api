@@ -3170,7 +3170,10 @@ type Store struct {
 	dispatchReconciledAt     int64
 
 	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
-	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
+	codexForceWebsocket atomic.Bool // 强制 Codex 上游走 WebSocket（复用连接池）
+	// codexRequestCompression HTTP /responses 请求体 zstd 压缩，默认开启（对齐真实客户端）。
+	// 与上面几项 WS 设置正交：WS 走 permessage-deflate，本项只作用于 HTTP 路径。
+	codexRequestCompression     atomic.Bool
 	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
 	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
 	codexWSHideUpstreamErrors   atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
@@ -3639,6 +3642,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
 			SchedulerMode:                      "round_robin",
+			CodexRequestCompression:            true,
 			CodexWSHideUpstreamErrors:          true,
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
@@ -3673,6 +3677,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		promptFilterNewAPIBindings: make(map[int64]database.PromptFilterNewAPIBinding),
 		oauthRefreshLocks:          make(map[string]*oauthRefreshLocalLock),
 	}
+	s.codexRequestCompression.Store(settings.CodexRequestCompression)
 	s.availability.Store(newAvailabilityHub())
 	s.publishAccountSnapshot(nil)
 	s.sessionSlotBufferEnabled.Store(settings.SessionSlotBufferEnabled)
@@ -3751,6 +3756,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 
 	// Codex 上游 WebSocket 相关设置（默认关闭，不影响现有路径）
 	s.codexForceWebsocket.Store(settings.CodexForceWebsocket)
+	s.codexRequestCompression.Store(settings.CodexRequestCompression)
 	s.codexWSKeepaliveEnabled.Store(settings.CodexWSKeepaliveEnabled)
 	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(settings.CodexWSKeepaliveIntervalSec))
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
@@ -3932,6 +3938,23 @@ func (s *Store) CodexForceWebsocket() bool {
 		return false
 	}
 	return s.codexForceWebsocket.Load()
+}
+
+// SetCodexRequestCompression 设置 HTTP 请求体 zstd 压缩开关（运行时热更新）。
+func (s *Store) SetCodexRequestCompression(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexRequestCompression.Store(enabled)
+}
+
+// CodexRequestCompression 返回是否对 HTTP /responses 请求体做 zstd 压缩。
+// nil store 回落到 true：该项默认开启，取不到配置时应保持与真实客户端一致的行为。
+func (s *Store) CodexRequestCompression() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexRequestCompression.Load()
 }
 
 // SetCodexWSKeepaliveEnabled 设置上游 WS 空闲连接保活开关（运行时热更新）。

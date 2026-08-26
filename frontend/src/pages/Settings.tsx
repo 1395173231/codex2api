@@ -1361,6 +1361,7 @@ export default function Settings() {
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     codex_force_websocket: false,
+    codex_request_compression: true,
     codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
     codex_ws_keepalive_interval_sec: 60,
@@ -2954,6 +2955,12 @@ export default function Settings() {
                   <Switch
                     checked={settingsForm.codex_force_websocket}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_force_websocket', checked)}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.codexRequestCompression')} description={t('settings.codexRequestCompressionDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_request_compression}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_request_compression', checked)}
                   />
                 </SettingField>
                 <SettingField label={t('settings.codexWSWeakNetworkMode')} description={t('settings.codexWSWeakNetworkModeDesc')} layout="switch">

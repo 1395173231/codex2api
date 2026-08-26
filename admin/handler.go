@@ -8328,6 +8328,7 @@ type settingsResponse struct {
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
 	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
+	CodexRequestCompression             bool   `json:"codex_request_compression"`
 	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
@@ -8487,6 +8488,7 @@ type updateSettingsReq struct {
 	FastSchedulerEnabled                *bool    `json:"fast_scheduler_enabled"`
 	SchedulerEngine                     *string  `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool    `json:"codex_force_websocket"`
+	CodexRequestCompression             *bool    `json:"codex_request_compression"`
 	CodexWSWeakNetworkMode              *bool    `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool    `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         *int     `json:"codex_ws_keepalive_interval_sec"`
@@ -9227,6 +9229,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -9892,6 +9895,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexForceWebsocket(*req.CodexForceWebsocket)
 		runtimeCfg.CodexForceWebsocket = *req.CodexForceWebsocket
 		log.Printf("设置已更新: codex_force_websocket = %t", *req.CodexForceWebsocket)
+	}
+	if req.CodexRequestCompression != nil {
+		h.store.SetCodexRequestCompression(*req.CodexRequestCompression)
+		runtimeCfg.CodexRequestCompression = *req.CodexRequestCompression
+		log.Printf("设置已更新: codex_request_compression = %t", *req.CodexRequestCompression)
 	}
 
 	if req.CodexWSWeakNetworkMode != nil {
@@ -10578,6 +10586,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -10838,6 +10847,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),

@@ -554,7 +554,7 @@ func TestResponsesWebSocket1009FallbackStripsEnvelopeType(t *testing.T) {
 
 	httpBodyCh := make(chan []byte, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		httpBodyCh <- body
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -672,7 +672,7 @@ func TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache(t *testi
 
 	httpBodyCh := make(chan []byte, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		httpBodyCh <- body
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
@@ -1355,7 +1355,7 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 		httpCalls++
 		httpAccountIDs <- r.Header.Get("X-Resin-Account")
 		httpLiteHeaders <- r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite")
-		requestBody, _ := io.ReadAll(r.Body)
+		requestBody := readUpstreamRequestBody(r)
 		httpNamespaces <- gjson.GetBytes(requestBody, "input.0.namespace").String()
 		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
 			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
@@ -1491,9 +1491,10 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httpCalls++
 		httpAccountIDs <- r.Header.Get("X-Resin-Account")
-		httpSessionIDs <- r.Header.Get("Session_id")
+		// 出站会话头已改为真实客户端形态（连字符 session-id），见 ApplyCodexSessionHeaders。
+		httpSessionIDs <- r.Header.Get("Session-Id")
 		httpLiteHeaders <- r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite")
-		requestBody, _ := io.ReadAll(r.Body)
+		requestBody := readUpstreamRequestBody(r)
 		httpCacheKeys <- gjson.GetBytes(requestBody, "prompt_cache_key").String()
 		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
 			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses", r.URL.Path)
@@ -2340,7 +2341,7 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
 		seenAuth = r.Header.Get("Authorization")
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -2413,7 +2414,7 @@ func TestResponsesCompactAppliesAccountMappingBeforeSuffixFallback(t *testing.T)
 
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_compact_mapped",
@@ -2585,7 +2586,7 @@ func newOpenAIResponsesSSEUpstream(seenPath *string, seenAuth *string, seenBody 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seenPath = r.URL.Path
 		*seenAuth = r.Header.Get("Authorization")
-		*seenBody, _ = io.ReadAll(r.Body)
+		*seenBody = readUpstreamRequestBody(r)
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		events := []string{
@@ -5136,7 +5137,7 @@ func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) 
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		if r.URL.Path == "/v1/responses/compact" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{
@@ -5221,7 +5222,7 @@ func TestResponses_BodySignalCompactStreamingUsesAccountCompactMapping(t *testin
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_account_mapping","status":"completed","output":[{"type":"compaction_summary","summary":"mapped"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
 	}))
@@ -5276,7 +5277,7 @@ func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *test
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_non_stream_compaction",
@@ -5459,7 +5460,7 @@ func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_plain_test",
@@ -5570,7 +5571,7 @@ func TestResponses_NativeRemoteCompactionV2UsesRelayOnlyPool(t *testing.T) {
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_issue_540","status":"completed","output":[{"type":"compaction_summary","summary":"compacted"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
 	}))
@@ -5717,7 +5718,7 @@ func TestResponsesCompactStaleSuffixIdentityRuleKeepsBaseModelUpstream(t *testin
 
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_compact_identity",

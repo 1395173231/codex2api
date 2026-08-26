@@ -34,26 +34,29 @@ const (
 	RequestIsolationModeIsolated  = "isolated"
 	RequestIsolationModePerAPIKey = "per-api-key"
 
-	defaultClientCompatMode       = ClientCompatModePreserve
-	defaultCodexMinCLIVersion     = "0.144.1"
-	defaultStreamFlushPolicy      = StreamFlushPolicyImmediate
-	defaultStreamFlushIntervalMS  = 20
-	minStreamFlushIntervalMS      = 1
-	maxStreamFlushIntervalMS      = 1000
-	defaultFirstTokenMode         = FirstTokenModeStrict
-	defaultFirstTokenTimeoutSec   = 0
-	maxFirstTokenTimeoutSec       = 600
-	defaultBillingTierPolicy      = BillingTierPolicyActual
-	defaultCodexWSHideErrors      = true
-	defaultCodexWSSilentRetry     = true
-	defaultCodexWSSilentRetries   = 2
-	defaultCodexWSSizeRouter      = true
-	maxCodexWSSilentRetries       = 10
-	defaultCodexWSBusyMaxWaitSec  = 30
-	defaultCodexWSBusyPatienceSec = 2
-	maxCodexWSBusyWaitSec         = 300
-	defaultCodexWSStatelessSlots  = 8
-	maxCodexWSStatelessSlots      = 32
+	defaultClientCompatMode      = ClientCompatModePreserve
+	defaultCodexMinCLIVersion    = "0.144.1"
+	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
+	defaultStreamFlushIntervalMS = 20
+	minStreamFlushIntervalMS     = 1
+	maxStreamFlushIntervalMS     = 1000
+	defaultFirstTokenMode        = FirstTokenModeStrict
+	defaultFirstTokenTimeoutSec  = 0
+	maxFirstTokenTimeoutSec      = 600
+	defaultBillingTierPolicy     = BillingTierPolicyActual
+	// defaultCodexRequestCompression 对齐真实 Codex CLI：它对 ChatGPT 后端的
+	// HTTP /responses 请求体默认 zstd 压缩，所以网关默认也压。
+	defaultCodexRequestCompression = true
+	defaultCodexWSHideErrors       = true
+	defaultCodexWSSilentRetry      = true
+	defaultCodexWSSilentRetries    = 2
+	defaultCodexWSSizeRouter       = true
+	maxCodexWSSilentRetries        = 10
+	defaultCodexWSBusyMaxWaitSec   = 30
+	defaultCodexWSBusyPatienceSec  = 2
+	maxCodexWSBusyWaitSec          = 300
+	defaultCodexWSStatelessSlots   = 8
+	maxCodexWSStatelessSlots       = 32
 
 	defaultCodexContinueMaxRounds = 8
 	minCodexContinueMaxRounds     = 1
@@ -70,6 +73,10 @@ type RuntimeSettings struct {
 	FirstTokenTimeoutSec  int
 	BillingTierPolicy     string
 	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
+	// CodexRequestCompression 对 HTTP /responses 请求体做 zstd 压缩（默认 true，
+	// 与真实 Codex CLI 一致）。与 CodexForceWebsocket 正交：WS 路径走
+	// permessage-deflate（拨号器已开启），本项只作用于 HTTP 路径，两者可同时生效。
+	CodexRequestCompression bool
 	// CodexWSWeakNetworkMode 对 VPN/住宅代理等不稳定链路采用保守复用：
 	// 缩短空闲/最大寿命、每次复用都做真实 Ping/Pong，并暂停空闲保活（默认 false）。
 	CodexWSWeakNetworkMode bool
@@ -163,6 +170,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		FirstTokenMode:                   defaultFirstTokenMode,
 		FirstTokenTimeoutSec:             defaultFirstTokenTimeoutSec,
 		BillingTierPolicy:                defaultBillingTierPolicy,
+		CodexRequestCompression:          defaultCodexRequestCompression,
 		CodexWSHideErrors:                defaultCodexWSHideErrors,
 		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
 		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
@@ -327,6 +335,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
 		next.CodexForceWebsocket = settings.CodexForceWebsocket
+		next.CodexRequestCompression = settings.CodexRequestCompression
 		next.CodexWSWeakNetworkMode = settings.CodexWSWeakNetworkMode
 		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled

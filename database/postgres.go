@@ -1337,6 +1337,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_image_studio_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_account_portal_page_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_request_compression BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_weak_network_mode BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
@@ -2198,6 +2199,7 @@ type SystemSettings struct {
 	PublicImageStudioPageEnabled       bool
 	PublicAccountPortalPageEnabled     bool // 账号自助添加公开门户开关，默认 false
 	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexRequestCompression            bool // HTTP /responses 请求体 zstd 压缩（对齐真实客户端），默认 true
 	CodexWSWeakNetworkMode             bool // WS 弱网保守复用模式，默认 false
 	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
 	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
@@ -2432,6 +2434,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(public_account_portal_page_enabled, false),
 			       COALESCE(reasoning_effort_models, '[]'),
 			       COALESCE(codex_force_websocket, false),
+			       COALESCE(codex_request_compression, true),
 			       COALESCE(codex_ws_keepalive_enabled, false),
 			       COALESCE(codex_ws_keepalive_interval_sec, 60),
 			       COALESCE(codex_ws_hide_upstream_errors, true),
@@ -2508,6 +2511,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PublicAccountPortalPageEnabled,
 		&s.ReasoningEffortModels,
 		&s.CodexForceWebsocket,
+		&s.CodexRequestCompression,
 		&s.CodexWSKeepaliveEnabled,
 		&s.CodexWSKeepaliveIntervalSec,
 		&s.CodexWSHideUpstreamErrors,
@@ -2699,9 +2703,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_window_minutes,
 					session_slot_buffer_enabled,
 					session_slot_buffer_seconds,
-					scheduler_engine
+					scheduler_engine,
+					codex_request_compression
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2741,10 +2746,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $118 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $119 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $119 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $120 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2771,6 +2776,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				public_image_studio_page_enabled = EXCLUDED.public_image_studio_page_enabled,
 					reasoning_effort_models = EXCLUDED.reasoning_effort_models,
 					codex_force_websocket = EXCLUDED.codex_force_websocket,
+					codex_request_compression = EXCLUDED.codex_request_compression,
 					codex_ws_keepalive_enabled = EXCLUDED.codex_ws_keepalive_enabled,
 					codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors = EXCLUDED.codex_ws_hide_upstream_errors,
@@ -2864,6 +2870,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.SessionSlotBufferEnabled,
 		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
 		NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled),
+		s.CodexRequestCompression,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
