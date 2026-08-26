@@ -1334,7 +1334,7 @@
     "openaiBaseUrl": "Base URL",
     "openaiApiKey": "API Key",
     "apiBalanceQueryUrl": "余额查询接口（可选）",
-    "apiBalanceQueryUrlHint": "留空时自动识别 sub2api 的 /v1/usage 与 New API 账单接口。也可填写当前平台以 / 开头的路径或完整 http/https URL；API Key 会随查询请求发送。",
+    "apiBalanceQueryUrlHint": "留空时自动识别 sub2api 的 /v1/usage 与 New API 账单接口。也可填写当前平台以 / 开头的路径或与 Base URL 同主机的完整 http/https URL；API Key 会随查询请求发送，因此不允许跨主机地址。",
     "apiBalanceLabel": "余额",
     "apiBalanceLoading": "正在查询 API 平台余额",
     "apiBalanceFailed": "余额查询失败：{{error}}。点击重试，或在账号设置中填写余额查询接口。",

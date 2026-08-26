@@ -84,7 +84,7 @@
     "apiBalanceFailed": "餘額查詢失敗：{{error}}。點擊重試，或在帳號設定中配置查詢介面。",
     "apiBalanceTooltip": "來源：{{source}} · 更新於 {{time}}。點擊刷新。",
     "apiBalanceQueryUrl": "餘額查詢介面（可選）",
-    "apiBalanceQueryUrlHint": "留空會自動嘗試 sub2api /v1/usage 與 New API 計費介面；也可填寫以 / 開頭的路徑或完整 http/https URL，查詢時會攜帶 API Key。",
+    "apiBalanceQueryUrlHint": "留空會自動嘗試 sub2api /v1/usage 與 New API 計費介面；也可填寫以 / 開頭的路徑或與 Base URL 同主機的完整 http/https URL。查詢時會攜帶 API Key，因此不允許跨主機位址。",
     "occupiedRequestsTooltip": "目前真實在途 {{active}}，佔用槽位 {{occupied}}（含 {{buffered}} 個會話緩衝槽）",
     "pendingReview": {
       "title": "自助提交待審核",

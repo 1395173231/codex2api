@@ -1334,7 +1334,7 @@
     "openaiBaseUrl": "Base URL",
     "openaiApiKey": "API Key",
     "apiBalanceQueryUrl": "Balance query endpoint (optional)",
-    "apiBalanceQueryUrlHint": "Leave blank to auto-detect sub2api /v1/usage and New API billing endpoints. You may also enter a root-relative path or a full http/https URL; the API key is sent with the query.",
+    "apiBalanceQueryUrlHint": "Leave blank to auto-detect sub2api /v1/usage and New API billing endpoints. You may also enter a root-relative path or a full http/https URL on the same host as the Base URL; the API key is sent with the query, so cross-host URLs are rejected.",
     "apiBalanceLabel": "Balance",
     "apiBalanceLoading": "Querying the API platform balance",
     "apiBalanceFailed": "Balance query failed: {{error}}. Click to retry or configure an endpoint in account settings.",
