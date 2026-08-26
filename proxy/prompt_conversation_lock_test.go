@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
@@ -323,6 +324,55 @@ func TestConversationLockRequiresStableSignedFingerprintAndCanBeDisabled(t *test
 	handler.logUpstreamCyberPolicy(disabled, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
 	if _, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), hashRiskIdentity(fingerprint)); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("disabled conversation-lock feature created a lock: %v", err)
+	}
+}
+
+func TestUnsignedUpstreamCYUsesScopedFingerprintReplayLock(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := promptRequestBody(t, "repeat this exact request")
+	fingerprint := promptfilter.PromptEvidenceFingerprint("repeat this exact request")
+
+	newUnsigned := func(keyID int64, remoteAddr string, requestBody []byte) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Request.RemoteAddr = remoteAddr
+		c.Set(contextAPIKeyID, keyID)
+		setRawRequestBody(c, requestBody)
+		setIngressRequestBodyIfAbsent(c, requestBody)
+		return c
+	}
+
+	first := newUnsigned(101, "198.51.100.9:1234", body)
+	if _, accepted := handler.logUpstreamCyberPolicy(first, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`)); !accepted {
+		t.Fatal("unsigned upstream CY evidence was not accepted")
+	}
+	lock, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), fingerprint)
+	if err != nil {
+		t.Fatalf("fingerprint replay lock was not persisted: %v", err)
+	}
+	if lock.IdentityKind != "fingerprint_replay" || lock.Platform != "codex-fingerprint" {
+		t.Fatalf("unexpected fingerprint lock identity: %+v", lock)
+	}
+	if !strings.Contains(lock.NewAPIUserID, "apikey:101") {
+		t.Fatalf("fingerprint lock subject leaked beyond the API key scope: %q", lock.NewAPIUserID)
+	}
+
+	repeat := newUnsigned(101, "198.51.100.9:1234", body)
+	if _, locked := handler.activePromptConversationLock(repeat, handler.promptFilterConfigForRequest(repeat), body); !locked {
+		t.Fatal("same API key, IP, and fingerprint did not activate replay cooldown")
+	}
+
+	differentIP := newUnsigned(101, "198.51.100.10:1234", body)
+	if _, locked := handler.activePromptConversationLock(differentIP, handler.promptFilterConfigForRequest(differentIP), body); locked {
+		t.Fatal("fingerprint replay cooldown leaked across client IPs")
+	}
+	differentKey := newUnsigned(102, "198.51.100.9:1234", body)
+	if _, locked := handler.activePromptConversationLock(differentKey, handler.promptFilterConfigForRequest(differentKey), body); locked {
+		t.Fatal("fingerprint replay cooldown leaked across API keys")
+	}
+	differentPrompt := newUnsigned(101, "198.51.100.9:1234", promptRequestBody(t, "a different request"))
+	if _, locked := handler.activePromptConversationLock(differentPrompt, handler.promptFilterConfigForRequest(differentPrompt), ingressRequestBody(differentPrompt, nil)); locked {
+		t.Fatal("fingerprint replay cooldown leaked across prompt fingerprints")
 	}
 }
 

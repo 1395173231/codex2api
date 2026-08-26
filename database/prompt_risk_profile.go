@@ -132,6 +132,8 @@ type PromptRiskProfileQuery struct {
 	AccountID             int64
 	MinScore              int
 	Query                 string
+	UpstreamCYOnly        bool
+	ActivityState         string
 	PrioritizeActiveLocks bool
 	ActiveLocksOnly       bool
 	ConversationLockTTL   time.Duration
@@ -968,22 +970,36 @@ func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversat
 		if err != nil {
 			return nil, err
 		}
+		effectiveTTL := conversationTTL
+		if identityKind == PromptConversationLockIdentityFingerprintReplay {
+			effectiveTTL = userCooldownTTL
+		}
 		if sessionHash = strings.ToLower(strings.TrimSpace(sessionHash)); sessionHash != "" &&
-			(conversationTTL <= 0 || lockedAt.After(now.Add(-conversationTTL))) {
+			(effectiveTTL <= 0 || lockedAt.After(now.Add(-effectiveTTL))) {
 			key := PromptRiskSubjectSession + "\x00" + sessionHash
 			confidence := 85
-			if identityKind == PromptConversationLockIdentityCodexSession {
+			display := "session-" + shortRiskKey(sessionHash)
+			switch identityKind {
+			case PromptConversationLockIdentityCodexSession:
 				confidence = 50
+			case PromptConversationLockIdentityFingerprintReplay:
+				// 指纹重放锁只绑定 API Key、客户端 IP 与提示词指纹,不能解释
+				// 为人员身份;合成画像仅为了让活动冷却在管理端可见、可解锁。
+				confidence = 20
+				display = "replay-" + shortRiskKey(sessionHash)
 			}
 			profile := PromptRiskProfile{
 				SubjectType: PromptRiskSubjectSession, SubjectKey: sessionHash,
-				SubjectDisplay: "session-" + shortRiskKey(sessionHash), Platform: platform,
+				SubjectDisplay: display, Platform: platform,
 				IdentityConfidence: confidence, RiskLevel: PromptRiskLevelLow,
 				RecommendedActions: []string{"observe"}, HasActivity: false, LatestAt: lockedAt,
 				ScoreBreakdown: PromptRiskScoreBreakdown{IdentityConfidence: confidence},
 			}
-			if identityKind == PromptConversationLockIdentityCodexSession && strings.HasPrefix(userID, "apikey:") {
-				profile.APIKeyID, _ = strconv.ParseInt(strings.TrimPrefix(userID, "apikey:"), 10, 64)
+			if idPart, ok := strings.CutPrefix(userID, "apikey:"); ok {
+				if sep := strings.IndexByte(idPart, ':'); sep >= 0 {
+					idPart = idPart[:sep]
+				}
+				profile.APIKeyID, _ = strconv.ParseInt(idPart, 10, 64)
 			}
 			if current, ok := result[key]; !ok || lockedAt.After(current.LockedAt) {
 				result[key] = promptRiskActiveRestriction{Profile: profile, LockedAt: lockedAt}
@@ -1030,6 +1046,21 @@ func promptRiskActiveProfileMatchesQuery(profile PromptRiskProfile, query Prompt
 	}
 	if level := strings.TrimSpace(query.RiskLevel); level != "" && level != "all" && profile.RiskLevel != level {
 		return false
+	}
+	// 与 SQL 聚合侧的过滤语义保持一致:合成的活动锁画像没有事件计数,
+	// 不得泄漏进 cy_only / activity_state 过滤结果。
+	if query.UpstreamCYOnly && profile.UpstreamCYCount == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(query.ActivityState)) {
+	case "active":
+		if !profile.HasActivity {
+			return false
+		}
+	case "identity_only":
+		if profile.HasActivity {
+			return false
+		}
 	}
 	if !includeTextQuery {
 		return true
@@ -1137,6 +1168,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 	}
 	defer rows.Close()
 	aggregates := make([]promptRiskAggregate, 0)
+	aggregateKeys := make(map[string]struct{})
 	for rows.Next() {
 		var item promptRiskAggregate
 		var latestRaw any
@@ -1157,7 +1189,21 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		if err != nil {
 			return nil, 0, err
 		}
+		aggregateKeys[item.Profile.SubjectType+"\x00"+item.Profile.SubjectKey] = struct{}{}
 		finalizePromptRiskAggregate(&item)
+		if query.UpstreamCYOnly && item.Profile.UpstreamCYCount == 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(query.ActivityState)) {
+		case "active":
+			if !item.Profile.HasActivity {
+				continue
+			}
+		case "identity_only":
+			if item.Profile.HasActivity {
+				continue
+			}
+		}
 		if query.MinScore > 0 && item.Profile.RiskScore < query.MinScore {
 			continue
 		}
@@ -1215,7 +1261,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 			aggregates = append(aggregates, pendingActiveProfiles[i])
 		}
 	}
-	includeIdentityDirectory := query.APIKeyID == 0 && query.AccountID == 0 &&
+	includeIdentityDirectory := !query.UpstreamCYOnly && query.ActivityState != "active" && query.APIKeyID == 0 && query.AccountID == 0 &&
 		(strings.TrimSpace(query.SubjectType) == "" || strings.TrimSpace(query.SubjectType) == "all" || strings.TrimSpace(query.SubjectType) == PromptRiskSubjectNewAPIUser) &&
 		query.MinScore == 0 && (strings.TrimSpace(query.RiskLevel) == "" || strings.TrimSpace(query.RiskLevel) == "all" || strings.TrimSpace(query.RiskLevel) == PromptRiskLevelLow)
 	if includeIdentityDirectory {
@@ -1223,10 +1269,7 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		if listErr != nil {
 			return nil, 0, listErr
 		}
-		existing := make(map[string]struct{}, len(aggregates))
-		for i := range aggregates {
-			existing[aggregates[i].Profile.SubjectType+"\x00"+aggregates[i].Profile.SubjectKey] = struct{}{}
-		}
+		existing := aggregateKeys
 		platformFilter := strings.TrimSpace(query.Platform)
 		subjectKeyFilter := strings.TrimSpace(query.SubjectKey)
 		queryFilter := strings.ToLower(strings.TrimSpace(query.Query))

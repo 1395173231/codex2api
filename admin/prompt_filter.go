@@ -576,6 +576,24 @@ func (h *Handler) ClearPromptPolicyIncidents(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "上游 CY 事件已清空；风险画像已保留")
 }
 
+func (h *Handler) DeletePromptPolicyIncident(c *gin.Context) {
+	incidentID := strings.TrimSpace(c.Param("incident_id"))
+	if incidentID == "" {
+		writeError(c, http.StatusBadRequest, "incident_id 不能为空")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.DeletePromptPolicyIncident(ctx, incidentID); errors.Is(err, sql.ErrNoRows) {
+		writeError(c, http.StatusNotFound, "CY 事件不存在或已删除")
+		return
+	} else if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	writeMessage(c, http.StatusOK, "CY 事件已删除；风险画像和学习证据已保留")
+}
+
 func (h *Handler) GetPromptPolicyAuditHealth(c *gin.Context) {
 	if h == nil || h.db == nil {
 		writeError(c, http.StatusServiceUnavailable, "CY 审计存储不可用")

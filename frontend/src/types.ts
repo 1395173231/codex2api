@@ -38,6 +38,7 @@ export interface AccountUsageWindow {
   user_billed?: number
   model_counts?: Record<string, number>
   model_success_counts?: Record<string, number>
+  model_avg_first_token_ms?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -123,6 +124,7 @@ export interface AccountRow {
   antigravity_permissions?: AntigravityPermissionsSnapshot
   antigravity_sync_warning?: string
   base_url?: string
+  balance_query_url?: string
   models?: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -622,6 +624,7 @@ export interface AddOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
   api_key: string
+  balance_query_url?: string
   models: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -633,6 +636,7 @@ export interface UpdateOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
   api_key?: string
+  balance_query_url?: string
   models: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -650,6 +654,14 @@ export interface FetchOpenAIResponsesModelsRequest {
 export interface FetchOpenAIResponsesModelsResponse {
   base_url: string
   models: string[]
+}
+
+export interface OpenAIResponsesBalanceResponse {
+  balance: number
+  unit: string
+  source: string
+  unlimited?: boolean
+  queried_at: ISODateString
 }
 
 export type GrokAuthKind = 'oauth' | 'api_key'
@@ -2081,6 +2093,7 @@ export interface PromptConversationLock {
   id: number
   lock_key: string
   status: 'active' | 'unlocked'
+  identity_kind: 'newapi' | 'codex_session' | 'fingerprint_replay' | string
   platform: string
   newapi_user_id: string
   session_fingerprint: string
@@ -2096,7 +2109,7 @@ export interface PromptConversationLock {
   locked_at: ISODateString
   unlocked_at?: ISODateString
   unlock_reason?: string
-  restriction_scope?: 'conversation' | 'user_cooldown'
+	restriction_scope?: 'conversation' | 'user_cooldown' | 'fingerprint_replay'
   expires_at?: ISODateString
   remaining_seconds?: number
   created_at: ISODateString
@@ -2908,10 +2921,10 @@ export interface ModelPricingOverride {
   input_long?: number
   cached_input_long?: number
   output_long?: number
-	input_long_priority?: number
-	cached_input_long_priority?: number
-	output_long_priority?: number
-	long_context_threshold_tokens?: number
+  input_long_priority?: number
+  cached_input_long_priority?: number
+  output_long_priority?: number
+  long_context_threshold_tokens?: number
 }
 
 export interface OfficialPricingSyncConfig {

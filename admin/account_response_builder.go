@@ -122,6 +122,10 @@ func (h *Handler) buildAccountResponse(
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	}
+	balanceQueryURL := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		balanceQueryURL = row.GetCredential(openAIResponsesBalanceQueryURLCredential)
+	}
 	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
 	codexFingerprintMode := ""
 	if !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount {
@@ -182,6 +186,7 @@ func (h *Handler) buildAccountResponse(
 		AntigravityPermissions:   antigravityPermissions,
 		AntigravitySyncWarning:   row.GetCredential("antigravity_sync_warning"),
 		BaseURL:                  baseURL,
+		BalanceQueryURL:          balanceQueryURL,
 		Models:                   row.GetCredentialStringSlice("models"),
 		ModelMapping:             modelMapping,
 		CodexClientMetadataMode:  codexClientMetadataMode,

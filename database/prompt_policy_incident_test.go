@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -308,6 +309,33 @@ func TestClearPromptFilterLogsKeepsIncidentsAndCandidateEvidence(t *testing.T) {
 	}
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_rule_candidate_evidence`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("evidence unexpectedly cleared count=%d err=%v", count, err)
+	}
+}
+
+func TestDeletePromptPolicyIncidentRemovesHistoryButRetainsLearningEvidence(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	incident, candidate, evidence := promptPolicyTestInputs("incident-delete")
+	if err := db.PersistPromptPolicyIncident(ctx, incident, candidate, evidence); err != nil {
+		t.Fatalf("PersistPromptPolicyIncident: %v", err)
+	}
+	stored, err := db.GetPromptPolicyIncident(ctx, incident.IncidentID)
+	if err != nil {
+		t.Fatalf("GetPromptPolicyIncident: %v", err)
+	}
+	if err := db.DeletePromptPolicyIncident(ctx, incident.IncidentID); err != nil {
+		t.Fatalf("DeletePromptPolicyIncident: %v", err)
+	}
+	if _, err := db.GetPromptPolicyIncident(ctx, incident.IncidentID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted incident still readable: %v", err)
+	}
+	items, err := db.ListPromptRuleCandidateEvidence(ctx, stored.CandidateID, 10)
+	if err != nil || len(items) != 1 || items[0].PromptPolicyIncidentID != "" {
+		t.Fatalf("learning evidence was removed or retained a stale incident link: items=%#v err=%v", items, err)
+	}
+	var riskEvents int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_risk_events WHERE source_id=$1`, incident.IncidentID).Scan(&riskEvents); err != nil || riskEvents == 0 {
+		t.Fatalf("risk profile history was not retained after incident deletion: count=%d err=%v", riskEvents, err)
 	}
 }
 

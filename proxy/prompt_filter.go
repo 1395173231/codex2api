@@ -504,6 +504,11 @@ func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model 
 	if delegated {
 		metadata.ConversationLocked = h.lockPromptConversationAfterUpstreamCYB(c, endpoint, model, incidentID, metadata)
 		c.Set(newAPIUpstreamCyberDecisionContextKey, metadata)
+	} else {
+		// Without a verified NewAPI identity, do not apply a Key-wide strike or
+		// cooldown. Keep the replay guard scoped to a stable Codex session or to
+		// the exact prompt fingerprint plus API Key and client IP.
+		h.lockPromptConversationAfterUnsignedUpstreamCYB(c, endpoint, model, incidentID)
 	}
 	return incidentID, accepted
 }

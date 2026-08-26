@@ -11,6 +11,7 @@ import type {
   AgentIdentityBatchImportResponse,
   AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  OpenAIResponsesBalanceResponse,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
   AddAntigravityAccountRequest,
@@ -615,6 +616,11 @@ export const api = {
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getOpenAIResponsesBalance: (id: number, signal?: AbortSignal, force = false) =>
+    request<OpenAIResponsesBalanceResponse>(
+      `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
+      { signal, timeoutMs: 25_000 },
+    ),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -1191,7 +1197,9 @@ export const api = {
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
-	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean } = {}) => {
+	deletePromptPolicyIncident: (incidentId: string) =>
+		request<MessageResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`, { method: 'DELETE' }),
+	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean; cyOnly?: boolean; activityState?: string } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
 		search.set('page_size', String(params.pageSize || 20))
@@ -1203,6 +1211,8 @@ export const api = {
 		if (params.minScore) search.set('min_score', params.minScore)
 		if (params.q) search.set('q', params.q)
 		if (params.lockedOnly) search.set('locked_only', 'true')
+		if (params.cyOnly) search.set('cy_only', 'true')
+		if (params.activityState) search.set('activity_state', params.activityState)
 		return request<import('./types').PromptRiskProfilesResponse>(`/prompt-policy/risk-profiles?${search.toString()}`)
 	},
 	getPromptRiskProfile: (subjectType: string, subjectKey: string, eventPage = 1, eventPageSize = 20, trustEventPage = 1, trustEventPageSize = 20) =>
@@ -1284,7 +1294,13 @@ export const api = {
     }>('/codex-cli-version/sync', { method: 'POST' }),
   listModelPricing: () =>
     request<{
-      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      models: Array<{
+        model: string
+        source: string
+        pricing: ModelPricingOverride
+        canonical_model?: string
+        is_alias?: boolean
+      }>
       sync_url: string
       default_sync_url: string
       models_dev_url: string
