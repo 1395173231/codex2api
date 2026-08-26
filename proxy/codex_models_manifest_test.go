@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -208,6 +209,25 @@ func TestFetchCodexModelsManifest_PassesThroughBodyAndETag(t *testing.T) {
 	}
 	if manifest.ETag != `W/"abc123"` {
 		t.Errorf("ETag = %q, want W/\"abc123\"", manifest.ETag)
+	}
+}
+
+func TestFetchCodexModelsManifestRejectsConfiguredOversizeBody(t *testing.T) {
+	previous := CurrentRuntimeSettings()
+	next := previous
+	next.ModelsListReadMaxBytes = database.MinModelsListReadMaxBytes
+	ApplyRuntimeSettings(next)
+	t.Cleanup(func() { ApplyRuntimeSettings(previous) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", int(database.MinModelsListReadMaxBytes)+1)))
+	}))
+	defer server.Close()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123"}
+	_, err := fetchCodexModelsManifestWithURL(context.Background(), account, "", server.URL, "0.140.0", "")
+	if !errors.Is(err, ErrModelsListResponseTooLarge) {
+		t.Fatalf("error = %v, want ErrModelsListResponseTooLarge", err)
 	}
 }
 

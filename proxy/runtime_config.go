@@ -72,7 +72,9 @@ type RuntimeSettings struct {
 	FirstTokenMode        string
 	FirstTokenTimeoutSec  int
 	BillingTierPolicy     string
-	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
+	// ModelsListReadMaxBytes 是上游 /v1/models 与 Codex 模型清单成功响应的读取上限。
+	ModelsListReadMaxBytes int64
+	CodexForceWebsocket    bool // 强制 Codex 上游走 WebSocket（默认 false）
 	// CodexRequestCompression 对 HTTP /responses 请求体做 zstd 压缩（默认 true，
 	// 与真实 Codex CLI 一致）。与 CodexForceWebsocket 正交：WS 路径走
 	// permessage-deflate（拨号器已开启），本项只作用于 HTTP 路径，两者可同时生效。
@@ -171,6 +173,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		FirstTokenMode:                   defaultFirstTokenMode,
 		FirstTokenTimeoutSec:             defaultFirstTokenTimeoutSec,
 		BillingTierPolicy:                defaultBillingTierPolicy,
+		ModelsListReadMaxBytes:           database.DefaultModelsListReadMaxBytes,
 		CodexRequestCompression:          defaultCodexRequestCompression,
 		CodexWSHideErrors:                defaultCodexWSHideErrors,
 		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
@@ -261,6 +264,7 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
 	settings.FirstTokenMode = NormalizeFirstTokenMode(settings.FirstTokenMode)
 	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
+	settings.ModelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(settings.ModelsListReadMaxBytes)
 	settings.RequestIsolationMode = NormalizeRequestIsolationMode(settings.RequestIsolationMode)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
@@ -337,6 +341,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.FirstTokenMode = settings.FirstTokenMode
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
+		next.ModelsListReadMaxBytes = settings.ModelsListReadMaxBytes
 		next.CodexForceWebsocket = settings.CodexForceWebsocket
 		next.CodexRequestCompression = settings.CodexRequestCompression
 		next.CodexWSWeakNetworkMode = settings.CodexWSWeakNetworkMode

@@ -123,6 +123,7 @@ const AUTO_SAVE_TOAST_MS = 2000
 const DEFAULT_RESPONSE_CACHE_TOTAL_BYTES = 64 * MIB
 const DEFAULT_RESPONSE_CACHE_ENTRY_BYTES = 8 * MIB
 const DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES = 64 * MIB
+const DEFAULT_MODELS_LIST_READ_MAX_BYTES = 8 * MIB
 const RESPONSE_CACHE_BUDGET_KEYS = [
   'response_cache_local_max_bytes',
   'response_cache_local_max_entry_bytes',
@@ -1335,6 +1336,10 @@ export default function Settings() {
       ...cacheNormalized,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
       first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
+      models_list_read_max_bytes:
+        Number.isFinite(cacheNormalized.models_list_read_max_bytes) && cacheNormalized.models_list_read_max_bytes >= MIB
+          ? cacheNormalized.models_list_read_max_bytes
+          : DEFAULT_MODELS_LIST_READ_MAX_BYTES,
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1479,6 +1484,7 @@ export default function Settings() {
     first_token_timeout_seconds: 0,
     first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
+    models_list_read_max_bytes: DEFAULT_MODELS_LIST_READ_MAX_BYTES,
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
     public_image_studio_page_enabled: true,
@@ -3641,6 +3647,30 @@ export default function Settings() {
                     onChange={(value) => autoSaveStringField('billing_tier_policy', value)}
                     options={billingTierPolicyOptions}
                   />
+                </SettingField>
+                <SettingField label={t('settings.modelsListReadMaxBytes')} description={t('settings.modelsListReadMaxBytesDesc')}>
+                  <div className="relative">
+                    <DraftNumberInput
+                      min={1}
+                      max={256}
+                      className="pr-12 tabular-nums"
+                      value={bytesToMiB(settingsForm.models_list_read_max_bytes)}
+                      onValueChange={(value) =>
+                        setSettingsForm((form) => ({
+                          ...form,
+                          models_list_read_max_bytes: mibToBytes(value),
+                        }))
+                      }
+                      onValueCommit={(value) =>
+                        void autoSaveSettingsPatch({
+                          models_list_read_max_bytes: mibToBytes(value),
+                        })
+                      }
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-muted-foreground">
+                      MiB
+                    </span>
+                  </div>
                 </SettingField>
                 <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
                   <SegmentedPillGroup

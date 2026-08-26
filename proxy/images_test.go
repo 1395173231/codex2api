@@ -639,6 +639,95 @@ func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	}
 }
 
+func TestCollectImagesResponseClassifiesNoOutputOutcomes(t *testing.T) {
+	tests := []struct {
+		name       string
+		upstream   string
+		kind       imageNoOutputKind
+		statusCode int
+		retry      bool
+		code       string
+	}{
+		{
+			name:       "explicit safety refusal text",
+			upstream:   `data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"I cannot generate this because it violates the safety policy"}]}]}}` + "\n\n",
+			kind:       imageNoOutputSafety,
+			statusCode: http.StatusBadRequest,
+			code:       "content_policy_violation",
+		},
+		{
+			name:       "plain text capability fallback",
+			upstream:   `data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Try describing the scene in more detail."}]}]}}` + "\n\n",
+			kind:       imageNoOutputUnavailable,
+			statusCode: http.StatusBadGateway,
+			retry:      true,
+			code:       "image_generation_unavailable",
+		},
+		{
+			name:       "empty completed response",
+			upstream:   `data: {"type":"response.completed","response":{"output":[]}}` + "\n\n",
+			kind:       imageNoOutputEmpty,
+			statusCode: http.StatusBadGateway,
+			retry:      true,
+			code:       "image_generation_empty_output",
+		},
+		{
+			name:       "incomplete generation",
+			upstream:   `data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}` + "\n\n",
+			kind:       imageNoOutputIncomplete,
+			statusCode: http.StatusBadGateway,
+			retry:      true,
+			code:       "response_incomplete",
+		},
+		{
+			name:       "incomplete content filter",
+			upstream:   `data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}` + "\n\n",
+			kind:       imageNoOutputSafety,
+			statusCode: http.StatusBadRequest,
+			code:       "content_policy_violation",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(tt.upstream), "b64_json", "gpt-image-2", nil, imageUpscalePlan{})
+			outcome := imageNoOutputDetails(err)
+			if outcome == nil || outcome.kind != tt.kind {
+				t.Fatalf("outcome = %#v err=%v, want kind %s", outcome, err, tt.kind)
+			}
+			statusCode, payload := imageErrorResponse(err)
+			if statusCode != tt.statusCode || payload["error"].(gin.H)["code"] != tt.code {
+				t.Fatalf("response = (%d, %#v), want status=%d code=%s", statusCode, payload, tt.statusCode, tt.code)
+			}
+			generalRetries := 0
+			if got := shouldRetryImageStreamError(err, &generalRetries, 0, 0, maxImageAttempts); got != tt.retry {
+				t.Fatalf("retry = %t, want %t", got, tt.retry)
+			}
+		})
+	}
+}
+
+func TestStreamImagesNoOutputFailureStaysPrivateBeforeImageOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := `data: {"type":"response.output_text.delta","delta":"Image generation is temporarily unavailable"}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	handler := &Handler{}
+
+	_, imageCount, _, _, wroteImageOutput, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now(), imageUpscalePlan{})
+	if outcome := imageNoOutputDetails(err); outcome == nil || outcome.kind != imageNoOutputUnavailable {
+		t.Fatalf("stream outcome = %#v err=%v", outcome, err)
+	}
+	if imageCount != 0 || wroteImageOutput {
+		t.Fatalf("image output = (count=%d wrote=%t), want none", imageCount, wroteImageOutput)
+	}
+	if body := recorder.Body.String(); strings.Contains(body, "temporarily unavailable") || strings.Contains(body, "event: error") {
+		t.Fatalf("retryable pre-output failure leaked downstream: %q", body)
+	}
+}
+
 func TestImageReadersHonorExplicitSSEErrorEvent(t *testing.T) {
 	upstream := "event: error\n" +
 		`data: {"type":"invalid_request_error","error":{"message":"explicit image failure"}}` + "\n\n"
@@ -718,6 +807,125 @@ func TestForwardImagesSelectiveRetryBuffersWholeExplicitErrorAttempt(t *testing.
 	}
 	if strings.Contains(body, "ZmFpbGVkLXBhcnRpYWw=") || strings.Contains(body, "must stay upstream") {
 		t.Fatalf("selected failed image attempt leaked downstream: %q", body)
+	}
+}
+
+func TestForwardImagesTextFallbackCoolsAccountAndFailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		ApplyRuntimeSettings(previousRuntime)
+		resinCfg.Store(previousResin)
+	})
+	// The structured image-unavailable path owns one bounded failover even when
+	// generic transport retries are disabled.
+	nextRuntime := previousRuntime
+	nextRuntime.ContinuousRetryPolicy = database.ContinuousRetryPolicy{}
+	ApplyRuntimeSettings(nextRuntime)
+
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Please try a different image prompt."}]}]}}`+"\n\n")
+			return
+		}
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"created_at":1710000000,"output":[{"type":"image_generation_call","result":"`+tinyPNGBase64+`","output_format":"png"}]}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-no-output-failover-test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0,
+	})
+	t.Cleanup(store.Stop)
+	first := &auth.Account{DBID: 1, AccessToken: "image-token-1", PlanType: "plus", AccountID: "image-account-1"}
+	second := &auth.Account{DBID: 2, AccessToken: "image-token-2", PlanType: "plus", AccountID: "image-account-2"}
+	store.AddAccount(first)
+	store.AddAccount(second)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	responsesBody := []byte(`{"model":"gpt-5.4","input":"draw","tools":[{"type":"image_generation","model":"gpt-image-2"}],"stream":true}`)
+	handler.forwardImagesRequest(c, "/v1/images/generations", "gpt-image-2", "gpt-image-2", "gpt-image-2", responsesBody, "b64_json", "image_generation", false)
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2; status=%d body=%s", got, recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotTokens := append([]string(nil), tokens...)
+	mu.Unlock()
+	if len(gotTokens) != 2 || gotTokens[0] == gotTokens[1] {
+		t.Fatalf("expected account failover, authorization sequence=%v", gotTokens)
+	}
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), tinyPNGBase64) {
+		t.Fatalf("failover result: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	cooled := first.ModelCooldownRemaining("gpt-image-2") > 0 || second.ModelCooldownRemaining("gpt-image-2") > 0
+	if !cooled {
+		t.Fatal("plain-text image fallback should cool the account/model pair")
+	}
+}
+
+func TestForwardImagesEmptyTerminalRetriesSameAccountOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousRuntime := CurrentRuntimeSettings()
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		ApplyRuntimeSettings(previousRuntime)
+		resinCfg.Store(previousResin)
+	})
+	nextRuntime := previousRuntime
+	nextRuntime.ContinuousRetryPolicy = database.ContinuousRetryPolicy{}
+	ApplyRuntimeSettings(nextRuntime)
+
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"output":[]}}`+"\n\n")
+			return
+		}
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"`+tinyPNGBase64+`","output_format":"png"}]}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-empty-retry-test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0})
+	t.Cleanup(store.Stop)
+	account := &auth.Account{DBID: 1, AccessToken: "same-image-token", PlanType: "plus", AccountID: "same-image-account"}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	responsesBody := []byte(`{"model":"gpt-5.4","input":"draw","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`)
+	handler.forwardImagesRequest(c, "/v1/images/generations", "gpt-image-2", "gpt-image-2", "gpt-image-2", responsesBody, "b64_json", "image_generation", false)
+
+	if calls.Load() != 2 || recorder.Code != http.StatusOK {
+		t.Fatalf("same-account retry failed: calls=%d status=%d body=%s", calls.Load(), recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotTokens := append([]string(nil), tokens...)
+	mu.Unlock()
+	if len(gotTokens) != 2 || gotTokens[0] != gotTokens[1] {
+		t.Fatalf("empty terminal should retry the same account once: %v", gotTokens)
+	}
+	if account.ModelCooldownRemaining("gpt-image-2") > 0 {
+		t.Fatal("empty terminal must not cool a healthy account")
 	}
 }
 

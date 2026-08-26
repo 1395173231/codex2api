@@ -209,8 +209,10 @@ export interface AccountRow {
   usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
-  // 官方结算口径的近 7 天成本(美元)。来自 account_daily_usage 快照,与
-  // billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  // 官方结算口径的累计成本(美元)。来自 account_daily_usage 快照全窗口,
+  // 与 billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  official_usd?: number
+  // 兼容旧 page-stats 字段；值与 official_usd 相同,不再表示「只含 7 天」。
   official_usd_7d?: number
   // 官方快照已成功同步过但上游窗口内没有数据(官方统计有滞后)。
   // 有这个标记时不再重拉 page-stats,胶囊显示静态"暂无数据"而非转圈。
@@ -297,6 +299,7 @@ export interface AccountPageStatsItem {
   usage_today_detail?: AccountUsageWindow
   billed_5h?: number
   billed_7d?: number
+  official_usd?: number
   official_usd_7d?: number
   official_usage_synced?: boolean
 }
@@ -1742,6 +1745,7 @@ export interface SystemSettings {
   first_token_timeout_seconds: number
   first_token_excludes_ws_acquire: boolean
   billing_tier_policy: 'actual' | 'requested' | string
+  models_list_read_max_bytes: number
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
   public_image_studio_page_enabled: boolean

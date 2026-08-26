@@ -3986,7 +3986,10 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	body, readErr := proxy.ReadModelsListBody(resp.Body, proxy.CurrentRuntimeSettings().ModelsListReadMaxBytes)
+	if readErr != nil {
+		return nil, fmt.Errorf("读取 /v1/models 响应失败: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
 		if message == "" {
@@ -8446,6 +8449,7 @@ type settingsResponse struct {
 	FirstTokenMode                     string                           `json:"first_token_mode"`
 	FirstTokenTimeoutSeconds           int                              `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  string                           `json:"billing_tier_policy"`
+	ModelsListReadMaxBytes             int64                            `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers               bool                             `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          bool                             `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled       bool                             `json:"public_image_studio_page_enabled"`
@@ -8601,6 +8605,7 @@ type updateSettingsReq struct {
 	FirstTokenMode                      *string   `json:"first_token_mode"`
 	FirstTokenTimeoutSeconds            *int      `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                   *string   `json:"billing_tier_policy"`
+	ModelsListReadMaxBytes              *int64    `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers                *bool     `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled           *bool     `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled        *bool     `json:"public_image_studio_page_enabled"`
@@ -9356,6 +9361,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
@@ -9649,6 +9655,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	persistedAutoResetCreditsEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
+	modelsListReadMaxBytes := database.DefaultModelsListReadMaxBytes
 	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
 	sessionSlotBufferSeconds := database.NormalizeSessionSlotBufferSeconds(int(h.store.GetSessionSlotBuffer() / time.Second))
 	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
@@ -9670,6 +9677,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
+		modelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(existingSettings.ModelsListReadMaxBytes)
 		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
 		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(existingSettings.SessionSlotBufferSeconds)
 	}
@@ -9678,6 +9686,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	if req.SessionSlotBufferSeconds != nil {
 		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(*req.SessionSlotBufferSeconds)
+	}
+	modelsListReadLimitChanged := false
+	if req.ModelsListReadMaxBytes != nil {
+		if err := database.ValidateModelsListReadMaxBytes(*req.ModelsListReadMaxBytes); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		modelsListReadLimitChanged = *req.ModelsListReadMaxBytes != modelsListReadMaxBytes
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -9734,6 +9750,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
+	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
 		Enabled:            req.ContinuousRetryEnabled,
@@ -10743,6 +10760,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusInternalServerError, "保存响应缓存设置前无法持久化系统设置")
 			return
 		}
+		if modelsListReadLimitChanged {
+			writeError(c, http.StatusInternalServerError, "保存模型列表读取上限前无法持久化系统设置")
+			return
+		}
 		if promptFilterChanged {
 			writeError(c, http.StatusInternalServerError, "保存 Prompt 检查设置失败，设置未生效")
 			return
@@ -10813,6 +10834,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
+		}
+		if modelsListReadLimitChanged {
+			if updateErr := h.db.UpdateModelsListReadMaxBytes(c.Request.Context(), *req.ModelsListReadMaxBytes); updateErr != nil {
+				writeError(c, http.StatusInternalServerError, "保存模型列表读取上限失败："+updateErr.Error())
+				return
+			}
+			modelsListReadMaxBytes = *req.ModelsListReadMaxBytes
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				current.ModelsListReadMaxBytes = modelsListReadMaxBytes
+				return current
+			})
+			log.Printf("设置已更新: models_list_read_max_bytes = %d", modelsListReadMaxBytes)
 		}
 	}
 
@@ -11008,6 +11041,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
 		ImageStorageBackend:                 imgCfg.Backend,
 		ImageS3Endpoint:                     imgCfg.Endpoint,

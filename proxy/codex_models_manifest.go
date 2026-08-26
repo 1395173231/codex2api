@@ -376,9 +376,6 @@ const CodexModelsManifestURL = "https://chatgpt.com/backend-api/codex/models"
 // codexModelsManifestURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var codexModelsManifestURLForTest = ""
 
-// manifest 响应体上限。清单是结构化 JSON，正常远小于该值，仅作读取护栏。
-const codexModelsManifestBodyLimit int64 = 8 << 20
-
 // CodexModelsManifest 承载上游清单原文与缓存元数据，供 handler 原样透传给客户端。
 type CodexModelsManifest struct {
 	Body        []byte
@@ -458,7 +455,7 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 		return nil, fmt.Errorf("codex models upstream status %d: %s", resp.StatusCode, message)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, codexModelsManifestBodyLimit))
+	body, err := ReadModelsListBody(resp.Body, CurrentRuntimeSettings().ModelsListReadMaxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read codex models response: %w", err)
 	}

@@ -3469,6 +3469,52 @@ func TestRestoreMissingResponseOutputsPreservesCompletedOutput(t *testing.T) {
 	}
 }
 
+func TestRestoreMissingResponseOutputsReplacesPartialTerminalOutput(t *testing.T) {
+	response := []byte(`{"id":"resp_1","object":"response","output":[{"id":"rs_1","type":"reasoning","summary":[]}]}`)
+	outputItems := []json.RawMessage{
+		json.RawMessage(`{"id":"rs_1","type":"reasoning","summary":[]}`),
+		json.RawMessage(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"complete"}]}`),
+	}
+
+	got := restoreMissingResponseOutputs(response, outputItems)
+	output := gjson.GetBytes(got, "output").Array()
+	if len(output) != 2 || output[1].Get("content.0.text").String() != "complete" {
+		t.Fatalf("partial terminal output was not rebuilt: %s", got)
+	}
+}
+
+func TestResponseOutputCollectorOrdersByOutputIndexAndDedupes(t *testing.T) {
+	collector := newResponseOutputCollector()
+	collector.Add([]byte(`{"type":"response.output_item.done","output_index":2,"item":{"id":"msg_2","type":"message","content":[]}}`))
+	collector.Add([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","summary":[]}}`))
+	collector.Add([]byte(`{"type":"response.output_item.done","output_index":2,"item":{"id":"msg_2","type":"message","content":[]}}`))
+
+	items := collector.Items()
+	if len(items) != 2 {
+		t.Fatalf("collector item count = %d, want 2", len(items))
+	}
+	if first := gjson.GetBytes(items[0], "id").String(); first != "rs_0" {
+		t.Fatalf("first collected id = %q, want rs_0", first)
+	}
+	if second := gjson.GetBytes(items[1], "id").String(); second != "msg_2" {
+		t.Fatalf("second collected id = %q, want msg_2", second)
+	}
+}
+
+func TestRestoreMissingResponseOutputsInStreamTerminal(t *testing.T) {
+	collector := newResponseOutputCollector()
+	collector.Add([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"done"}]}}`))
+	event := []byte(`{"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`)
+
+	got := restoreMissingResponseOutputsInEvent(event, collector.Items())
+	if text := gjson.GetBytes(got, "response.output.0.content.0.text").String(); text != "done" {
+		t.Fatalf("stream terminal output was not rebuilt: %s", got)
+	}
+	if usage := gjson.GetBytes(got, "response.usage.input_tokens").Int(); usage != 1 {
+		t.Fatalf("terminal fields were not preserved: %s", got)
+	}
+}
+
 func TestAppendMissingResponseImageOutputsAddsOutputItemDone(t *testing.T) {
 	response := []byte(`{"id":"resp_1"}`)
 	imageOutputs := []json.RawMessage{

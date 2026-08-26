@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,8 @@ type Handler struct {
 	scopeUsageMu sync.Mutex
 	scopeUsage   *apiKeyScopeUsageTracker
 	liveStore    *liveCallStore
+	// Responses WebSocket 同作用域会话的本机抢占注册表；跨实例所有权由 runtime cache 协调。
+	responsesWSSessionPreemptions responsesWSSessionPreemptRegistry
 	// 指纹重放冷却的存在性闸门缓存(见 hasActiveFingerprintReplayLocks)。
 	fpReplayGateMu     sync.Mutex
 	fpReplayGateAt     time.Time
@@ -2614,15 +2617,109 @@ func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.
 	return json.RawMessage(raw), true
 }
 
+type responseOutputItemRecord struct {
+	outputIndex int
+	hasIndex    bool
+	sequence    int
+	raw         json.RawMessage
+}
+
+// responseOutputCollector rebuilds terminal response.output from the canonical
+// response.output_item.done lifecycle events. Relays occasionally return an
+// empty or partially populated terminal output array even though every item was
+// already delivered. The collector is request-scoped and bounded by the same
+// logical reconstruction budget used for response-context replay.
+type responseOutputCollector struct {
+	indexed   map[int]responseOutputItemRecord
+	unindexed []responseOutputItemRecord
+	seen      map[string]struct{}
+	bytes     int64
+	limit     int64
+	sequence  int
+	overflow  bool
+}
+
+func newResponseOutputCollector() *responseOutputCollector {
+	limit := GetResponseCacheAppliedConfig().ReconstructMaxBytes
+	if limit <= 0 {
+		limit = responseCacheMaxBytes
+	}
+	return &responseOutputCollector{
+		indexed: make(map[int]responseOutputItemRecord),
+		seen:    make(map[string]struct{}),
+		limit:   limit,
+	}
+}
+
+func (c *responseOutputCollector) Add(data []byte) bool {
+	if c == nil || c.overflow {
+		return false
+	}
+	raw, ok := extractResponseOutputItemDone(data, c.seen)
+	if !ok {
+		return false
+	}
+	record := responseOutputItemRecord{sequence: c.sequence, raw: raw}
+	c.sequence++
+	if outputIndex := gjson.GetBytes(data, "output_index"); outputIndex.Exists() && outputIndex.Int() >= 0 {
+		record.hasIndex = true
+		record.outputIndex = int(outputIndex.Int())
+	}
+
+	nextBytes := c.bytes + int64(len(raw))
+	if record.hasIndex {
+		if previous, exists := c.indexed[record.outputIndex]; exists {
+			nextBytes -= int64(len(previous.raw))
+		}
+	}
+	if nextBytes > c.limit {
+		c.overflow = true
+		c.indexed = nil
+		c.unindexed = nil
+		c.bytes = 0
+		log.Printf("跳过 Responses 终态 output 重建: output_item.done 累计超过 %d 字节", c.limit)
+		return false
+	}
+	c.bytes = nextBytes
+	if record.hasIndex {
+		c.indexed[record.outputIndex] = record
+	} else {
+		c.unindexed = append(c.unindexed, record)
+	}
+	return true
+}
+
+func (c *responseOutputCollector) Items() []json.RawMessage {
+	if c == nil || c.overflow || (len(c.indexed) == 0 && len(c.unindexed) == 0) {
+		return nil
+	}
+	records := make([]responseOutputItemRecord, 0, len(c.indexed)+len(c.unindexed))
+	for _, record := range c.indexed {
+		records = append(records, record)
+	}
+	records = append(records, c.unindexed...)
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].hasIndex != records[j].hasIndex {
+			return records[i].hasIndex
+		}
+		if records[i].hasIndex && records[i].outputIndex != records[j].outputIndex {
+			return records[i].outputIndex < records[j].outputIndex
+		}
+		return records[i].sequence < records[j].sequence
+	})
+	items := make([]json.RawMessage, 0, len(records))
+	for _, record := range records {
+		items = append(items, record.raw)
+	}
+	return items
+}
+
 func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMessage) []byte {
 	if len(responseJSON) == 0 || len(outputItems) == 0 {
 		return responseJSON
 	}
 	var response map[string]any
 	if err := json.Unmarshal(responseJSON, &response); err != nil {
-		return responseJSON
-	}
-	if outputs, ok := response["output"].([]any); ok && len(outputs) > 0 {
 		return responseJSON
 	}
 	outputs := make([]any, 0, len(outputItems))
@@ -2639,12 +2736,31 @@ func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMe
 	if len(outputs) == 0 {
 		return responseJSON
 	}
+	if terminalOutputs, ok := response["output"].([]any); ok && len(terminalOutputs) >= len(outputs) {
+		return responseJSON
+	}
 	response["output"] = outputs
 	restored, err := json.Marshal(response)
 	if err != nil {
 		return responseJSON
 	}
 	return restored
+}
+
+func restoreMissingResponseOutputsInEvent(eventData []byte, outputItems []json.RawMessage) []byte {
+	response := gjson.GetBytes(eventData, "response")
+	if !response.Exists() || !response.IsObject() {
+		return eventData
+	}
+	restored := restoreMissingResponseOutputs([]byte(response.Raw), outputItems)
+	if bytes.Equal(restored, []byte(response.Raw)) {
+		return eventData
+	}
+	updated, err := sjson.SetRawBytes(eventData, "response", restored)
+	if err != nil {
+		return eventData
+	}
+	return updated
 }
 
 func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.RawMessage) []byte {
@@ -4746,7 +4862,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
 		var preContentErrorCandidate []byte
-		var streamedOutputItems []json.RawMessage
+		outputCollector := newResponseOutputCollector()
 		var completedResponseData []byte
 		var completedResponseOutputItems []json.RawMessage
 		var compactionProvenancePayloads [][]byte
@@ -4836,15 +4952,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
-				if eventType == "response.output_item.done" {
-					item := parsed.Get("item")
-					if isCodexToolCallContextType(item.Get("type").String()) {
-						streamedOutputItems = append(streamedOutputItems, json.RawMessage(item.Raw))
-					}
-				}
+				outputCollector.Add(data)
 
 				// 提取 usage + service_tier
 				if isResponsesSuccessTerminalEvent(eventType) {
+					// 某些网关的终态 response.output 为空或只含部分项，但此前
+					// output_item.done 已完整到达。流式透传前就地补齐，确保 SSE 与
+					// 非流式响应得到同一份可回放终态。
+					data = restoreMissingResponseOutputsInEvent(data, outputCollector.Items())
+					parsed = gjson.ParseBytes(data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -4854,7 +4970,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						// Otherwise a local filter/write failure would publish an ID that
 						// the client never received. Truncated terminals remain uncached.
 						completedResponseData = append(completedResponseData[:0], data...)
-						completedResponseOutputItems = append(completedResponseOutputItems[:0], streamedOutputItems...)
+						completedResponseOutputItems = append(completedResponseOutputItems[:0], outputCollector.Items()...)
 					}
 					gotTerminal = true
 					preContentErrorCandidate = nil
@@ -5078,8 +5194,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
-			outputItems := make([]json.RawMessage, 0, 2)
-			seenOutputItems := make(map[string]struct{})
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
@@ -5100,9 +5214,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					preContentErrorCandidate = append(preContentErrorCandidate[:0], data...)
 					return true
 				}
-				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
-					outputItems = append(outputItems, outputItem)
-				}
+				outputCollector.Add(data)
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
@@ -5122,7 +5234,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					if eventType == "response.completed" {
 						completedResponseData = append(completedResponseData[:0], data...)
-						completedResponseOutputItems = append(completedResponseOutputItems[:0], outputItems...)
+						completedResponseOutputItems = append(completedResponseOutputItems[:0], outputCollector.Items()...)
 					}
 					gotTerminal = true
 					lastResponseData = data
@@ -5141,7 +5253,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
-					responseJSON = restoreMissingResponseOutputs(responseJSON, outputItems)
+					responseJSON = restoreMissingResponseOutputs(responseJSON, outputCollector.Items())
 					responseJSON = appendMissingResponseImageOutputs(responseJSON, imageOutputs)
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}
@@ -6852,6 +6964,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				translation := streamTranslator.TranslateParsedResult(parsed)
 				chunk, done := translation.Chunk, translation.Terminal
+				if translation.Failed && eventType != "response.failed" {
+					if toolErr := streamTranslator.ToolArgumentsError(); toolErr != nil {
+						terminalFailurePayload = malformedToolArgumentsFailurePayload(toolErr)
+						gotTerminal = true
+						preContentErrorCandidate = nil
+					}
+				}
 
 				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstTokenWithBudgets(eventType, terminalFailurePayload, contentTokenSeen, visibleBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, c.Request.Context().Err(), writeErr, continuousRetryPolicy) {
 					pendingFirstTokenChunks.Reset()
@@ -6961,8 +7080,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 					finishReasonOverride = responsesIncompleteFinishReason(eventType,
 						parsed.Get("response.incomplete_details.reason").String())
-					// 从 response.output 提取 function_call 项
-					toolCalls = ExtractToolCallsFromOutput(data)
+					// 从 response.output 提取 function_call 项。普通 function 的
+					// arguments 若被截断，整次上游响应按协议错误处理，不能把坏调用
+					// 返回并在下一轮继续污染历史。
+					var toolErr error
+					toolCalls, toolErr = ExtractToolCallsFromOutputValidated(data)
+					if toolErr != nil {
+						terminalFailurePayload = malformedToolArgumentsFailurePayload(toolErr)
+					}
 					gotTerminal = true
 					preContentErrorCandidate = nil
 					return false

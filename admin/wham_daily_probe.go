@@ -195,7 +195,7 @@ func (h *Handler) runWhamDailyUsageProbe(ctx context.Context, lastAttempt map[in
 
 // enqueueWhamDailyUsageBackfill 给当前页缺少官方结算快照的账号补一次上游拉取。
 // 后台小时级探针会覆盖全池，但列表打开时快照往往还是空的：page-stats 只读本地表，
-// 不在这里即时回补的话，「官方 7d」胶囊要等用户手动刷新或下一次探针才会出现。
+// 不在这里即时回补的话，「官方结算」胶囊要等用户手动刷新或下一次探针才会出现。
 func (h *Handler) enqueueWhamDailyUsageBackfill(ids []int64) {
 	if h == nil || h.store == nil || len(ids) == 0 {
 		return

@@ -138,6 +138,10 @@ Codex2API 采用三层配置架构：
 
 系统设置存储在数据库的 `SystemSettings` 表中，可通过管理后台 `/admin/settings` 实时修改。
 
+### 模型列表读取上限
+
+`models_list_read_max_bytes` 限制上游 OpenAI 兼容 `/v1/models` 与 Codex OAuth 模型清单成功响应的最大读取大小。默认 `8,388,608` bytes（8 MiB），管理后台以整数 MiB 展示，允许范围为 1-256 MiB。响应超过上限时请求会明确失败，不会把截断的 JSON 当成完整模型列表解析。
+
 ### Responses 上下文缓存
 
 Responses 连续请求会按 `previous_response_id` 重建上下文。每个 Codex2API 进程都有一层有界 L1 缓存，三个字节预算保存在数据库中；管理台用整数 MiB 展示和修改，管理 API 使用原始字节数。

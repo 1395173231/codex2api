@@ -491,20 +491,14 @@ func TestContinuousRetryImageStreamSelectionHonorsPolicyAndSafety(t *testing.T) 
 	}
 	moderationFailure := newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":500,"error":{"code":"moderation_blocked"}}}`))
 	general := 0
-	for name, failure := range map[string]error{
-		"disabled moderation": moderationFailure,
-		"disabled quota":      newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":429,"error":{"code":"insufficient_quota"}}}`)),
-	} {
-		general = 0
-		if !shouldRetryImageStreamError(failure, &general, 1, 0, maxImageAttempts, database.ContinuousRetryPolicy{}) {
-			t.Fatalf("%s did not preserve the disabled legacy retry", name)
-		}
-	}
-	general = 0
-	if !shouldRetryImageStreamError(moderationFailure, &general, 2, 0, maxImageAttempts, policy) {
-		t.Fatal("unselected structured image moderation refusal did not preserve the finite legacy retry")
+	if shouldRetryImageStreamError(moderationFailure, &general, 1, 0, maxImageAttempts, database.ContinuousRetryPolicy{}) {
+		t.Fatal("disabled policy retried an explicit image moderation refusal")
 	}
 	quotaFailure := newImageResponseFailedError([]byte(`{"type":"response.failed","response":{"status_code":429,"error":{"code":"insufficient_quota"}}}`))
+	general = 0
+	if shouldRetryImageStreamError(moderationFailure, &general, 2, 0, maxImageAttempts, policy) {
+		t.Fatal("default continuous policy retried an explicit image moderation refusal")
+	}
 	general = 0
 	if !shouldRetryImageStreamError(quotaFailure, &general, 2, 0, maxImageAttempts, policy) {
 		t.Fatal("unselected permanent image quota failure did not preserve the finite legacy retry")
@@ -518,8 +512,8 @@ func TestContinuousRetryImageStreamSelectionHonorsPolicyAndSafety(t *testing.T) 
 	if !shouldRetryImageStreamError(quotaFailure, &general, 0, 0, maxImageAttempts, catchAll) {
 		t.Fatal("catch-all did not select a permanent image quota failure")
 	}
-	if !shouldRetryImageStreamError(moderationFailure, &general, 0, 0, maxImageAttempts, catchAll) {
-		t.Fatal("catch-all did not select a structured image moderation refusal")
+	if shouldRetryImageStreamError(moderationFailure, &general, 0, 0, maxImageAttempts, catchAll) {
+		t.Fatal("catch-all retried an explicit image moderation refusal")
 	}
 	if !shouldRetryImageStreamError(quotaFailure, &general, 0, maxImageAttempts-1, maxImageAttempts, catchAll) {
 		t.Fatal("catch-all did not bypass the ordinary image attempt cap")

@@ -76,6 +76,7 @@ import {
   isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
+  officialUsdValue,
   supportsOfficialUsage,
 } from "../lib/usageFormat";
 import {
@@ -1744,7 +1745,7 @@ export default function Accounts() {
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [quickConfigAccount, setQuickConfigAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
-  // 用量弹窗打开时停在哪个 tab。列表里点「官方 7d」成本直接落到官方统计,
+  // 用量弹窗打开时停在哪个 tab。列表里点「官方结算」成本直接落到官方统计,
   // 其余入口保持默认的概览。
   const [usageInitialPage, setUsageInitialPage] = useState<
     "overview" | "official"
@@ -2757,7 +2758,20 @@ export default function Accounts() {
   // 否则官方成本胶囊要等翻页/改筛选才出现,看起来像刷新没生效。
   const [pageStatsReloadToken, setPageStatsReloadToken] = useState(0);
   const handleOfficialUsageRefreshed = useCallback(
-    () => setPageStatsReloadToken((token) => token + 1),
+    (patch?: { accountId: number; officialUsd: number | null }) => {
+      if (patch) {
+        setAccountPageStats((current) => ({
+          ...current,
+          [String(patch.accountId)]: {
+            ...current[String(patch.accountId)],
+            official_usd: patch.officialUsd ?? undefined,
+            official_usd_7d: patch.officialUsd ?? undefined,
+            official_usage_synced: true,
+          },
+        }));
+      }
+      setPageStatsReloadToken((token) => token + 1);
+    },
     [],
   );
   // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
@@ -2769,11 +2783,22 @@ export default function Accounts() {
         if (!stats) return account;
         // 行自身已带的字段优先(如 refreshAccountRow 拉回的完整详情比
         // 本页 stats 快照更新),page-stats 只补基础行缺失的部分。
+        // 官方结算例外：点进官方统计刷新后必须以最新快照为准，
+        // 否则行上的旧额度会挡住这次同步时间点。
         const merged = { ...account };
         if (merged.billed_5h == null && stats.billed_5h != null) merged.billed_5h = stats.billed_5h;
         if (merged.billed_7d == null && stats.billed_7d != null) merged.billed_7d = stats.billed_7d;
-        if (merged.official_usd_7d == null && stats.official_usd_7d != null) merged.official_usd_7d = stats.official_usd_7d;
-        if (merged.official_usage_synced == null && stats.official_usage_synced != null) merged.official_usage_synced = stats.official_usage_synced;
+        const officialUsd = stats.official_usd ?? stats.official_usd_7d;
+        if (officialUsd != null) {
+          merged.official_usd = officialUsd;
+          merged.official_usd_7d = officialUsd;
+        } else if (stats.official_usage_synced) {
+          merged.official_usd = undefined;
+          merged.official_usd_7d = undefined;
+        }
+        if (stats.official_usage_synced != null) {
+          merged.official_usage_synced = stats.official_usage_synced;
+        }
         if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
         if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
         if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
@@ -2840,7 +2865,7 @@ export default function Accounts() {
   useEffect(() => {
     officialCostReloadAttemptsRef.current = 0;
   }, [accountPageIDsKey]);
-  // 官方 7d 只存在于 page-stats 的快照字段。后台探针有启动延迟，列表打开时
+  // 官方结算只存在于 page-stats 的快照字段。后台探针有启动延迟，列表打开时
   // 经常还是空的；后端会给当前页做即时回补，这里按缺字段重拉，直到胶囊出现。
   useEffect(() => {
     if (providerView !== "codex") return undefined;
@@ -15154,8 +15179,7 @@ function BilledCell({
   onOpenOfficial?: (account: AccountRow) => void;
 }) {
   const { t } = useTranslation();
-  const official =
-    typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
+  const official = officialUsdValue(account);
   const showOfficial =
     supportsOfficialUsage(account) && !isOfficialCostHiddenAccount(account);
   const showAPIBalance = account.openai_responses_api === true;

@@ -437,6 +437,20 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
 	}
+	// Only a request that passed payload, prompt-policy and API-key admission may
+	// replace the active owner. Claim before concurrency/account acquisition so
+	// the old request can release those leases for the new one.
+	if preemptCtx, cleanupPreempt, armed := h.beginResponsesWSSessionPreemption(c.Request.Context(), c, rawBody, sessionIdentity); armed {
+		originalRequest := c.Request
+		c.Request = originalRequest.WithContext(preemptCtx)
+		defer func() {
+			cleanupPreempt()
+			c.Request = originalRequest
+		}()
+		if preemptCtx.Err() != nil {
+			return errResponsesWSClientGone
+		}
+	}
 	releaseAPIKeyConcurrency, concurrencyErr, ok := h.acquireAPIKeyConcurrencyForWebSocket(c)
 	if !ok {
 		_ = writeResponsesWSError(conn, concurrencyErr)

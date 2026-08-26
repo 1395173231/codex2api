@@ -129,6 +129,39 @@ func TestSQLiteSessionSlotBufferSettingsRoundtrip(t *testing.T) {
 	}
 }
 
+func TestSQLiteModelsListReadLimitRoundTripAndFullUpdatePreservesValue(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "models-list-limit.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const want = int64(16 << 20)
+	if err := db.UpdateModelsListReadMaxBytes(ctx, want); err != nil {
+		t.Fatalf("UpdateModelsListReadMaxBytes: %v", err)
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
+
+	settings.SiteName = "preserve-model-list-limit"
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after full update: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit after full update = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

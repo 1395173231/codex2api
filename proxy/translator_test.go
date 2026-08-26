@@ -71,6 +71,65 @@ func TestTranslateRequestAcceptsParallelToolResults(t *testing.T) {
 	}
 }
 
+func TestTranslateRequestPreservesChatFileContentParts(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"summarize these"},
+			{"type":"file","file":{"filename":"report.pdf","file_data":"data:application/pdf;base64,JVBERg=="}},
+			{"type":"file","file":{"file_id":"file_abc"}},
+			{"type":"file","file":{"filename":"empty.pdf"}}
+		]}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := gjson.GetBytes(got, "input.0.content").Array()
+	if len(parts) != 3 {
+		t.Fatalf("content part count = %d, want 3; body=%s", len(parts), got)
+	}
+	if parts[1].Get("type").String() != "input_file" ||
+		parts[1].Get("filename").String() != "report.pdf" ||
+		parts[1].Get("file_data").String() != "data:application/pdf;base64,JVBERg==" {
+		t.Fatalf("file_data part mismatch: %s", parts[1].Raw)
+	}
+	if parts[2].Get("type").String() != "input_file" || parts[2].Get("file_id").String() != "file_abc" {
+		t.Fatalf("file_id part mismatch: %s", parts[2].Raw)
+	}
+}
+
+func TestTranslateRequestDropsMalformedToolCallHistoryAsPair(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"user","content":"start"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_good","type":"function","function":{"name":"good","arguments":""}},
+				{"id":"call_bad","type":"function","function":{"name":"bad","arguments":"{\"cmd\":\"unterminated"}}
+			]},
+			{"role":"tool","tool_call_id":"call_bad","content":"poison"},
+			{"role":"tool","tool_call_id":"call_good","content":"ok"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "call_bad") || strings.Contains(string(got), "poison") {
+		t.Fatalf("malformed call and output should be removed together: %s", got)
+	}
+	if args := gjson.GetBytes(got, "input.1.arguments").String(); args != "{}" {
+		t.Fatalf("blank valid arguments = %q, want {}; body=%s", args, got)
+	}
+	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_good" {
+		t.Fatalf("valid parallel tool output was not preserved: %s", got)
+	}
+}
+
 func TestTranslateChatToResponsesForGrokPreservesControls(t *testing.T) {
 	raw := []byte(`{
 		"model":"grok-4.5",
@@ -176,13 +235,17 @@ func TestResolveBillingServiceTier(t *testing.T) {
 		requested string
 		want      string
 	}{
-		{name: "actual priority wins", actual: "priority", requested: "fast", want: "priority"},
+		{name: "actual priority keeps requested priority", actual: "priority", requested: "fast", want: "priority"},
 		{name: "actual default wins when requested fast downgrades", actual: "default", requested: "fast", want: "default"},
-		{name: "actual unknown tier wins when requested fast", actual: "burst", requested: "fast", want: "burst"},
-		{name: "upstream concrete tier wins when client did not request fast", actual: "burst", requested: "", want: "burst"},
+		{name: "unknown observation cannot lower requested fast", actual: "burst", requested: "fast", want: "priority"},
+		{name: "upstream priority cannot raise untiered request", actual: "priority", requested: "", want: ""},
+		{name: "upstream unknown cannot raise untiered request", actual: "burst", requested: "", want: ""},
+		{name: "upstream default keeps untiered request at base", actual: "default", requested: "", want: ""},
+		{name: "upstream default cannot raise requested flex", actual: "default", requested: "flex", want: "flex"},
+		{name: "upstream flex lowers requested priority", actual: "flex", requested: "priority", want: "flex"},
 		{name: "requested fast fallback bills priority", actual: "", requested: "fast", want: "priority"},
 		{name: "requested priority fallback bills priority", actual: "", requested: "priority", want: "priority"},
-		{name: "default stays default", actual: "default", requested: "", want: "default"},
+		{name: "case and whitespace normalized", actual: " DEFAULT ", requested: " Fast ", want: "default"},
 	}
 
 	for _, tt := range tests {
@@ -203,7 +266,7 @@ func TestResolveBillingServiceTierRequestedPolicy(t *testing.T) {
 	}{
 		{name: "requested fast bills priority when upstream downgrades", actual: "default", requested: "fast", want: "priority"},
 		{name: "requested priority bills priority when upstream downgrades", actual: "default", requested: "priority", want: "priority"},
-		{name: "actual tier fallback when no requested tier", actual: "default", requested: "", want: "default"},
+		{name: "no requested tier stays base", actual: "priority", requested: "", want: ""},
 	}
 
 	for _, tt := range tests {
@@ -3100,8 +3163,11 @@ func TestStreamTranslator_FunctionCall(t *testing.T) {
 		"arguments":"{\"city\":\"NYC\"}"
 	}`)
 	chunk, done = st.Translate(doneEvent)
-	if done || chunk != nil {
-		t.Fatal("function_call_arguments.done should be ignored")
+	if done || chunk == nil {
+		t.Fatal("function_call_arguments.done should emit the canonical missing suffix")
+	}
+	if suffix := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); suffix != `"NYC"}` {
+		t.Fatalf("canonical arguments suffix = %q, want %q", suffix, `"NYC"}`)
 	}
 
 	// 4. response.completed
@@ -3262,6 +3328,66 @@ func TestChatStreamTranslationDistinguishesFailedTerminal(t *testing.T) {
 	}
 }
 
+func TestStreamTranslatorRejectsMalformedFunctionArgumentsBeforeSuccess(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+	st.Translate([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":3,
+		"item":{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"exec","arguments":""}
+	}`))
+	st.Translate([]byte(`{"type":"response.function_call_arguments.delta","output_index":3,"delta":"{\"cmd\":\"unterminated"}`))
+
+	result := st.TranslateParsedResult(gjson.Parse(
+		`{"type":"response.function_call_arguments.done","output_index":3,"arguments":"{\"cmd\":\"unterminated"}`,
+	))
+	if !result.Terminal || !result.Failed {
+		t.Fatalf("malformed done result = %#v", result)
+	}
+	if !gjson.GetBytes(result.Chunk, "error").Exists() || st.ToolArgumentsError() == nil {
+		t.Fatalf("malformed call should produce an explicit protocol error: %s", result.Chunk)
+	}
+}
+
+func TestStreamTranslatorKeepsValidToolCallAtOutputLimit(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+	st.Translate([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":2,
+		"item":{"type":"function_call","id":"fc_ok","call_id":"call_ok","name":"exec","arguments":""}
+	}`))
+	st.Translate([]byte(`{"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"cmd\":\"ls\"}"}`))
+	chunk, done := st.Translate([]byte(`{"type":"response.function_call_arguments.done","output_index":2,"arguments":"{\"cmd\":\"ls\"}"}`))
+	if done || chunk != nil {
+		t.Fatalf("matching done event should not duplicate arguments: done=%v chunk=%s", done, chunk)
+	}
+
+	result := st.TranslateParsedResult(gjson.Parse(
+		`{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}`,
+	))
+	if !result.Terminal || result.Failed {
+		t.Fatalf("valid tool call at limit should remain a successful incomplete result: %#v", result)
+	}
+	if reason := gjson.GetBytes(result.Chunk, "choices.0.finish_reason").String(); reason != "length" {
+		t.Fatalf("finish_reason = %q, want length; chunk=%s", reason, result.Chunk)
+	}
+}
+
+func TestStreamTranslatorEmitsCanonicalArgumentsMissingFromDeltas(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+	st.Translate([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"function_call","id":"fc_ok","call_id":"call_ok","name":"exec","arguments":""}
+	}`))
+	chunk, done := st.Translate([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_ok","call_id":"call_ok","name":"exec","arguments":"{}"}}`))
+	if done {
+		t.Fatal("output_item.done should not terminate the response")
+	}
+	if args := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); args != "{}" {
+		t.Fatalf("canonical missing arguments delta = %q, want {}; chunk=%s", args, chunk)
+	}
+}
+
 func TestStreamTranslator_TextOnly(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
@@ -3382,6 +3508,32 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 	}
 }
 
+func TestExtractToolCallsFromOutputValidatedRejectsMalformedOrdinaryCall(t *testing.T) {
+	event := []byte(`{"type":"response.completed","response":{"output":[
+		{"type":"function_call","call_id":"call_bad","name":"exec","arguments":"{\"cmd\":"},
+		{"type":"custom_tool_call","call_id":"call_custom","name":"raw","input":"not-json"}
+	]}}`)
+
+	if calls, err := ExtractToolCallsFromOutputValidated(event); err == nil || calls != nil {
+		t.Fatalf("calls=%v err=%v, want malformed ordinary call error", calls, err)
+	}
+}
+
+func TestExtractToolCallsFromOutputValidatedNormalizesBlankAndKeepsCustom(t *testing.T) {
+	event := []byte(`{"type":"response.completed","response":{"output":[
+		{"type":"function_call","call_id":"call_empty","name":"noop","arguments":""},
+		{"type":"custom_tool_call","call_id":"call_custom","name":"raw","input":"not-json"}
+	]}}`)
+
+	calls, err := ExtractToolCallsFromOutputValidated(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[0].Arguments != "{}" || calls[1].Arguments != "not-json" {
+		t.Fatalf("validated calls mismatch: %+v", calls)
+	}
+}
+
 // issue #330：上游要求 tool_search_call.arguments 为 object、function_call.arguments
 // 为 string；回放历史时类型不符会被上游 400 拒绝，需在发送前修正。
 func TestNormalizeResponsesToolCallArgumentTypes(t *testing.T) {
@@ -3436,6 +3588,40 @@ func TestNormalizeResponsesToolCallArgumentTypes(t *testing.T) {
 	}
 	if items[5].Get("arguments").String() != "not-json" {
 		t.Fatalf("unparseable tool_search_call arguments should be left as-is: %s", items[5].Raw)
+	}
+}
+
+func TestPrepareResponsesBodyDropsMalformedOrdinaryFunctionCallPair(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"bad","name":"exec","arguments":"{\"cmd\":"},
+			{"type":"function_call_output","call_id":"bad","output":"poison"},
+			{"type":"function_call","call_id":"empty","name":"noop","arguments":""},
+			{"type":"function_call_output","call_id":"empty","output":"ok"},
+			{"type":"custom_tool_call","call_id":"custom","name":"shell","input":"not-json"},
+			{"type":"custom_tool_call_output","call_id":"custom","output":"custom-ok"},
+			{"type":"tool_search_call","call_id":"search","arguments":{"query":"weather"}},
+			{"type":"tool_search_call_output","call_id":"search","output":"sunny"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"call_id":"bad"`) || strings.Contains(string(got), "poison") {
+		t.Fatalf("malformed ordinary function call pair survived: %s", got)
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 6 {
+		t.Fatalf("input count = %d, want 6; body=%s", len(items), got)
+	}
+	if args := items[0].Get("arguments").String(); args != "{}" {
+		t.Fatalf("blank ordinary function arguments = %q, want {}", args)
+	}
+	if input := items[2].Get("input").String(); input != "not-json" {
+		t.Fatalf("custom tool free-form input was changed: %s", items[2].Raw)
+	}
+	if !items[4].Get("arguments").IsObject() {
+		t.Fatalf("tool_search arguments should remain an object: %s", items[4].Raw)
 	}
 }
 

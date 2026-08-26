@@ -1234,7 +1234,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 			response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 			response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
-			response_cache_config_generation BIGINT NOT NULL DEFAULT 1
+			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
+			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608
 		);
 	CREATE TABLE IF NOT EXISTS api_key_scope_counters (
 		api_key_id BIGINT NOT NULL,
@@ -1291,6 +1292,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_spread BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -2123,6 +2125,34 @@ func NormalizeSiteName(value string) string {
 	return value
 }
 
+const (
+	DefaultModelsListReadMaxBytes int64 = 8 << 20
+	MinModelsListReadMaxBytes     int64 = 1 << 20
+	MaxModelsListReadMaxBytes     int64 = 256 << 20
+)
+
+// ValidateModelsListReadMaxBytes 校验模型列表响应的最大读取字节数。
+func ValidateModelsListReadMaxBytes(value int64) error {
+	if value < MinModelsListReadMaxBytes || value > MaxModelsListReadMaxBytes {
+		return fmt.Errorf("models_list_read_max_bytes 必须在 %d 到 %d 字节之间", MinModelsListReadMaxBytes, MaxModelsListReadMaxBytes)
+	}
+	return nil
+}
+
+// NormalizeModelsListReadMaxBytes 把缺失或越界旧值收敛到安全范围。
+func NormalizeModelsListReadMaxBytes(value int64) int64 {
+	if value <= 0 {
+		return DefaultModelsListReadMaxBytes
+	}
+	if value < MinModelsListReadMaxBytes {
+		return MinModelsListReadMaxBytes
+	}
+	if value > MaxModelsListReadMaxBytes {
+		return MaxModelsListReadMaxBytes
+	}
+	return value
+}
+
 // SystemSettings 运行时设置项
 type SystemSettings struct {
 	SiteName                           string
@@ -2165,6 +2195,7 @@ type SystemSettings struct {
 	SessionAffinitySpread              bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
 	SessionSlotBufferEnabled           bool   // 成功请求结束后为原会话短暂保留并发槽
 	SessionSlotBufferSeconds           int    // 会话并发槽缓冲时间，默认 10 秒，范围 1..60
+	ModelsListReadMaxBytes             int64  // 上游 /models 与 Codex 模型清单的最大读取字节数，默认 8 MiB
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
 	PromptFilterEnabled                bool
@@ -2481,7 +2512,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_overload_pause_minutes, 30),
 		       COALESCE(codex_overload_window_minutes, 5),
 		       COALESCE(session_slot_buffer_enabled, false),
-		       COALESCE(session_slot_buffer_seconds, 10)
+		       COALESCE(session_slot_buffer_seconds, 10),
+		       COALESCE(models_list_read_max_bytes, 8388608)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2559,6 +2591,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOverloadWindowMinutes,
 		&s.SessionSlotBufferEnabled,
 		&s.SessionSlotBufferSeconds,
+		&s.ModelsListReadMaxBytes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2595,6 +2628,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
+	s.ModelsListReadMaxBytes = NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes)
 	s.SchedulerEngine = NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled)
 	s.FastSchedulerEnabled = s.SchedulerEngine != "legacy"
 	return s, err
@@ -2983,6 +3017,20 @@ func (db *DB) UpdateCodexSyncedCLIVersion(ctx context.Context, version string) e
 		ON CONFLICT (id) DO UPDATE SET
 			codex_synced_cli_version = EXCLUDED.codex_synced_cli_version
 	`, strings.TrimSpace(version))
+	return err
+}
+
+// UpdateModelsListReadMaxBytes 原子更新模型列表读取上限，不回写整行设置。
+func (db *DB) UpdateModelsListReadMaxBytes(ctx context.Context, value int64) error {
+	if err := ValidateModelsListReadMaxBytes(value); err != nil {
+		return err
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO system_settings (id, models_list_read_max_bytes)
+		VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET
+			models_list_read_max_bytes = EXCLUDED.models_list_read_max_bytes
+	`, value)
 	return err
 }
 
