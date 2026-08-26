@@ -8283,6 +8283,7 @@ type settingsResponse struct {
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
 	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
@@ -8441,6 +8442,7 @@ type updateSettingsReq struct {
 	AutoResetCreditsBeforeExpiryMin     *int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                    *bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                *bool    `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     *string  `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool    `json:"codex_force_websocket"`
 	CodexWSWeakNetworkMode              *bool    `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool    `json:"codex_ws_keepalive_enabled"`
@@ -9180,6 +9182,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
@@ -9829,7 +9832,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
-	if req.FastSchedulerEnabled != nil {
+	if req.SchedulerEngine != nil {
+		engine := strings.ToLower(strings.TrimSpace(*req.SchedulerEngine))
+		if engine != "legacy" && engine != "shadow" && engine != "indexed" {
+			writeError(c, http.StatusBadRequest, "scheduler_engine 必须是 legacy、shadow 或 indexed")
+			return
+		}
+		h.store.SetSchedulerEngine(engine)
+		log.Printf("设置已更新: scheduler_engine = %s", engine)
+	} else if req.FastSchedulerEnabled != nil {
 		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
 		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
 	}
@@ -10522,6 +10533,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
@@ -10781,6 +10793,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),

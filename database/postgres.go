@@ -1027,6 +1027,27 @@ func (db *DB) migrate(ctx context.Context) error {
 		updated_at    TIMESTAMPTZ DEFAULT NOW()
 	);
 
+	CREATE TABLE IF NOT EXISTS scheduler_outbox (
+		id          BIGSERIAL PRIMARY KEY,
+		entity_type VARCHAR(32) NOT NULL,
+		entity_id   BIGINT NOT NULL DEFAULT 0,
+		event_type  VARCHAR(32) NOT NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_scheduler_outbox_created ON scheduler_outbox(created_at, id);
+	CREATE TABLE IF NOT EXISTS maintenance_jobs (
+		entity_id BIGINT NOT NULL,
+		job_kind VARCHAR(64) NOT NULL,
+		due_at TIMESTAMPTZ NOT NULL,
+		lease_owner TEXT NOT NULL DEFAULT '',
+		lease_until TIMESTAMPTZ NULL,
+		attempts INT NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY(entity_id, job_kind)
+	);
+	CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_due ON maintenance_jobs(job_kind, due_at, entity_id);
+
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE;
@@ -1043,6 +1064,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_skip_usage_window BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 1;
 
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id                        SERIAL PRIMARY KEY,
@@ -1248,6 +1270,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_engine VARCHAR(20) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_rate_limit_retries INT DEFAULT 1;
@@ -1549,6 +1572,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	_, err := db.conn.ExecContext(ctx, query)
 	if err != nil {
 		return err
+	}
+	if err := db.installSchedulerOutboxTriggers(ctx); err != nil {
+		return fmt.Errorf("install scheduler outbox triggers: %w", err)
 	}
 
 	// 独立长超时：将已有 TIMESTAMP 列迁移为 TIMESTAMPTZ（大表 ALTER COLUMN TYPE 可能较慢）
@@ -2098,6 +2124,7 @@ type SystemSettings struct {
 	LazyMode                           bool
 	ProxyPoolEnabled                   bool
 	FastSchedulerEnabled               bool
+	SchedulerEngine                    string
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	AllowRemoteMigration               bool
@@ -2306,6 +2333,20 @@ func NormalizeSessionSlotBufferSeconds(seconds int) int {
 	return seconds
 }
 
+// NormalizeSchedulerEngine preserves the old fast_scheduler_enabled setting
+// for upgraded databases whose new scheduler_engine column is still blank.
+func NormalizeSchedulerEngine(value string, legacyFastEnabled bool) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "legacy", "shadow", "indexed":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		if legacyFastEnabled {
+			return "indexed"
+		}
+		return "legacy"
+	}
+}
+
 // GetSystemSettings 加载全局设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
@@ -2315,6 +2356,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
+		       COALESCE(scheduler_engine, ''),
 		       COALESCE(max_retries, 2),
 		       COALESCE(max_rate_limit_retries, 1),
 		       COALESCE(allow_remote_migration, false),
@@ -2420,7 +2462,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SiteName, &s.SiteLogo,
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.SchedulerEngine, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
@@ -2518,6 +2560,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
+	s.SchedulerEngine = NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled)
+	s.FastSchedulerEnabled = s.SchedulerEngine != "legacy"
 	return s, err
 }
 
@@ -2634,9 +2678,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_minutes,
 					codex_overload_window_minutes,
 					session_slot_buffer_enabled,
-					session_slot_buffer_seconds
+					session_slot_buffer_seconds,
+					scheduler_engine
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2676,10 +2721,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $117 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $118 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $118 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $119 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2750,7 +2795,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_minutes = EXCLUDED.codex_overload_pause_minutes,
 					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes,
 					session_slot_buffer_enabled = EXCLUDED.session_slot_buffer_enabled,
-					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds
+					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds,
+					scheduler_engine = EXCLUDED.scheduler_engine
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2797,6 +2843,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexOverloadWindowMinutes(s.CodexOverloadWindowMinutes),
 		s.SessionSlotBufferEnabled,
 		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
+		NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled),
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -6199,6 +6246,69 @@ func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCool
 		row.UpdatedAt, parseErr = parseDBTimeValue(updatedRaw)
 		if parseErr != nil {
 			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", parseErr)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// ListActiveModelCooldownsForAccount is the indexed, single-account variant
+// used outside batched scheduler projection refreshes.
+func (db *DB) ListActiveModelCooldownsForAccount(ctx context.Context, accountID int64) ([]*AccountModelCooldownRow, error) {
+	if accountID <= 0 {
+		return nil, nil
+	}
+	return db.ListActiveModelCooldownsForAccounts(ctx, []int64{accountID})
+}
+
+// ListActiveModelCooldownsForAccounts loads only the cooldown rows touched by
+// one scheduler-outbox batch. The consumer caps that batch at 500 account IDs,
+// so both PostgreSQL and SQLite stay comfortably within bind limits.
+func (db *DB) ListActiveModelCooldownsForAccounts(ctx context.Context, accountIDs []int64) ([]*AccountModelCooldownRow, error) {
+	accountIDs = positiveUniqueIDs(accountIDs)
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	args := make([]interface{}, 0, len(accountIDs)+1)
+	placeholders := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		args = append(args, accountID)
+		if db.isSQLite() {
+			placeholders = append(placeholders, "?")
+		} else {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+	}
+	args = append(args, db.timeArg(time.Now()))
+	resetPlaceholder := "?"
+	if !db.isSQLite() {
+		resetPlaceholder = fmt.Sprintf("$%d", len(args))
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT account_id, model, COALESCE(reason, ''), reset_at, updated_at
+		FROM account_model_cooldowns
+		WHERE account_id IN (`+strings.Join(placeholders, ",")+`) AND reset_at > `+resetPlaceholder+`
+		ORDER BY account_id, model
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("批量查询账号模型冷却失败: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*AccountModelCooldownRow
+	for rows.Next() {
+		row := &AccountModelCooldownRow{}
+		var resetRaw, updatedRaw interface{}
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.Reason, &resetRaw, &updatedRaw); err != nil {
+			return nil, err
+		}
+		row.ResetAt, err = parseDBTimeValue(resetRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 reset_at 失败: %w", err)
+		}
+		row.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", err)
 		}
 		result = append(result, row)
 	}

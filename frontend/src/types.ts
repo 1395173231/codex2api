@@ -1129,6 +1129,10 @@ export interface OpsOverviewResponse {
     used_bytes: number
     total_bytes: number
     process_bytes: number
+    container_used_bytes?: number
+    container_limit_bytes?: number
+    container_percent?: number
+    container_source?: 'cgroup' | 'process'
     heap_alloc_bytes?: number
     heap_inuse_bytes?: number
     heap_released_bytes?: number
@@ -1174,6 +1178,43 @@ export interface OpsOverviewResponse {
   requests: {
     active: number
     total: number
+  }
+  scheduler?: {
+    engine: 'legacy' | 'shadow' | 'indexed' | string
+    selection_total: number
+    selection_fast_hit: number
+    selection_slow_hit: number
+    selection_miss: number
+    selection_duration_ns: number
+    slow_scanned_accounts: number
+    wait_started: number
+    wait_wakeups: number
+    wait_timeouts: number
+    wait_canceled: number
+    waiters: number
+    availability_signals: number
+    snapshot_generation: number
+    snapshot_account_count: number
+    last_snapshot_at: ISODateString | ''
+    outbox_watermark: number
+    outbox_high_watermark: number
+    outbox_backlog: number
+    outbox_events: number
+    outbox_batches: number
+    outbox_errors: number
+    outbox_lag_ms: number
+    outbox_last_applied_at: ISODateString | ''
+    routing_cache_hits: number
+    routing_cache_misses: number
+    routing_cache_builds: number
+    routing_cache_fallbacks: number
+    routing_cache_invalidations: number
+    routing_cache_evictions: number
+    routing_cache_entries: number
+    routing_cache_accounts: number
+    shadow_checks: number
+    shadow_agreements: number
+    shadow_mismatches: number
   }
   postgres: {
     healthy: boolean
@@ -1346,6 +1387,7 @@ export interface SystemSettings {
   auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean

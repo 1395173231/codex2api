@@ -477,6 +477,46 @@ func (db *DB) ListAccountGroupMemberships(ctx context.Context) (map[int64][]int6
 	return out, rows.Err()
 }
 
+// ListAccountGroupMembershipsByAccountIDs returns the routing memberships for
+// one scheduler-outbox batch. Keeping this projection bounded avoids turning a
+// single remote account mutation into a scan of every membership in a large
+// pool.
+func (db *DB) ListAccountGroupMembershipsByAccountIDs(ctx context.Context, accountIDs []int64) (map[int64][]int64, error) {
+	accountIDs = normalizeIDSlice(accountIDs)
+	if len(accountIDs) == 0 {
+		return map[int64][]int64{}, nil
+	}
+	placeholders := make([]string, len(accountIDs))
+	args := make([]interface{}, len(accountIDs))
+	for i, id := range accountIDs {
+		if db.isSQLite() {
+			placeholders[i] = "?"
+		} else {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		args[i] = id
+	}
+	query := fmt.Sprintf(`SELECT account_id, group_id
+		FROM account_group_members
+		WHERE account_id IN (%s)
+		ORDER BY account_id, group_id`, strings.Join(placeholders, ","))
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]int64, len(accountIDs))
+	for rows.Next() {
+		var accountID, groupID int64
+		if err := rows.Scan(&accountID, &groupID); err != nil {
+			return nil, err
+		}
+		out[accountID] = append(out[accountID], groupID)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) VerifyAccountGroupIDs(ctx context.Context, ids []int64) ([]int64, error) {
 	ids = normalizeIDSlice(ids)
 	if len(ids) == 0 {

@@ -47,7 +47,8 @@ Codex2API 采用三层配置架构：
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
-| `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
+| `CODEX_SCHEDULER_ENGINE` | 否 | 空 | 调度引擎强制值：`legacy` / `shadow` / `indexed`。设置后优先于数据库配置，适合容器级灰度或紧急回退 |
+| `FAST_SCHEDULER_ENABLED` | 否 | `false` | 旧版兼容开关；未设置 `CODEX_SCHEDULER_ENGINE` 且数据库没有 `SchedulerEngine` 时，`true` 映射为 `indexed` |
 | `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
 
 ### Codex 上游稳定性配置
@@ -165,7 +166,8 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
 | `RetryIntervalMS` | int | 0 | 0-30000 | 普通重试前等待的毫秒数；`0` 保持立即重试 |
 | `TransportRetryPolicy` | string | `rotate` | `rotate` / `sticky` | 传输错误重试时换号，或保留同一账号重试 |
-| `FastSchedulerEnabled` | bool | false | - | 启用快速调度器 |
+| `SchedulerEngine` | string | `legacy` | `legacy` / `shadow` / `indexed` | 调度执行引擎；设置页可热切换，跨实例通过数据库 outbox 增量同步 |
+| `FastSchedulerEnabled` | bool | false | - | 旧版兼容字段；新部署应使用 `SchedulerEngine` |
 | `CodexForceWebsocket` | bool | false | - | 强制 Codex 上游走 WebSocket 长连接（复用连接池），更接近官方 CLI 体验；关闭时走原有 HTTP 请求 |
 | `CodexWSKeepaliveEnabled` | bool | false | - | 启用上游 WS 空闲连接保活（后台仅发 Ping，不发起新请求、不消耗账号额度） |
 | `CodexWSKeepaliveIntervalSec` | int | 60 | 10-600 | WS 保活 Ping 间隔（秒），仅在 `CodexWSKeepaliveEnabled` 开启时生效 |
@@ -176,6 +178,14 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
 
 调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
+
+调度引擎的推荐上线顺序是 `legacy → shadow → indexed`：
+
+- `legacy` 保留原有全池扫描，作为无停机回退路径。
+- `shadow` 仍由 legacy 选号，每 64 次请求抽样一次索引可用性并在运维页展示一致/差异计数；它用于短时灰度，不建议长期承载全量流量。
+- `indexed` 使用分层内存索引、稀疏 API Key 路由子池和事件驱动等待。账号数增长时，稳态选号不再复制或扫描完整账号切片。
+
+启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和调度设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。环境变量 `CODEX_SCHEDULER_ENGINE` 一旦设置，会固定本实例引擎并覆盖管理后台值。
 
 ### 测试配置
 

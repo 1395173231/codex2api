@@ -49,7 +49,17 @@
     "sessionSlotBuffer": "會話並發槽緩衝",
     "sessionSlotBufferDesc": "成功請求結束後，為原會話短暫保留帳號並發槽；同一會話可立即取回，其他新會話不能搶佔。失敗和重試仍立即釋放，正在執行的請求不會中斷。每次都產生新親和鍵的短請求也會佔用到期，因此緩衝時間越長，吞吐下降越明顯。預設關閉。",
     "sessionSlotBufferSeconds": "緩衝時間（秒）",
-    "sessionSlotBufferSecondsDesc": "成功請求結束後保留槽位的時間，範圍 1–60 秒，預設 10 秒。儲存後立即生效，無需重啟。"
+    "sessionSlotBufferSecondsDesc": "成功請求結束後保留槽位的時間，範圍 1–60 秒，預設 10 秒。儲存後立即生效，無需重啟。",
+    "schedulerEngine": "調度引擎",
+    "schedulerEngineDesc": "決定新請求如何從帳號池中選擇帳號，切換後立即生效，無需重新啟動。",
+    "schedulerEngineCompatibilityTitle": "舊版設定對應關係",
+    "schedulerEngineCompatibilityNote": "舊版「快速調度器」已合併到這裡：原來關閉對應「舊版掃描」，原來開啟對應「索引調度」；「影子校驗」是新增的切換驗證模式。下方「調度模式」仍獨立決定輪詢、剩餘配額或順序耗盡。",
+    "schedulerEngineLegacy": "舊版掃描",
+    "schedulerEngineLegacyDesc": "每次請求掃描帳號池快照並篩選、評分候選帳號。相容性最佳，可用於緊急回退；帳號越多，CPU 開銷越高。",
+    "schedulerEngineShadow": "影子校驗",
+    "schedulerEngineShadowDesc": "仍由舊版掃描實際選號，同時每 64 次請求抽樣校驗一次索引可用性。用於切換前驗證一致性，無法降低主要掃描開銷。",
+    "schedulerEngineIndexed": "索引調度",
+    "schedulerEngineIndexedDesc": "使用事件驅動的優先順序與健康狀態索引，穩態只檢查少量候選帳號，避免全池掃描。建議大型帳號池使用。"
   },
   "promptFilter": {
     "views": {"profiles":"風險畫像","intelligence":"CY 學習審核"},

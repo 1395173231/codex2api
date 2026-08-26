@@ -744,6 +744,37 @@ function SettingsCard({
   )
 }
 
+function SettingsCollapsibleNote({
+  title,
+  children,
+}: {
+  title: string
+  children: ReactNode
+}) {
+  return (
+    <details
+      role="note"
+      className="group overflow-hidden rounded-lg border border-primary/20 bg-primary/5"
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3 py-2.5 marker:content-none transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+        <CircleHelp className="size-4 shrink-0 text-primary" aria-hidden="true" />
+        <span className="min-w-0 flex-1 text-xs font-semibold text-foreground">
+          {title}
+        </span>
+        <ChevronDown
+          className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180"
+          aria-hidden="true"
+        />
+      </summary>
+      <div className="border-t border-primary/10 px-3 pb-2.5 pt-2">
+        <p className="text-[11px] leading-relaxed text-muted-foreground sm:text-xs">
+          {children}
+        </p>
+      </div>
+    </details>
+  )
+}
+
 function SettingHelp({ text }: { text: string }) {
   return (
     <TooltipProvider delayDuration={200}>
@@ -1202,6 +1233,28 @@ export default function Settings() {
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
     { label: t('settings.schedulerModeFillFirst'), value: 'fill_first' },
   ]
+  const schedulerEngineOptions = [
+    { label: t('settings.schedulerEngineLegacy'), value: 'legacy' },
+    { label: t('settings.schedulerEngineShadow'), value: 'shadow' },
+    { label: t('settings.schedulerEngineIndexed'), value: 'indexed' },
+  ]
+  const schedulerEngineExplanations = [
+    {
+      label: t('settings.schedulerEngineLegacy'),
+      value: 'legacy',
+      description: t('settings.schedulerEngineLegacyDesc'),
+    },
+    {
+      label: t('settings.schedulerEngineShadow'),
+      value: 'shadow',
+      description: t('settings.schedulerEngineShadowDesc'),
+    },
+    {
+      label: t('settings.schedulerEngineIndexed'),
+      value: 'indexed',
+      description: t('settings.schedulerEngineIndexedDesc'),
+    },
+  ]
   const transportRetryPolicyOptions = [
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
@@ -1304,6 +1357,7 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     codex_force_websocket: false,
@@ -2395,25 +2449,65 @@ export default function Settings() {
           </SettingsCard>
 
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>
-            <div className="grid gap-4 lg:grid-cols-2">
-              <div className="space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
+            <div className="grid auto-rows-min items-start gap-4 lg:grid-cols-2">
+              <div className="h-fit space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
                 <div>
                   <h3 className="text-sm font-semibold">{t('settings.schedulingAccountGroup')}</h3>
                   <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
                     {t('settings.schedulingAccountGroupDesc')}
                   </p>
                 </div>
-                <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')} layout="switch">
-                  <Switch
-                    checked={settingsForm.fast_scheduler_enabled}
-                    onCheckedChange={(checked) => autoSaveBooleanField('fast_scheduler_enabled', checked)}
+                <SettingsCollapsibleNote title={t('settings.schedulerEngineCompatibilityTitle')}>
+                  {t('settings.schedulerEngineCompatibilityNote')}
+                </SettingsCollapsibleNote>
+                <SettingField label={t('settings.schedulerEngine')} description={t('settings.schedulerEngineDesc')}>
+                  <SegmentedPillGroup
+                    value={settingsForm.scheduler_engine}
+                    onChange={(value) => autoSaveStringField('scheduler_engine', value)}
+                    options={schedulerEngineOptions}
                   />
                 </SettingField>
+                <div className="grid gap-2" role="list" aria-label={t('settings.schedulerEngine')}>
+                  {schedulerEngineExplanations.map((option) => {
+                    const active = option.value === settingsForm.scheduler_engine
+                    return (
+                      <div
+                        key={option.value}
+                        role="listitem"
+                        aria-current={active ? 'true' : undefined}
+                        className={cn(
+                          'rounded-lg border px-3 py-2.5 transition-colors',
+                          active
+                            ? 'border-primary/35 bg-primary/5'
+                            : 'border-border/50 bg-background/45',
+                        )}
+                      >
+                        <div className="flex items-start gap-2.5">
+                          <span
+                            className={cn(
+                              'mt-1.5 size-1.5 shrink-0 rounded-full',
+                              active ? 'bg-primary' : 'bg-muted-foreground/40',
+                            )}
+                            aria-hidden="true"
+                          />
+                          <div className="min-w-0">
+                            <div className={cn('text-xs font-semibold', active ? 'text-primary' : 'text-foreground')}>
+                              {option.label}
+                            </div>
+                            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground sm:text-xs">
+                              {option.description}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
                 <SettingField
                   label={t('settings.schedulerMode')}
                   description={t('settings.schedulerModeDesc')}
-                  warning={settingsForm.fast_scheduler_enabled ? undefined : t('settings.schedulerModeRequiresFast')}
-                  className={cn(!settingsForm.fast_scheduler_enabled && 'opacity-60')}
+                  warning={settingsForm.scheduler_engine !== 'legacy' ? undefined : t('settings.schedulerModeRequiresFast')}
+                  className={cn(settingsForm.scheduler_engine === 'legacy' && 'opacity-60')}
                 >
                   <SegmentedPillGroup
                     value={settingsForm.scheduler_mode}
@@ -2423,7 +2517,7 @@ export default function Settings() {
                 </SettingField>
               </div>
 
-              <div className="space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
+              <div className="h-fit space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
                 <div>
                   <h3 className="text-sm font-semibold">{t('settings.schedulingAffinityGroup')}</h3>
                   <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
