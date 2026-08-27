@@ -1379,6 +1379,8 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    subscription_upgrades_enabled: false,
+    subscription_upgrades_env_default: false,
     scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
@@ -2692,6 +2694,30 @@ export default function Settings() {
               <Switch
                 checked={Boolean(settingsForm.auto_activate_5h_window_enabled)}
                 onCheckedChange={(checked) => autoSaveBooleanField('auto_activate_5h_window_enabled', checked)}
+              />
+            </SettingField>
+          </SettingsCard>
+
+          <SettingsCard
+            title={t('settings.subscriptionUpgradesTitle')}
+            description={t('settings.subscriptionUpgradesDesc')}
+            icon={<ShieldAlert className="size-4" />}
+          >
+            <SettingsCollapsibleNote title={t('settings.subscriptionUpgradesWarningTitle')}>
+              {t('settings.subscriptionUpgradesWarningNote')}
+            </SettingsCollapsibleNote>
+            <SettingField
+              label={t('settings.subscriptionUpgradesEnabled')}
+              description={
+                settingsForm.subscription_upgrades_env_default
+                  ? t('settings.subscriptionUpgradesEnabledEnvDesc')
+                  : t('settings.subscriptionUpgradesEnabledDesc')
+              }
+              layout="switch"
+            >
+              <Switch
+                checked={Boolean(settingsForm.subscription_upgrades_enabled)}
+                onCheckedChange={(checked) => autoSaveBooleanField('subscription_upgrades_enabled', checked)}
               />
             </SettingField>
           </SettingsCard>

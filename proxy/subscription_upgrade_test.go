@@ -126,3 +126,33 @@ func TestSubscriptionUpgradeClientSubmitOmitsEmptyPaymentMethodAndStopsFor3DS(t 
 		t.Fatalf("POST count = %d, want exactly one", postCount)
 	}
 }
+
+// 上游定价配置给的是主单位金额，硬编码 ×100 会让无小数币种的展示价差 100 倍。
+func TestSubscriptionUpgradeClientQuoteHandlesZeroDecimalCurrency(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/subscriptions/update/preview":
+			_, _ = w.Write([]byte(`{"currency":"jpy","amount_due":{"amount":4500,"currency":"jpy"}}`))
+		case "/backend-api/checkout_pricing_config/configs/JPY":
+			_, _ = w.Write([]byte(`{"currency_config":{"pro":{"month":{"amount":30000}}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewSubscriptionUpgradeClient(server.URL, server.Client())
+	quote, err := client.Quote(context.Background(), SubscriptionUpgradeCredentials{
+		AccessToken: "test-at", WorkspaceID: testWorkspaceUUID,
+	}, "chatgptpro", "JPY")
+	if err != nil {
+		t.Fatalf("Quote: %v", err)
+	}
+	// JPY 无小数位：¥30,000/月的最小单位就是 30000，不是 3000000。
+	if quote.RecurringAmountMinor != 30000 {
+		t.Fatalf("recurring amount = %d, want 30000", quote.RecurringAmountMinor)
+	}
+	if quote.AmountDueMinor != 4500 || quote.Currency != "JPY" {
+		t.Fatalf("amount due = %s %d, want JPY 4500", quote.Currency, quote.AmountDueMinor)
+	}
+}

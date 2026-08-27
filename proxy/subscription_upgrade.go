@@ -138,7 +138,7 @@ func (c *SubscriptionUpgradeClient) Quote(ctx context.Context, credentials Subsc
 	quote := &SubscriptionUpgradeQuote{
 		Currency:             quoteCurrency,
 		AmountDueMinor:       amountDue,
-		RecurringAmountMinor: int64(math.Round(monthly.Amount * 100)),
+		RecurringAmountMinor: int64(math.Round(monthly.Amount * float64(currencyMinorUnitFactor(quoteCurrency)))),
 		TaxAmountMinor:       preview.TaxAmount,
 		RenewalDate:          preview.RenewalDate,
 		LineItems:            make([]SubscriptionUpgradeLineItem, 0, len(preview.LineItems)),
@@ -236,6 +236,22 @@ func responseRequiresUserAction(value any, depth int) bool {
 		}
 	}
 	return false
+}
+
+// currencyMinorUnitFactor 返回主单位换算成最小单位的倍数。上游定价配置给的是
+// 主单位金额，硬编码 ×100 会让 JPY/KRW 这类无小数币种的展示价差 100 倍。
+// 注意这只影响展示用的 recurring 价格：金额上限校验用的是上游 preview 的原始
+// 最小单位数值，不经过这里。
+func currencyMinorUnitFactor(currency string) int64 {
+	switch strings.ToUpper(strings.TrimSpace(currency)) {
+	case "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG",
+		"RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF":
+		return 1
+	case "BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND":
+		return 1000
+	default:
+		return 100
+	}
 }
 
 func targetPricingPlanKey(targetPlan string) string {

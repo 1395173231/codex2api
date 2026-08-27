@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -40,13 +41,49 @@ type subscriptionUpgradeQuoteRecord struct {
 	ExpiresAt      time.Time
 }
 
+// subscriptionUpgradeFeatureEnabled 读取环境变量默认值。它只在管理员从未在后台
+// 显式设置过开关时生效；一旦后台保存过，数据库值就是唯一权威。
 func subscriptionUpgradeFeatureEnabled() bool {
 	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("CODEX2API_SUBSCRIPTION_UPGRADES_ENABLED")))
 	return err == nil && enabled
 }
 
+// initSubscriptionUpgradeGate 以环境变量为初值，再用数据库里管理员保存过的值覆盖。
+func (h *Handler) initSubscriptionUpgradeGate() {
+	if h == nil {
+		return
+	}
+	h.subscriptionUpgradeEnvDefault = subscriptionUpgradeFeatureEnabled()
+	h.subscriptionUpgradeEnabled.Store(h.subscriptionUpgradeEnvDefault)
+	if h.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stored, err := h.db.LoadSubscriptionUpgradesEnabled(ctx)
+	if err != nil {
+		log.Printf("加载订阅升级开关失败，暂用环境变量默认值 %t: %v", h.subscriptionUpgradeEnvDefault, err)
+		return
+	}
+	if stored != nil {
+		h.subscriptionUpgradeEnabled.Store(*stored)
+	}
+}
+
+// setSubscriptionUpgradeEnabled 热更新本进程的开关（跨实例不同步，与其余设置一致）。
+func (h *Handler) setSubscriptionUpgradeEnabled(enabled bool) {
+	if h == nil {
+		return
+	}
+	h.subscriptionUpgradeEnabled.Store(enabled)
+}
+
+func (h *Handler) subscriptionUpgradesEnabled() bool {
+	return h != nil && h.subscriptionUpgradeEnabled.Load()
+}
+
 func (h *Handler) subscriptionUpgradeReady(c *gin.Context) bool {
-	if h == nil || !h.subscriptionUpgradeEnabled {
+	if !h.subscriptionUpgradesEnabled() {
 		c.JSON(http.StatusNotFound, gin.H{"error": "subscription upgrade feature is disabled"})
 		return false
 	}
@@ -208,6 +245,14 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read upgrade operation journal"})
 		return
 	}
+	// 账号级互斥必须先于报价查验。若放在查验之后，两个带不同幂等键、引用同一份
+	// 报价的并发请求会各自拿到一份报价拷贝，然后串行进入付费段各发一次付费 POST：
+	// 幂等键不同，数据库唯一约束拦不住，结果是真实双重扣款。
+	lockValue, _ := h.subscriptionUpgradeLocks.LoadOrStore(account.DBID, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
 	h.subscriptionUpgradeQuoteMu.Lock()
 	quote, exists := h.subscriptionUpgradeQuotes[request.QuoteID]
 	if exists && time.Now().After(quote.ExpiresAt) {
@@ -219,10 +264,6 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "upgrade quote is missing or expired"})
 		return
 	}
-	lockValue, _ := h.subscriptionUpgradeLocks.LoadOrStore(account.DBID, &sync.Mutex{})
-	lock := lockValue.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
 
 	credentials := subscriptionUpgradeCredentials(account)
 	client := h.subscriptionUpgradeClientFactory(account, account.GetProxyURL())
@@ -244,7 +285,7 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 	operation := database.SubscriptionUpgradeOperation{
 		ID: uuid.NewString(), AccountID: account.DBID, IdempotencyKeyHash: keyHash,
 		SourcePlan: quote.SourcePlan, TargetPlan: quote.TargetPlan, Currency: confirmedCurrency,
-		AmountDueMinor: fresh.AmountDueMinor, Status: "submitting",
+		AmountDueMinor: fresh.AmountDueMinor, Status: database.SubscriptionUpgradeStatusSubmitting,
 	}
 	if err := h.db.CreateSubscriptionUpgradeOperation(c.Request.Context(), operation); err != nil {
 		if errors.Is(err, database.ErrSubscriptionUpgradeIdempotencyConflict) {
@@ -253,6 +294,11 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 				c.JSON(http.StatusOK, existing)
 				return
 			}
+		}
+		// 跨实例闸门：另一个实例已为该账号写下在途行，这里不能再发付费 POST。
+		if errors.Is(err, database.ErrSubscriptionUpgradeInFlight) {
+			c.JSON(http.StatusConflict, gin.H{"error": "another paid upgrade for this account is still in flight; reconcile that operation before starting a new one"})
+			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upgrade operation journal"})
 		return
@@ -269,17 +315,22 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 		TargetPlan: quote.TargetPlan, FlowID: uuid.NewString(), MutationID: uuid.NewString(),
 		IdempotencyKey: idempotencyKey, PaymentMethodID: fresh.PaymentMethodID,
 	})
+	// 付费 POST 一旦发出，后续所有落库和只读校验都必须脱离请求 context：
+	// ambiguous_transport 恰恰就是连接中断的场景，继续用已取消的请求 context
+	// 会让最需要留痕的那条记录静默丢失，操作永远停在 submitting。
+	postCtx, cancelPostCtx := subscriptionUpgradePostPaymentContext()
+	defer cancelPostCtx()
 	if submitErr != nil {
-		h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, "ambiguous_transport", "paid submission outcome is ambiguous; do not retry", 0)
-		h.respondSubscriptionUpgradeOperation(c, operation.ID, http.StatusAccepted)
+		h.updateSubscriptionUpgradeOperation(postCtx, operation.ID, "ambiguous_transport", "paid submission outcome is ambiguous; do not retry", 0)
+		h.respondSubscriptionUpgradeOperation(c, postCtx, operation.ID, http.StatusAccepted)
 		return
 	}
 	if result != nil && result.RequiresUserAction {
-		h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, "requires_user_action", "complete upstream payment authentication before verification", http.StatusOK)
-		h.respondSubscriptionUpgradeOperation(c, operation.ID, http.StatusAccepted)
+		h.updateSubscriptionUpgradeOperation(postCtx, operation.ID, "requires_user_action", "complete upstream payment authentication before verification", http.StatusOK)
+		h.respondSubscriptionUpgradeOperation(c, postCtx, operation.ID, http.StatusAccepted)
 		return
 	}
-	verified, verifyErr := client.Read(c.Request.Context(), credentials)
+	verified, verifyErr := client.Read(postCtx, credentials)
 	status, detail := "verification_pending", "paid submission accepted; upstream entitlement not yet observed"
 	if verifyErr == nil && verified != nil && strings.EqualFold(verified.PlanType, quote.ExpectedPlan) {
 		status, detail = "succeeded", "upstream entitlement verified"
@@ -289,11 +340,11 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 		// Re-saving the invalidated AT/RT cannot. Refresh at most once and only
 		// re-run the read-only verification; the paid POST is never repeated.
 		if account.HasSessionToken() && h.refreshAccount != nil {
-			if refreshErr := h.refreshAccount(c.Request.Context(), account.DBID); refreshErr == nil {
+			if refreshErr := h.refreshAccount(postCtx, account.DBID); refreshErr == nil {
 				refreshedAccount := h.store.FindByID(account.DBID)
 				if refreshedAccount != nil {
 					refreshedClient := h.subscriptionUpgradeClientFactory(refreshedAccount, refreshedAccount.GetProxyURL())
-					refreshedSubscription, refreshedErr := refreshedClient.Read(c.Request.Context(), subscriptionUpgradeCredentials(refreshedAccount))
+					refreshedSubscription, refreshedErr := refreshedClient.Read(postCtx, subscriptionUpgradeCredentials(refreshedAccount))
 					if refreshedErr == nil && refreshedSubscription != nil && strings.EqualFold(refreshedSubscription.PlanType, quote.ExpectedPlan) {
 						status, detail = "succeeded", "upstream entitlement verified after silent reauthorization from the stored web session"
 					}
@@ -301,8 +352,8 @@ func (h *Handler) CreateSubscriptionUpgrade(c *gin.Context) {
 			}
 		}
 	}
-	h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, status, detail, http.StatusOK)
-	h.respondSubscriptionUpgradeOperation(c, operation.ID, http.StatusAccepted)
+	h.updateSubscriptionUpgradeOperation(postCtx, operation.ID, status, detail, http.StatusOK)
+	h.respondSubscriptionUpgradeOperation(c, postCtx, operation.ID, http.StatusAccepted)
 }
 
 func subscriptionUpgradeIdempotencyHash(key string) string {
@@ -310,22 +361,85 @@ func subscriptionUpgradeIdempotencyHash(key string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// subscriptionUpgradePostPaymentContext 返回脱离请求生命周期的 context，供付费
+// POST 之后的落库与只读校验使用。
+func subscriptionUpgradePostPaymentContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+// subscriptionUpgradeUnauthorized 只认 401。chatgpt.com 的 403 多数是 Cloudflare
+// 盾误伤而非凭据被作废，把它报成「上游已接受付费并作废了凭据族」会误导对账；
+// 403 落到 verification_pending 更符合实际，管理员可用对账端点复核。
 func subscriptionUpgradeUnauthorized(err error) bool {
 	var upstreamErr *proxy.SubscriptionUpstreamHTTPError
-	return errors.As(err, &upstreamErr) && (upstreamErr.StatusCode == http.StatusUnauthorized || upstreamErr.StatusCode == http.StatusForbidden)
+	return errors.As(err, &upstreamErr) && upstreamErr.StatusCode == http.StatusUnauthorized
 }
 
 func (h *Handler) updateSubscriptionUpgradeOperation(ctx context.Context, id, status, detail string, httpStatus int) {
-	_ = h.db.UpdateSubscriptionUpgradeOperation(ctx, id, status, detail, httpStatus)
+	if err := h.db.UpdateSubscriptionUpgradeOperation(ctx, id, status, detail, httpStatus); err != nil {
+		// 付费已经发生，日志是唯一剩下的线索，绝不能静默吞掉。
+		log.Printf("订阅升级操作 %s 落库失败(status=%s detail=%q): %v", id, status, detail, err)
+	}
 }
 
-func (h *Handler) respondSubscriptionUpgradeOperation(c *gin.Context, id string, status int) {
-	operation, err := h.db.GetSubscriptionUpgradeOperation(c.Request.Context(), id)
+func (h *Handler) respondSubscriptionUpgradeOperation(c *gin.Context, ctx context.Context, id string, status int) {
+	operation, err := h.db.GetSubscriptionUpgradeOperation(ctx, id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read upgrade operation journal"})
 		return
 	}
 	c.JSON(status, operation)
+}
+
+// VerifySubscriptionUpgradeOperation 是只读对账出口：重新读取上游订阅，把已经
+// 生效的升级从 submitting/ambiguous_transport/verification_* 推进到终态。它永远
+// 不会重发付费 POST，也是把卡在 submitting 的账号从在途闸门里解出来的唯一途径。
+func (h *Handler) VerifySubscriptionUpgradeOperation(c *gin.Context) {
+	if !h.subscriptionUpgradeReady(c) {
+		return
+	}
+	operationID := strings.TrimSpace(c.Param("operation_id"))
+	operation, err := h.db.GetSubscriptionUpgradeOperation(c.Request.Context(), operationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription upgrade operation not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read upgrade operation journal"})
+		return
+	}
+	if operation.Status == "succeeded" {
+		c.JSON(http.StatusOK, operation)
+		return
+	}
+	account := h.store.FindByID(operation.AccountID)
+	if account == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "account for this operation no longer exists"})
+		return
+	}
+	expectedPlan, _ := subscriptionUpgradeTransition(operation.SourcePlan, operation.TargetPlan)
+	if expectedPlan == "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "operation records an unsupported subscription transition"})
+		return
+	}
+	client := h.subscriptionUpgradeClientFactory(account, account.GetProxyURL())
+	subscription, readErr := client.Read(c.Request.Context(), subscriptionUpgradeCredentials(account))
+	switch {
+	case readErr == nil && subscription != nil && strings.EqualFold(subscription.PlanType, expectedPlan):
+		h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, "succeeded",
+			"upstream entitlement verified by admin reconciliation", operation.SubmitHTTPStatus)
+	case subscriptionUpgradeUnauthorized(readErr):
+		h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, "verification_requires_reauthentication",
+			"upstream still rejects the OAuth credential family; reauthorize the account, then reconcile again without repeating payment",
+			operation.SubmitHTTPStatus)
+	case readErr != nil:
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read upstream subscription for reconciliation"})
+		return
+	default:
+		h.updateSubscriptionUpgradeOperation(c.Request.Context(), operation.ID, "verification_pending",
+			"reconciliation did not observe the target entitlement yet; do not repeat payment", operation.SubmitHTTPStatus)
+	}
+	h.respondSubscriptionUpgradeOperation(c, c.Request.Context(), operation.ID, http.StatusOK)
 }
 
 func (h *Handler) GetSubscriptionUpgradeOperation(c *gin.Context) {

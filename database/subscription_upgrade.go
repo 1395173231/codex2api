@@ -4,10 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 var ErrSubscriptionUpgradeIdempotencyConflict = errors.New("subscription upgrade idempotency key already exists")
+
+// ErrSubscriptionUpgradeInFlight 表示同一账号已有一次付费提交尚未落定。
+var ErrSubscriptionUpgradeInFlight = errors.New("subscription upgrade already in flight for this account")
+
+// SubscriptionUpgradeStatusSubmitting 是付费 POST 前写入的前置状态。它同时充当
+// 跨实例互斥：部分唯一索引保证同一账号只能存在一行 submitting。
+const SubscriptionUpgradeStatusSubmitting = "submitting"
+
+// 部分唯一索引名，用于把唯一冲突和幂等键冲突区分开。
+const subscriptionUpgradeInFlightIndex = "subscription_upgrade_operations_inflight_idx"
 
 // SubscriptionUpgradeOperation is an append-oriented payment journal. It must
 // contain no OAuth credentials, cookies, payment method IDs, or card data.
@@ -62,7 +73,30 @@ func (db *DB) ensureSubscriptionUpgradeSchema(ctx context.Context) error {
 	if _, err := db.conn.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("create subscription upgrade operation table: %w", err)
 	}
+	// 同一账号同时只允许一行 submitting。进程内互斥挡不住多实例，这个部分唯一
+	// 索引才是真正原子的双重扣款闸门：第二个实例插不进去，也就发不出第二次付费。
+	if _, err := db.conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS `+
+		subscriptionUpgradeInFlightIndex+` ON subscription_upgrade_operations (account_id)
+		WHERE status = '`+SubscriptionUpgradeStatusSubmitting+`'`); err != nil {
+		return fmt.Errorf("create subscription upgrade in-flight index: %w", err)
+	}
 	return nil
+}
+
+// isSubscriptionUpgradeInFlightConflict 识别在途唯一索引冲突。两种驱动的报错形态
+// 不同：Postgres 会带上索引名，SQLite 的部分唯一索引只报到列名，必须分别匹配。
+// 复合幂等约束的冲突已被 ON CONFLICT 吞掉，这里再按列名把它排除掉以防误判。
+func isSubscriptionUpgradeInFlightConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	if strings.Contains(message, subscriptionUpgradeInFlightIndex) {
+		return true
+	}
+	return strings.Contains(message, "UNIQUE constraint failed") &&
+		strings.Contains(message, "subscription_upgrade_operations.account_id") &&
+		!strings.Contains(message, "idempotency_key_hash")
 }
 
 func (db *DB) CreateSubscriptionUpgradeOperation(ctx context.Context, operation SubscriptionUpgradeOperation) error {
@@ -79,6 +113,10 @@ func (db *DB) CreateSubscriptionUpgradeOperation(ctx context.Context, operation 
 			operation.Detail,
 		)
 		if err != nil {
+			// ON CONFLICT 只覆盖幂等键那一个约束，在途索引的冲突会以普通错误抛出。
+			if isSubscriptionUpgradeInFlightConflict(err) {
+				return ErrSubscriptionUpgradeInFlight
+			}
 			return err
 		}
 		rows, err := result.RowsAffected()
