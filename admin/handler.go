@@ -211,6 +211,13 @@ func validateResponseCacheSettingsUpdateRanges(update database.ResponseCacheSett
 			database.MinResponseCacheReconstructMaxBytes,
 			database.MaxResponseCacheReconstructMaxBytes,
 		)
+	case update.WritePolicy != nil && !database.ValidResponseCacheWritePolicy(*update.WritePolicy):
+		return fmt.Errorf(
+			"%w: response_cache_write_policy must be %q or %q",
+			database.ErrInvalidResponseCacheSettings,
+			database.ResponseCacheWritePolicyAlways,
+			database.ResponseCacheWritePolicyOnDemand,
+		)
 	default:
 		return nil
 	}
@@ -8502,6 +8509,7 @@ type settingsResponse struct {
 	ResponseCacheLocalMaxBytes         int64                            `json:"response_cache_local_max_bytes"`
 	ResponseCacheLocalMaxEntryBytes    int64                            `json:"response_cache_local_max_entry_bytes"`
 	ResponseCacheReconstructMaxBytes   int64                            `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy           string                           `json:"response_cache_write_policy"`
 	ResponseCacheConfigGeneration      int64                            `json:"response_cache_config_generation"`
 	RelayModelCooldownMode             string                           `json:"relay_model_cooldown_mode"`
 	RelayModelCooldownSeconds          int                              `json:"relay_model_cooldown_seconds"`
@@ -8662,6 +8670,7 @@ type updateSettingsReq struct {
 	ResponseCacheLocalMaxBytes          *int64                           `json:"response_cache_local_max_bytes"`
 	ResponseCacheLocalMaxEntryBytes     *int64                           `json:"response_cache_local_max_entry_bytes"`
 	ResponseCacheReconstructMaxBytes    *int64                           `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy            *string                          `json:"response_cache_write_policy"`
 	ResponseCacheConfigGeneration       rawJSON                          `json:"response_cache_config_generation"`
 	RelayModelCooldownMode              *string                          `json:"relay_model_cooldown_mode"`
 	RelayModelCooldownSeconds           *int                             `json:"relay_model_cooldown_seconds"`
@@ -9333,6 +9342,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
 		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
 		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
 		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
@@ -9706,10 +9716,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		LocalMaxBytes:       req.ResponseCacheLocalMaxBytes,
 		LocalMaxEntryBytes:  req.ResponseCacheLocalMaxEntryBytes,
 		ReconstructMaxBytes: req.ResponseCacheReconstructMaxBytes,
+		WritePolicy:         req.ResponseCacheWritePolicy,
 	}
 	responseCacheUpdateRequested := responseCacheUpdate.LocalMaxBytes != nil ||
 		responseCacheUpdate.LocalMaxEntryBytes != nil ||
-		responseCacheUpdate.ReconstructMaxBytes != nil
+		responseCacheUpdate.ReconstructMaxBytes != nil ||
+		responseCacheUpdate.WritePolicy != nil
 	if err := validateResponseCacheSettingsUpdateRanges(responseCacheUpdate); err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -11118,6 +11130,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
 		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
 		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
 		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,

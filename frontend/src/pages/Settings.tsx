@@ -128,6 +128,7 @@ const RESPONSE_CACHE_BUDGET_KEYS = [
   'response_cache_local_max_bytes',
   'response_cache_local_max_entry_bytes',
   'response_cache_reconstruct_max_bytes',
+  'response_cache_write_policy',
 ] as const satisfies ReadonlyArray<keyof SystemSettings>
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
@@ -202,6 +203,7 @@ const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSetting
   response_cache_reconstruct_max_bytes: Number.isFinite(settings.response_cache_reconstruct_max_bytes)
     ? settings.response_cache_reconstruct_max_bytes
     : DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+  response_cache_write_policy: settings.response_cache_write_policy === 'on_demand' ? 'on_demand' : 'always',
   response_cache_config_generation: Number.isFinite(settings.response_cache_config_generation)
     ? settings.response_cache_config_generation
     : 0,
@@ -1288,6 +1290,10 @@ export default function Settings() {
     { label: t('settings.modelCooldownModeFixed'), value: 'fixed' },
     { label: t('settings.modelCooldownModeAdaptive'), value: 'adaptive' },
   ]
+  const responseCacheWritePolicyOptions = [
+    { label: t('settings.responseCache.writePolicyAlways'), value: 'always' },
+    { label: t('settings.responseCache.writePolicyOnDemand'), value: 'on_demand' },
+  ]
   const affinityModeOptions = [
     { label: t('settings.affinityModeBounded'), value: 'bounded' },
     { label: t('settings.affinityModeOff'), value: 'off' },
@@ -1442,6 +1448,7 @@ export default function Settings() {
     response_cache_local_max_bytes: DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
     response_cache_local_max_entry_bytes: DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
     response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+    response_cache_write_policy: 'always',
     response_cache_config_generation: 0,
     relay_model_cooldown_mode: 'off',
     relay_model_cooldown_seconds: 2,
@@ -3288,6 +3295,17 @@ export default function Settings() {
                   {responseCacheValidationMessage}
                 </p>
               ) : null}
+
+              <SettingField
+                label={t('settings.responseCache.writePolicy')}
+                description={t('settings.responseCache.writePolicyDesc')}
+              >
+                <SegmentedPillGroup
+                  value={settingsForm.response_cache_write_policy}
+                  onChange={(value) => autoSaveStringField('response_cache_write_policy', value)}
+                  options={responseCacheWritePolicyOptions}
+                />
+              </SettingField>
 
               {/* 可视化预算分配比例条 (Memory Allocation Bar) */}
               <div className="rounded-xl border border-border/70 bg-muted/20 p-3.5 space-y-2.5">

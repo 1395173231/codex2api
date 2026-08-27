@@ -13,6 +13,8 @@ export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
+export type ResponseCacheWritePolicy = 'always' | 'on_demand'
+
 export interface StatsChannelCounts {
   total: number
   available: number
@@ -1386,12 +1388,14 @@ export interface OpsOverviewResponse {
       local_max_bytes: number
       local_max_entry_bytes: number
       reconstruct_max_bytes: number
+      write_policy?: ResponseCacheWritePolicy
     }
     applied_config: {
       generation: number
       local_max_bytes: number
       local_max_entry_bytes: number
       reconstruct_max_bytes: number
+      write_policy?: ResponseCacheWritePolicy
     }
     entries: number
     max_entries: number
@@ -1409,6 +1413,8 @@ export interface OpsOverviewResponse {
     oversize_bypasses: number
     oversize_rejections: number
     known_unavailable_errors: number
+    skipped_writes?: number
+    chain_owners?: number
     last_config_sync_at: ISODateString | ''
     last_config_sync_error: string
   }
@@ -1720,6 +1726,7 @@ export interface SystemSettings {
   response_cache_local_max_bytes: number
   response_cache_local_max_entry_bytes: number
   response_cache_reconstruct_max_bytes: number
+  response_cache_write_policy: ResponseCacheWritePolicy
   readonly response_cache_config_generation: number
   relay_model_cooldown_mode: ModelCooldownMode
   relay_model_cooldown_seconds: number

@@ -3466,6 +3466,10 @@
       "entryDesc": "Integer from 1 to 256 MiB and no greater than the local total budget.",
       "reconstruct": "Reconstruction limit",
       "reconstructDesc": "Integer from 8 to 512 MiB. Bounds the logical context reconstructed for one continuation.",
+      "writePolicy": "Write policy",
+      "writePolicyDesc": "Always: cache every tool-call response. On demand: cache only for keys that sent a previous_response_id continuation within the last hour; deployments dominated by full-context clients (e.g. the official Codex CLI) save memory and Redis substantially, at the cost of one miss on a key's first continuation after the window lapses.",
+      "writePolicyAlways": "Always",
+      "writePolicyOnDemand": "On demand",
       "l1Note": "The default 8 MiB entry value is an L1 admission limit. With Redis, a larger context may still continue up to the reconstruction limit, but it is not promoted into local L1.",
       "memoryNote": "In Memory mode, an oversize or evicted context cannot be recovered from another backend. A dependent continuation may return HTTP 409 response_context_unavailable.",
       "validation": {

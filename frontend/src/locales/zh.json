@@ -3466,6 +3466,10 @@
       "entryDesc": "整数 1–256 MiB，且不得大于本地总预算。",
       "reconstruct": "单次重建上限",
       "reconstructDesc": "整数 8–512 MiB；限制一次续链允许重建的逻辑上下文大小。",
+      "writePolicy": "写入策略",
+      "writePolicyDesc": "始终写入：每个含工具调用的响应都缓存。按需写入：仅当下游 Key 最近 1 小时内发过 previous_response_id 续链时才缓存；全量上下文客户端（如官方 Codex CLI）为主的部署可大幅降低内存与 Redis 占用，代价是某个 Key 恢复续链后的首个请求会未命中一次。",
+      "writePolicyAlways": "始终写入",
+      "writePolicyOnDemand": "按需写入",
       "l1Note": "默认 8 MiB 是 L1 单条准入限制。Redis 模式下，更大的上下文仍可在重建上限内续链，但不会提升到本地 L1。",
       "memoryNote": "Memory 模式下，超限或已淘汰的上下文无法从后端恢复；依赖该上下文的续链可能返回 HTTP 409 response_context_unavailable。",
       "validation": {

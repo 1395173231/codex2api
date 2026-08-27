@@ -175,10 +175,11 @@ type opsMemoryResponse struct {
 }
 
 type opsResponseCacheConfig struct {
-	Generation          int64 `json:"generation"`
-	LocalMaxBytes       int64 `json:"local_max_bytes"`
-	LocalMaxEntryBytes  int64 `json:"local_max_entry_bytes"`
-	ReconstructMaxBytes int64 `json:"reconstruct_max_bytes"`
+	Generation          int64  `json:"generation"`
+	LocalMaxBytes       int64  `json:"local_max_bytes"`
+	LocalMaxEntryBytes  int64  `json:"local_max_entry_bytes"`
+	ReconstructMaxBytes int64  `json:"reconstruct_max_bytes"`
+	WritePolicy         string `json:"write_policy"`
 }
 
 type opsResponseCache struct {
@@ -200,6 +201,8 @@ type opsResponseCache struct {
 	OversizeBypasses       uint64                 `json:"oversize_bypasses"`
 	OversizeRejections     uint64                 `json:"oversize_rejections"`
 	KnownUnavailableErrors uint64                 `json:"known_unavailable_errors"`
+	SkippedWrites          uint64                 `json:"skipped_writes"`
+	ChainOwners            int                    `json:"chain_owners"`
 	LastConfigSyncAt       string                 `json:"last_config_sync_at"`
 	LastConfigSyncError    string                 `json:"last_config_sync_error"`
 }
