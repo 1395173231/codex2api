@@ -206,6 +206,12 @@ data: [DONE]
 | include              | array        | 否   | 包含的额外字段                                                                                     |
 | previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
+启用系统设置 `codex_preflight_sse_passthrough_enabled` 时，内容生成前的
+`codex.rate_limits`、`codex.response.metadata` 和 `response.metadata` 不会把原始
+JSON 发送给客户端，而是用固定的 SSE 注释 `: ping\n\n` 作为首帧时序标记；客户端若
+按首帧计算首响应时间，应把该注释视为计时信号。真实内容仍按首内容边界缓冲，原生
+Responses WebSocket 不是 SSE，不发送该注释并直接隐藏这些元数据帧。
+
 `previous_response_id` 的上下文先查当前进程的有界 L1。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的 relay-style 后备，网关可保留原始 `previous_response_id` 继续转发，而不是立即返回上述错误。客户端原生 Responses WebSocket 入口不执行这次本地查找，会保留 `previous_response_id` 交给上游。
 
 原生 WebSocket 入口为 `GET /v1/responses`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。`stream_id` 是抢占键的一部分，因此多路复用的不同流互不影响；不同 API Key 或不同路由作用域也不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。

@@ -19,6 +19,26 @@ type SessionAffinityBinding struct {
 	ProxyURL  string `json:"proxy_url,omitempty"`
 }
 
+// MessageAffinityBinding is a privacy-preserving observation that one message
+// fingerprint has repeatedly succeeded on an account. Count provides inertia;
+// repeated conflicts eventually set Stop so common/public text stops voting.
+type MessageAffinityBinding struct {
+	AccountID int64 `json:"account_id,string"`
+	Count     int   `json:"count"`
+	Changes   int   `json:"changes,omitempty"`
+	Stop      bool  `json:"stop,omitempty"`
+}
+
+const DefaultMessageAffinityTTL = 6 * time.Hour
+
+// MessageAffinityCache is an additive capability. Keeping it separate from
+// TokenCache preserves compatibility with test doubles and external cache
+// implementations that only provide the original token-cache contract.
+type MessageAffinityCache interface {
+	GetMessageAffinities(ctx context.Context, scope string, hashes []uint64) (map[uint64]MessageAffinityBinding, error)
+	RecordMessageAffinities(ctx context.Context, scope string, hashes []uint64, accountID int64, ttl time.Duration) error
+}
+
 // ResponseContextReadStatus classifies a bounded shared-backend lookup without
 // changing the TokenCache compatibility interface.
 type ResponseContextReadStatus uint8

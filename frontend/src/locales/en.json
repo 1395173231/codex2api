@@ -3280,7 +3280,7 @@
         "b4": "SSE / WebSocket output scan: inspect streamed model output; can limit to terminal rules only.",
         "b5": "NewAPI audit integration: verify signed identity and policy metadata only through one-to-one Codex2API Key bindings; unbound Keys cannot accept identity.",
         "b6": "Scheduled intelligence: periodic public search and optional candidate rule generation.",
-        "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency. Output scanning holds a small window for cross-frame detection: when combined with preflight passthrough (codex_preflight_sse_passthrough), tiny metadata frames may still be briefly buffered so first-frame speed is not guaranteed to recover; and once HTTP 200 is committed before the first content event, upstream error status-code recovery changes — grayscale the two together."
+        "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency. Output scanning holds a small window for cross-frame detection: when combined with the preflight first-frame marker (codex_preflight_sse_passthrough), a fixed : ping\n\n comment may commit HTTP 200 before real content while the original metadata remains hidden; upstream error status-code recovery then changes — grayscale the two together."
       },
       "review": {
         "title": "Full model review",
@@ -4008,10 +4008,10 @@
     "compactViaResponsesDesc": "The official upstream removed the dedicated /responses/compact endpoint (now returns 404). When enabled, downstream /v1/responses/compact requests on official Codex OAuth accounts are rewritten as /responses calls with a compaction_trigger input item, and the streamed result is aggregated into a single JSON response.",
     "compactViaResponsesEnabled": "Rewrite compact via /responses",
     "compactViaResponsesEnabledDesc": "Off by default. Only affects compact passthrough on official OAuth accounts; relay (OpenAI Responses API) accounts still call their own /responses/compact endpoint.",
-    "codexPreflightSSEPassthrough": "Preflight SSE Passthrough (Legacy Compat)",
-    "codexPreflightSSEPassthroughDesc": "Forward pre-content upstream metadata events (codex.rate_limits / codex.response.metadata / response.metadata) to the downstream immediately instead of buffering them until the first real content event. For multi-tier gateways that treat the first SSE data frame as time-to-first-response.",
-    "codexPreflightSSEPassthroughEnabled": "Enable immediate passthrough",
-    "codexPreflightSSEPassthroughEnabledDesc": "Warning: legacy compatibility mode, off by default. When enabled, HTTP 200 is committed before the first content event; upstream failures in that window can only be delivered as 200 + SSE failed frames — real HTTP error codes, pre-first-token silent account rotation, and overflow auto-compact are all unavailable in that window. Hot-reloads without restart.",
+    "codexPreflightSSEPassthrough": "Preflight SSE First-Frame Marker (Legacy Compat)",
+    "codexPreflightSSEPassthroughDesc": "Replace pre-content upstream metadata with a fixed SSE comment (: ping\n\n) immediately; the original codex.rate_limits / codex.response.metadata / response.metadata payloads are never forwarded. This supports multi-tier gateways that treat the first SSE data frame as time-to-first-response.",
+    "codexPreflightSSEPassthroughEnabled": "Enable immediate first-frame marker",
+    "codexPreflightSSEPassthroughEnabledDesc": "Warning: legacy compatibility mode, off by default. When enabled, only a fixed : ping\n\n comment is sent immediately (the original metadata is never exposed), but HTTP 200 is still committed before the first real content event, so the real HTTP status cannot be restored; logical pre-content buffering remains in place, and the configured retry/overflow policy decides whether the request continues. Hot-reloads without restart.",
     "modelCooldownTitle": "Model 429 cooldown policy",
     "modelCooldownDesc": "Control model-level 429 cooldowns separately for direct API upstreams and OAuth account pools. Explicit 5h/7d usage windows still follow their real reset times.",
     "relayModelCooldownTitle": "API plan / direct upstream",

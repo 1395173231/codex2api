@@ -390,6 +390,11 @@ func sessionAffinityKey(raw string) string {
 	return runtimeHashKey("codex:session:", raw)
 }
 
+func messageAffinityKey(scope string, hash uint64) string {
+	scopeSum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(scope))))
+	return fmt.Sprintf("codex:message-affinity:%s:%016x", hex.EncodeToString(scopeSum[:]), hash)
+}
+
 func responseContextKey(responseID string) string {
 	return runtimeHashKey("codex:response:", responseID)
 }
@@ -476,6 +481,126 @@ end
 return 0
 `
 	return tc.client.Eval(ctx, script, []string{sessionAffinityKey(key)}, accountID).Err()
+}
+
+func (tc *redisTokenCache) GetMessageAffinities(ctx context.Context, scope string, hashes []uint64) (map[uint64]MessageAffinityBinding, error) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" || len(hashes) == 0 {
+		return nil, nil
+	}
+	uniqueHashes := make([]uint64, 0, len(hashes))
+	keys := make([]string, 0, len(hashes))
+	seen := make(map[uint64]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if hash == 0 {
+			continue
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		uniqueHashes = append(uniqueHashes, hash)
+		keys = append(keys, messageAffinityKey(scope, hash))
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	values, err := tc.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	bindings := make(map[uint64]MessageAffinityBinding, len(values))
+	for i, value := range values {
+		if value == nil {
+			continue
+		}
+		var raw []byte
+		switch typed := value.(type) {
+		case string:
+			raw = []byte(typed)
+		case []byte:
+			raw = typed
+		default:
+			continue
+		}
+		var binding MessageAffinityBinding
+		if err := json.Unmarshal(raw, &binding); err != nil || binding.AccountID == 0 {
+			continue
+		}
+		bindings[uniqueHashes[i]] = binding
+	}
+	if len(bindings) == 0 {
+		return nil, nil
+	}
+	return bindings, nil
+}
+
+func (tc *redisTokenCache) RecordMessageAffinities(ctx context.Context, scope string, hashes []uint64, accountID int64, ttl time.Duration) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" || accountID == 0 || len(hashes) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = DefaultMessageAffinityTTL
+	}
+	keys := make([]string, 0, len(hashes))
+	seen := make(map[uint64]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if hash == 0 {
+			continue
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		keys = append(keys, messageAffinityKey(scope, hash))
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	ttlMilliseconds := ttl.Milliseconds()
+	if ttlMilliseconds <= 0 {
+		ttlMilliseconds = 1
+	}
+	const script = `
+local account_id = ARGV[1]
+local max_count = tonumber(ARGV[2])
+local stop_changes = tonumber(ARGV[3])
+local ttl_ms = tonumber(ARGV[4])
+for _, key in ipairs(KEYS) do
+  local binding = nil
+  local raw = redis.call("GET", key)
+  if raw then
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      binding = decoded
+    end
+  end
+  if not binding or binding["account_id"] == nil or tostring(binding["account_id"]) == "" then
+	 binding = {account_id = account_id, count = 1, changes = 0, stop = false}
+  elseif binding["stop"] == true then
+    -- Keep unstable/public hashes silent while refreshing their bounded lifetime.
+  elseif tostring(binding["account_id"]) == account_id then
+    local count = tonumber(binding["count"]) or 0
+    binding["count"] = math.min(max_count, count + 1)
+  else
+    local count = tonumber(binding["count"]) or 0
+    if count > 0 then
+      binding["count"] = count - 1
+      local changes = (tonumber(binding["changes"]) or 0) + 1
+      binding["changes"] = changes
+      if changes >= stop_changes then
+        binding["stop"] = true
+      end
+    else
+      binding = {account_id = account_id, count = 1, changes = 0, stop = false}
+    end
+  end
+  redis.call("SET", key, cjson.encode(binding), "PX", ttl_ms)
+end
+return #KEYS
+`
+	return tc.client.Eval(ctx, script, keys, accountID, 16, 3, ttlMilliseconds).Err()
 }
 
 func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {

@@ -897,8 +897,8 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 			},
 		},
 		{
-			// 真实 ChatGPT WS 几乎总会先推 rate_limits / metadata。本机 2004 还开了
-			// loose + preflight passthrough，这两帧会先落到客户端。降级不能被它们挡住。
+			// 真实 ChatGPT WS 几乎总会先推 rate_limits / metadata；兼容模式现在只发固定
+			// SSE 标记并隐藏原始帧。即使存在前置标记，降级也不能被它们挡住。
 			name:      "in-stream response.failed after preflight",
 			preflight: true,
 			rejected: func() *http.Response {

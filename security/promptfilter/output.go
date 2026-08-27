@@ -67,6 +67,14 @@ func (s *OutputScanner) Push(data []byte) ([]byte, error) {
 	return release, nil
 }
 
+// HasPending reports whether the scanner still owns bytes that have not been
+// released to the downstream writer. Callers that need to insert an opaque
+// protocol comment may bypass the scanner only when this is false; otherwise
+// doing so could split a partially framed SSE record.
+func (s *OutputScanner) HasPending() bool {
+	return s != nil && (len(s.pending) > 0 || len(s.recordBuffer) > 0)
+}
+
 func (s *OutputScanner) Flush() ([]byte, error) {
 	if s == nil {
 		return nil, nil

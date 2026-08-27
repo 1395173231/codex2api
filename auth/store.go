@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"math"
 	"math/rand"
@@ -3256,7 +3255,7 @@ type Store struct {
 	compactViaResponsesEnabled  atomic.Bool  // /v1/responses/compact 改写为 /responses body-signal 压缩，默认关闭
 	firstTokenExcludesWsAcquire atomic.Bool  // 落库 first_token_ms 扣除 WS 取连耗时，默认关闭
 
-	// 前置元数据 SSE 事件立即透传下游（旧版兼容，默认关闭，issue #425）
+	// 前置元数据以固定 SSE 注释立即标记下游（原始 payload 隐藏；旧版兼容，默认关闭，issue #425）
 	codexPreflightSSEPassthroughEnabled atomic.Bool
 
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
@@ -4212,7 +4211,7 @@ func (s *Store) CompactViaResponsesEnabled() bool {
 	return s.compactViaResponsesEnabled.Load()
 }
 
-// SetCodexPreflightSSEPassthroughEnabled 设置是否将前置元数据 SSE 事件立即透传下游（旧版兼容）。
+// SetCodexPreflightSSEPassthroughEnabled 设置是否以固定 SSE 注释立即标记前置元数据（原始 payload 隐藏；旧版兼容）。
 func (s *Store) SetCodexPreflightSSEPassthroughEnabled(enabled bool) {
 	if s == nil {
 		return
@@ -4220,7 +4219,7 @@ func (s *Store) SetCodexPreflightSSEPassthroughEnabled(enabled bool) {
 	s.codexPreflightSSEPassthroughEnabled.Store(enabled)
 }
 
-// CodexPreflightSSEPassthroughEnabled 返回是否将前置元数据 SSE 事件立即透传下游（旧版兼容）。
+// CodexPreflightSSEPassthroughEnabled 返回是否启用前置元数据固定 SSE 注释标记（旧版兼容）。
 func (s *Store) CodexPreflightSSEPassthroughEnabled() bool {
 	if s == nil {
 		return false
@@ -6432,13 +6431,13 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
 // 会重新建立绑定。
 func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, nil, false, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 // NextForSessionWithDispatch 优先复用绑定账号，并按用量策略选号。
 func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, nil, false, policy)
 	return account, proxyURL
 }
 
@@ -6446,7 +6445,20 @@ func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude m
 // request paths. The returned guard must be passed to BindSessionAffinityWithGuard
 // after the attempt is selected or committed.
 func (s *Store) NextForSessionWithDispatchGuard(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, nil, false, policy)
+}
+
+// NextForSessionWithMessageHashesWithDispatch applies message-overlap hints only
+// after exact local/shared session affinity misses.
+func (s *Store) NextForSessionWithMessageHashesWithDispatch(key string, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, messageHashes, false, policy)
+	return account, proxyURL
+}
+
+// NextForSessionWithMessageHashesWithDispatchGuard combines message-overlap
+// fallback selection with the capacity-spillover binding guard.
+func (s *Store) NextForSessionWithMessageHashesWithDispatchGuard(key string, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, messageHashes, false, policy)
 }
 
 // NextForContinuationWithFilter preserves an existing account binding for a
@@ -6454,13 +6466,13 @@ func (s *Store) NextForSessionWithDispatchGuard(key string, apiKeyID int64, excl
 // to the account that created them, so bounded-affinity escape must not rotate
 // accounts.
 func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, nil, true, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 // NextForContinuationWithDispatch preserves a bound turn and applies a usage policy.
 func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, nil, true, policy)
 	return account, proxyURL
 }
 
@@ -6473,8 +6485,9 @@ func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, excl
 //     别的账号。调用方据此决定是等它空出来，还是剥离续链 id 降级换号。
 //
 // 绑定本身不存在时仍走完整挑号，与普通请求一致；TTL 过期只影响普通请求，
-// preserveBinding=true 的续链请求仍保留原账号。
-func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+// preserveBinding=true 的续链请求仍保留原账号。普通请求只有在精确绑定
+// 未命中后才使用 messageHashes 作为跨会话的弱提示。
+func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, messageHashes []uint64, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	if s == nil {
 		return nil, "", SessionAffinityGuard{}
 	}
@@ -6540,7 +6553,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
-				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				fallback := s.nextAccountForFreshSessionWithDispatch(key, apiKeyID, messageHashes, exclude, filter, policy)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
@@ -6554,7 +6567,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), "", SessionAffinityGuard{}
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
-			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
+			return s.nextAccountForFreshSessionWithDispatch(key, apiKeyID, messageHashes, exclude, filter, policy), "", SessionAffinityGuard{}
 		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
@@ -6578,7 +6591,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
-				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				fallback := s.nextAccountForFreshSessionWithDispatch(key, apiKeyID, messageHashes, exclude, filter, policy)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
@@ -6587,7 +6600,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 
-	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
+	return s.nextAccountForFreshSessionWithDispatch(key, apiKeyID, messageHashes, exclude, filter, policy), "", SessionAffinityGuard{}
 }
 
 // nextAccountForFreshAffinity 为"新亲和键首次绑定"选号(issue #484)。
@@ -6610,11 +6623,11 @@ func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int
 	if !s.GetSessionAffinitySpread() || strings.TrimSpace(key) == "" {
 		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
 	}
-	filter = s.withUsableEgressFilter(filter)
 	if s.SchedulerEngine() == "indexed" {
+		indexedFilter := s.withUsableEgressFilter(filter)
 		if scheduler := s.routingFastScheduler(apiKeyID); scheduler != nil {
 			started := time.Now()
-			acc := scheduler.AcquireForAffinityWithDispatch(affinityKeyHash(key), apiKeyID, exclude, filter, policy)
+			acc := scheduler.AcquireForAffinityWithDispatch(affinityKeyHash(key), apiKeyID, exclude, indexedFilter, policy)
 			if acc != nil && s.accountHasBlockingCachedCooldown(acc, policy) {
 				s.Release(acc)
 				acc = nil
@@ -6625,68 +6638,13 @@ func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int
 			}
 			// 亲和起点不可用时退化为普通选号(含冷却重试与慢路兜底),
 			// 而不是直接放弃让请求掉进 30 秒等待。
-			return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
+			return s.NextExcludingWithDispatch(apiKeyID, exclude, indexedFilter, policy)
 		}
 	}
 
-	type affinityCandidate struct {
-		acc               *Account
-		schedulerPriority int64
-		tierPriority      int
-		limit             int64
-		weight            uint64
-	}
-	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-
-	accounts := s.accountSnapshotAccounts()
-	candidates := make([]affinityCandidate, 0, len(accounts))
-	for _, acc := range accounts {
-		if exclude != nil && exclude[acc.DBID] {
-			continue
-		}
-		if !acc.dispatchableForPolicy(policy) {
-			continue
-		}
-		if !s.accountAllowedForAPIKey(acc, apiKeyID) {
-			continue
-		}
-		if filter != nil && !filter(acc) {
-			continue
-		}
-		load := accountOccupiedRequests(acc)
-		tier, _, _, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, policy)
-		if limit <= 0 || load >= limit {
-			continue
-		}
-		hasher := fnv.New64a()
-		_, _ = hasher.Write([]byte(key))
-		_, _ = hasher.Write([]byte{':'})
-		_, _ = hasher.Write([]byte(strconv.FormatInt(acc.DBID, 10)))
-		candidates = append(candidates, affinityCandidate{
-			acc:               acc,
-			schedulerPriority: acc.schedulerPriority(),
-			tierPriority:      tierPriority(tier),
-			limit:             limit,
-			weight:            hasher.Sum64(),
-		})
-	}
-	if len(candidates) == 0 {
+	layer := s.freshAffinityCandidateLayer(key, apiKeyID, exclude, filter, policy)
+	if len(layer) == 0 {
 		return nil
-	}
-
-	// 只保留最高的 (调度优先级, 健康档位) 层。
-	bestSchedPrio, bestTier := candidates[0].schedulerPriority, candidates[0].tierPriority
-	for _, c := range candidates[1:] {
-		if c.schedulerPriority > bestSchedPrio ||
-			(c.schedulerPriority == bestSchedPrio && c.tierPriority > bestTier) {
-			bestSchedPrio, bestTier = c.schedulerPriority, c.tierPriority
-		}
-	}
-	layer := candidates[:0]
-	for _, c := range candidates {
-		if c.schedulerPriority == bestSchedPrio && c.tierPriority == bestTier {
-			layer = append(layer, c)
-		}
 	}
 	sort.Slice(layer, func(i, j int) bool { return layer[i].weight > layer[j].weight })
 
@@ -7076,34 +7034,43 @@ func (s *Store) hasContinuationCandidateWithDispatch(key string, apiKeyID int64,
 
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, nil, false, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 func (s *Store) WaitForSessionAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, nil, false, policy)
 	return account, proxyURL
 }
 
 // WaitForSessionAvailableWithDispatchGuard is the binding-aware waiting path.
 // It preserves the capacity-spillover decision made by the successful retry.
 func (s *Store) WaitForSessionAvailableWithDispatchGuard(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, nil, false, policy)
+}
+
+func (s *Store) WaitForSessionAvailableWithMessageHashesWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, messageHashes, false, policy)
+	return account, proxyURL
+}
+
+func (s *Store) WaitForSessionAvailableWithMessageHashesWithDispatchGuard(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, messageHashes, false, policy)
 }
 
 // WaitForContinuationAvailableWithFilter waits for the account already bound
 // to a stateful continuation instead of falling through to another account.
 func (s *Store) WaitForContinuationAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, nil, true, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 func (s *Store) WaitForContinuationAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, nil, true, policy)
 	return account, proxyURL
 }
 
-func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, messageHashes []uint64, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -7151,7 +7118,7 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 		if preserveBinding {
 			acc, proxyURL = s.NextForContinuationWithDispatch(key, apiKeyID, exclude, filter, policy)
 		} else {
-			acc, proxyURL, guard = s.NextForSessionWithDispatchGuard(key, apiKeyID, exclude, filter, policy)
+			acc, proxyURL, guard = s.NextForSessionWithMessageHashesWithDispatchGuard(key, apiKeyID, messageHashes, exclude, filter, policy)
 		}
 		if acc != nil {
 			return acc, proxyURL, guard

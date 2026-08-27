@@ -3698,6 +3698,9 @@ func TranslateStreamChunkResult(eventData []byte, model string, chunkID string, 
 // TranslateStreamChunk 将 Codex SSE 数据块翻译为 OpenAI Chat Completions 流式格式（无状态）
 func TranslateStreamChunk(eventData []byte, model string, chunkID string, created int64) ([]byte, bool) {
 	eventType := gjson.GetBytes(eventData, "type").String()
+	if shouldHidePreflightSSEEventFromClient(eventType, eventData) {
+		return nil, false
+	}
 
 	switch eventType {
 	case "response.output_text.delta":
@@ -3913,6 +3916,9 @@ func (st *StreamTranslator) validateTerminalFunctionCalls(parsed gjson.Result) {
 // TranslateParsed 将已解析的 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式。
 func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) {
 	eventType := parsed.Get("type").String()
+	if shouldHidePreflightSSEEventFromClient(eventType) {
+		return nil, false
+	}
 
 	switch eventType {
 	case "response.output_text.delta":

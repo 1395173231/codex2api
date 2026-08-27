@@ -97,22 +97,63 @@ func autoCompactOverflowEnabled(c *gin.Context) bool {
 // codex.*（codex.rate_limits / codex.response.metadata，WS 传输路径）与裸
 // response.metadata（HTTP 传输路径），均不携带模型产出。
 func isCodexPreflightSSEEvent(eventType string) bool {
-	eventType = strings.TrimSpace(eventType)
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
 	if eventType == "response.metadata" {
 		return true
 	}
 	return strings.HasPrefix(eventType, "codex.")
 }
 
+// preflightSSEPingComment is the deliberately content-free replacement for
+// upstream preflight metadata.  In particular, codex.rate_limits contains
+// account-pool and plan information that must never cross the client boundary.
+// Keep this a fixed SSE comment: do not interpolate the event name or payload,
+// because even an apparently harmless subset of the metadata can identify the
+// selected account or its remaining quota.
+const preflightSSEPingComment = ": ping\n\n"
+
+// shouldHidePreflightSSEEventFromClient centralizes the privacy boundary for
+// pre-content metadata.  The event is still parsed and retained internally for
+// usage/retry/provenance decisions, but its upstream JSON must not be written
+// to a downstream client (including a successful continuous-retry attempt).
+func shouldHidePreflightSSEEventFromClient(eventType string, payload ...[]byte) bool {
+	if isCodexPreflightSSEEvent(eventType) {
+		return true
+	}
+	// An explicit SSE event name normally wins for error classification, but a
+	// malformed/provider-specific frame can still carry a sensitive codex.* type
+	// in its JSON body. Inspect optional payloads as a second privacy check.
+	for _, data := range payload {
+		if isCodexPreflightSSEEvent(gjson.GetBytes(data, "type").String()) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldEmitPreflightSSEPing reports whether the legacy immediate-passthrough
+// compatibility mode should produce a content-free marker for this event.
+// Lifecycle frames remain governed by shouldDeferPreContentSSEEvent and are not
+// replaced.  A false result means the metadata is simply suppressed at the
+// client boundary; it may still be observed internally by the relay.
+func shouldEmitPreflightSSEPing(eventType string, contentTokenSeen, gotTerminal, preflightPassthrough bool, payload ...[]byte) bool {
+	return preflightPassthrough && !contentTokenSeen && !gotTerminal &&
+		shouldHidePreflightSSEEventFromClient(eventType, payload...)
+}
+
 // shouldDeferPreContentSSEEvent 决定首个内容事件前的 SSE 事件是否延迟冲刷。
 // 生命周期事件（response.created / response.in_progress）始终缓冲；前置元数据
-// 事件默认一并缓冲，preflightPassthrough 开启时立即写出（旧版兼容，issue #425）——
-// 代价是提前提交 200，该窗口内的 response.failed 无法再按真实错误码返回，
-// 也无法走静默换号或超窗压缩重试。
-func shouldDeferPreContentSSEEvent(eventType string, contentTokenSeen, gotTerminal, preflightPassthrough bool) bool {
+// 事件默认一并缓冲，preflightPassthrough 开启时用固定 SSE 注释立即标记（旧版
+// 兼容，issue #425）。原始 metadata 无论开关状态都由客户端输出边界抑制，避免
+// codex.rate_limits 泄露帐号池信息；立即标记仍会提交 200，因此该窗口内无法恢复
+// 真实 HTTP 状态码；逻辑上的首内容前缓冲与可重试判定仍由各策略决定。
+func shouldDeferPreContentSSEEvent(eventType string, contentTokenSeen, gotTerminal, _ bool) bool {
+	// Metadata remains on the pre-content side of the semantic boundary even
+	// when the legacy compatibility switch is enabled. The caller may emit a
+	// separate fixed SSE comment as an immediate timing marker, but the upstream
+	// metadata itself must never be treated as a client-visible content event.
 	return !contentTokenSeen && !gotTerminal &&
-		(isPreContentLifecycleEvent(eventType) ||
-			(!preflightPassthrough && isCodexPreflightSSEEvent(eventType)))
+		(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
 }
 
 // isContextLengthExceededBody 判断上游错误体（HTTP 错误响应或 response.failed

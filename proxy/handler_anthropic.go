@@ -281,7 +281,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter)
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
@@ -665,6 +665,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
+				h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
@@ -755,6 +756,12 @@ func (h *Handler) Messages(c *gin.Context) {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					preContentErrorCandidate = nil
+				}
+				// Do not let an unknown preflight metadata object fall through the
+				// Anthropic translator. In particular, rate-limit payloads are private
+				// account-pool data and are never valid model content.
+				if shouldHidePreflightSSEEventFromClient(eventType, data) {
+					return !isResponsesTerminalEvent(eventType)
 				}
 				visibleBody := wroteAnyBody && !continuousRetryBuffersAttempts(continuousRetryPolicy)
 				if eventType == "error" && continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -1106,6 +1113,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		if outcome.logStatusCode == http.StatusOK {
+			h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		} else {
 			h.store.Release(account)

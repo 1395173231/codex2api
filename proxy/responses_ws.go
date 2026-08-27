@@ -585,7 +585,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else if continuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
@@ -889,7 +889,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		preserveAffinity := preserveContinuationBinding()
 		allowContinuationDegrade := canDegradeContinuation()
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, attemptExpandedInputRaw, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, apiKeyID, sessionIdentity.messageHashes, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, attemptExpandedInputRaw, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
 			if continuousRetryDeadlineExceeded(c.Request.Context()) {
 				return errResponsesWSClientGone
 			}
@@ -995,6 +995,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	account *auth.Account,
 	proxyURL string,
 	affinityKey string,
+	apiKeyID int64,
+	messageHashes []uint64,
 	affinityGuard auth.SessionAffinityGuard,
 	preserveAffinity bool,
 	allowContinuationDegrade bool,
@@ -1028,8 +1030,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	var actualServiceTier string
 	ttftRecorded := false
 	// contentTokenSeen 用严格判定（与 first_token_mode 无关）。loose 模式下
-	// codex.rate_limits / metadata 会置位 ttftRecorded；本机 2004 还开了
-	// preflight passthrough，这两帧会先写出并置位 wroteAnyBody。若用它们做
+	// codex.rate_limits / metadata 会置位 ttftRecorded；即使启用前置兼容标记，
+	// 原始元数据也不会写给客户端（SSE 仅发送固定注释，原生 WS 直接丢弃）。若用它们做
 	// 「首包前」判断，previous_response_not_found 降级在真实上游上永远进不去（#541）。
 	contentTokenSeen := false
 	preflightSettings := CurrentRuntimeSettings()
@@ -1138,6 +1140,14 @@ func (h *Handler) streamResponsesWSUpstream(
 			gotTerminal = true
 			preContentErrorCandidate = nil
 		}
+		// Native Responses WebSocket frames are JSON, not SSE. Never send the
+		// preflight metadata frame (or an SSE comment-shaped substitute) over this
+		// protocol: codex.rate_limits exposes account-pool details and `: ping` is
+		// not a valid Responses WebSocket message. HTTP SSE uses the fixed comment
+		// marker in the forwarding path above.
+		if shouldHidePreflightSSEEventFromClient(eventType, data) {
+			return !isResponsesTerminalEvent(eventType)
+		}
 		if wsReplay != nil {
 			// Continuous retry keeps the complete attempt private. Any upstream
 			// error event is authoritative and ends the attempt immediately, even if
@@ -1202,8 +1212,8 @@ func (h *Handler) streamResponsesWSUpstream(
 					return false
 				}
 				// 续链 id 上游认不出：换号重试没用（换了还是找不到），但剥离续链 id
-				// 后同一账号就能继续。前置元数据（rate_limits / metadata）即使已经
-				// 写出也不算内容，不能挡住降级——真实 ChatGPT WS 几乎总会先推这两帧。
+				// 后同一账号就能继续。前置元数据（rate_limits / metadata）在输出边界已被
+				// 隐藏，不算内容，不能挡住降级——真实 ChatGPT WS 几乎总会先推这两帧。
 				if allowContinuationDegrade && eventType == "response.failed" && !contentTokenSeen &&
 					isPreviousResponseNotFoundBody(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
@@ -1456,6 +1466,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 	}
 	if outcome.logStatusCode == http.StatusOK {
+		h.store.RecordMessageAffinity(apiKeyID, messageHashes, account)
 		h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 	} else {
 		h.store.Release(account)

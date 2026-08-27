@@ -357,6 +357,32 @@ func (w *streamFlushWriter) WriteSSEComment(comment string) error {
 	return nil
 }
 
+// WriteSSECommentImmediate emits a fixed SSE comment as soon as the writer's
+// output policy permits. It drains coalesced bytes and writes the marker directly
+// when the output scanner has no pending bytes. If a scanner is holding a partial
+// or cross-frame record, bypassing it could split an SSE frame or release a policy
+// match, so the marker follows the normal scanner path until a safe boundary.
+func (w *streamFlushWriter) WriteSSECommentImmediate(comment string) error {
+	if w == nil || w.writer == nil || comment == "" {
+		return nil
+	}
+	if w.outputScanner != nil && (w.outputScanner.HasPending() ||
+		(w.buffer.Len() > 0 && !bytes.HasSuffix(w.buffer.Bytes(), sseDataSuffix))) {
+		return w.WriteString(comment)
+	}
+	if w.buffer.Len() > 0 {
+		if err := w.writeUnderlying(w.buffer.Bytes()); err != nil {
+			return err
+		}
+		w.buffer.Reset()
+	}
+	if err := w.writeUnderlyingString(comment); err != nil {
+		return err
+	}
+	w.flushTransport()
+	return nil
+}
+
 func (w *streamFlushWriter) Flush() error {
 	if w == nil {
 		return nil

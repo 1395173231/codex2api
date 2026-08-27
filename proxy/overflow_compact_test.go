@@ -175,10 +175,10 @@ func TestShouldDeferPreContentSSEEvent(t *testing.T) {
 		{"off_http_metadata_deferred", "response.metadata", false, false, false, true},
 		{"off_created_deferred", "response.created", false, false, false, true},
 		{"off_in_progress_deferred", "response.in_progress", false, false, false, true},
-		// 开关开启:preflight 元数据立即写出,生命周期事件仍缓冲
-		{"on_rate_limits_passthrough", "codex.rate_limits", false, false, true, false},
-		{"on_codex_metadata_passthrough", "codex.response.metadata", false, false, true, false},
-		{"on_http_metadata_passthrough", "response.metadata", false, false, true, false},
+		// 开关开启:preflight 元数据仍保持首内容前语义（客户端由调用方改发固定注释）,生命周期事件仍缓冲
+		{"on_rate_limits_marker_keeps_buffer", "codex.rate_limits", false, false, true, true},
+		{"on_codex_metadata_marker_keeps_buffer", "codex.response.metadata", false, false, true, true},
+		{"on_http_metadata_marker_keeps_buffer", "response.metadata", false, false, true, true},
 		{"on_created_still_deferred", "response.created", false, false, true, true},
 		{"on_in_progress_still_deferred", "response.in_progress", false, false, true, true},
 		// 内容开始后不再缓冲,与开关状态无关

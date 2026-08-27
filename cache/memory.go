@@ -20,6 +20,11 @@ type memorySessionAffinityEntry struct {
 	expiresAt time.Time
 }
 
+type memoryMessageAffinityEntry struct {
+	binding   MessageAffinityBinding
+	expiresAt time.Time
+}
+
 type memoryResponseContextEntry struct {
 	items     []json.RawMessage
 	expiresAt time.Time
@@ -43,6 +48,7 @@ type MemoryTokenCache struct {
 	locks     map[int64]time.Time
 	leases    map[string]memoryLeaseEntry
 	sessions  map[string]memorySessionAffinityEntry
+	messages  map[string]memoryMessageAffinityEntry
 	responses map[string]memoryResponseContextEntry
 	runtime   map[string]memoryRuntimeEntry
 	poolSize  int
@@ -60,6 +66,7 @@ func NewMemory(poolSize int) TokenCache {
 		locks:     make(map[int64]time.Time),
 		leases:    make(map[string]memoryLeaseEntry),
 		sessions:  make(map[string]memorySessionAffinityEntry),
+		messages:  make(map[string]memoryMessageAffinityEntry),
 		responses: make(map[string]memoryResponseContextEntry),
 		runtime:   make(map[string]memoryRuntimeEntry),
 		poolSize:  poolSize,
@@ -94,6 +101,11 @@ func (tc *MemoryTokenCache) cleanupLoop() {
 		for key, entry := range tc.sessions {
 			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
 				delete(tc.sessions, key)
+			}
+		}
+		for key, entry := range tc.messages {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.messages, key)
 			}
 		}
 		for key, entry := range tc.responses {
@@ -343,6 +355,104 @@ func (tc *MemoryTokenCache) DeleteSessionAffinity(ctx context.Context, key strin
 		delete(tc.sessions, key)
 	}
 	tc.mu.Unlock()
+	return nil
+}
+
+const (
+	memoryMessageAffinityMaxCount    = 16
+	memoryMessageAffinityStopChanges = 3
+)
+
+func memoryMessageAffinityKey(scope string, hash uint64) string {
+	return fmt.Sprintf("%s:%016x", strings.ToLower(strings.TrimSpace(scope)), hash)
+}
+
+func (tc *MemoryTokenCache) GetMessageAffinities(ctx context.Context, scope string, hashes []uint64) (map[uint64]MessageAffinityBinding, error) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" || len(hashes) == 0 {
+		return nil, nil
+	}
+	now := time.Now()
+	bindings := make(map[uint64]MessageAffinityBinding, len(hashes))
+	tc.mu.Lock()
+	for _, hash := range hashes {
+		if hash == 0 {
+			continue
+		}
+		key := memoryMessageAffinityKey(scope, hash)
+		entry, ok := tc.messages[key]
+		if !ok {
+			continue
+		}
+		if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+			delete(tc.messages, key)
+			continue
+		}
+		if entry.binding.AccountID != 0 {
+			bindings[hash] = entry.binding
+		}
+	}
+	tc.mu.Unlock()
+	if len(bindings) == 0 {
+		return nil, nil
+	}
+	return bindings, nil
+}
+
+func (tc *MemoryTokenCache) RecordMessageAffinities(ctx context.Context, scope string, hashes []uint64, accountID int64, ttl time.Duration) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" || accountID == 0 || len(hashes) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = DefaultMessageAffinityTTL
+	}
+	expiresAt := time.Now().Add(ttl)
+	seen := make(map[uint64]struct{}, len(hashes))
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.messages == nil {
+		tc.messages = make(map[string]memoryMessageAffinityEntry)
+	}
+	now := time.Now()
+	for _, hash := range hashes {
+		if hash == 0 {
+			continue
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		key := memoryMessageAffinityKey(scope, hash)
+		entry, ok := tc.messages[key]
+		if !ok || (!entry.expiresAt.IsZero() && now.After(entry.expiresAt)) || entry.binding.AccountID == 0 {
+			tc.messages[key] = memoryMessageAffinityEntry{
+				binding:   MessageAffinityBinding{AccountID: accountID, Count: 1},
+				expiresAt: expiresAt,
+			}
+			continue
+		}
+		binding := entry.binding
+		switch {
+		case binding.Stop:
+			// Refresh the bounded lifetime without allowing a public hash to vote.
+		case binding.AccountID == accountID:
+			if binding.Count < memoryMessageAffinityMaxCount {
+				binding.Count++
+			}
+		default:
+			if binding.Count > 0 {
+				binding.Count--
+				binding.Changes++
+				if binding.Changes >= memoryMessageAffinityStopChanges {
+					binding.Stop = true
+				}
+			} else {
+				binding = MessageAffinityBinding{AccountID: accountID, Count: 1}
+			}
+		}
+		tc.messages[key] = memoryMessageAffinityEntry{binding: binding, expiresAt: expiresAt}
+	}
 	return nil
 }
 

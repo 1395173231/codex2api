@@ -1210,6 +1210,7 @@ type requestSessionIdentity struct {
 	affinityID            string
 	upstreamSeed          string
 	explicitUpstreamID    string
+	messageHashes         []uint64
 	hasDownstreamAffinity bool
 	hasRequestFingerprint bool
 }
@@ -1235,6 +1236,7 @@ func ResolveSessionID(headers http.Header, body []byte) string {
 
 func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {
 	hasEngineFingerprint := EvaluateEngineFingerprint(headers, body, nil)
+	messageHashes := deriveMessageAffinityHashes(body)
 	explicitID := ResolveExplicitSessionID(headers, body)
 	upstreamSeed := explicitID
 	if upstreamSeed == "" {
@@ -1266,6 +1268,7 @@ func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSess
 			affinityID:            affinityID,
 			upstreamSeed:          upstreamSeed,
 			explicitUpstreamID:    explicitID,
+			messageHashes:         messageHashes,
 			hasDownstreamAffinity: true,
 			hasRequestFingerprint: true,
 		}
@@ -1274,6 +1277,7 @@ func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSess
 		affinityID:            affinityID,
 		upstreamSeed:          upstreamSeed,
 		explicitUpstreamID:    explicitID,
+		messageHashes:         messageHashes,
 		hasRequestFingerprint: hasEngineFingerprint,
 	}
 }

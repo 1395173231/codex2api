@@ -113,10 +113,10 @@ type RuntimeSettings struct {
 	// （上游已下线专用 compact 端点，默认 false）。中转账号不受影响。
 	CompactViaResponses bool
 	// CodexPreflightSSEPassthrough 将前置元数据事件（codex.rate_limits /
-	// codex.response.metadata / response.metadata）立即透传下游而不缓冲到首个内容
-	// 事件（旧版兼容，默认 false，issue #425）。开启后首内容前会提前提交 200，
-	// 该窗口内的 response.failed 只能以 SSE failed 帧下发，真实错误码/静默换号/
-	// 超窗压缩重试均不可用。
+	// codex.response.metadata / response.metadata）替换为固定的 SSE 注释并立即
+	// 标记下游首帧（旧版兼容，默认 false，issue #425）。原始 metadata 永不透传；
+	// 注释仍会在首内容前提交 200，因此无法恢复真实 HTTP 状态码；逻辑上的首内容前
+	// 缓冲与可重试判定仍保留，失败是否继续重试/压缩由对应策略决定。
 	CodexPreflightSSEPassthrough bool
 	// FirstTokenExcludesWsAcquire 落库的 first_token_ms 是否扣除本次 attempt 的
 	// WS 取连耗时（默认 false，保持含取连的原口径；原始值 = first_token_ms + ws_acquire_ms）。

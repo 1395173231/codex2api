@@ -2259,7 +2259,7 @@ type SystemSettings struct {
 	CodexOverloadWindowMinutes          int  // 统计窗口（分钟），默认 5，范围 1-120
 	OverflowAutoCompactEnabled          bool // 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）
 	CompactViaResponsesEnabled          bool // /v1/responses/compact 改写为 /responses body-signal 压缩（上游已下线专用端点，默认 false）
-	CodexPreflightSSEPassthroughEnabled bool // 前置元数据 SSE 事件立即透传下游（旧版兼容，默认 false，issue #425）
+	CodexPreflightSSEPassthroughEnabled bool // 前置元数据固定 SSE 注释标记（原始 payload 隐藏；旧版兼容，默认 false，issue #425）
 	FirstTokenExcludesWsAcquire         bool // 落库 first_token_ms 扣除 WS 取连耗时，默认 false（原始值 = first_token_ms + ws_acquire_ms）
 	CodexContinueThinkingEnabled        bool // 检测到上游截断思考时自动续想并折叠成单响应，默认 false
 	CodexContinueMaxRounds              int  // 单次请求最大续想轮数（含首轮），默认 8

@@ -112,6 +112,20 @@ func (h *Handler) nextAccountForSessionWithDispatchGuard(sessionID string, apiKe
 	return h.store.NextForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, policy)
 }
 
+func (h *Handler) nextAccountForSessionWithMessageHashesWithDispatch(sessionID string, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	if h == nil || h.store == nil {
+		return nil, ""
+	}
+	return h.store.NextForSessionWithMessageHashesWithDispatch(sessionID, apiKeyID, messageHashes, exclude, filter, policy)
+}
+
+func (h *Handler) nextAccountForSessionWithMessageHashesWithDispatchGuard(sessionID string, apiKeyID int64, messageHashes []uint64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard) {
+	if h == nil || h.store == nil {
+		return nil, "", auth.SessionAffinityGuard{}
+	}
+	return h.store.NextForSessionWithMessageHashesWithDispatchGuard(sessionID, apiKeyID, messageHashes, exclude, filter, policy)
+}
+
 func dispatchPolicyForModel(model string) auth.DispatchPolicy {
 	if isProOnlyModel(model) {
 		return auth.DispatchPolicySpark
@@ -937,15 +951,22 @@ func continuousRetryProtocolForGrok(protocol GrokProtocol) continuousRetryHTTPPr
 
 // forwardGrokNativeResponse preserves a proven same-protocol upstream wire
 // response. Native SSE frames are forwarded byte-for-byte (including event,
-// id, retry, comments, multiline data, line endings, and [DONE]); their data
-// projection is inspected only for terminal state, usage, and the pre-output
-// retry boundary. firstTokenMs is measured from startedAt.
+// id, retry, comments, multiline data, line endings, and [DONE]) except for
+// sensitive preflight metadata, which is suppressed or replaced by the fixed
+// timing comment. Their data projection is inspected only for terminal state,
+// usage, and the pre-output retry boundary. firstTokenMs is measured from
+// startedAt.
 func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func()) (*UsageInfo, streamOutcome, bool, int) {
 	return forwardGrokNativeResponseTo(c, resp, protocol, streaming, startedAt, firstVisible, nil, nil)
 }
 
 func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher) (*UsageInfo, streamOutcome, bool, int) {
 	privateAttempt := output != nil && output != c.Writer
+	// A private continuous-retry replay must never receive a preflight marker:
+	// the replay is committed only after a successful terminal and would
+	// otherwise turn a hidden upstream attempt into visible client output.
+	preflightSettings := CurrentRuntimeSettings()
+	preflightPassthrough := !privateAttempt && continuousRetryPreflightPassthrough(preflightSettings)
 	resp.Header.Del(grokNativeRouteHeader)
 	if !streaming {
 		body, err := readAllLimited(resp.Body, grokMaxDecodedBody)
@@ -990,6 +1011,8 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 	}
 	var usage *UsageInfo
 	var terminal, failed, wrote, visible bool
+	// Collapse a burst of preflight frames into one timing marker per attempt.
+	preflightPingSent := false
 	firstTokenMs := 0
 	var failure streamOutcome
 	var pending bytes.Buffer
@@ -1012,6 +1035,25 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 			}
 		}
 		isVisible := frame.HasData && !frame.Done && grokNativeVisibleEvent(protocol, frame.Data)
+		// Preflight metadata is never forwarded as a native data frame. For the
+		// Responses SSE compatibility mode, emit the same fixed marker used by
+		// the regular relay path; Chat/Messages native streams receive no SSE
+		// substitute because their compatibility switch is Responses-specific.
+		if shouldHidePreflightSSEEventFromClient(normalizedUpstreamSSEEventType(frame.Event, frame.Data), frame.Data) {
+			if frame.HasData && auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolResponses &&
+				preflightPassthrough && !preflightPingSent && !visible && !terminal {
+				if err := writeAll(output, []byte(preflightSSEPingComment)); err != nil {
+					writeErr = err
+					return false
+				}
+				preflightPingSent = true
+				// Keep `wrote` as the logical model-output flag: the marker commits
+				// the HTTP stream physically, but must not close the pre-content retry
+				// boundary.
+				outputFlusher.Flush()
+			}
+			return true
+		}
 		// Hold only the frames that must stay invisible for a silent retry.
 		// Responses used to buffer every non-text frame until the first
 		// output_text.delta (issue #207's anti-pattern); reasoning models then
@@ -3765,11 +3807,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithMessageHashesWithDispatchGuard(affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			} else if turnContinuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
@@ -4190,6 +4232,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 				}
 				if outcome.logStatusCode == http.StatusOK {
+					h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 					h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 				} else {
 					h.store.Release(account)
@@ -4261,6 +4304,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				streamWriter.diag = streamDiag
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
+				// Collapse a burst of preflight frames into one timing marker per attempt.
+				preflightPingSent := false
 				readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 					streamDiag.markUpstreamFrame()
 					if continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -4340,6 +4385,21 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
+					}
+					// Hide Codex preflight metadata at the client boundary. The legacy
+					// passthrough switch still gets an immediate marker, but account/plan
+					// details never leave the gateway. The marker is physical wire output but is
+					// intentionally not counted as model content for retry decisions.
+					if shouldHidePreflightSSEEventFromClient(eventType, data) {
+						if !clientGone && !preflightPingSent && shouldEmitPreflightSSEPing(eventType, contentTokenSeen, gotTerminal, preflightPassthrough, data) {
+							if err := streamWriter.WriteSSECommentImmediate(preflightSSEPingComment); err != nil {
+								writeErr = err
+								clientGone = true
+							} else {
+								preflightPingSent = true
+							}
+						}
+						return !isResponsesTerminalEvent(eventType)
 					}
 					if !clientGone {
 						// 可重试的 error 帧（上游降载先导帧）与生命周期帧一样缓冲：
@@ -4602,6 +4662,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
+				h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
@@ -4904,9 +4965,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 并发方,锁零竞争。
 			var downstreamMu sync.Mutex
 			var pendingFirstTokenEvents bytes.Buffer
+			// Collapse a burst of preflight frames into one timing marker per attempt.
+			preflightPingSent := false
 			contEnabled, contMaxRounds := codexContinueThinkingSettings()
-			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
-			// 热更新对新请求生效，流转发中途不切换缓冲策略。
+			// 前置元数据兼容标记（旧版 issue #425）：每个 attempt 取一次快照，
+			// 热更新对新请求生效，流转发中途不切换缓冲策略；原始 metadata 在客户端
+			// 输出边界统一隐藏，启用时只发固定 SSE 注释。
 			preflightSettings := CurrentRuntimeSettings()
 			preflightSettings.ContinuousRetryPolicy = continuousRetryPolicy
 			preflightPassthrough := continuousRetryPreflightPassthrough(preflightSettings)
@@ -5022,15 +5086,27 @@ func (h *Handler) Responses(c *gin.Context) {
 					return false
 				}
 
+				// Preflight metadata is useful to the relay internally but is not a
+				// client protocol event: codex.rate_limits can reveal the account pool,
+				// plan and remaining quota. In the legacy immediate mode preserve the
+				// first-frame timing contract with a fixed SSE comment; otherwise keep
+				// the metadata private and leave the existing first-content buffer intact.
+				// The marker is physical wire output but is intentionally not counted as
+				// model content for retry decisions.
+				if shouldHidePreflightSSEEventFromClient(eventType, data) {
+					if !clientGone && !preflightPingSent && shouldEmitPreflightSSEPing(eventType, contentTokenSeen, gotTerminal, preflightPassthrough, data) {
+						if err := streamWriter.WriteSSECommentImmediate(preflightSSEPingComment); err != nil {
+							writeErr = err
+							clientGone = true
+						} else {
+							preflightPingSent = true
+						}
+					}
+					return !isResponsesTerminalEvent(eventType)
+				}
 				if !clientGone {
-					// codex.* 前置元数据事件（rate_limits / response.metadata）与生命周期
-					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
-					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
-					// 既无法按真实错误码返回，也无法走超窗压缩重试。
-					// preflightPassthrough（issue #425）恢复旧版语义：元数据事件立即下发，
-					// 管理员显式接受上述代价；生命周期事件（created/in_progress）不受开关影响。
-					// 可重试的 error 帧（上游降载先导帧）不受 preflightPassthrough 影响，
-					// 始终缓冲：立即写出会置位 wroteAnyBody，随后的 response.failed 就
+					// 生命周期帧与可重试的 error 先导帧仍按首内容前策略缓冲。
+					// 立即写出 error 会置位 wroteAnyBody，随后的 response.failed 就
 					// 进不了首包前静默换号/超窗压缩分支。必须写出时改写降载码。
 					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
 						(!contentTokenSeen && !visibleBody && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy))
@@ -5065,9 +5141,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					if clientGone {
 						return false
 					}
-					// 首个真实字节前不能写注释，否则会提前提交 HTTP 200，
-					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
-					if !wroteAnyBody {
+					// 首个真实字节/首帧标记前不能写普通保活注释，否则会提前提交 HTTP 200；
+					// 首帧标记已提交时允许继续保活。
+					if !wroteAnyBody && !preflightPingSent {
 						return true
 					}
 					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
@@ -5115,10 +5191,9 @@ func (h *Handler) Responses(c *gin.Context) {
 							}
 							return !clientGone
 						}
-						// 首个真实字节写出前绝不保活:注释一旦落笔就提交 200 header,
-						// 首 token 前 response.failed 按真实错误码返回/换号重试的全部
-						// 语义会被摧毁(PR #318 同类坑)。此时也无 200 可保,直接跳过。
-						if clientGone || !wroteAnyBody {
+						// 首帧标记/真实字节都尚未写出时绝不主动保活：注释一旦落笔就提交 200 header；
+						// 标记已经提交后可继续发送普通保活。
+						if clientGone || (!wroteAnyBody && !preflightPingSent) {
 							return !clientGone
 						}
 						if err := streamWriter.WriteSSEComment(continueKeepaliveComment); err != nil {
@@ -5511,6 +5586,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if !accountReleasedForOverflow {
 			if outcome.logStatusCode == http.StatusOK {
+				h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
@@ -5679,7 +5755,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithMessageHashesWithDispatchGuard(affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -5706,7 +5782,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
 			if account == nil {
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					return
@@ -5967,6 +6043,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 			})
+
+			h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 
 			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			contentType := resp.Header.Get("Content-Type")
@@ -6335,6 +6413,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 		h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		c.Data(http.StatusOK, "application/json", respBody)
 		h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
@@ -6481,7 +6560,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolChat) {
@@ -6825,6 +6904,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
+				h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 				h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 			} else {
 				h.store.Release(account)
@@ -6937,6 +7017,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					preContentErrorCandidate = nil
+				}
+				// Unknown metadata must not fall through the translator's generic
+				// `delta` handling. The Responses event itself is not client content,
+				// and codex.rate_limits is sensitive account-pool data.
+				if shouldHidePreflightSSEEventFromClient(eventType, data) {
+					return !isResponsesTerminalEvent(eventType)
 				}
 				visibleBody := wroteAnyBody && !continuousRetryBuffersAttempts(continuousRetryPolicy)
 				if eventType == "error" && continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -7314,6 +7400,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		if outcome.logStatusCode == http.StatusOK {
+			h.store.RecordMessageAffinity(apiKeyID, sessionIdentity.messageHashes, account)
 			h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 		} else {
 			h.store.Release(account)
