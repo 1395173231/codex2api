@@ -163,6 +163,13 @@ type Handler struct {
 	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
 	// 防止并发请求在“检查不存在”后同时建号。
 	agentIdentityImportMu sync.Mutex
+
+	// Paid subscription mutations are experimental and disabled by default.
+	subscriptionUpgradeEnabled       bool
+	subscriptionUpgradeClientFactory func(*auth.Account, string) subscriptionUpgradeUpstream
+	subscriptionUpgradeQuoteMu       sync.Mutex
+	subscriptionUpgradeQuotes        map[string]subscriptionUpgradeQuoteRecord
+	subscriptionUpgradeLocks         sync.Map
 }
 
 type responseCacheSettingsStore interface {
@@ -931,22 +938,27 @@ func parseUsageChannel(c *gin.Context) string {
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:                store,
-		cache:                tc,
-		db:                   db,
-		cacheCfgStore:        db,
-		rateLimiter:          rl,
-		cpuSampler:           newCPUSampler(),
-		startedAt:            time.Now(),
-		databaseDriver:       db.Driver(),
-		databaseLabel:        db.Label(),
-		cacheDriver:          tc.Driver(),
-		cacheLabel:           tc.Label(),
-		adminSecretEnv:       adminSecretEnv,
-		imageProxy:           proxy.NewHandler(store, db, nil, nil),
-		chartCacheData:       make(map[string]*chartCacheEntry),
-		accountListCache:     make(map[string]*accountListSnapshot),
-		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		store:                      store,
+		cache:                      tc,
+		db:                         db,
+		cacheCfgStore:              db,
+		rateLimiter:                rl,
+		cpuSampler:                 newCPUSampler(),
+		startedAt:                  time.Now(),
+		databaseDriver:             db.Driver(),
+		databaseLabel:              db.Label(),
+		cacheDriver:                tc.Driver(),
+		cacheLabel:                 tc.Label(),
+		adminSecretEnv:             adminSecretEnv,
+		imageProxy:                 proxy.NewHandler(store, db, nil, nil),
+		chartCacheData:             make(map[string]*chartCacheEntry),
+		accountListCache:           make(map[string]*accountListSnapshot),
+		accountAnalysisCache:       make(map[string]*accountAnalysisCacheEntry),
+		subscriptionUpgradeEnabled: subscriptionUpgradeFeatureEnabled(),
+		subscriptionUpgradeQuotes:  make(map[string]subscriptionUpgradeQuoteRecord),
+		subscriptionUpgradeClientFactory: func(account *auth.Account, proxyURL string) subscriptionUpgradeUpstream {
+			return proxy.NewChatGPTSubscriptionUpgradeClient(account, proxyURL)
+		},
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1025,6 +1037,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/page-stats", h.GetAccountPageStats)
 	api.GET("/accounts/live", h.GetAccountLiveState)
 	api.GET("/accounts/:id", h.GetAccount)
+	api.GET("/accounts/:id/subscription", h.GetAccountSubscription)
+	api.POST("/accounts/:id/subscription/upgrade-quotes", h.CreateSubscriptionUpgradeQuote)
+	api.POST("/accounts/:id/subscription/upgrades", h.CreateSubscriptionUpgrade)
+	api.GET("/subscription-upgrades/:operation_id", h.GetSubscriptionUpgradeOperation)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)

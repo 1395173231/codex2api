@@ -1609,6 +1609,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
 		return err
 	}
+	if err := db.ensureSubscriptionUpgradeSchema(ctx); err != nil {
+		return err
+	}
 	return db.runDataMigrationsWithTimeout()
 }
 

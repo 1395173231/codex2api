@@ -802,6 +802,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	if err := db.installSchedulerOutboxTriggers(ctx); err != nil {
 		return fmt.Errorf("install scheduler outbox triggers: %w", err)
 	}
+	if err := db.ensureSubscriptionUpgradeSchema(ctx); err != nil {
+		return err
+	}
 
 	return db.runDataMigrationsWithTimeout()
 }
