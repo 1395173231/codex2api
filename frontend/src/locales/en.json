@@ -3584,7 +3584,7 @@
     "schedulerModeRemainingQuota": "Remaining Quota",
     "schedulerModeFillFirst": "Fill First",
     "affinityMode": "Session Affinity",
-    "affinityModeDesc": "Affinity is separate from scheduling priority. With a shared API key, send X-Codex2API-Affinity-Key to distinguish end users; it is hashed and used locally only. Bounded rotates after 50 requests, 5 minutes, or unhealthy status; Off re-picks; Strict stays long-term.",
+    "affinityModeDesc": "Affinity is separate from scheduling priority. With a shared API key, send X-Codex2API-Affinity-Key to distinguish end users; it is hashed and used locally only. Bounded rotates only when the account turns unhealthy or the session idles over 10 minutes — active sessions stay pinned to preserve the upstream prompt cache; Off re-picks; Strict stays long-term.",
     "sessionAffinitySpread": "Affinity hash spread",
     "sessionAffinitySpreadDesc": "When a new affinity key binds for the first time, pick the account by deterministic hashing within the same priority and health tier instead of always taking the current top score: the same key always maps to the same account, different keys spread evenly, and an unavailable pick falls through in hash order. Off keeps the classic top-score behavior. Multi-replica deployments converge without coordination.",
     "sessionSlotBuffer": "Session slot buffer",
