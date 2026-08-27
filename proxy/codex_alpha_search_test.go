@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,7 +22,7 @@ func TestCodexAlphaSearchHandler_PassesThroughRequestAndResponse(t *testing.T) {
 
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		if got := r.Header.Get("Authorization"); got != "Bearer at-search" {
 			t.Errorf("Authorization = %q, want Bearer at-search", got)
 		}
@@ -75,7 +74,7 @@ func TestCodexAlphaSearchHandler_StripsPromptCacheKey(t *testing.T) {
 
 	var seenBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenBody, _ = io.ReadAll(r.Body)
+		seenBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"output":[]}`))
 	}))

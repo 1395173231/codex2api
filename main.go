@@ -329,6 +329,7 @@ func main() {
 		log.Fatalf("启动响应缓存设置同步失败")
 	}
 	adminHandler.StartAutoResetCredits(backgroundCtx)
+	adminHandler.StartAutoActivate5hWindow(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
 	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
@@ -422,12 +423,30 @@ func main() {
 					fi, statErr := f.Stat()
 					f.Close()
 					if statErr == nil && !fi.IsDir() {
+						if strings.HasPrefix(trimmed, "assets/") {
+							c.Header("Cache-Control", "public, max-age=31536000, immutable")
+						} else {
+							c.Header("Cache-Control", "no-cache")
+						}
 						c.FileFromFS(fp, httpFS)
 						return
 					}
 				}
+				// 带 hash 的静态资源不存在时必须返回 404。若回退到 index.html，
+				// 浏览器会把 HTML 当成 JS/CSS 解析并反复触发 chunk load error。
+				if strings.HasPrefix(trimmed, "assets/") {
+					c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+					c.Status(http.StatusNotFound)
+					return
+				}
 			}
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
+			c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+			c.Header("Pragma", "no-cache")
+			if c.Query("refresh-assets") == "1" {
+				// 仅清理 HTTP cache，不影响登录态、localStorage 或站点配置。
+				c.Header("Clear-Site-Data", `"cache"`)
+			}
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
 		serveKeyUsageFrontend := func(c *gin.Context) {
@@ -582,6 +601,7 @@ func main() {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
 	adminHandler.WaitAutoResetCredits()
+	adminHandler.WaitAutoActivate5hWindow()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
 	store.Stop()
