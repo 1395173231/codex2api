@@ -3120,7 +3120,8 @@ export interface APIKeyRow {
   reset_count: number
   last_reset_at?: ISODateString | null
   expires_at?: ISODateString | null
-  status?: 'active' | 'expired' | 'quota_exhausted'
+  status?: 'active' | 'expired' | 'quota_exhausted' | 'disabled'
+  enabled?: boolean
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
@@ -3185,6 +3186,7 @@ export interface UpdateAPIKeyRequest {
   expires_in_days?: number
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
+  enabled?: boolean
 }
 
 export interface PublicAPIKeyUsageKey {

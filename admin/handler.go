@@ -7924,6 +7924,7 @@ type updateAPIKeyReq struct {
 	ExpiresInDays   *int                   `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
 	Limits          *database.APIKeyLimits `json:"limits"`
+	Enabled         *bool                  `json:"enabled"`
 }
 
 func (h *Handler) UpdateAPIKey(c *gin.Context) {
@@ -8016,6 +8017,10 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	if req.Name != nil {
 		update.Name = *req.Name
 		update.NameSet = true
+	}
+	if req.Enabled != nil {
+		update.Enabled = *req.Enabled
+		update.EnabledSet = true
 	}
 	if req.Limits != nil {
 		update.Limits = sanitizeAPIKeyLimits(*req.Limits)

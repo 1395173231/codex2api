@@ -207,6 +207,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			last_reset_at TIMESTAMP NULL,
 			allowed_group_ids TEXT DEFAULT '[]',
 			expires_at TIMESTAMP NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_key_scope_counters (
@@ -556,6 +557,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"api_keys", "allowed_group_ids", "TEXT DEFAULT '[]'"},
 		{"api_keys", "limits", "TEXT DEFAULT '{}'"},
 		{"api_keys", "expires_at", "TIMESTAMP NULL"},
+		{"api_keys", "enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"account_groups", "description", "TEXT DEFAULT ''"},
 		{"account_groups", "color", "TEXT DEFAULT ''"},
 		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},

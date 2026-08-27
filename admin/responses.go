@@ -75,6 +75,7 @@ type MaskedAPIKeyRow struct {
 	AllowedGroupIDs []int64                  `json:"allowed_group_ids"`
 	Limits          database.APIKeyLimits    `json:"limits"`
 	WindowUsage     *APIKeyWindowUsageDetail `json:"window_usage,omitempty"`
+	Enabled         bool                     `json:"enabled"`
 	Status          string                   `json:"status"`
 	LastUsedAt      *string                  `json:"last_used_at,omitempty"`
 	CreatedAt       string                   `json:"created_at"`
@@ -101,7 +102,9 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 		lastResetAt = &formatted
 	}
 	status := "active"
-	if row.IsExpired(time.Now()) {
+	if !row.Enabled {
+		status = "disabled"
+	} else if row.IsExpired(time.Now()) {
 		status = "expired"
 	} else if row.IsQuotaExhausted() {
 		status = "quota_exhausted"
@@ -119,6 +122,7 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 		ExpiresAt:       expiresAt,
 		AllowedGroupIDs: append([]int64(nil), row.AllowedGroupIDs...),
 		Limits:          row.Limits,
+		Enabled:         row.Enabled,
 		Status:          status,
 		CreatedAt:       row.CreatedAt.Format(time.RFC3339),
 	}

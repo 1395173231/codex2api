@@ -1208,6 +1208,7 @@ func (db *DB) migrate(ctx context.Context) error {
 
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_group_ids JSONB DEFAULT '[]'::jsonb;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS limits JSONB DEFAULT '{}'::jsonb;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 			CREATE TABLE IF NOT EXISTS system_settings (
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -1636,6 +1637,7 @@ type APIKeyRow struct {
 	ExpiresAt       sql.NullTime `json:"expires_at"`
 	AllowedGroupIDs []int64      `json:"allowed_group_ids"`
 	Limits          APIKeyLimits `json:"limits"`
+	Enabled         bool         `json:"enabled"`
 	CreatedAt       time.Time    `json:"created_at"`
 }
 
@@ -1798,9 +1800,11 @@ type APIKeyUpdate struct {
 	AllowedGroupIDsSet bool
 	Limits             APIKeyLimits
 	LimitsSet          bool
+	Enabled            bool
+	EnabledSet         bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), COALESCE(enabled, TRUE)`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -1878,7 +1882,7 @@ func (row *APIKeyRow) IsQuotaExhausted() bool {
 }
 
 func (row *APIKeyRow) HasAccessConstraints() bool {
-	return row != nil && (row.QuotaLimit > 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) > 0 || !row.Limits.IsZero())
+	return row != nil && (row.QuotaLimit > 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) > 0 || !row.Limits.IsZero() || !row.Enabled)
 }
 
 // UpdateAPIKeyName updates the display name of an API key without changing the key value.
@@ -2044,6 +2048,9 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 		} else {
 			sets = append(sets, "limits = "+ph+"::jsonb")
 		}
+	}
+	if update.EnabledSet {
+		sets = append(sets, "enabled = "+setArg(update.Enabled))
 	}
 	if len(sets) == 0 {
 		return nil

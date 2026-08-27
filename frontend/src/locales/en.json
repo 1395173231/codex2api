@@ -4319,8 +4319,17 @@
       "active": "Active",
       "expired": "Expired",
       "quota_exhausted": "Quota exhausted",
-      "expiring_soon": "Expiring soon"
+      "expiring_soon": "Expiring soon",
+      "disabled": "Disabled"
     },
+    "enable": "Enable",
+    "disable": "Disable",
+    "disableTitle": "Disable API Key",
+    "disableDesc": "All requests with this key will be rejected immediately (401). Configuration and usage data are preserved, and the key can be re-enabled at any time.",
+    "disableConfirm": "Disable",
+    "enableSuccess": "Key enabled",
+    "disableSuccess": "Key disabled",
+    "toggleFailed": "Operation failed",
     "showKey": "Show key",
     "hideKey": "Hide key",
     "allowedGroups": "Allowed Groups",

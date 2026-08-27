@@ -4319,8 +4319,17 @@
       "active": "正常",
       "expired": "已过期",
       "quota_exhausted": "额度耗尽",
-      "expiring_soon": "即将过期"
+      "expiring_soon": "即将过期",
+      "disabled": "已禁用"
     },
+    "enable": "启用",
+    "disable": "禁用",
+    "disableTitle": "禁用 API Key",
+    "disableDesc": "禁用后该密钥的所有请求将立即被拒绝（401），已有配置与用量数据保留。可随时重新启用。",
+    "disableConfirm": "确认禁用",
+    "enableSuccess": "密钥已启用",
+    "disableSuccess": "密钥已禁用",
+    "toggleFailed": "操作失败",
     "showKey": "显示密钥",
     "hideKey": "隐藏密钥",
     "allowedGroups": "允许分组",
