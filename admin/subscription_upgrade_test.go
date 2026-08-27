@@ -84,6 +84,9 @@ func TestSubscriptionUpgradeTokenInvalidationRequiresReauthenticationWithoutSeco
 	quoteContext.Params = gin.Params{{Key: "id", Value: "20"}}
 	quoteContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/20/subscription/upgrade-quotes", strings.NewReader(`{"target_plan":"chatgptpro","currency":"PHP"}`))
 	handler.CreateSubscriptionUpgradeQuote(quoteContext)
+	if strings.Contains(quoteRecorder.Body.String(), `"silent_reauthorization_available":true`) {
+		t.Fatal("quote must not claim silent reauthorization without a Web Session")
+	}
 	var quoteResponse struct {
 		QuoteID string `json:"quote_id"`
 	}
@@ -155,6 +158,9 @@ func TestSubscriptionUpgradeUsesStoredWebSessionOnlyForReadOnlyRecovery(t *testi
 	quoteContext.Params = gin.Params{{Key: "id", Value: "20"}}
 	quoteContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/20/subscription/upgrade-quotes", strings.NewReader(`{"target_plan":"chatgptpro","currency":"PHP"}`))
 	handler.CreateSubscriptionUpgradeQuote(quoteContext)
+	if !strings.Contains(quoteRecorder.Body.String(), `"silent_reauthorization_available":true`) {
+		t.Fatalf("quote does not report stored Web Session readiness: %s", quoteRecorder.Body.String())
+	}
 	var quoteResponse struct {
 		QuoteID string `json:"quote_id"`
 	}

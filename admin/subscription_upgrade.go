@@ -169,7 +169,8 @@ func (h *Handler) CreateSubscriptionUpgradeQuote(c *gin.Context) {
 		"currency": record.Currency, "amount_due_minor": record.AmountDueMinor,
 		"recurring_amount_minor": quote.RecurringAmountMinor, "tax_amount_minor": quote.TaxAmountMinor,
 		"renewal_date": quote.RenewalDate, "default_payment_method_present": quote.DefaultPaymentMethodPresent,
-		"line_items": quote.LineItems, "expires_at": record.ExpiresAt,
+		"silent_reauthorization_available": account.HasSessionToken(),
+		"line_items":                       quote.LineItems, "expires_at": record.ExpiresAt,
 	})
 }
 

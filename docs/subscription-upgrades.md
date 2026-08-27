@@ -42,7 +42,9 @@ Content-Type: application/json
 
 The response includes the exact amount currently due in minor units, recurring
 price, tax, line items, renewal date, payment-method presence, and a two-minute
-`quote_id`.
+`quote_id`. `silent_reauthorization_available` reports whether Codex2API already
+holds a separate Web Session that can be tried if the paid update invalidates
+the current OAuth credential family. It never exposes that session credential.
 
 After a human reviews that preview, submit a bounded confirmation:
 
