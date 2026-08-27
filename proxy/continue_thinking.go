@@ -73,6 +73,7 @@ const (
 	continueStopNoEncrypted  = "no_encrypted"       // 命中指纹但 reasoning 缺 encrypted_content
 	continueStopClientGone   = "client_gone"        // 客户端已断开，不再续想
 	continueStopUpstreamEOF  = "upstream_eof"       // 上游未发 terminal 就关闭
+	continueStopReadError    = "read_error"         // 上游流在 terminal 前发生真实读取错误
 	continueStopRoundError   = "continuation_error" // 续想轮请求失败（4xx/传输错误）
 	continueStopForwardAbort = "forward_abort"      // 下游回调要求中止（交还上层语义）
 )
@@ -554,6 +555,20 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 		}
 
 		if outcome.terminal == nil {
+			if outcome.readErr != nil {
+				// 真实读取错误（WS close/read limit、代理 reset、pipe error 等）不能伪装成
+				// 干净 EOF。首轮尚无输出时保持静默，让上层透明重试；已有实时/缓冲
+				// 输出时只冲刷内容，终态由 handler 按 readErr 合成 response.failed，
+				// 从而保留 transport 分类、账号惩罚和 WS 鉴权核验语义。
+				result.StopReason = continueStopReadError
+				if roundNo == 1 && len(st.finalOutput) == 0 && !st.flushedAny && len(outcome.buffered) == 0 {
+					return result
+				}
+				if !st.flushBuffered(outcome.buffered, f) {
+					result.StopReason = continueStopForwardAbort
+				}
+				return result
+			}
 			// 上游 EOF 无终态。第 1 轮且从未产出任何输出（含缓冲）时保持静默，让上层的
 			// 透明断流重试接管；否则冲刷已缓冲内容 + 合成 incomplete 给客户端一个终态，
 			// 避免缓冲内容被丢弃或客户端收到空的 200 流。

@@ -363,7 +363,7 @@ func (wc *WsConnection) enqueueBusinessFrameForCapturedLease(messageType int, pa
 
 func isReadLeaseTerminal(payload []byte) bool {
 	switch gjson.GetBytes(payload, "type").String() {
-	case "response.completed", "response.failed", "response.done", "error":
+	case "response.completed", "response.failed", "response.incomplete", "response.done", "error":
 		return true
 	default:
 		return false

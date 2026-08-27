@@ -97,9 +97,13 @@ type Config struct {
 	MaxRequestBodySize     int
 	Database               DatabaseConfig
 	Cache                  CacheConfig
-	UseWebsocket           bool     // 是否启用 WebSocket 传输
-	CodexUpstreamTransport string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
-	TrustedProxies         []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	UseWebsocket           bool   // 是否启用 WebSocket 传输
+	CodexUpstreamTransport string // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
+	// CodexRemoteCompactionTransport 控制原生 Remote Compaction v2
+	//（/responses + stream=true + compaction_trigger）的上游传输。
+	// http（默认）用于隔离长响应与 WebSocket 长连接波动；inherit 跟随普通请求；ws 强制 WebSocket。
+	CodexRemoteCompactionTransport string
+	TrustedProxies                 []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -166,6 +170,13 @@ func Load(envPath string) (*Config, error) {
 	}
 	if cfg.CodexUpstreamTransport == "ws" {
 		cfg.UseWebsocket = true
+	}
+
+	// Remote Compaction 的响应通常更长，默认独立走 HTTP SSE，避免全局强制 WS
+	// 时被代理 idle policy、WS 帧/队列限制或连接波动截断。inherit 可显式恢复旧行为。
+	cfg.CodexRemoteCompactionTransport = normalizeCodexRemoteCompactionTransport(os.Getenv("CODEX_REMOTE_COMPACTION_TRANSPORT"))
+	if cfg.CodexRemoteCompactionTransport == "" {
+		cfg.CodexRemoteCompactionTransport = "http"
 	}
 
 	// 数据库配置
@@ -280,6 +291,19 @@ func normalizeCodexUpstreamTransport(value string) string {
 		return "http"
 	case "auto":
 		return "auto"
+	case "ws", "websocket", "wss":
+		return "ws"
+	default:
+		return ""
+	}
+}
+
+func normalizeCodexRemoteCompactionTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http", "https", "sse":
+		return "http"
+	case "inherit", "auto":
+		return "inherit"
 	case "ws", "websocket", "wss":
 		return "ws"
 	default:

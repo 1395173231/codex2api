@@ -162,3 +162,21 @@ func TestHandleMessage_NormalFrameUnaffected(t *testing.T) {
 		t.Fatalf("expected 2 frames passed through, got %d", len(captured))
 	}
 }
+
+func TestHandleMessage_ResponseIncompleteIsTerminal(t *testing.T) {
+	r := &WsResponse{}
+	upstream := []byte(`{"type":"response.incomplete","response":{"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`)
+
+	var captured []byte
+	err := r.handleMessage(upstream, func(data []byte) bool {
+		captured = append(captured[:0], data...)
+		return true
+	})
+
+	if err != io.EOF {
+		t.Fatalf("incomplete frame returned %v, want io.EOF", err)
+	}
+	if string(captured) != string(upstream) {
+		t.Fatalf("incomplete payload changed:\ngot  %s\nwant %s", captured, upstream)
+	}
+}

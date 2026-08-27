@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,28 @@ import (
 
 	"github.com/tidwall/gjson"
 )
+
+type streamThenErrorReadCloser struct {
+	reader *strings.Reader
+	err    error
+}
+
+func newStreamThenErrorReadCloser(data string, err error) *streamThenErrorReadCloser {
+	return &streamThenErrorReadCloser{reader: strings.NewReader(data), err: err}
+}
+
+func (r *streamThenErrorReadCloser) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		return n, nil
+	}
+	if errors.Is(err, io.EOF) {
+		return 0, r.err
+	}
+	return n, err
+}
+
+func (r *streamThenErrorReadCloser) Close() error { return nil }
 
 // --- fixture 构造 -----------------------------------------------------------
 
@@ -537,6 +560,25 @@ func TestFoldFirstRoundEOFSilent(t *testing.T) {
 	}
 }
 
+func TestFoldFirstRoundReadErrorSilentForTransparentRetry(t *testing.T) {
+	readErr := errors.New("upstream pipe reset")
+	c := &foldCollector{}
+	res := c.fold(testBaseBody, 8, &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       newStreamThenErrorReadCloser("", readErr),
+	})
+
+	if res.GotTerminal || res.StopReason != continueStopReadError {
+		t.Fatalf("首轮无输出读取错误应静默交给上层重试: %+v", res)
+	}
+	if !errors.Is(res.ReadErr, readErr) {
+		t.Fatalf("ReadErr = %v, want %v", res.ReadErr, readErr)
+	}
+	if len(c.events) != 0 {
+		t.Fatalf("首轮无输出读取错误不应写下游事件: %v", c.eventTypes())
+	}
+}
+
 func TestFoldFirstRoundEOFWithBufferedContentFlushes(t *testing.T) {
 	// 第 1 轮缓冲了 message 内容后 EOF（无 terminal）：不应静默丢弃，
 	// 应冲刷缓冲内容并合成 incomplete，避免客户端收到空的 200 流。
@@ -559,6 +601,42 @@ func TestFoldFirstRoundEOFWithBufferedContentFlushes(t *testing.T) {
 	}
 	if c.eventTypes()[len(c.eventTypes())-1] != "response.incomplete" {
 		t.Fatalf("末事件应为 incomplete: %v", c.eventTypes())
+	}
+}
+
+func TestFoldFirstRoundReadErrorFlushesBufferedContentWithoutFakeIncomplete(t *testing.T) {
+	readErr := errors.New("upstream pipe reset")
+	var sse strings.Builder
+	for _, event := range []string{
+		evCreated(),
+		evMessageAdded(1, 0),
+		evMessageDelta(2, 0, "partial answer"),
+	} {
+		sse.WriteString("data: ")
+		sse.WriteString(event)
+		sse.WriteString("\n\n")
+	}
+	c := &foldCollector{}
+	res := c.fold(testBaseBody, 8, &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       newStreamThenErrorReadCloser(sse.String(), readErr),
+	})
+
+	if res.GotTerminal || res.StopReason != continueStopReadError {
+		t.Fatalf("有缓冲内容的读取错误应留给 handler 写失败终态: %+v", res)
+	}
+	if !errors.Is(res.ReadErr, readErr) {
+		t.Fatalf("ReadErr = %v, want %v", res.ReadErr, readErr)
+	}
+	joined := ""
+	for _, ev := range c.events {
+		joined += string(ev)
+		if gjson.GetBytes(ev, "type").String() == "response.incomplete" {
+			t.Fatalf("真实读取错误不应伪装成 response.incomplete: %s", ev)
+		}
+	}
+	if !strings.Contains(joined, "partial answer") {
+		t.Fatalf("缓冲内容应被冲刷给 handler, events=%v", c.eventTypes())
 	}
 }
 

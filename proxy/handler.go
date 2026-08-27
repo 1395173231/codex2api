@@ -167,6 +167,23 @@ func (h *Handler) shouldUseWebsocketForHTTP() bool {
 	}
 }
 
+// shouldUseWebsocketForRemoteCompaction 对原生 Remote Compaction v2 应用独立传输策略。
+// 默认（配置缺失、空值或非法值）使用 HTTP；inherit 才沿用普通 Responses 的选择，
+// 从而避免全局 codex_force_websocket 把长压缩响应强制放到更脆弱的 WS 长连接上。
+func (h *Handler) shouldUseWebsocketForRemoteCompaction(inherited bool) bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(h.cfg.CodexRemoteCompactionTransport)) {
+	case "ws", "websocket", "wss":
+		return true
+	case "inherit", "auto":
+		return inherited
+	default:
+		return false
+	}
+}
+
 func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
 	if h != nil && h.store != nil {
 		if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" && !h.store.ManagedProxyUnavailable(proxyURL) {
@@ -3887,7 +3904,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		attemptLogEffectiveModel := logEffectiveModel
 		// relay/Grok 账号走 HTTP 执行器（下方 IsRelayStyle 分支优先于 WS），这里同步排除，
 		// 避免日志把 relay 请求错标成 via_websocket。
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
+		wantWebsocket := h.shouldUseWebsocketForHTTP()
+		if nativeRemoteCompactionV2 {
+			wantWebsocket = h.shouldUseWebsocketForRemoteCompaction(wantWebsocket)
+		}
+		useWebsocket := wantWebsocket && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {

@@ -230,6 +230,7 @@ func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
 	t.Setenv("CACHE_DRIVER", "")
 	t.Setenv("REDIS_ADDR", "redis:6379")
 	t.Setenv("CODEX_UPSTREAM_TRANSPORT", "")
+	t.Setenv("CODEX_REMOTE_COMPACTION_TRANSPORT", "")
 	t.Setenv("USE_WEBSOCKET", "")
 
 	cfg, err := Load("__not_exists__.env")
@@ -241,6 +242,9 @@ func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
 	}
 	if cfg.UseWebsocket {
 		t.Fatal("UseWebsocket = true, want false")
+	}
+	if got := cfg.CodexRemoteCompactionTransport; got != "http" {
+		t.Fatalf("CodexRemoteCompactionTransport = %q, want http", got)
 	}
 }
 
@@ -281,6 +285,36 @@ func TestLoadKeepsLegacyUseWebsocketCompatibility(t *testing.T) {
 	}
 	if !cfg.UseWebsocket {
 		t.Fatal("UseWebsocket = false, want true")
+	}
+}
+
+func TestLoadHonorsCodexRemoteCompactionTransport(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "http alias", value: "sse", want: "http"},
+		{name: "inherit", value: "inherit", want: "inherit"},
+		{name: "auto alias", value: "auto", want: "inherit"},
+		{name: "websocket alias", value: "websocket", want: "ws"},
+		{name: "invalid falls back safely", value: "invalid", want: "http"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_DRIVER", "")
+			t.Setenv("DATABASE_HOST", "postgres")
+			t.Setenv("CACHE_DRIVER", "")
+			t.Setenv("REDIS_ADDR", "redis:6379")
+			t.Setenv("CODEX_REMOTE_COMPACTION_TRANSPORT", tt.value)
+
+			cfg, err := Load("__not_exists__.env")
+			if err != nil {
+				t.Fatalf("Load() 返回错误: %v", err)
+			}
+			if got := cfg.CodexRemoteCompactionTransport; got != tt.want {
+				t.Fatalf("CodexRemoteCompactionTransport = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

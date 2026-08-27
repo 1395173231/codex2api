@@ -21,6 +21,8 @@
 
 ### Fixes
 
+- **Remote Compaction stays on a stable HTTP lane even when ordinary Responses are forced through WebSocket.** Native `stream=true` compaction-trigger requests now default to HTTP SSE and can opt back into inherited or explicit WebSocket routing with `CODEX_REMOTE_COMPACTION_TRANSPORT`. The WebSocket relay also treats `response.incomplete` as a real terminal in both its executor and read-lease state machine, so normal truncated terminals stop cleanly and the connection can be reused safely.
+- **Continue-thinking no longer hides WebSocket, proxy, or pipe read failures as `response.incomplete(upstream_eof)`.** A genuine read error keeps its transport classification and ends an already-started stream with `response.failed(upstream_stream_break)`; only a clean EOF without a Responses terminal retains the legacy `upstream_eof` fallback.
 - **Status-less `ErrUpstream(0, ..., cause)` transport failures keep their transport classification after continuous retry landed.** Executors wrap `http.Client.Do` EOF/reset as a non-legacy-retryable structured error; the classifier now unwraps that cause so sticky same-account transport retries still bind the original relay account.
 - **Antigravity API Key accounts no longer enter OAuth unauthorized-refresh recovery, and API Key rotation rejects a duplicate credential family.** Account responses expose only the credential kind and never return the key itself.
 - **The OAuth Responses-to-Gemini converter rejects empty unsupported input, converts OpenAI function declarations into Gemini `functionDeclarations`, and rejects unsupported tool types instead of forwarding malformed objects.**

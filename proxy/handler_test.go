@@ -5786,6 +5786,160 @@ func TestResponses_NativeRemoteCompactionV2UsesRelayOnlyPool(t *testing.T) {
 	}
 }
 
+func TestResponses_NativeRemoteCompactionV2BypassesForcedWebsocket(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+	})
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	ApplyRuntimeSettings(nextSettings)
+
+	wsCalls := 0
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		wsCalls++
+		return nil, errors.New("remote compaction unexpectedly used websocket")
+	}
+
+	httpCalls := 0
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		seenBody = readUpstreamRequestBody(r)
+		if r.URL.Path != "/backend-api/codex/responses" && !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
+			t.Fatalf("upstream path = %q, want /backend-api/codex/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_remote_compaction_http","status":"completed","output":[{"type":"compaction","encrypted_content":"compact"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+	useDirectCodexUpstream(t, upstream.URL)
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:        1,
+		AccessToken: "at-codex",
+		PlanType:    "pro",
+		AccountID:   "acct-codex",
+		Models:      []string{"gpt-5.6-sol"},
+	})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if wsCalls != 0 {
+		t.Fatalf("websocket upstream calls = %d, want 0", wsCalls)
+	}
+	if httpCalls != 1 {
+		t.Fatalf("HTTP upstream calls = %d, want 1", httpCalls)
+	}
+	if !requestBodyHasCompactionTrigger(seenBody) {
+		t.Fatalf("HTTP upstream body lost compaction_trigger: %s", seenBody)
+	}
+	if !gjson.GetBytes(seenBody, "stream").Bool() {
+		t.Fatalf("HTTP upstream body lost stream=true: %s", seenBody)
+	}
+}
+
+func TestResponses_ContinueThinkingReadErrorReturnsFailedNotUpstreamEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+	})
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	nextSettings.CodexContinueThinking = true
+	nextSettings.ContinuousRetryPolicy = database.ContinuousRetryPolicy{}
+	ApplyRuntimeSettings(nextSettings)
+
+	var sse strings.Builder
+	for _, event := range []string{
+		evCreated(),
+		evMessageAdded(1, 0),
+		evMessageDelta(2, 0, "partial answer"),
+	} {
+		sse.WriteString("data: ")
+		sse.WriteString(event)
+		sse.WriteString("\n\n")
+	}
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       newStreamThenErrorReadCloser(sse.String(), errors.New("upstream pipe reset")),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:        1,
+		AccessToken: "at-codex",
+		PlanType:    "pro",
+		AccountID:   "acct-codex",
+		Models:      []string{"gpt-5.6-sol"},
+	})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	responseBody := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed SSE 200; body=%s", recorder.Code, responseBody)
+	}
+	if !strings.Contains(responseBody, "partial answer") {
+		t.Fatalf("buffered output was lost: %s", responseBody)
+	}
+	if !strings.Contains(responseBody, `"type":"response.failed"`) || !strings.Contains(responseBody, ErrorCodeUpstreamStreamBreak) {
+		t.Fatalf("read error should end with response.failed(upstream_stream_break): %s", responseBody)
+	}
+	if strings.Contains(responseBody, `"type":"response.incomplete"`) || strings.Contains(responseBody, "upstream_eof") {
+		t.Fatalf("read error was mislabeled as incomplete(upstream_eof): %s", responseBody)
+	}
+	if strings.Count(responseBody, `"type":"response.failed"`) != 1 {
+		t.Fatalf("expected exactly one failure terminal: %s", responseBody)
+	}
+}
+
 // issue #540：池里还有可用官方账号时，不能把流式 Remote Compact 钉死在官方账号上。
 // 官方号若因模型白名单选不上，必须回落到能打 /responses 的中转，而不是立刻 503。
 func TestResponses_NativeRemoteCompactionV2FallsBackToRelayWhenOfficialCannotServe(t *testing.T) {

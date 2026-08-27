@@ -388,7 +388,7 @@ type WsResponse struct {
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
 	// streamCompleted 标记读流已消费到明确的终止边界(response.completed /
-	// response.failed / 上游 error 帧)。Close() 只在此标记为 true 且未标记
+	// response.incomplete / response.failed / 上游 error 帧)。Close() 只在此标记为 true 且未标记
 	// connBroken 时才归还连接复用；其余情况(下游断开、ctx 取消、上游关闭、
 	// 握手失败后未读流等)上游可能仍在该连接上推送残留帧，归还复用会把上一个
 	// 请求的响应串给下一个用户(issue #308)，必须销毁。受 mu 保护。
@@ -475,10 +475,10 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 
 	// 检查是否是终止事件
 	eventType := gjson.GetBytes(payload, "type").String()
-	if eventType == "response.completed" || eventType == "response.failed" {
+	if eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.failed" {
 		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
 		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
-		if eventType == "response.completed" && r.manager != nil && r.conn != nil {
+		if (eventType == "response.completed" || eventType == "response.incomplete") && r.manager != nil && r.conn != nil {
 			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
 				accountID := int64(0)
 				if r.conn.session != nil {
@@ -600,7 +600,7 @@ func (r *WsResponse) Close() error {
 	}
 
 	// 根据读流的结束方式决定连接去向：
-	//   - 读到终止边界(completed/failed/error 帧)且无异常：归还连接池继续复用。
+	//   - 读到终止边界(completed/incomplete/failed/error 帧)且无异常：归还连接池继续复用。
 	//   - 其余任何情况一律销毁并移出连接池：
 	//     * 上游 WS 异常(close 1006/1009/1011、read error) → 坏连接复用会断流且 fd 滞留 CLOSE_WAIT；
 	//     * 下游写入失败 / ctx 取消 / 上游正常关闭 / 握手失败后未读流 → 流没消费到边界，
