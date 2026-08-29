@@ -258,3 +258,33 @@ func TestAffinityProxyStillValidTracksGroupProxy(t *testing.T) {
 		t.Fatal("new group proxy should be valid")
 	}
 }
+
+func TestResolveProxyCandidatesForAccountPriorityAndLimit(t *testing.T) {
+	store := &Store{globalProxy: "http://global:8080", proxyPoolEnabled: true, proxyPool: []string{"http://pool:8080", "http://group-2:8080"}}
+	store.SetGroupProxyURLs(5, []string{"http://group-1:8080", "http://group-2:8080", "http://group-1:8080"})
+	got := store.ResolveProxyCandidatesForAccount(&Account{DBID: 1, GroupIDs: []int64{5}}, 3)
+	want := []string{"http://group-1:8080", "http://group-2:8080"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestResolveProxyCandidatesForAccountDisabledPinFailsClosed(t *testing.T) {
+	store := &Store{globalProxy: "http://global:8080", proxyPoolEnabled: true, proxyPool: []string{"http://enabled:8080"}, proxyPoolSet: buildProxyPoolSet([]string{"http://enabled:8080"}), managedProxySet: buildProxyPoolSet([]string{"http://disabled:8080", "http://enabled:8080"})}
+	if got := store.ResolveProxyCandidatesForAccount(&Account{ProxyURL: "http://disabled:8080"}, 3); len(got) != 0 {
+		t.Fatalf("got %v, want no candidates", got)
+	}
+}
+
+func TestResolveProxyCandidatesForAccountAllowsDirectWhenPoolDisabled(t *testing.T) {
+	store := &Store{}
+	got := store.ResolveProxyCandidatesForAccount(&Account{DBID: 1}, 2)
+	if len(got) != 1 || got[0] != "" {
+		t.Fatalf("got %v, want one direct candidate", got)
+	}
+}

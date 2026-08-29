@@ -486,12 +486,18 @@ func (wc *WsConnection) BeginReadLease(requestID string) error {
 	if !wc.IsConnected() {
 		return fmt.Errorf("begin websocket read lease: connection is not connected")
 	}
+	if wc.IsDraining() {
+		return fmt.Errorf("begin websocket read lease: connection is draining")
+	}
 
 	state := wc.ensureReadState()
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if !wc.IsConnected() {
 		return fmt.Errorf("begin websocket read lease: connection is not connected")
+	}
+	if wc.IsDraining() {
+		return fmt.Errorf("begin websocket read lease: connection is draining")
 	}
 	if state.readerStopped {
 		return fmt.Errorf("begin websocket read lease: reader stopped: %w", state.readerErr)
@@ -518,6 +524,9 @@ func (wc *WsConnection) beginReadLeaseWrite(messageType int) (string, bool, erro
 	state := wc.ensureReadState()
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if wc.IsDraining() && (state.activeLease == "" || state.leasePhase != readLeaseReserved) {
+		return "", false, fmt.Errorf("write websocket request: connection is draining")
+	}
 	if state.readerStopped {
 		return "", false, fmt.Errorf("write websocket request: reader stopped: %w", state.readerErr)
 	}
@@ -547,6 +556,10 @@ func (wc *WsConnection) ensureReadLeaseForSend(requestID string) error {
 		phase := state.leasePhase
 		state.mu.Unlock()
 		return fmt.Errorf("send websocket request: lease %q is active in phase %d", activeLease, phase)
+	}
+	if wc.IsDraining() {
+		state.mu.Unlock()
+		return fmt.Errorf("send websocket request: connection is draining")
 	}
 	if state.readerStopped {
 		err := state.readerErr
@@ -718,7 +731,7 @@ func (wc *WsConnection) ensureReadLeaseForResponse(requestID string) error {
 }
 
 func (wc *WsConnection) readPumpReusable() bool {
-	if wc == nil {
+	if wc == nil || wc.IsDraining() {
 		return false
 	}
 	state := wc.ensureReadState()

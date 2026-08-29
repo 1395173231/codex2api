@@ -30,6 +30,18 @@ const (
 	StateClosing      ConnectionState = 3
 )
 
+// connectionLifecycle controls whether a live connection may accept new
+// requests. It is deliberately separate from ConnectionState: a draining
+// connection remains connected while its in-flight request(s) finish, but is
+// no longer eligible for new leases.
+type connectionLifecycle int32
+
+const (
+	connectionLifecycleActive connectionLifecycle = iota
+	connectionLifecycleDraining
+	connectionLifecycleClosed
+)
+
 // WsConnection WebSocket 连接包装
 type WsConnection struct {
 	// WebSocket 连接
@@ -53,8 +65,19 @@ type WsConnection struct {
 	// 连接池键
 	PoolKey string
 
+	// groupKey 是逻辑连接组键（不含代理与轮转代数）。同一逻辑会话/无状态
+	// 槽位的兄弟连接共享 groupKey，便于在轮转时把新请求分流到其它连接。
+	groupKey string
+	// proxyURL 是本次握手实际使用的有效代理 URL；仅用于路由选择和诊断，
+	// 不应直接写入包含凭据的日志。
+	proxyURL string
+
 	// 连接状态
 	state atomic.Int32
+
+	// lifecycle=Draining 时连接仍可为已有 pending 请求服务，但拒绝新请求。
+	lifecycle atomic.Int32
+	drainAt   atomic.Int64
 
 	// 最后使用时间
 	lastUsed atomic.Int64
@@ -124,6 +147,7 @@ func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsCo
 	}
 	wc.lastUsed.Store(time.Now().UnixNano())
 	wc.state.Store(int32(StateConnected))
+	wc.lifecycle.Store(int32(connectionLifecycleActive))
 	return wc
 }
 
@@ -152,18 +176,50 @@ func (wc *WsConnection) IsExpired() bool {
 	return time.Since(lastUsed) > connectionIdleTimeout()
 }
 
-// IsOverAge 检查连接是否超过当前模式的最大寿命。到龄连接不能再接新请求：
-// 默认模式提前规避上游 60 分钟硬限制；弱网模式使用更短窗口主动轮换。
+// IsOverAge 检查连接是否达到当前轮转年龄。到龄连接不能再接新请求；
+// rotation 模式会把它标记为 Draining，旧请求排空后再关闭。
 func (wc *WsConnection) IsOverAge() bool {
 	if wc.createdAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, wc.createdAt)) > connectionMaxLifetime()
+	return time.Since(time.Unix(0, wc.createdAt)) > connectionRotationAge()
 }
 
 // IsConnected 检查是否已连接
 func (wc *WsConnection) IsConnected() bool {
 	return wc.state.Load() == int32(StateConnected)
+}
+
+// IsDraining reports whether the socket remains alive only to drain existing
+// requests and must not receive a new lease.
+func (wc *WsConnection) IsDraining() bool {
+	return wc != nil && wc.lifecycle.Load() == int32(connectionLifecycleDraining)
+}
+
+// MarkDraining atomically transitions a live connection to the no-new-leases
+// state. It returns true only for the goroutine that performed the transition;
+// racing callers can inspect IsDraining().
+func (wc *WsConnection) MarkDraining() bool {
+	if wc == nil {
+		return false
+	}
+	if wc.lifecycle.CompareAndSwap(int32(connectionLifecycleActive), int32(connectionLifecycleDraining)) {
+		wc.drainAt.Store(time.Now().UnixNano())
+		return true
+	}
+	return false
+}
+
+// DrainAt returns when the connection entered the drain-only lifecycle.
+func (wc *WsConnection) DrainAt() time.Time {
+	if wc == nil {
+		return time.Time{}
+	}
+	ts := wc.drainAt.Load()
+	if ts <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ts)
 }
 
 // Close 安全关闭连接
@@ -173,6 +229,7 @@ func (wc *WsConnection) Close() error {
 	}
 	wc.closeOnce.Do(func() {
 		wc.state.Store(int32(StateClosing))
+		wc.lifecycle.Store(int32(connectionLifecycleClosed))
 		if wc.conn != nil {
 			wc.closeErr = wc.conn.Close()
 		}
@@ -182,6 +239,86 @@ func (wc *WsConnection) Close() error {
 		wc.onDisconnected(wc.session.AccountID)
 	}
 	return wc.closeErr
+}
+
+// retireConnection changes a live connection into a drain-only connection.
+// It intentionally keeps the entry in the connection map while requests are
+// in flight so account capacity still counts the physical socket. New acquire
+// paths skip it because canReuseConnection rejects IsDraining().
+func (m *Manager) retireConnection(wc *WsConnection) {
+	if m == nil || wc == nil || !wc.IsConnected() {
+		return
+	}
+	marked := wc.MarkDraining()
+	if !marked && !wc.IsDraining() {
+		return
+	}
+	if marked {
+		pending := 0
+		accountID := int64(0)
+		if wc.session != nil {
+			pending = wc.session.PendingCount()
+			accountID = wc.session.AccountID
+		}
+		age := time.Duration(0)
+		if wc.createdAt > 0 {
+			age = time.Since(time.Unix(0, wc.createdAt)).Round(time.Millisecond)
+		}
+		log.Printf("[WS] 连接进入 draining account=%d age=%s pending=%d", accountID, age, pending)
+	}
+	if wc.session == nil || wc.session.PendingCount() == 0 {
+		m.closeDrainedConnection(wc)
+	}
+}
+
+// closeDrainedConnection closes a retired connection only after all leases have
+// been removed. It is safe to call from cleanup and pending-removal callbacks.
+func (m *Manager) closeDrainedConnection(wc *WsConnection) {
+	if m == nil || wc == nil || !wc.IsDraining() {
+		return
+	}
+	if wc.session != nil && wc.session.PendingCount() > 0 {
+		return
+	}
+	if wc.PoolKey != "" {
+		m.connections.CompareAndDelete(wc.PoolKey, wc)
+		if wc.session != nil {
+			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+		}
+	}
+	if wc.session != nil {
+		wc.session.StopHeartbeat()
+		wc.session.SetConnected(false)
+	}
+	// Planned rotation can complete the WebSocket close handshake. This keeps
+	// the upstream from mistaking our deliberate drain for another abnormal
+	// 1006, while the raw Close path remains unchanged for real failures.
+	wc.writeMu.Lock()
+	if wc.conn != nil {
+		_ = wc.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "rotation"),
+			time.Now().Add(time.Second),
+		)
+	}
+	wc.writeMu.Unlock()
+	_ = wc.Close()
+}
+
+func (m *Manager) onSessionPendingEmpty(wc *WsConnection) {
+	if wc == nil {
+		return
+	}
+	// A turn may cross the rotation boundary while it is in flight. Recheck
+	// age at the exact moment the last lease is released so the next request
+	// cannot slip into an already-aged socket between cleanup ticks.
+	if wc.IsConnected() && wc.IsOverAge() {
+		m.retireConnection(wc)
+		return
+	}
+	if wc.IsDraining() {
+		m.closeDrainedConnection(wc)
+	}
 }
 
 // SetState 设置连接状态
@@ -221,10 +358,10 @@ func (wc *WsConnection) HTTPResponse() *http.Response {
 
 // Manager WebSocket 连接池管理器
 type Manager struct {
-	// 连接池（accountID -> *WsConnection）
+	// 连接池（poolKey -> *WsConnection）；同一账号可同时拥有多个兄弟连接
 	connections sync.Map
 
-	// 会话池（accountID -> *Session）
+	// 会话池（poolKey -> *Session）
 	sessions sync.Map
 
 	// 拨号器配置
@@ -265,6 +402,16 @@ type Manager struct {
 
 	// 测试钩子：连接写入池后、首个 pending/read lease 建立前触发。
 	afterConnectionStored func(wc *WsConnection)
+
+	// proxySelector 为账号提供多个代理候选。未设置时保持原有单代理行为。
+	proxySelector func(account *auth.Account, max int) []string
+	// siblingSequence 生成轮转兄弟连接的唯一池键后缀。
+	siblingSequence atomic.Uint64
+	// rotationRouteMu protects route reservations made while a sibling handshake
+	// is in flight; it prevents concurrent groups from exceeding the account-wide
+	// distinct-proxy limit before their sockets are stored in connections.
+	rotationRouteMu       sync.Mutex
+	rotationPendingRoutes map[string]map[string]int
 }
 
 // responseConnBinding 记录某个 response_id 由哪条连接产出。
@@ -330,25 +477,40 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）。
-// 有在途请求的连接/会话一律跳过：IsExpired 只看 lastUsed/LastActiveAt，上游长思考
-// 或 pong 丢失时会把活跃对象误判为空闲，直接 Close 会把在途流同秒批量截断
-// （issue #436）；等在途收尾（读路径业务帧静默上限 ActiveReadMaxTurnSilence 兜底）后下一轮再清。
+// evictExpired 清理过期连接和会话。到达轮转年龄的连接先进入 Draining，
+// 摘掉新请求但保留在途响应；最后一个 pending 清空后由 closeDrainedConnection 关闭。
+// 其它空闲过期连接仍可直接回收，避免陈旧 socket 长期占用连接池容量。
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
-		wc := value.(*WsConnection)
-		if wc.session != nil && wc.session.PendingCount() > 0 {
+		wc, ok := value.(*WsConnection)
+		if !ok || wc == nil {
 			return true
 		}
-		if wc.IsExpired() || !wc.IsConnected() || isRotatableOverAge(wc) {
-			m.connections.Delete(key)
-			wc.Close()
+		if !wc.IsConnected() {
+			m.DiscardConnection(wc)
+			return true
+		}
+		if wc.IsDraining() {
+			m.closeDrainedConnection(wc)
+			return true
+		}
+		if wc.IsOverAge() {
+			// Age rotation never cuts an in-flight response. Mark first, then
+			// let the pending-empty callback close it after the last lease.
+			m.retireConnection(wc)
+			return true
+		}
+		if wc.IsExpired() && (wc.session == nil || wc.session.PendingCount() == 0) {
+			m.DiscardConnection(wc)
 		}
 		return true
 	})
 
 	m.sessions.Range(func(key, value any) bool {
-		s := value.(*Session)
+		s, ok := value.(*Session)
+		if !ok || s == nil {
+			return true
+		}
 		if s.PendingCount() > 0 {
 			return true
 		}
@@ -411,6 +573,62 @@ func (m *Manager) getOnConnected() func(accountID int64, session *Session) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.onConnected
+}
+
+// SetProxySelector installs an optional account-level proxy candidate provider.
+// The callback is intentionally small so wsrelay does not depend on Store
+// internals; tests and standalone users can leave it unset.
+func (m *Manager) SetProxySelector(fn func(account *auth.Account, max int) []string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.proxySelector = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) proxyCandidates(account *auth.Account, proxyOverride string) []string {
+	max := wsMaxProxyRoutes()
+	if max < 1 {
+		max = 1
+	}
+	m.mu.RLock()
+	selector := m.proxySelector
+	m.mu.RUnlock()
+	result := make([]string, 0, max)
+	seen := make(map[string]struct{}, max)
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		effective := effectiveProxyURL(account, candidate)
+		if _, ok := seen[effective]; ok {
+			return
+		}
+		seen[effective] = struct{}{}
+		result = append(result, effective)
+	}
+	// Explicit retry/affinity override remains first.
+	if strings.TrimSpace(proxyOverride) != "" {
+		add(proxyOverride)
+	}
+	if selector != nil && len(result) < max {
+		candidates := selector(account, max)
+		for _, candidate := range candidates {
+			add(candidate)
+			if len(result) >= max {
+				break
+			}
+		}
+		// A configured selector returning no route is meaningful: auth.Store uses
+		// it for a fail-closed disabled pinned proxy. Do not silently turn that
+		// state into a direct connection.
+		if len(result) == 0 {
+			return nil
+		}
+	}
+	if len(result) == 0 {
+		add("")
+	}
+	return result
 }
 
 func (m *Manager) keyLock(key string) *sync.Mutex {
@@ -614,6 +832,9 @@ func (m *Manager) AcquireConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, error) {
+	if wsRotationModeEnabled() {
+		return m.acquireConnectionWithRotation(ctx, account, wsURL, sessionKey, headers, proxyOverride)
+	}
 	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 	lock := m.keyLock(key)
 	accountLock := m.accountLock(account.ID())
@@ -890,6 +1111,9 @@ func (m *Manager) AcquireReusableConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, string, error) {
+	if wsRotationModeEnabled() {
+		return m.acquireReusableConnectionWithRotation(ctx, account, wsURL, baseKey, fallbackKey, slots, headers, proxyOverride)
+	}
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 	accountLimit := accountConnectionLimit(account)
 	if slots < 1 || slots > accountLimit {
@@ -1013,7 +1237,7 @@ func canReuseConnection(wc *WsConnection) bool {
 	if wc == nil {
 		return false
 	}
-	if !wc.IsConnected() || wc.IsExpired() || wc.IsOverAge() {
+	if wc.IsDraining() || !wc.IsConnected() || wc.IsExpired() || wc.IsOverAge() {
 		return false
 	}
 	if wc.session == nil {
@@ -1022,9 +1246,8 @@ func canReuseConnection(wc *WsConnection) bool {
 	return wc.session.PendingCount() == 0 && wc.readPumpReusable()
 }
 
-// isRotatableOverAge 连接已到龄且当前无在途请求，可安全轮转（销毁重建）。
-// 到龄但仍有在途请求的连接不动：50 分钟阈值留了 10 分钟余量，在途流仍能正常
-// 收完，等其结束后再轮转，避免掐断在途响应。
+// isRotatableOverAge 保留给旧容量裁剪路径：仅表示到龄且当前无在途请求。
+// 新轮转路径会先 MarkDraining，再等待 pending 清空，不会直接掐断在途响应。
 func isRotatableOverAge(wc *WsConnection) bool {
 	if wc == nil || !wc.IsOverAge() {
 		return false
@@ -1058,7 +1281,7 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	return probeConnection(wc)
 }
 
-// createConnection 创建新 WebSocket 连接
+// createConnection 创建新 WebSocket 连接。
 func (m *Manager) createConnection(
 	ctx context.Context,
 	account *auth.Account,
@@ -1067,13 +1290,26 @@ func (m *Manager) createConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, error) {
+	return m.createConnectionForRoute(ctx, account, wsURL, sessionKey, sessionKey, sessionKey, headers, effectiveProxyURL(account, proxyOverride))
+}
+
+// createConnectionForRoute creates a connection whose logical session identity
+// can stay stable while poolSessionKey is unique for a rotated sibling. This is
+// what lets an old socket drain while a replacement occupies a new pool entry.
+func (m *Manager) createConnectionForRoute(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	sessionID string,
+	poolSessionKey string,
+	groupKey string,
+	headers http.Header,
+	proxyURL string,
+) (*WsConnection, error) {
 	// 浅拷贝共享 dialer，继承全部调优字段（NetDialContext/KeepAlive、读写缓冲、压缩等），
 	// 仅按需覆盖 Proxy；避免逐字段重建时漏抄字段（曾导致 NetDialContext/KeepAlive 失效）。
 	dialerCopy := *m.dialer
 	dialer := &dialerCopy
-
-	// 配置代理。Resin 启用时 effectiveProxyURL 已是 Resin 正向代理 URL。
-	proxyURL := effectiveProxyURL(account, proxyOverride)
 
 	if proxyURL != "" {
 		proxyURLParsed, err := url.Parse(proxyURL)
@@ -1085,14 +1321,14 @@ func (m *Manager) createConnection(
 		}
 	}
 
-	// 创建会话（先关闭旧 session 避免泄漏）
-	poolKey := m.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
+	// 创建会话（先关闭同一唯一池键上的旧 session，轮转兄弟使用不同键不会互相关闭）。
+	poolKey := m.poolKey(account.ID(), wsURL, poolSessionKey, proxyURL)
 	if oldSessionVal, ok := m.sessions.Load(poolKey); ok {
 		oldSession := oldSessionVal.(*Session)
 		oldSession.Close()
 	}
 	session := NewSession(account.ID(), m)
-	if trimmed := strings.TrimSpace(sessionKey); trimmed != "" {
+	if trimmed := strings.TrimSpace(sessionID); trimmed != "" {
 		session.ID = trimmed
 	}
 	m.sessions.Store(poolKey, session)
@@ -1110,11 +1346,14 @@ func (m *Manager) createConnection(
 	wc := NewWsConnection(conn, session, wsURL)
 	wc.account = account
 	wc.PoolKey = poolKey
+	wc.groupKey = normalizeRotationGroupKey(groupKey)
+	wc.proxyURL = strings.TrimSpace(proxyURL)
 	wc.upstreamUserAgent = strings.TrimSpace(headers.Get("User-Agent"))
 	wc.upstreamUserAgentKnown = true
 	wc.httpResp = resp
 	wc.onDisconnected = m.getOnDisconnected()
 	wc.onReadFailure = m.DiscardConnection
+	session.SetOnPendingEmpty(func() { m.onSessionPendingEmpty(wc) })
 	session.SetConnected(true)
 
 	// 控制帧处理器必须在唯一永久 reader 启动前安装。
@@ -1220,7 +1459,10 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 	if v, exists := m.connections.Load(binding.conn.PoolKey); !exists || v != binding.conn {
 		return nil, ""
 	}
-	if !binding.conn.IsConnected() || binding.conn.IsExpired() || binding.conn.IsOverAge() {
+	if binding.conn.IsOverAge() && binding.conn.IsConnected() {
+		m.retireConnection(binding.conn)
+	}
+	if binding.conn.IsDraining() || !binding.conn.IsConnected() || binding.conn.IsExpired() || binding.conn.IsOverAge() {
 		return nil, ""
 	}
 	return binding.conn, binding.sessionKey

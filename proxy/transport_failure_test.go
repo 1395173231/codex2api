@@ -80,3 +80,18 @@ func TestShouldPenalizeTransportKind(t *testing.T) {
 		t.Fatal("timeout failure should penalize")
 	}
 }
+
+func TestClassifyTransportFailureRotationSiblingCapacity(t *testing.T) {
+	for _, message := range []string{
+		"all websocket sibling slots for \"session\" are busy",
+		"rotation websocket capacity exhausted: account websocket connection capacity exhausted",
+		"account websocket proxy route limit reached",
+	} {
+		if got := classifyTransportFailure(errors.New(message)); got != upstreamErrorKindWsSiblingBusy {
+			t.Fatalf("classifyTransportFailure(%q) = %q, want %q", message, got, upstreamErrorKindWsSiblingBusy)
+		}
+	}
+	if shouldPenalizeTransportKind(upstreamErrorKindWsSiblingBusy) {
+		t.Fatal("rotation sibling capacity must not penalize account health")
+	}
+}

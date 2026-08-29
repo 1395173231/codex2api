@@ -72,6 +72,9 @@ func TestEvictExpiredRotatesIdleOverAgeConnection(t *testing.T) {
 	if _, ok := m.connections.Load(busy.PoolKey); !ok {
 		t.Fatal("over-age connection with in-flight request must be kept until it drains")
 	}
+	if !busy.IsDraining() {
+		t.Fatal("over-age connection with in-flight request must enter draining state")
+	}
 	if _, ok := m.connections.Load(fresh.PoolKey); !ok {
 		t.Fatal("fresh connection must survive eviction")
 	}

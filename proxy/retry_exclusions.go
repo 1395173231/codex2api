@@ -155,6 +155,10 @@ func (r *retryAccountExclusions) MarkTransportFailure(accountID int64, retryLimi
 // been promoted to unlimited by the policy even though the legacy transport
 // classifier only sees a generic dial error.
 func (r *retryAccountExclusions) MarkRequestFailure(accountID int64, err error, retryLimit int, policies ...database.ContinuousRetryPolicy) {
+	if isWsSiblingBusyError(err) {
+		r.MarkTransient(accountID)
+		return
+	}
 	if isExplicitUpstreamCyberPolicyError(err) {
 		r.MarkHard(accountID)
 		return

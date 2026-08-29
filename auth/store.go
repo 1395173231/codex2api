@@ -4414,6 +4414,88 @@ func (s *Store) ResolveProxyForAccount(acc *Account) string {
 	return proxyURL
 }
 
+// ResolveProxyCandidatesForAccount returns up to max usable proxy candidates while
+// preserving ResolveProxyForAccount priority and fail-closed pinned-proxy semantics.
+func (s *Store) ResolveProxyCandidatesForAccount(acc *Account, max int) []string {
+	if s == nil || max <= 0 {
+		return nil
+	}
+	var accountID int64
+	var accountProxy string
+	var groupIDs []int64
+	if acc != nil {
+		acc.mu.RLock()
+		accountID = acc.DBID
+		accountProxy = strings.TrimSpace(acc.ProxyURL)
+		groupIDs = cloneInt64Slice(acc.GroupIDs)
+		acc.mu.RUnlock()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	unavailable := func(p string) bool {
+		if !s.proxyPoolEnabled {
+			return false
+		}
+		if _, managed := s.managedProxySet[p]; !managed {
+			return false
+		}
+		_, enabled := s.proxyPoolSet[p]
+		return !enabled
+	}
+	result := make([]string, 0, max)
+	seen := make(map[string]struct{}, max)
+	add := func(p string) bool {
+		p = strings.TrimSpace(p)
+		if p == "" || unavailable(p) {
+			return false
+		}
+		if _, ok := seen[p]; ok {
+			return false
+		}
+		seen[p] = struct{}{}
+		result = append(result, p)
+		return len(result) >= max
+	}
+	if accountProxy != "" {
+		if unavailable(accountProxy) {
+			return nil
+		}
+		add(accountProxy)
+		return result
+	}
+	for _, gid := range groupIDs {
+		urls := s.getGroupProxyURLs(gid)
+		if len(urls) == 0 {
+			continue
+		}
+		start := stickyProxyIndex(accountID, len(urls))
+		for i := 0; i < len(urls); i++ {
+			if add(urls[(start+i)%len(urls)]) {
+				return result
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+	if s.proxyPoolEnabled && len(s.proxyPool) > 0 {
+		start := stickyProxyIndex(accountID, len(s.proxyPool))
+		for i := 0; i < len(s.proxyPool); i++ {
+			if add(s.proxyPool[(start+i)%len(s.proxyPool)]) {
+				return result
+			}
+		}
+	}
+	add(s.globalProxy)
+	if len(result) == 0 && !s.proxyPoolEnabled {
+		// An explicitly disabled proxy pool still permits direct egress, matching
+		// ResolveProxyForAccount's directAllowed semantics. When the managed pool
+		// is enabled but empty, keep fail-closed behavior by returning no route.
+		result = append(result, "")
+	}
+	return result
+}
+
 // resolveProxyForAccountSnapshot returns both the selected proxy and whether
 // direct egress is permitted from one proxy-policy snapshot. Holding the store
 // read lock across selection prevents an account pin from being rejected under

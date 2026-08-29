@@ -39,7 +39,7 @@ func (m *Manager) PingIdleConnections() (pinged int, failed int) {
 		if !ok || wc == nil {
 			return true
 		}
-		if !wc.IsConnected() {
+		if !wc.IsConnected() || wc.IsDraining() {
 			return true
 		}
 		// 到龄连接不续命：Pong 会刷新 lastUsed 让连接永不空闲过期，最终撞上游

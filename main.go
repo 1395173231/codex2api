@@ -383,12 +383,19 @@ func main() {
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 
+	// 为上游 WS 兄弟连接提供账号级代理候选；未启用轮转模式时该回调
+	// 不改变原有单代理池键语义。
+	wsManager := wsrelay.GetManager()
+	wsManager.SetProxySelector(func(account *auth.Account, max int) []string {
+		return store.ResolveProxyCandidatesForAccount(account, max)
+	})
+
 	// 注册 Agent Identity task 确保函数（proxy 无 Store 引用，启动时注入）
 	proxy.EnsureCodexAgentIdentityTaskFunc = store.EnsureCodexAgentIdentityTask
 
 	// 上游 WS 空闲连接保活常驻任务（默认关闭：goroutine 常驻但仅在运行时开关开启时才发送 Ping）
 	wsKeepalive := wsrelay.NewKeepaliveTask(
-		wsrelay.GetManager(),
+		wsManager,
 		store.CodexWSKeepaliveEnabled,
 		store.CodexWSKeepaliveIntervalSec,
 	)

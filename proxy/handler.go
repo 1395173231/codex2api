@@ -1908,7 +1908,13 @@ const upstreamErrorKindMessageTooBig = "message_too_big"
 
 // upstreamErrorKindWsBusyAcquire 是 wsrelay busy session acquire 超时（issue #413）：
 // 同会话的前一个请求长时间占用 WS 连接导致的排队超时，属会话占用而非账号故障。
-const upstreamErrorKindWsBusyAcquire = "ws_busy_acquire"
+const (
+	upstreamErrorKindWsBusyAcquire = "ws_busy_acquire"
+	// Rotation mode can reject an acquire because every sibling slot or the
+	// account route budget is occupied. This is scheduler pressure, not an
+	// upstream account failure, so it must not lower account health.
+	upstreamErrorKindWsSiblingBusy = "ws_sibling_busy"
+)
 
 // isWsBusyAcquireTimeoutError 按错误文案识别 busy acquire 超时。wsrelay 依赖 proxy，
 // proxy 无法反向导入其哨兵类型，跨包只能靠稳定的错误消息片段匹配。
@@ -1916,10 +1922,21 @@ func isWsBusyAcquireTimeoutError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "waiting for busy session")
 }
 
+func isWsSiblingBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "all websocket sibling slots") ||
+		strings.Contains(message, "rotation websocket capacity exhausted") ||
+		strings.Contains(message, "websocket proxy route limit reached")
+}
+
 // shouldPenalizeTransportKind 返回该传输失败是否应计入账号健康惩罚。
-// busy acquire 超时的账号本身没有故障，惩罚会让 fast scheduler 错误降权（issue #413）。
+// busy acquire 超时与 rotation sibling 容量不足都不是账号故障，惩罚会让
+// fast scheduler 错误降权（issue #413）。
 func shouldPenalizeTransportKind(kind string) bool {
-	return kind != "" && kind != upstreamErrorKindWsBusyAcquire
+	return kind != "" && kind != upstreamErrorKindWsBusyAcquire && kind != upstreamErrorKindWsSiblingBusy
 }
 
 func isWebsocketMessageTooBigError(err error) bool {
@@ -1993,6 +2010,9 @@ func classifyTransportFailure(err error) string {
 	}
 	if isWsBusyAcquireTimeoutError(err) {
 		return upstreamErrorKindWsBusyAcquire
+	}
+	if isWsSiblingBusyError(err) {
+		return upstreamErrorKindWsSiblingBusy
 	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded") {
@@ -3448,7 +3468,7 @@ func (h *Handler) stickyTransportRetryEnabled() bool {
 // plain transport blips. A selected upstream error, and every catch-all
 // failure, must rotate so the continuous-retry switch does what its label says.
 func (h *Handler) shouldStickyTransportRetry(err error, kind string, timedOut, shouldRetry bool, policy database.ContinuousRetryPolicy) bool {
-	if !shouldRetry || timedOut || kind == "" || kind == upstreamErrorKindWsBusyAcquire || !h.stickyTransportRetryEnabled() {
+	if !shouldRetry || timedOut || kind == "" || kind == upstreamErrorKindWsBusyAcquire || kind == upstreamErrorKindWsSiblingBusy || !h.stickyTransportRetryEnabled() {
 		return false
 	}
 	if policy.CatchesAllUpstreamFailures() {

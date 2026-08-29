@@ -42,7 +42,7 @@ const (
 	// 连接最大寿命：上游 chatgpt backend 对每条 Responses WS 连接强制 60 分钟
 	// 寿命上限，超限后该连接上的 response.create 一律返回
 	// websocket_connection_limit_reached（且 Ping 探活仍成功，无法靠探活识别）。
-	// 提前到 50 分钟在空闲时主动轮转销毁，避免活跃会话撞线（issue #346）。
+	// 默认提前到 50 分钟轮转；CODEX_WS_ROTATION_MAX_AGE 可进一步缩短。
 	MaxConnLifetime = 50 * time.Minute
 
 	// 握手超时：30 秒
@@ -147,6 +147,10 @@ type Session struct {
 	// 连接关闭回调
 	onClose func()
 
+	// onPendingEmpty 在最后一个 pending 请求被移除后触发。Manager 用它
+	// 完成 Draining 连接的延迟关闭；回调不参与普通会话逻辑。
+	onPendingEmpty func()
+
 	// 会话管理器引用
 	manager *Manager
 }
@@ -211,9 +215,27 @@ func (s *Session) GetPendingRequest(requestID string) (*PendingRequest, bool) {
 
 // RemovePendingRequest 移除等待请求
 func (s *Session) RemovePendingRequest(requestID string) {
+	if s == nil {
+		return
+	}
 	if v, ok := s.pending.LoadAndDelete(requestID); ok {
 		pr := v.(*PendingRequest)
 		pr.Close()
+	}
+	if s.PendingCount() == 0 {
+		s.notifyPendingEmpty()
+	}
+}
+
+func (s *Session) notifyPendingEmpty() {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	callback := s.onPendingEmpty
+	s.mu.RUnlock()
+	if callback != nil {
+		callback()
 	}
 }
 
@@ -356,6 +378,7 @@ func (s *Session) Close() {
 		s.pending.Delete(key)
 		return true
 	})
+	s.notifyPendingEmpty()
 
 	// 调用关闭回调
 	if s.onClose != nil {
@@ -370,8 +393,22 @@ func (s *Session) SetOnClose(fn func()) {
 	s.mu.Unlock()
 }
 
+// SetOnPendingEmpty installs the drain callback used by a Manager-owned
+// connection. It is safe to call with nil for test/manual sessions.
+func (s *Session) SetOnPendingEmpty(fn func()) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.onPendingEmpty = fn
+	s.mu.Unlock()
+}
+
 // ClearPendingRequests 清理所有等待请求
 func (s *Session) ClearPendingRequests() {
+	if s == nil {
+		return
+	}
 	s.pending.Range(func(key, value any) bool {
 		pr := value.(*PendingRequest)
 		// 发送错误响应
@@ -384,4 +421,5 @@ func (s *Session) ClearPendingRequests() {
 		s.pending.Delete(key)
 		return true
 	})
+	s.notifyPendingEmpty()
 }
