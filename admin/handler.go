@@ -8387,6 +8387,10 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	CodexWSRotationEnabled              bool   `json:"codex_ws_rotation_enabled"`
+	CodexWSRotationMaxAgeSec            int    `json:"codex_ws_rotation_max_age_sec"`
+	CodexWSMaxSiblings                  int    `json:"codex_ws_max_siblings"`
+	CodexWSMaxProxyRoutes               int    `json:"codex_ws_max_proxy_routes"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
@@ -8555,6 +8559,10 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool     `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int      `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               *int      `json:"codex_ws_stateless_slots"`
+	CodexWSRotationEnabled              *bool     `json:"codex_ws_rotation_enabled"`
+	CodexWSRotationMaxAgeSec            *int      `json:"codex_ws_rotation_max_age_sec"`
+	CodexWSMaxSiblings                  *int      `json:"codex_ws_max_siblings"`
+	CodexWSMaxProxyRoutes               *int      `json:"codex_ws_max_proxy_routes"`
 	GithubToken                         *string   `json:"github_token"`
 	GithubProxyURL                      *string   `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           *bool     `json:"codex_overload_pause_enabled"`
@@ -9307,6 +9315,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSRotationEnabled:              runtimeCfg.CodexWSRotationEnabled,
+		CodexWSRotationMaxAgeSec:            runtimeCfg.CodexWSRotationMaxAgeSec,
+		CodexWSMaxSiblings:                  runtimeCfg.CodexWSMaxSiblings,
+		CodexWSMaxProxyRoutes:               runtimeCfg.CodexWSMaxProxyRoutes,
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -9684,6 +9696,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedAutoActivate5hWindowEnabled := false
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
+	persistedCodexWSRotationEnabled := false
+	persistedCodexWSRotationMaxAgeSec := database.NormalizeCodexWSRotationMaxAgeSec(0)
+	persistedCodexWSMaxSiblings := database.NormalizeCodexWSMaxSiblings(0)
+	persistedCodexWSMaxProxyRoutes := database.NormalizeCodexWSMaxProxyRoutes(0)
 	modelsListReadMaxBytes := database.DefaultModelsListReadMaxBytes
 	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
 	sessionSlotBufferSeconds := database.NormalizeSessionSlotBufferSeconds(int(h.store.GetSessionSlotBuffer() / time.Second))
@@ -9707,6 +9723,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
+		persistedCodexWSRotationEnabled = existingSettings.CodexWSRotationEnabled
+		persistedCodexWSRotationMaxAgeSec = database.NormalizeCodexWSRotationMaxAgeSec(existingSettings.CodexWSRotationMaxAgeSec)
+		persistedCodexWSMaxSiblings = database.NormalizeCodexWSMaxSiblings(existingSettings.CodexWSMaxSiblings)
+		persistedCodexWSMaxProxyRoutes = database.NormalizeCodexWSMaxProxyRoutes(existingSettings.CodexWSMaxProxyRoutes)
 		modelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(existingSettings.ModelsListReadMaxBytes)
 		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
 		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(existingSettings.SessionSlotBufferSeconds)
@@ -9782,6 +9802,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
+	runtimeCfg.CodexWSRotationEnabled = persistedCodexWSRotationEnabled
+	runtimeCfg.CodexWSRotationMaxAgeSec = persistedCodexWSRotationMaxAgeSec
+	runtimeCfg.CodexWSMaxSiblings = persistedCodexWSMaxSiblings
+	runtimeCfg.CodexWSMaxProxyRoutes = persistedCodexWSMaxProxyRoutes
 	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
@@ -10072,6 +10096,26 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexWSStatelessSlots(v)
 		runtimeCfg.CodexWSStatelessSlots = v
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
+	}
+
+	if req.CodexWSRotationEnabled != nil {
+		runtimeCfg.CodexWSRotationEnabled = *req.CodexWSRotationEnabled
+		log.Printf("设置已更新: codex_ws_rotation_enabled = %t", *req.CodexWSRotationEnabled)
+	}
+	if req.CodexWSRotationMaxAgeSec != nil {
+		v := database.NormalizeCodexWSRotationMaxAgeSec(*req.CodexWSRotationMaxAgeSec)
+		runtimeCfg.CodexWSRotationMaxAgeSec = v
+		log.Printf("设置已更新: codex_ws_rotation_max_age_sec = %d", v)
+	}
+	if req.CodexWSMaxSiblings != nil {
+		v := database.NormalizeCodexWSMaxSiblings(*req.CodexWSMaxSiblings)
+		runtimeCfg.CodexWSMaxSiblings = v
+		log.Printf("设置已更新: codex_ws_max_siblings = %d", v)
+	}
+	if req.CodexWSMaxProxyRoutes != nil {
+		v := database.NormalizeCodexWSMaxProxyRoutes(*req.CodexWSMaxProxyRoutes)
+		runtimeCfg.CodexWSMaxProxyRoutes = v
+		log.Printf("设置已更新: codex_ws_max_proxy_routes = %d", v)
 	}
 
 	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
@@ -10710,6 +10754,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSRotationEnabled:              runtimeCfg.CodexWSRotationEnabled,
+		CodexWSRotationMaxAgeSec:            runtimeCfg.CodexWSRotationMaxAgeSec,
+		CodexWSMaxSiblings:                  runtimeCfg.CodexWSMaxSiblings,
+		CodexWSMaxProxyRoutes:               runtimeCfg.CodexWSMaxProxyRoutes,
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -11019,6 +11067,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSRotationEnabled:              runtimeCfg.CodexWSRotationEnabled,
+		CodexWSRotationMaxAgeSec:            runtimeCfg.CodexWSRotationMaxAgeSec,
+		CodexWSMaxSiblings:                  runtimeCfg.CodexWSMaxSiblings,
+		CodexWSMaxProxyRoutes:               runtimeCfg.CodexWSMaxProxyRoutes,
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,

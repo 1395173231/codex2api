@@ -1644,6 +1644,10 @@ export interface SystemSettings {
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
   codex_ws_stateless_slots: number
+  codex_ws_rotation_enabled: boolean
+  codex_ws_rotation_max_age_sec: number
+  codex_ws_max_siblings: number
+  codex_ws_max_proxy_routes: number
   // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
   github_token?: string
   github_token_configured?: boolean

@@ -106,6 +106,33 @@ func TestRemoveConnectionUsesEffectiveProxyKey(t *testing.T) {
 	}
 }
 
+func TestProxyCandidatesUseResinSiblingIdentities(t *testing.T) {
+	old := proxy.GetResinConfig()
+	t.Cleanup(func() { proxy.SetResinConfig(old) })
+	proxy.SetResinConfig(&proxy.ResinConfig{
+		BaseURL:      "http://127.0.0.1:2260/my-token",
+		PlatformName: "codex2api",
+	})
+	t.Setenv("CODEX_WS_MAX_PROXY_ROUTES", "3")
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	got := manager.proxyCandidates(&auth.Account{DBID: 42}, "")
+	if len(got) != 3 {
+		t.Fatalf("proxy candidates = %d, want 3 (%v)", len(got), got)
+	}
+	want := []string{"codex2api.42", "codex2api.42-1", "codex2api.42-2"}
+	for i, candidate := range got {
+		parsed, err := url.Parse(candidate)
+		if err != nil {
+			t.Fatalf("candidate %d parse: %v", i, err)
+		}
+		if username := parsed.User.Username(); username != want[i] {
+			t.Fatalf("candidate %d username = %q, want %q", i, username, want[i])
+		}
+	}
+}
+
 func TestEffectiveProxyURLUsesResinForwardProxy(t *testing.T) {
 	old := proxy.GetResinConfig()
 	proxy.SetResinConfig(nil)

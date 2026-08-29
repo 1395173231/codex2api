@@ -1862,6 +1862,51 @@ func TestUpdateSettingsPersistsWeakNetworkMode(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsPersistsWebsocketRotationSettings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"codex_ws_rotation_enabled":true,"codex_ws_rotation_max_age_sec":900,"codex_ws_max_siblings":5,"codex_ws_max_proxy_routes":3}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.CodexWSRotationEnabled || response.CodexWSRotationMaxAgeSec != 900 || response.CodexWSMaxSiblings != 5 || response.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("response rotation settings = %+v, want enabled/900/5/3", response)
+	}
+	runtime := proxy.CurrentRuntimeSettings()
+	if !runtime.CodexWSRotationEnabled || runtime.CodexWSRotationMaxAgeSec != 900 || runtime.CodexWSMaxSiblings != 5 || runtime.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("runtime rotation settings = %+v, want enabled/900/5/3", runtime)
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.CodexWSRotationEnabled || persisted.CodexWSRotationMaxAgeSec != 900 || persisted.CodexWSMaxSiblings != 5 || persisted.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("persisted rotation settings = %+v, want enabled/900/5/3", persisted)
+	}
+}
+
 func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

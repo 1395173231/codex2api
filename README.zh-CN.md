@@ -338,6 +338,8 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 `MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestContent`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
 
+Codex 上游 WebSocket 的「按时间轮换」「轮换最长存活时间」「最大兄弟连接数」「最大代理线路数」也在此页面提供自动保存，修改后直接更新当前进程运行态，无需重启；对应环境变量存在时，环境变量优先作为部署级覆盖。
+
 首次启动时程序会自动写入默认设置。
 
 #### Responses 上下文缓存
@@ -536,7 +538,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 
 上游持久 WebSocket 连接池同样受账号当前 `DynamicConcurrencyLimit` 约束，连接复用不会突破账号的有效并发上限。
 
-对于 VPN、住宅代理或容易回收长连接的出口，可设置 `CODEX_WS_CONNECTION_MODE=rotation` 启用按年龄轮转：连接到龄后停止接收新请求，由同一逻辑组的兄弟连接承接；旧连接只在所有 pending 请求结束后关闭。可用 `CODEX_WS_ROTATION_MAX_AGE`、`CODEX_WS_MAX_SIBLINGS` 和 `CODEX_WS_MAX_PROXY_ROUTES` 调整轮转年龄、兄弟数量与代理路由上限；未设置时保持旧的 busy 等待模式。轮转代理候选沿用账号路由优先级（账号固定代理、首个配置代理的组、代理池、全局代理）；账号固定代理仍保持单路由 fail-closed 语义。
+对于 VPN、住宅代理或容易回收长连接的出口，可设置 `CODEX_WS_CONNECTION_MODE=rotation` 启用按年龄轮转：连接到龄后停止接收新请求，由同一逻辑组的兄弟连接承接；旧连接只在所有 pending 请求结束后关闭。可用 `CODEX_WS_ROTATION_MAX_AGE`、`CODEX_WS_MAX_SIBLINGS` 和 `CODEX_WS_MAX_PROXY_ROUTES` 调整轮转年龄、兄弟数量与代理路由上限；未设置时保持旧的 busy 等待模式。轮转代理候选沿用账号路由优先级（账号固定代理、首个配置代理的组、代理池、全局代理）；账号固定代理仍保持单路由 fail-closed 语义。启用 Resin 时，候选会改用同一账号的粘性用户名 `account_id`（数据库账号 ID）、`account_id-1`、`account_id-2`（最多三条），让 Resin 为兄弟连接分配不同绑定 IP。
 
 **调度分惩罚/奖励：**
 

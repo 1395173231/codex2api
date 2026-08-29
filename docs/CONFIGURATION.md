@@ -60,9 +60,9 @@ Codex2API 采用三层配置架构：
 | `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_WS_CONNECTION_MODE` | 否 | `busy` | `busy` 保持旧的同 key 等待；`rotation` 按连接年龄停止接新请求，交给兄弟连接并在 pending 清空后关闭 |
-| `CODEX_WS_ROTATION_MAX_AGE` | 否 | 当前连接寿命上限 | Go duration（如 `45m`）；连接到龄后进入 draining，且不会超过现有硬寿命上限 |
+| `CODEX_WS_ROTATION_MAX_AGE` | 否 | `45m`（管理面板默认） | Go duration（如 `45m`）；连接到龄后进入 draining，且不会超过现有硬寿命上限 |
 | `CODEX_WS_MAX_SIBLINGS` | 否 | `3` | 单个逻辑会话/无状态槽位允许的轮转代数上限，范围 `1-16` |
-| `CODEX_WS_MAX_PROXY_ROUTES` | 否 | `2` | 轮转兄弟允许使用的不同代理路由上限，范围 `1-3`；候选来自账号组/代理池 |
+| `CODEX_WS_MAX_PROXY_ROUTES` | 否 | `2` | 轮转兄弟允许使用的不同代理路由上限，范围 `1-3`；候选来自账号组/代理池。启用 Resin 时会把同一账号映射为 `account_id`（数据库账号 ID）、`account_id-1`、`account_id-2` 等粘性用户名，以获得不同绑定 IP |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |

@@ -1340,6 +1340,21 @@ export default function Settings() {
         Number.isFinite(cacheNormalized.models_list_read_max_bytes) && cacheNormalized.models_list_read_max_bytes >= MIB
           ? cacheNormalized.models_list_read_max_bytes
           : DEFAULT_MODELS_LIST_READ_MAX_BYTES,
+      // Keep the new rotation controls safe when a rolling deployment serves
+      // settings from an older backend that does not return these fields yet.
+      codex_ws_rotation_enabled: cacheNormalized.codex_ws_rotation_enabled === true,
+      codex_ws_rotation_max_age_sec:
+        Number.isFinite(cacheNormalized.codex_ws_rotation_max_age_sec)
+          ? Math.min(3600, Math.max(300, cacheNormalized.codex_ws_rotation_max_age_sec))
+          : 2700,
+      codex_ws_max_siblings:
+        Number.isFinite(cacheNormalized.codex_ws_max_siblings)
+          ? Math.min(16, Math.max(1, cacheNormalized.codex_ws_max_siblings))
+          : 3,
+      codex_ws_max_proxy_routes:
+        Number.isFinite(cacheNormalized.codex_ws_max_proxy_routes)
+          ? Math.min(3, Math.max(1, cacheNormalized.codex_ws_max_proxy_routes))
+          : 2,
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1396,6 +1411,10 @@ export default function Settings() {
     codex_ws_busy_overflow_enabled: false,
     codex_ws_busy_patience_sec: 2,
     codex_ws_stateless_slots: 8,
+    codex_ws_rotation_enabled: false,
+    codex_ws_rotation_max_age_sec: 2700,
+    codex_ws_max_siblings: 3,
+    codex_ws_max_proxy_routes: 2,
     github_token_configured: false,
     github_proxy_url: '',
     codex_overload_pause_enabled: false,
@@ -3184,11 +3203,15 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_size_router_enabled', checked)}
                   />
                 </SettingField>
-                <SettingField label={t('settings.codexWSBusyOverflowEnabled')} description={t('settings.codexWSBusyOverflowEnabledDesc')} layout="switch">
+                <SettingField label={t('settings.codexWSBusyOverflowEnabled')} description={t('settings.codexWSBusyOverflowEnabledDesc')} layout="switch" className={cn(settingsForm.codex_ws_rotation_enabled && 'opacity-60')}>
                   <Switch
                     checked={settingsForm.codex_ws_busy_overflow_enabled}
+                    disabled={settingsForm.codex_ws_rotation_enabled}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_busy_overflow_enabled', checked)}
                   />
+                </SettingField>
+                <SettingField label={t('settings.codexWSRotationEnabled')} description={t('settings.codexWSRotationEnabledDesc')} layout="switch">
+                  <Switch checked={settingsForm.codex_ws_rotation_enabled} onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_rotation_enabled', checked)} />
                 </SettingField>
               </div>
 
@@ -3255,20 +3278,74 @@ export default function Settings() {
                   label={t('settings.codexWSBusyPatience')}
                   description={t('settings.codexWSBusyPatienceDesc')}
                   suffix={t('settings.unit.sec')}
-                  className={cn(!settingsForm.codex_ws_busy_overflow_enabled && 'opacity-60')}
+                  className={cn((!settingsForm.codex_ws_busy_overflow_enabled || settingsForm.codex_ws_rotation_enabled) && 'opacity-60')}
                 >
                   <DraftNumberInput
                     min={0}
                     max={300}
-                    disabled={!settingsForm.codex_ws_busy_overflow_enabled}
+                    disabled={!settingsForm.codex_ws_busy_overflow_enabled || settingsForm.codex_ws_rotation_enabled}
                     value={settingsForm.codex_ws_busy_patience_sec}
                     emptyValue={0}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_patience_sec: value }))}
                     onValueCommit={(value) => {
-                      if (!settingsForm.codex_ws_busy_overflow_enabled) return
+                      if (!settingsForm.codex_ws_busy_overflow_enabled || settingsForm.codex_ws_rotation_enabled) return
                       void autoSaveSettingsPatch({
                         codex_ws_busy_patience_sec: value,
                       })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSRotationMaxAge')}
+                  description={t('settings.codexWSRotationMaxAgeDesc')}
+                  suffix={t('settings.unit.sec')}
+                  className={cn(!settingsForm.codex_ws_rotation_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={300}
+                    max={3600}
+                    disabled={!settingsForm.codex_ws_rotation_enabled}
+                    value={settingsForm.codex_ws_rotation_max_age_sec}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_rotation_max_age_sec: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_rotation_enabled) return
+                      void autoSaveSettingsPatch({ codex_ws_rotation_max_age_sec: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSMaxSiblings')}
+                  description={t('settings.codexWSMaxSiblingsDesc')}
+                  suffix={t('settings.unit.times')}
+                  className={cn(!settingsForm.codex_ws_rotation_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={16}
+                    disabled={!settingsForm.codex_ws_rotation_enabled}
+                    value={settingsForm.codex_ws_max_siblings}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_max_siblings: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_rotation_enabled) return
+                      void autoSaveSettingsPatch({ codex_ws_max_siblings: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSMaxProxyRoutes')}
+                  description={t('settings.codexWSMaxProxyRoutesDesc')}
+                  suffix={t('settings.unit.times')}
+                  className={cn(!settingsForm.codex_ws_rotation_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={3}
+                    disabled={!settingsForm.codex_ws_rotation_enabled}
+                    value={settingsForm.codex_ws_max_proxy_routes}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_max_proxy_routes: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_rotation_enabled) return
+                      void autoSaveSettingsPatch({ codex_ws_max_proxy_routes: value })
                     }}
                   />
                 </SettingField>

@@ -260,6 +260,24 @@ func TestResinAccountIDRejectsUnsavedAccounts(t *testing.T) {
 	}
 }
 
+func TestBuildForwardProxyURLForAccountSlotUsesDistinctStickyIdentities(t *testing.T) {
+	old := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(old) })
+	SetResinConfig(&ResinConfig{BaseURL: "http://127.0.0.1:2260/token", PlatformName: "codex2api"})
+
+	want := []string{"codex2api.42", "codex2api.42-1", "codex2api.42-2"}
+	for slot, expected := range want {
+		proxyURL := BuildForwardProxyURLForAccountSlot("42", slot)
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			t.Fatalf("slot %d URL parse: %v", slot, err)
+		}
+		if got := parsed.User.Username(); got != expected {
+			t.Fatalf("slot %d username = %q, want %q", slot, got, expected)
+		}
+	}
+}
+
 func TestEffectiveProxyURLForAccountFallsBackWithoutDBID(t *testing.T) {
 	old := resinCfg.Load()
 	t.Cleanup(func() { resinCfg.Store(old) })

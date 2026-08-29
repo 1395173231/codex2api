@@ -384,7 +384,8 @@ func main() {
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 
 	// 为上游 WS 兄弟连接提供账号级代理候选；未启用轮转模式时该回调
-	// 不改变原有单代理池键语义。
+	// 不改变原有单代理池键语义。Resin 启用时 wsrelay 会把候选映射为
+	// account_id/account_id-sub_number 粘性身份，以获得不同绑定 IP。
 	wsManager := wsrelay.GetManager()
 	wsManager.SetProxySelector(func(account *auth.Account, max int) []string {
 		return store.ResolveProxyCandidatesForAccount(account, max)

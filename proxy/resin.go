@@ -138,6 +138,26 @@ func BuildForwardProxyURL(accountID string) string {
 	return BuildForwardProxyURLFromConfig(GetResinConfig(), accountID)
 }
 
+// BuildForwardProxyURLForAccountSlot 为同一账号的多个长连接构建不同 Resin 粘性身份。
+// slot=0 保持历史的 <accountID> 身份；slot>0 使用 <accountID>-<slot>，从而让
+// Resin 可以为兄弟 WebSocket 连接分配不同的绑定 IP，同时不影响普通账号请求的稳定出口。
+func BuildForwardProxyURLForAccountSlot(accountID string, slot int) string {
+	return BuildForwardProxyURLForAccountSlotFromConfig(GetResinConfig(), accountID, slot)
+}
+
+// BuildForwardProxyURLForAccountSlotFromConfig 是按固定配置构建 Resin 兄弟身份的纯函数变体。
+// 调用方可在一次候选解析中复用同一个配置快照，避免 Resin 热更新恰好发生在枚举中间时混用两套端点。
+func BuildForwardProxyURLForAccountSlotFromConfig(cfg *ResinConfig, accountID string, slot int) string {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return ""
+	}
+	if slot > 0 {
+		accountID = fmt.Sprintf("%s-%d", accountID, slot)
+	}
+	return BuildForwardProxyURLFromConfig(cfg, accountID)
+}
+
 // BuildForwardProxyURLFromConfig 是 BuildForwardProxyURL 的可测试纯函数变体。
 func BuildForwardProxyURLFromConfig(cfg *ResinConfig, accountID string) string {
 	accountID = strings.TrimSpace(accountID)

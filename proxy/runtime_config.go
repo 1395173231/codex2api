@@ -94,6 +94,12 @@ type RuntimeSettings struct {
 	// （默认 8，范围 1-32，issue #522）。调大→单账号挂更多空闲连接；调小→握手更频繁，
 	// 高 RPM 下可能触发上游握手限流。实际生效值仍受账号动态并发上限钳制。
 	CodexWSStatelessSlots int
+	// CodexWSRotationEnabled 启用按连接年龄轮换的兄弟 WebSocket 调度。
+	// 到龄连接停止接收新请求，等待在途请求排空后优雅关闭。
+	CodexWSRotationEnabled   bool // 按连接年龄轮换，默认关闭（环境变量 CODEX_WS_CONNECTION_MODE 可强制覆盖）
+	CodexWSRotationMaxAgeSec int  // 轮换年龄（秒），默认 2700，范围 300-3600
+	CodexWSMaxSiblings       int  // 每个逻辑组的兄弟连接上限，默认 3，范围 1-16
+	CodexWSMaxProxyRoutes    int  // 每个账号的 Resin/代理线路上限，默认 2，范围 1-3
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升 API 限流配额；
 	// 只发给 api.github.com，绝不发给镜像或其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -185,6 +191,9 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
 		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
 		CodexWSStatelessSlots:            defaultCodexWSStatelessSlots,
+		CodexWSRotationMaxAgeSec:         database.NormalizeCodexWSRotationMaxAgeSec(0),
+		CodexWSMaxSiblings:               database.NormalizeCodexWSMaxSiblings(0),
+		CodexWSMaxProxyRoutes:            database.NormalizeCodexWSMaxProxyRoutes(0),
 		CodexOverloadThresholdPercent:    database.NormalizeCodexOverloadThresholdPercent(0),
 		CodexOverloadPauseMinutes:        database.NormalizeCodexOverloadPauseMinutes(0),
 		CodexOverloadWindowMinutes:       database.NormalizeCodexOverloadWindowMinutes(0),
@@ -314,6 +323,9 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSStatelessSlots > maxCodexWSStatelessSlots {
 		settings.CodexWSStatelessSlots = maxCodexWSStatelessSlots
 	}
+	settings.CodexWSRotationMaxAgeSec = database.NormalizeCodexWSRotationMaxAgeSec(settings.CodexWSRotationMaxAgeSec)
+	settings.CodexWSMaxSiblings = database.NormalizeCodexWSMaxSiblings(settings.CodexWSMaxSiblings)
+	settings.CodexWSMaxProxyRoutes = database.NormalizeCodexWSMaxProxyRoutes(settings.CodexWSMaxProxyRoutes)
 	settings.CodexOverloadThresholdPercent = database.NormalizeCodexOverloadThresholdPercent(settings.CodexOverloadThresholdPercent)
 	settings.CodexOverloadPauseMinutes = database.NormalizeCodexOverloadPauseMinutes(settings.CodexOverloadPauseMinutes)
 	settings.CodexOverloadWindowMinutes = database.NormalizeCodexOverloadWindowMinutes(settings.CodexOverloadWindowMinutes)
@@ -359,6 +371,10 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
 		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
 		next.CodexWSStatelessSlots = settings.CodexWSStatelessSlots
+		next.CodexWSRotationEnabled = settings.CodexWSRotationEnabled
+		next.CodexWSRotationMaxAgeSec = settings.CodexWSRotationMaxAgeSec
+		next.CodexWSMaxSiblings = settings.CodexWSMaxSiblings
+		next.CodexWSMaxProxyRoutes = settings.CodexWSMaxProxyRoutes
 		next.GithubToken = strings.TrimSpace(settings.GithubToken)
 		next.GithubProxyURL = strings.TrimSpace(settings.GithubProxyURL)
 		next.CodexOverloadPauseEnabled = settings.CodexOverloadPauseEnabled

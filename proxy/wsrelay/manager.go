@@ -592,6 +592,34 @@ func (m *Manager) proxyCandidates(account *auth.Account, proxyOverride string) [
 	if max < 1 {
 		max = 1
 	}
+	// Resin binds the upstream IP to the Proxy-Auth username. A normal account
+	// candidate list would therefore collapse every route to platform.account,
+	// defeating sibling rotation. Resin intentionally supersedes the normal
+	// proxyOverride/selector route here because account-bound traffic must keep
+	// its Resin lease. Keep slot 0 compatible with existing traffic, then derive
+	// account-sub_number identities for additional siblings.
+	if resinConfig := proxy.GetResinConfig(); resinConfig != nil && account != nil {
+		// Unsaved accounts have no stable Resin lease identity; fall back to
+		// the normal selector path instead of manufacturing a shared route.
+		if accountID := proxy.ResinAccountID(account); accountID != "" {
+			result := make([]string, 0, max)
+			seen := make(map[string]struct{}, max)
+			for slot := 0; slot < max; slot++ {
+				effective := strings.TrimSpace(proxy.BuildForwardProxyURLForAccountSlotFromConfig(resinConfig, accountID, slot))
+				if effective == "" {
+					continue
+				}
+				if _, ok := seen[effective]; ok {
+					continue
+				}
+				seen[effective] = struct{}{}
+				result = append(result, effective)
+			}
+			if len(result) > 0 {
+				return result
+			}
+		}
+	}
 	m.mu.RLock()
 	selector := m.proxySelector
 	m.mu.RUnlock()

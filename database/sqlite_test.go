@@ -4254,6 +4254,49 @@ func TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip(t *testing.T) {
 	}
 }
 
+func TestSQLiteSystemSettingsWebsocketRotationRoundtrip(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "ws-rotation-settings.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	seed := &SystemSettings{
+		MaxConcurrency:           2,
+		TestConcurrency:          1,
+		TestModel:                "gpt-5.4",
+		CodexWSRotationEnabled:   true,
+		CodexWSRotationMaxAgeSec: 900,
+		CodexWSMaxSiblings:       4,
+		CodexWSMaxProxyRoutes:    3,
+	}
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(seed): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got == nil || !got.CodexWSRotationEnabled || got.CodexWSRotationMaxAgeSec != 900 || got.CodexWSMaxSiblings != 4 || got.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("rotation settings = %#v, want enabled/900/4/3", got)
+	}
+
+	seed.CodexWSRotationMaxAgeSec = 1
+	seed.CodexWSMaxSiblings = 100
+	seed.CodexWSMaxProxyRoutes = 100
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(clamp): %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(clamp): %v", err)
+	}
+	if got.CodexWSRotationMaxAgeSec != 300 || got.CodexWSMaxSiblings != 16 || got.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("clamped rotation settings = %#v, want 300/16/3", got)
+	}
+}
+
 func TestSQLiteSystemSettingsWeakNetworkModeRoundtrip(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	db, err := New("sqlite", dbPath)

@@ -172,6 +172,49 @@ func TestRotationProxyCandidatesUseSelectorAndLimit(t *testing.T) {
 	}
 }
 
+func TestLegacyModeIgnoresConfigurableRotationAge(t *testing.T) {
+	previous := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previous) })
+	t.Setenv("CODEX_WS_CONNECTION_MODE", "busy")
+	t.Setenv("CODEX_WS_ROTATION_MAX_AGE", "1ms")
+	next := proxy.DefaultRuntimeSettings()
+	next.CodexWSRotationEnabled = true
+	proxy.ApplyRuntimeSettings(next)
+	if wsRotationModeEnabled() {
+		t.Fatal("explicit legacy mode should disable rotation")
+	}
+	if got := connectionRotationAge(); got != connectionMaxLifetime() {
+		t.Fatalf("legacy rotation age = %s, want hard lifetime %s", got, connectionMaxLifetime())
+	}
+}
+
+func TestRotationModeReadsRuntimeSettingsWhenEnvUnset(t *testing.T) {
+	previous := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previous) })
+	t.Setenv("CODEX_WS_CONNECTION_MODE", "")
+	t.Setenv("CODEX_WS_ROTATION_MAX_AGE", "")
+	t.Setenv("CODEX_WS_MAX_SIBLINGS", "")
+	t.Setenv("CODEX_WS_MAX_PROXY_ROUTES", "")
+	next := proxy.DefaultRuntimeSettings()
+	next.CodexWSRotationEnabled = true
+	next.CodexWSRotationMaxAgeSec = 600
+	next.CodexWSMaxSiblings = 5
+	next.CodexWSMaxProxyRoutes = 3
+	proxy.ApplyRuntimeSettings(next)
+	if !wsRotationModeEnabled() {
+		t.Fatal("rotation mode should follow runtime setting when env is unset")
+	}
+	if got := connectionRotationAge(); got != 10*time.Minute {
+		t.Fatalf("runtime rotation age = %s, want 10m", got)
+	}
+	if got := wsMaxSiblingConnections(); got != 5 {
+		t.Fatalf("runtime sibling limit = %d, want 5", got)
+	}
+	if got := wsMaxProxyRoutes(); got != 3 {
+		t.Fatalf("runtime route limit = %d, want 3", got)
+	}
+}
+
 func TestRotationModeSettingsStayIndependentFromLegacyBusySettings(t *testing.T) {
 	setBusyRuntimeSettings(t, func(s *proxy.RuntimeSettings) {
 		s.CodexWSBusyOverflow = false

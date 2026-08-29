@@ -1350,6 +1350,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_busy_overflow_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_busy_patience_sec INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_stateless_slots INT DEFAULT 8;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_rotation_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_rotation_max_age_sec INT DEFAULT 2700;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_max_siblings INT DEFAULT 3;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_max_proxy_routes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_token TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_proxy_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_pause_enabled BOOLEAN DEFAULT FALSE;
@@ -2245,6 +2249,10 @@ type SystemSettings struct {
 	CodexWSBusyOverflowEnabled         bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
 	CodexWSBusyPatienceSec             int  // 触发溢出前的短等待（秒），默认 2（issue #413）
 	CodexWSStatelessSlots              int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
+	CodexWSRotationEnabled             bool
+	CodexWSRotationMaxAgeSec           int
+	CodexWSMaxSiblings                 int
+	CodexWSMaxProxyRoutes              int
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
 	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -2508,6 +2516,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(NULLIF(TRIM(codex_fingerprint_default_mode), ''), 'off'),
 			       COALESCE(compact_via_responses_enabled, false),
 		       COALESCE(codex_ws_stateless_slots, 8),
+		       COALESCE(codex_ws_rotation_enabled, false),
+		       COALESCE(codex_ws_rotation_max_age_sec, 2700),
+		       COALESCE(codex_ws_max_siblings, 3),
+		       COALESCE(codex_ws_max_proxy_routes, 2),
 		       COALESCE(github_token, ''),
 		       COALESCE(github_proxy_url, ''),
 		       COALESCE(codex_overload_pause_enabled, false),
@@ -2586,7 +2598,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSWeakNetworkMode,
 		&s.CodexFingerprintDefaultMode,
 		&s.CompactViaResponsesEnabled,
-		&s.CodexWSStatelessSlots,
+		&s.CodexWSStatelessSlots, &s.CodexWSRotationEnabled, &s.CodexWSRotationMaxAgeSec, &s.CodexWSMaxSiblings, &s.CodexWSMaxProxyRoutes,
 		&s.GithubToken,
 		&s.GithubProxyURL,
 		&s.CodexOverloadPauseEnabled,
@@ -2634,6 +2646,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
 	s.ModelsListReadMaxBytes = NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes)
+	s.CodexWSRotationMaxAgeSec = NormalizeCodexWSRotationMaxAgeSec(s.CodexWSRotationMaxAgeSec)
+	s.CodexWSMaxSiblings = NormalizeCodexWSMaxSiblings(s.CodexWSMaxSiblings)
+	s.CodexWSMaxProxyRoutes = NormalizeCodexWSMaxProxyRoutes(s.CodexWSMaxProxyRoutes)
 	s.SchedulerEngine = NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled)
 	s.FastSchedulerEnabled = s.SchedulerEngine != "legacy"
 	return s, err
@@ -2832,6 +2847,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_fingerprint_default_mode,
 					compact_via_responses_enabled,
 					codex_ws_stateless_slots,
+                    codex_ws_rotation_enabled, codex_ws_rotation_max_age_sec, codex_ws_max_siblings, codex_ws_max_proxy_routes,
 					github_token,
 					github_proxy_url,
 					codex_overload_pause_enabled,
@@ -2844,7 +2860,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_request_compression,
 					auto_activate_5h_window_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2884,10 +2900,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $120 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $124 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $121 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $125 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2952,6 +2968,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_fingerprint_default_mode = EXCLUDED.codex_fingerprint_default_mode,
 					compact_via_responses_enabled = EXCLUDED.compact_via_responses_enabled,
 					codex_ws_stateless_slots = EXCLUDED.codex_ws_stateless_slots,
+                    codex_ws_rotation_enabled = EXCLUDED.codex_ws_rotation_enabled, codex_ws_rotation_max_age_sec = EXCLUDED.codex_ws_rotation_max_age_sec, codex_ws_max_siblings = EXCLUDED.codex_ws_max_siblings, codex_ws_max_proxy_routes = EXCLUDED.codex_ws_max_proxy_routes,
 					github_token = EXCLUDED.github_token,
 					github_proxy_url = EXCLUDED.github_proxy_url,
 					codex_overload_pause_enabled = EXCLUDED.codex_overload_pause_enabled,
@@ -3000,6 +3017,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode),
 		s.CompactViaResponsesEnabled,
 		NormalizeCodexWSStatelessSlots(s.CodexWSStatelessSlots),
+		s.CodexWSRotationEnabled, NormalizeCodexWSRotationMaxAgeSec(s.CodexWSRotationMaxAgeSec), NormalizeCodexWSMaxSiblings(s.CodexWSMaxSiblings), NormalizeCodexWSMaxProxyRoutes(s.CodexWSMaxProxyRoutes),
 		strings.TrimSpace(s.GithubToken),
 		strings.TrimSpace(s.GithubProxyURL),
 		s.CodexOverloadPauseEnabled,
@@ -3170,6 +3188,47 @@ func NormalizeCodexWSStatelessSlots(slots int) int {
 		return 32
 	}
 	return slots
+}
+
+// NormalizeCodexWSRotationMaxAgeSec 把 WS 轮换最长存活时间限制在 300-3600 秒，非正值回落默认 2700 秒。
+func NormalizeCodexWSRotationMaxAgeSec(seconds int) int {
+	const (
+		defaultSeconds = 45 * 60
+		minSeconds     = 5 * 60
+		maxSeconds     = 60 * 60
+	)
+	if seconds <= 0 {
+		return defaultSeconds
+	}
+	if seconds < minSeconds {
+		return minSeconds
+	}
+	if seconds > maxSeconds {
+		return maxSeconds
+	}
+	return seconds
+}
+
+// NormalizeCodexWSMaxSiblings 把每个账号/缓存键的 WS 兄弟连接数限制在 1-16，非正值回落默认 3。
+func NormalizeCodexWSMaxSiblings(value int) int {
+	if value <= 0 {
+		return 3
+	}
+	if value > 16 {
+		return 16
+	}
+	return value
+}
+
+// NormalizeCodexWSMaxProxyRoutes 把 WS 兄弟连接允许使用的代理线路数限制在 1-3，非正值回落默认 2。
+func NormalizeCodexWSMaxProxyRoutes(value int) int {
+	if value <= 0 {
+		return 2
+	}
+	if value > 3 {
+		return 3
+	}
+	return value
 }
 
 // normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。

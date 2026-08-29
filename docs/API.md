@@ -1544,7 +1544,11 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "response_cache_reconstruct_max_bytes": 67108864,
   "response_cache_config_generation": 1,
   "admin_secret": "",
-  "admin_auth_source": "env"
+  "admin_auth_source": "env",
+  "codex_ws_rotation_enabled": false,
+  "codex_ws_rotation_max_age_sec": 2700,
+  "codex_ws_max_siblings": 3,
+  "codex_ws_max_proxy_routes": 2
 }
 ```
 
@@ -1570,6 +1574,10 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "retry_interval_ms": 500,
   "transport_retry_policy": "sticky",
   "codex_fingerprint_default_mode": "session",
+  "codex_ws_rotation_enabled": true,
+  "codex_ws_rotation_max_age_sec": 2700,
+  "codex_ws_max_siblings": 3,
+  "codex_ws_max_proxy_routes": 2,
   "response_cache_local_max_bytes": 134217728,
   "response_cache_local_max_entry_bytes": 8388608,
   "response_cache_reconstruct_max_bytes": 134217728
@@ -1577,6 +1585,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 ```
 
 **响应:** 更新后的完整设置对象
+
+`codex_ws_rotation_enabled` 开启按连接年龄轮换：到龄连接停止接收新请求，旧连接等待 pending 请求排空后优雅关闭，新请求切换到同账号兄弟连接。`codex_ws_rotation_max_age_sec` 范围为 300–3600 秒，`codex_ws_max_siblings` 范围为 1–16，`codex_ws_max_proxy_routes` 范围为 1–3；这些设置保存后立即更新当前进程运行态。Resin 启用时，兄弟候选使用 `account_id`、`account_id-1`、`account_id-2` 等粘性用户名绑定不同 IP。设置对应环境变量时，环境变量优先。
 
 `codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
