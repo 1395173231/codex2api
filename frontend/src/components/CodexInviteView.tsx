@@ -934,7 +934,10 @@ function TrackingCard({
             <span>{t('invite.trackingLoadFailed', { error })}</span>
           </p>
         ) : items == null ? (
-          <p className="text-sm text-muted-foreground">{t('invite.trackingLoading')}</p>
+          <div className="flex flex-1 flex-col items-center justify-center py-10 text-center">
+            <Loader2 className="size-5 animate-spin text-muted-foreground" />
+            <p className="mt-3 text-sm text-muted-foreground">{t('invite.trackingLoading')}</p>
+          </div>
         ) : items.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center py-10 text-center">
             <div className="mb-3 flex size-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
