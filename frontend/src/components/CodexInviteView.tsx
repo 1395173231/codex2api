@@ -662,16 +662,8 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                     </p>
                   )}
 
-                  <button
-                    type="button"
-                    onClick={() => setShowAdvanced((v) => !v)}
-                    className="mt-4 inline-flex items-center gap-1 self-start text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    <ChevronDown className={`size-3.5 transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
-                    {t('invite.advanced')}
-                  </button>
                   {showAdvanced && (
-                    <div className="mt-3 rounded-xl border bg-muted/30 p-3">
+                    <div className="mt-4 rounded-xl border bg-muted/30 p-3">
                       <label className="mb-1 block text-xs font-medium text-muted-foreground">
                         {t('invite.proxyLabel')}
                       </label>
@@ -686,7 +678,16 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
 
                   {error && <div className="mt-3 text-sm text-red-500">{error}</div>}
 
-                  <div className="mt-auto flex justify-end pt-4">
+                  {/* 次级操作(高级选项)与主 CTA 同一行:左 toggle、右发送,消除底部两行堆叠 */}
+                  <div className="mt-auto flex items-center justify-between gap-3 pt-4">
+                    <button
+                      type="button"
+                      onClick={() => setShowAdvanced((v) => !v)}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      <ChevronDown className={`size-3.5 transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
+                      {t('invite.advanced')}
+                    </button>
                     <Button disabled={!canSend} onClick={() => void handleSend()} className="min-w-[8.5rem]">
                       <Send className="size-3.5" />
                       {sending
