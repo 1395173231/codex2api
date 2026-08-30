@@ -1665,6 +1665,7 @@
     "trackingLoading": "正在加载邀请记录…",
     "trackingLoadFailed": "邀请记录加载失败：{{error}}",
     "trackingEmpty": "暂无已发邀请",
+    "trackingEmptyHint": "发送邀请后，这里会显示每封邀请的兑换状态。",
     "trackingCreatedAt": "发送于 {{time}}",
     "trackingExpiresAt": "过期于 {{time}}",
     "challengedRetry": "请求被 Cloudflare 人机挑战拦下（与邀请资格无关，也没有发出任何邮件）。稍后重试即可。",

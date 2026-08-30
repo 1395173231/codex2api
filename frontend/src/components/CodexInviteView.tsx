@@ -927,7 +927,7 @@ function TrackingCard({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto p-5">
+      <div className="flex min-h-0 flex-1 flex-col overflow-auto p-5">
         {error ? (
           <p className="flex items-start gap-1.5 break-all text-sm text-amber-600">
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
@@ -936,7 +936,15 @@ function TrackingCard({
         ) : items == null ? (
           <p className="text-sm text-muted-foreground">{t('invite.trackingLoading')}</p>
         ) : items.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t('invite.trackingEmpty')}</p>
+          <div className="flex flex-1 flex-col items-center justify-center py-10 text-center">
+            <div className="mb-3 flex size-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
+              <History className="size-5" />
+            </div>
+            <p className="text-sm font-medium text-foreground">{t('invite.trackingEmpty')}</p>
+            <p className="mt-1 max-w-56 text-xs leading-relaxed text-muted-foreground">
+              {t('invite.trackingEmptyHint')}
+            </p>
+          </div>
         ) : (
           <div className="space-y-2">
             {items.map((item, i) => (
