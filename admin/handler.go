@@ -8369,6 +8369,7 @@ type settingsResponse struct {
 	AutoCleanError                      bool   `json:"auto_clean_error"`
 	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	CodexAnalyticsEnabled               bool   `json:"codex_analytics_enabled"`
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
@@ -8541,6 +8542,7 @@ type updateSettingsReq struct {
 	AutoCleanError                      *bool     `json:"auto_clean_error"`
 	AutoCleanExpired                    *bool     `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             *bool     `json:"auto_reset_credits_enabled"`
+	CodexAnalyticsEnabled               *bool     `json:"codex_analytics_enabled"`
 	AutoResetCreditsBeforeExpiryMin     *int      `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         *bool     `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool     `json:"proxy_pool_enabled"`
@@ -9239,12 +9241,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	codexAnalyticsEnabled := runtimeCfg.CodexAnalyticsEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
 	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
 	if dbSettings != nil {
 		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		codexAnalyticsEnabled = dbSettings.CodexAnalyticsEnabled
 		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
 		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
 		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
@@ -9297,6 +9301,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		CodexAnalyticsEnabled:               codexAnalyticsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -9693,6 +9698,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelPricingOverrides := "{}"
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
+	persistedCodexAnalyticsEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedAutoActivate5hWindowEnabled := false
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
@@ -9720,6 +9726,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		modelPricingOverrides = existingSettings.ModelPricingOverrides
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedCodexAnalyticsEnabled = existingSettings.CodexAnalyticsEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
@@ -9799,6 +9806,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
 	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.CodexAnalyticsEnabled = persistedCodexAnalyticsEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
@@ -9820,6 +9828,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
 	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
+	analyticsChanged := req.CodexAnalyticsEnabled != nil && *req.CodexAnalyticsEnabled != persistedCodexAnalyticsEnabled
 	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
 	usageLogMode := h.db.GetUsageLogMode()
 	usageLogBatchSize := h.db.GetUsageLogBatchSize()
@@ -10474,6 +10483,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
 		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
 	}
+	if req.CodexAnalyticsEnabled != nil {
+		runtimeCfg.CodexAnalyticsEnabled = *req.CodexAnalyticsEnabled
+		log.Printf("设置已更新: codex_analytics_enabled = %t", *req.CodexAnalyticsEnabled)
+	}
 	if req.AutoResetCreditsBeforeExpiryMin != nil {
 		runtimeCfg.AutoResetCreditsBeforeExpiryMin = *req.AutoResetCreditsBeforeExpiryMin
 		log.Printf("设置已更新: auto_reset_credits_before_expiry_min = %d", *req.AutoResetCreditsBeforeExpiryMin)
@@ -10743,6 +10756,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		CodexAnalyticsEnabled:               runtimeCfg.CodexAnalyticsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -10874,6 +10888,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
 			return
 		}
+		if analyticsChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存 Codex 分析事件设置失败，设置未生效")
+			return
+		}
 		if autoActivate5hChanged {
 			runtimeCfg = effectiveRuntimeCfg
 			writeError(c, http.StatusInternalServerError, "保存 5h 窗口自动激活设置失败，设置未生效")
@@ -10940,6 +10959,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
+		}
+		if analyticsChanged {
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				current.CodexAnalyticsEnabled = runtimeCfg.CodexAnalyticsEnabled
+				return current
+			})
 		}
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
@@ -11056,6 +11081,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		CodexAnalyticsEnabled:               runtimeCfg.CodexAnalyticsEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),

@@ -56,6 +56,7 @@ Codex2API 采用三层配置架构：
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CODEX_UPSTREAM_TRANSPORT` | 否 | `http` | Codex 上游协议：`http` / `auto` / `ws`。HTTP 入站在 `auto` 下仍走 HTTP 上游 |
+| `CODEX_ANALYTICS_ENABLED` | 否 | `false` | 最小化 Codex 分析上报的首次建库/数据库读取失败回退默认值；正常运行时以管理后台「系统设置 → Codex 分析事件上报」为权威值并热生效。使用处理请求的 Codex 账号异步上报，不含提示词/回复正文、IP、邮箱、下游 API Key 或错误原文；队列满或网络失败不会阻塞模型请求 |
 | `CODEX_REMOTE_COMPACTION_TRANSPORT` | 否 | `http` | 原生 Remote Compaction v2（`/responses` + `stream=true` + `compaction_trigger`）的上游协议：`http` / `inherit` / `ws`。默认独立走 HTTP SSE；`inherit` 才跟随普通请求的全局/运行时 WS 策略 |
 | `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |

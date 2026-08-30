@@ -4336,3 +4336,36 @@ func TestSQLiteSystemSettingsWeakNetworkModeRoundtrip(t *testing.T) {
 		t.Fatal("codex_ws_weak_network_mode = true after disabling, want false")
 	}
 }
+
+func TestSQLiteSystemSettingsCodexAnalyticsRoundtrip(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "analytics-settings.db"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{MaxConcurrency: 2, TestModel: "gpt-5.4", CodexAnalyticsEnabled: true}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings(true): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(true): %v", err)
+	}
+	if got == nil || !got.CodexAnalyticsEnabled {
+		t.Fatalf("CodexAnalyticsEnabled = %v, want true", got != nil && got.CodexAnalyticsEnabled)
+	}
+
+	got.CodexAnalyticsEnabled = false
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(false): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(false): %v", err)
+	}
+	if after == nil || after.CodexAnalyticsEnabled {
+		t.Fatalf("CodexAnalyticsEnabled = %v, want false", after != nil && after.CodexAnalyticsEnabled)
+	}
+}

@@ -594,6 +594,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// 出站前最后兜底：任何中间改写都不能把普通 input 项放到
 		// compaction_trigger 后面，否则上游直接返回 invalid_request_error。
 		requestBody = normalizeCompactionTriggerFinal(requestBody, false)
+		observeAnalyticsOutboundRequest(ctx, requestBody, headers)
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
@@ -685,6 +686,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 		// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
 		ApplyCodexRoutingHint(req.Header, account, requestBody)
+		observeAnalyticsOutboundRequest(ctx, requestBody, req.Header)
 
 		logCodexFingerprintDebug("http", account, effectiveProxyURL, req.Header)
 

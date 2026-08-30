@@ -1396,6 +1396,7 @@ export default function Settings() {
     fast_scheduler_enabled: false,
     scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
+    codex_analytics_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
@@ -2580,6 +2581,23 @@ export default function Settings() {
                 </SettingField>
               </div>
             </div>
+          </SettingsCard>
+
+          <SettingsCard
+            title={t('settings.codexAnalyticsTitle')}
+            description={t('settings.codexAnalyticsDesc')}
+            icon={<Activity className="size-4" />}
+          >
+            <SettingField
+              label={t('settings.codexAnalyticsEnabled')}
+              description={t('settings.codexAnalyticsEnabledDesc')}
+              layout="switch"
+            >
+              <Switch
+                checked={settingsForm.codex_analytics_enabled}
+                onCheckedChange={(checked) => autoSaveBooleanField('codex_analytics_enabled', checked)}
+              />
+            </SettingField>
           </SettingsCard>
 
           <SettingsCard

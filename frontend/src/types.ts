@@ -1626,6 +1626,7 @@ export interface SystemSettings {
   auto_clean_error: boolean
   auto_clean_expired: boolean
   auto_reset_credits_enabled: boolean
+  codex_analytics_enabled: boolean
   auto_reset_credits_before_expiry_min: number
   auto_activate_5h_window_enabled: boolean
   proxy_pool_enabled: boolean

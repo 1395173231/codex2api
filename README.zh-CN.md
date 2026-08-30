@@ -310,6 +310,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | --- | --- |
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP 请求体上限，单位 MB，默认 `48` |
+| `CODEX_ANALYTICS_ENABLED` | 最小化 Codex 分析上报的首次建库/故障回退默认值；管理后台开关为权威值并支持热生效。默认关闭，不含提示词/回复正文、IP、邮箱或下游 API Key |
 | `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
 | `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
 | `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |
@@ -442,6 +443,10 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 ```
 
 > 所有导入接口自动去重，已存在的 Token 不会重复写入。更多管理接口（导出、迁移、OAuth 授权等）参见 [API 文档](docs/API.md)。
+
+#### CDK 自动兑换并导入
+
+仓库附带 `tools/redeem-and-import.mjs`，可从兑换平台批量兑换 CDK、下载 Sub2API JSON，并上传到 `/api/admin/accounts/import`；可选按 `/api/admin/health` 的可用/总账号数达到目标后自动停止。另有本地 Web 面板 `tools/redeem-and-import-panel.mjs`，用于查看状态、刷新、启动/停止任务和重载兑换码。配置与安全说明见 [`tools/README.md`](tools/README.md)。真实 CDK、下载 token 和管理密钥请通过环境变量/本地未跟踪文件提供，不要写入源码。
 
 #### OAuth PKCE 授权
 

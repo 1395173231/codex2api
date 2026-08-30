@@ -99,6 +99,10 @@
     }
   },
   "settings": {
+    "codexAnalyticsTitle": "Codex 分析事件回報",
+    "codexAnalyticsDesc": "向 OpenAI 提供最小化的執行統計，協助改進 Codex。預設關閉。",
+    "codexAnalyticsEnabled": "啟用分析事件回報",
+    "codexAnalyticsEnabledDesc": "僅回報事件類型、模型、狀態、耗時與 Token 等統計；不包含請求/回應內容、Cookie、金鑰或原始錯誤文字。",
     "pricing": {
       "contextThreshold": "長上下文閾值",
       "revertThreshold": "還原為 {{value}} tokens",

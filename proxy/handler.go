@@ -25,6 +25,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
+	"github.com/codex2api/telemetry"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -51,18 +52,20 @@ func upstreamErrorConsoleBody(body []byte) string {
 
 // Handler API 路由处理器
 type Handler struct {
-	store        *auth.Store
-	configKeys   map[string]bool // 配置文件中的静态 key
-	db           *database.DB
-	cfg          *config.Config       // 全局配置
-	deviceCfg    *DeviceProfileConfig // 设备指纹配置
-	cache        cache.TokenCache     // Redis/Memory 运行态缓存
-	apiKeyGateMu sync.Mutex
-	promptRiskMu sync.Mutex
-	apiKeyGate   *apiKeyConcurrencyLimiter
-	scopeUsageMu sync.Mutex
-	scopeUsage   *apiKeyScopeUsageTracker
-	liveStore    *liveCallStore
+	store          *auth.Store
+	configKeys     map[string]bool // 配置文件中的静态 key
+	db             *database.DB
+	cfg            *config.Config        // 全局配置
+	deviceCfg      *DeviceProfileConfig  // 设备指纹配置
+	analytics      telemetry.Sink        // 可选的 OpenAI Codex analytics 异步上报器
+	analyticsTurns *analyticsTurnTracker // 按真实 thread/turn 聚合 Responses sampling
+	cache          cache.TokenCache      // Redis/Memory 运行态缓存
+	apiKeyGateMu   sync.Mutex
+	promptRiskMu   sync.Mutex
+	apiKeyGate     *apiKeyConcurrencyLimiter
+	scopeUsageMu   sync.Mutex
+	scopeUsage     *apiKeyScopeUsageTracker
+	liveStore      *liveCallStore
 	// Responses WebSocket 同作用域会话的本机抢占注册表；跨实例所有权由 runtime cache 协调。
 	responsesWSSessionPreemptions responsesWSSessionPreemptRegistry
 	// 指纹重放冷却的存在性闸门缓存(见 hasActiveFingerprintReplayLocks)。
@@ -1446,6 +1449,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateWsAcquireFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
+	h.captureAnalyticsTurn(c, input)
 	h.logUsage(input)
 }
 
@@ -1477,6 +1481,7 @@ func (h *Handler) logContinueThinkingRounds(c *gin.Context, res continueFoldResu
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
 			BillingServiceTier:   usageTiers.BillingServiceTier,
+			InternalReason:       analyticsContinueRound,
 			// 隐藏的续想轮不是「重试」：不置 IsRetryAttempt/AttemptIndex，
 			// 否则会污染重试统计并与外层 attempt 编号混淆。
 		}
@@ -3835,6 +3840,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
+		resetAnalyticsResponseObservation(c)
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
@@ -4356,6 +4362,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					parsed := gjson.ParseBytes(data)
 					eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+					observeAnalyticsResponsePayload(c, data)
 					ttftGuard.MarkProgress(eventType)
 					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 					if !ttftRecorded && isFirstToken {
@@ -4712,6 +4719,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
+		rememberAnalyticsUpstreamSession(c, upstreamSessionID)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -5066,6 +5074,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 非流式响应得到同一份可回放终态。
 					data = restoreMissingResponseOutputsInEvent(data, outputCollector.Items())
 					parsed = gjson.ParseBytes(data)
+					observeAnalyticsResponsePayload(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -5786,6 +5795,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
+		resetAnalyticsResponseObservation(c)
 		var account *auth.Account
 		var stickyProxyURL string
 		var affinityGuard auth.SessionAffinityGuard
@@ -6100,6 +6110,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		// compact（会话压缩续写）刻意保留确定性 IsolateCodexSessionID、不走 resolveUpstreamSessionID
 		// 的默认隔离：压缩本身是对同一会话的延续，需要稳定的 prompt_cache_key 维持缓存连续性。
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionIdentity.upstreamSeed)
+		rememberAnalyticsUpstreamSession(c, upstreamSessionID)
 		// compact_via_responses_enabled：上游已下线 /responses/compact 专用端点（404），
 		// 开启后官方账号改走 /responses + compaction_trigger 的 body-signal 形态
 		// （强制 HTTP SSE），成功后聚合回 compact 的一次性 JSON。
@@ -6598,6 +6609,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
+		resetAnalyticsResponseObservation(c)
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
@@ -6691,6 +6703,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
+		rememberAnalyticsUpstreamSession(c, upstreamSessionID)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，

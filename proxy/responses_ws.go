@@ -331,6 +331,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// prior frame's config or body digest.
 	resetPromptRequestSecurityFrame(c)
 	resetPromptPolicyRequestCorrelationID(c)
+	resetAnalyticsResponseObservation(c)
 	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
@@ -560,6 +561,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
+		resetAnalyticsResponseObservation(c)
 		if c.Request.Context().Err() != nil {
 			return errResponsesWSClientGone
 		}
@@ -682,6 +684,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
+		rememberAnalyticsUpstreamSession(c, upstreamSessionID)
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 			return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		})
@@ -1095,6 +1098,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		parsed := gjson.ParseBytes(data)
 		eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+		observeAnalyticsResponsePayload(c, data)
 		clientData := data
 		if options != nil && options.transformClientEvent != nil {
 			if transformed := options.transformClientEvent(data); len(transformed) > 0 {

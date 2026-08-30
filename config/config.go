@@ -103,7 +103,10 @@ type Config struct {
 	//（/responses + stream=true + compaction_trigger）的上游传输。
 	// http（默认）用于隔离长响应与 WebSocket 长连接波动；inherit 跟随普通请求；ws 强制 WebSocket。
 	CodexRemoteCompactionTransport string
-	TrustedProxies                 []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	// CodexAnalyticsEnabled 是首次建库/数据库读取失败时的默认值；持久化网页设置
+	// 是正常运行时的权威值。默认关闭；上报不包含提示词、回复正文、IP、邮箱或下游 API Key。
+	CodexAnalyticsEnabled bool
+	TrustedProxies        []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -171,6 +174,7 @@ func Load(envPath string) (*Config, error) {
 	if cfg.CodexUpstreamTransport == "ws" {
 		cfg.UseWebsocket = true
 	}
+	cfg.CodexAnalyticsEnabled = parseBoolEnv(os.Getenv("CODEX_ANALYTICS_ENABLED"))
 
 	// Remote Compaction 的响应通常更长，默认独立走 HTTP SSE，避免全局强制 WS
 	// 时被代理 idle policy、WS 帧/队列限制或连接波动截断。inherit 可显式恢复旧行为。

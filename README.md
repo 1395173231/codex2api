@@ -259,6 +259,7 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | --- | --- |
 | `CODEX_PORT` | HTTP port, default `8080` |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP request body limit in MB, default `48` |
+| `CODEX_ANALYTICS_ENABLED` | Initial-database/fallback default for minimal Codex analytics. The dashboard setting is authoritative and hot-reloadable; off by default and excludes prompts, responses, IPs, email addresses, and downstream API keys |
 | `ADMIN_SECRET` | Admin dashboard secret. When set, `/admin` prompts for authentication |
 | `DATABASE_DRIVER` | Database driver: `postgres` or `sqlite` |
 | `DATABASE_PATH` | SQLite database file path, used when `DATABASE_DRIVER=sqlite` |

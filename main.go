@@ -28,6 +28,7 @@ import (
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
+	"github.com/codex2api/telemetry"
 	"github.com/gin-gonic/gin"
 )
 
@@ -124,6 +125,7 @@ func main() {
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
 			CodexContinueMaxRounds:            8,
+			CodexAnalyticsEnabled:             cfg.CodexAnalyticsEnabled,
 			AutoPause5hGuardBandPercent:       5,
 			AutoPause5hGuardConcurrency:       1,
 			SmartPacingMinConcurrency:         1,
@@ -176,6 +178,7 @@ func main() {
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
 			CodexContinueMaxRounds:            8,
+			CodexAnalyticsEnabled:             cfg.CodexAnalyticsEnabled,
 			AutoPause5hGuardBandPercent:       5,
 			AutoPause5hGuardConcurrency:       1,
 			SmartPacingMinConcurrency:         1,
@@ -381,6 +384,20 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	handler.SetRuntimeCache(tc)
+	// Reporter 与 middleware 始终装配，网页设置通过 RuntimeSettings 热启停。
+	// 未启用时不会入队或发起网络请求；环境变量只负责新库默认值/兼容回退。
+	analyticsReporter := telemetry.NewReporter(telemetry.Config{
+		Enabled:    true,
+		ShouldSend: func() bool { return proxy.CurrentRuntimeSettings().CodexAnalyticsEnabled },
+		OnError: func(err error) {
+			log.Printf("OpenAI Codex analytics 上报失败（模型请求不受影响）: %v", err)
+		},
+	})
+	handler.SetAnalyticsReporter(analyticsReporter)
+	r.Use(handler.AnalyticsMiddleware())
+	if proxy.CurrentRuntimeSettings().CodexAnalyticsEnabled {
+		log.Printf("OpenAI Codex analytics 已启用（网页设置优先；仅上报最小结构化统计）")
+	}
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
@@ -609,6 +626,14 @@ func main() {
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
+	}
+	handler.FlushAnalytics()
+	if analyticsReporter != nil {
+		analyticsCtx, cancelAnalytics := context.WithTimeout(context.Background(), 6*time.Second)
+		if err := analyticsReporter.Close(analyticsCtx); err != nil {
+			log.Printf("OpenAI Codex analytics 队列未完全排空: %v", err)
+		}
+		cancelAnalytics()
 	}
 	adminHandler.WaitAutoResetCredits()
 	adminHandler.WaitAutoActivate5hWindow()

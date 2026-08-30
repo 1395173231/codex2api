@@ -1384,6 +1384,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_analytics_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
@@ -2294,6 +2295,7 @@ type SystemSettings struct {
 	CodexCLIVersionSyncIntervalHours int
 	// AutoResetCreditsEnabled 控制 Plus/Pro 主动重置次数的临期自动消费（默认关闭）。
 	AutoResetCreditsEnabled bool
+	CodexAnalyticsEnabled   bool // 向 OpenAI 上报最小 Codex 事件统计，默认关闭
 	// AutoResetCreditsBeforeExpiryMin 是进入临期窗口的提前分钟数（默认 60，范围 10-10080）。
 	AutoResetCreditsBeforeExpiryMin int
 	// AutoActivate5hWindowEnabled 控制 5h 窗口重置后是否发送一次最小真实 /responses 以启动下一轮窗口（默认关闭，issue #581）。
@@ -2502,6 +2504,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(model_pricing_sync_url, ''),
 			       COALESCE(ignore_usage_limit_status, false),
 			       COALESCE(auto_reset_credits_enabled, false),
+			       COALESCE(codex_analytics_enabled, false),
 			       COALESCE(auto_reset_credits_before_expiry_min, 60),
 			       COALESCE(payload_rules, '{}'),
 			       COALESCE(codex_ws_size_router_enabled, true),
@@ -2585,6 +2588,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ModelPricingSyncURL,
 		&s.IgnoreUsageLimitStatus,
 		&s.AutoResetCreditsEnabled,
+		&s.CodexAnalyticsEnabled,
 		&s.AutoResetCreditsBeforeExpiryMin,
 		&s.PayloadRules,
 		&s.CodexWSSizeRouterEnabled,
@@ -2830,6 +2834,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					model_pricing_sync_url,
 					ignore_usage_limit_status,
 					auto_reset_credits_enabled,
+					codex_analytics_enabled,
 					auto_reset_credits_before_expiry_min,
 					prompt_filter_strict_terminal_enabled,
 					prompt_filter_advanced_config,
@@ -2860,7 +2865,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_request_compression,
 					auto_activate_5h_window_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2900,10 +2905,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $124 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+					prompt_filter_custom_patterns = CASE WHEN $125 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $125 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+					prompt_filter_review_api_key = CASE WHEN $126 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2950,7 +2955,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_cli_version_sync_enabled = EXCLUDED.codex_cli_version_sync_enabled,
 					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
 					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status,
-					auto_reset_credits_enabled = EXCLUDED.auto_reset_credits_enabled,
+						auto_reset_credits_enabled = EXCLUDED.auto_reset_credits_enabled,
+						codex_analytics_enabled = EXCLUDED.codex_analytics_enabled,
 					auto_reset_credits_before_expiry_min = EXCLUDED.auto_reset_credits_before_expiry_min,
 					prompt_filter_strict_terminal_enabled = EXCLUDED.prompt_filter_strict_terminal_enabled,
 					prompt_filter_advanced_config = EXCLUDED.prompt_filter_advanced_config,
@@ -3002,7 +3008,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
 		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
-		s.IgnoreUsageLimitStatus, s.AutoResetCreditsEnabled,
+		s.IgnoreUsageLimitStatus, s.AutoResetCreditsEnabled, s.CodexAnalyticsEnabled,
 		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin),
 		s.PromptFilterStrictTerminalEnabled, s.PromptFilterAdvancedConfig, payloadRules, s.PublicAccountPortalPageEnabled,
 		s.CodexWSSizeRouterEnabled,

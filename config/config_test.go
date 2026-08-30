@@ -12,6 +12,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_ANALYTICS_ENABLED",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -60,6 +61,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	}
 	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
+	}
+	if cfg.CodexAnalyticsEnabled {
+		t.Fatal("CodexAnalyticsEnabled = true, want privacy-preserving default false")
 	}
 	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
 		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)
@@ -245,6 +249,22 @@ func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
 	}
 	if got := cfg.CodexRemoteCompactionTransport; got != "http" {
 		t.Fatalf("CodexRemoteCompactionTransport = %q, want http", got)
+	}
+}
+
+func TestLoadEnablesCodexAnalyticsExplicitly(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_ANALYTICS_ENABLED", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if !cfg.CodexAnalyticsEnabled {
+		t.Fatal("CodexAnalyticsEnabled = false, want true")
 	}
 }
 
