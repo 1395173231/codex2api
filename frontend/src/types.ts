@@ -1644,8 +1644,6 @@ export interface SystemSettings {
   auto_activate_5h_window_enabled: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
-  subscription_upgrades_enabled: boolean
-  subscription_upgrades_env_default: boolean
   scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
   codex_request_compression: boolean
