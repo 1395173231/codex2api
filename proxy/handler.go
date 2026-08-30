@@ -1222,9 +1222,10 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
 	}
 	if h.configKeys[key] {
 		return &database.APIKeyRow{
-			ID:   0,
-			Name: "config",
-			Key:  key,
+			ID:      0,
+			Name:    "config",
+			Key:     key,
+			Enabled: true,
 		}, true, nil
 	}
 	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
@@ -1272,10 +1273,12 @@ func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow
 	if record.ID <= 0 {
 		return nil, false
 	}
+	// 运行时缓存只收录无任何访问约束的 key（含 enabled=true），此处可安全回填。
 	return &database.APIKeyRow{
 		ID:        record.ID,
 		Name:      record.Name,
 		Key:       key,
+		Enabled:   true,
 		CreatedAt: record.CreatedAt,
 	}, true
 }
@@ -3071,6 +3074,13 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if !apiKeyRow.Enabled {
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED_DISABLED_KEY", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidAuth, "API key is disabled", api.ErrorTypeAuthentication))
+			c.Abort()
+			return
+		}
 		if apiKeyRow.IsExpired(time.Now()) {
 			maskedKey := security.MaskAPIKey(key)
 			security.SecurityAuditLog("AUTH_FAILED_EXPIRED_KEY", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
@@ -3839,6 +3849,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
 		resetAnalyticsResponseObservation(c)
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
@@ -4197,6 +4208,29 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				return
+			}
+			// Grok 降智检测:拿到 200 后先扣流判定,缺思考即丢弃响应换号(issue #587)。
+			// 默认关闭;放行时 resp.Body 已替换为无损前缀回放,后续转发字节级不变。
+			switch h.applyGrokQualityGuard(c, grokQualityGuardArgs{
+				Ctx: c.Request.Context(), Account: account, Resp: resp,
+				Inbound: GrokProtocolResponses, IsStream: isStream,
+				Endpoint: "/v1/responses", UpstreamPath: upstreamEndpoint,
+				LogModel: logModel, EffectiveModel: attemptLogEffectiveModel,
+				GateModel: attemptEffectiveModel, ReasoningEffort: reasoningEffort,
+				RawBody: rawBody, UpstreamBody: upstreamBody,
+				Start: start, Attempt: attempt, Attempts: &grokQualityAttempts,
+			}) {
+			case grokQualityGuardRetry:
+				stopTTFTGuard()
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				continue
+			case grokQualityGuardFailClosed:
+				stopTTFTGuard()
+				h.store.Release(account)
+				h.sendGrokNativeHTTPError(c, GrokProtocolResponses, grokQualityDegradedOutcome())
 				return
 			}
 			// Catch-all streaming may need to discard this entire attempt after a
@@ -6608,6 +6642,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
 		resetAnalyticsResponseObservation(c)
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
@@ -6886,6 +6921,28 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		SyncCodexUsageState(h.store, account, resp)
+		// Grok 降智检测:拿到 200 后先扣流判定,缺思考即丢弃响应换号(issue #587)。
+		switch h.applyGrokQualityGuard(c, grokQualityGuardArgs{
+			Ctx: c.Request.Context(), Account: account, Resp: resp,
+			Inbound: GrokProtocolChatCompletions, IsStream: isStream,
+			Endpoint: "/v1/chat/completions", UpstreamPath: upstreamEndpoint,
+			LogModel: logModel, EffectiveModel: attemptLogEffectiveModel,
+			GateModel: attemptEffectiveModel, ReasoningEffort: reasoningEffort,
+			RawBody: rawBody, ResponsesBody: codexBody,
+			Start: start, Attempt: attempt, Attempts: &grokQualityAttempts,
+		}) {
+		case grokQualityGuardRetry:
+			ttftGuard.Stop()
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			retryExclusions.MarkHard(account.ID())
+			continue
+		case grokQualityGuardFailClosed:
+			ttftGuard.Stop()
+			h.store.Release(account)
+			h.sendGrokNativeHTTPError(c, GrokProtocolChatCompletions, grokQualityDegradedOutcome())
+			return
+		}
 		if isGrokNativeRouteResponse(resp) {
 			downstreamFlusher, _ := c.Writer.(http.Flusher)
 			streamAttempt := h.newContinuousRetryStreamAttempt(isStream && continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
