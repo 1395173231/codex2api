@@ -578,6 +578,15 @@ export interface InviteGuideAccountPlan {
   remaining_reward_capacity?: number
   // grant_amount 是邀请人单次能拿到的额度，不含受邀人那一份。
   grant_amount?: number
+  // 本月发送用量，来自资格接口的 time_frame_rules。与下面的 invites_* 不是同一个
+  // 窗口：这是「月」，那是邀请记录的 90 天。
+  monthly_sent?: number
+  monthly_send_total?: number
+  // 近 90 天的实际邀请记录。字段缺失表示「没有跟踪数据」，与「确实是 0」不同——
+  // 导入探测只抓资格不抓记录，多数账号本来就没有这部分数据。
+  invites_sent?: number
+  invites_accepted?: number
+  invites_pending?: number
   potential_credits: number
   offer_id?: string
   title?: string

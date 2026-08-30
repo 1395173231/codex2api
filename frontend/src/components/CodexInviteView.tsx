@@ -17,6 +17,7 @@ import {
   Send,
   Sparkles,
   UserCircle2,
+  Users,
 } from 'lucide-react'
 import PageHeader from './PageHeader'
 import { Button } from '@/components/ui/button'
@@ -253,6 +254,26 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   }, [accountQuery, accountTyping])
 
   const parsed = useMemo(() => parseEmails(emailsText), [emailsText])
+  // 收件人选择器的勾选状态直接派生自输入框文本（单一事实来源）：手动输入的邮箱
+  // 在下拉里自动呈已选态，勾选/取消即增删输入框内容，两个入口不会各存一份。
+  const selectedRecipientEmails = useMemo(() => {
+    const set = new Set<string>()
+    for (const token of emailsText.split(SPLIT_RE)) {
+      const value = token.trim()
+      if (value) set.add(value.toLowerCase())
+    }
+    return set
+  }, [emailsText])
+  const toggleRecipientEmail = useCallback((email: string) => {
+    const key = email.trim().toLowerCase()
+    setEmailsText((prev) => {
+      const tokens = prev.split(SPLIT_RE).map((token) => token.trim()).filter(Boolean)
+      if (tokens.some((token) => token.toLowerCase() === key)) {
+        return tokens.filter((token) => token.toLowerCase() !== key).join('\n')
+      }
+      return tokens.length > 0 ? `${tokens.join('\n')}\n${email.trim()}` : email.trim()
+    })
+  }, [])
   const selectedAccount = useMemo(
     () => codexAccounts.find((a) => a.id === accountId) ?? null,
     [codexAccounts, accountId],
@@ -449,10 +470,8 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
 
   // 只探当前可见且还没有结果的账号。后端按 50 封顶并走导入闸门排队，
   // 这里探完后轮询几次回读，不做无限等待。
-  const probeVisibleCredits = async () => {
-    const ids = filteredAccounts
-      .map((a) => a.id)
-      .filter((id) => !creditsMap[id] || creditsMap[id].state === 'pending')
+  const probeCreditsByIds = async (candidateIds: number[]) => {
+    const ids = candidateIds.filter((id) => !creditsMap[id] || creditsMap[id].state === 'pending')
     if (ids.length === 0 || creditsProbing) return
     setCreditsProbing(true)
     try {
@@ -467,6 +486,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
       setCreditsProbing(false)
     }
   }
+  const probeVisibleCredits = () => probeCreditsByIds(filteredAccounts.map((a) => a.id))
 
   useEffect(() => {
     const handlePointerDown = (event: PointerEvent) => {
@@ -543,7 +563,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
             <EmptyState message={pickerLoading ? t('invite.accountsLoading') : t('invite.noCodexAccounts')} spinning={pickerLoading} />
           </div>
         ) : (
-          <div className="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2 xl:grid-cols-12">
+          <div className="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2 xl:min-h-[calc(100dvh-12rem)] xl:grid-cols-12">
             {/* 左列：账号选择 + 资格配额；与中/右列拉齐等高 */}
             <section className="flex min-h-0 min-w-0 flex-col gap-5 xl:col-span-4">
               <div className="shrink-0 rounded-2xl border bg-card shadow-sm">
@@ -600,7 +620,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                       <div
                         id="codex-invite-account-list"
                         role="listbox"
-                        className="max-h-72 overflow-auto p-1"
+                        className="max-h-[min(60dvh,30rem)] overflow-auto p-1"
                       >
                         {filteredAccounts.length > 0 ? (
                           filteredAccounts.map((account, index) => {
@@ -635,10 +655,13 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                                       </span>
                                     )}
                                   </span>
-                                  <span className="block truncate text-xs text-muted-foreground">
-                                    {[account.name && account.name !== account.email ? account.name : '', account.plan_type, account.status]
-                                      .filter(Boolean)
-                                      .join(' · ') || '-'}
+                                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    <span className="truncate">
+                                      {[account.name && account.name !== account.email ? account.name : '', account.plan_type, account.status]
+                                        .filter(Boolean)
+                                        .join(' · ') || '-'}
+                                    </span>
+                                    <InviteStatsInline plan={creditsMap[account.id]} />
                                   </span>
                                 </span>
                                 <InviteCreditsBadge plan={creditsMap[account.id]} />
@@ -717,6 +740,17 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                   </div>
                 </div>
                 <div className="flex min-h-0 flex-1 flex-col p-5">
+                  <div className="mb-2">
+                    <RecipientAccountPicker
+                      selectedEmails={selectedRecipientEmails}
+                      onToggle={toggleRecipientEmail}
+                      excludeEmail={selectedAccount?.email}
+                      creditsMap={creditsMap}
+                      onLoadCredits={loadVisibleCredits}
+                      onProbeCredits={probeCreditsByIds}
+                      probing={creditsProbing}
+                    />
+                  </div>
                   <textarea
                     value={emailsText}
                     onChange={(e) => setEmailsText(e.target.value)}
@@ -965,7 +999,7 @@ function EligibilityPanel({
         </div>
 
         {eligibility.rules && eligibility.rules.length > 0 && (
-          <ul className="mt-auto space-y-1.5 rounded-xl border bg-muted/20 px-3 py-2.5 text-xs text-muted-foreground">
+          <ul className="space-y-1.5 rounded-xl border bg-muted/20 px-3 py-2.5 text-xs text-muted-foreground">
             {eligibility.rules.map((rule, i) => (
               <li key={i} className="flex items-start gap-1.5">
                 <span className="mt-1.5 size-1 shrink-0 rounded-full bg-muted-foreground/50" />
@@ -1119,6 +1153,40 @@ function FreshnessHint({ meta }: { meta: InviteCacheMeta | null }) {
   )
 }
 
+// InviteStatsInline 在下拉副行追加邀请维度的小信息：单次能拿多少积分、发了多少封、
+// 被接受了几封。没有数据的字段直接不渲染——用 0 占位会被读成「一封都没发过」。
+//
+// 「已发」优先取跟踪记录（近 90 天），此时和「已接受」同属一个窗口，两个数字可比；
+// 没有跟踪数据才退回资格接口的本月发送用量，并明确标注「本月」，避免让人以为
+// 这两个数来自同一个统计口径。
+function InviteStatsInline({ plan }: { plan?: InviteGuideAccountPlan }) {
+  const { t } = useTranslation()
+  if (!plan || plan.state === 'pending') return null
+
+  const parts: string[] = []
+  if (typeof plan.grant_amount === 'number' && plan.grant_amount > 0) {
+    parts.push(t('invite.statPerInvite', { amount: Math.round(plan.grant_amount).toLocaleString() }))
+  }
+  // 无资格账号且从没发过邀请时不显示「已发 0 · 已接受 0」——行上已经有「无资格」
+  // 徽标，再挂两个 0 只是噪音。发过的仍然显示：那是有用的历史。
+  const hideEmptyStats = plan.state === 'ineligible' && !plan.invites_sent
+  if (typeof plan.invites_sent === 'number' && !hideEmptyStats) {
+    parts.push(t('invite.statSent', { count: plan.invites_sent }))
+    if (typeof plan.invites_accepted === 'number') {
+      parts.push(t('invite.statAccepted', { count: plan.invites_accepted }))
+    }
+  } else if (typeof plan.monthly_sent === 'number' && !hideEmptyStats) {
+    parts.push(
+      typeof plan.monthly_send_total === 'number'
+        ? t('invite.statMonthlySentOf', { sent: plan.monthly_sent, total: plan.monthly_send_total })
+        : t('invite.statMonthlySent', { sent: plan.monthly_sent }),
+    )
+  }
+  if (parts.length === 0) return null
+
+  return <span className="shrink-0 whitespace-nowrap text-muted-foreground/80">· {parts.join(' · ')}</span>
+}
+
 // InviteCreditsBadge 显示该账号还能拿到多少邀请积分（单次奖励额度 × 剩余奖励次数）。
 // 没探测过（pending / 无数据）时不渲染任何东西——留白比显示一个「0」诚实，
 // 后者会被读成「这个号没积分了」。
@@ -1152,6 +1220,215 @@ function InviteCreditsBadge({ plan }: { plan?: InviteGuideAccountPlan }) {
       +{Math.round(plan.potential_credits).toLocaleString()}
     </span>
   )
+}
+
+// RecipientAccountPicker 从账号列表挑选受邀邮箱，支持单选与连续多选（勾选不关闭
+// 下拉）。候选由服务端分页搜索驱动，与左列账号选择器同一条数据通道；只展示有邮箱
+// 的账号，按邮箱去重（team 空间会让同一登录邮箱出现在多个账号行里），并排除当前
+// 发起账号自己——给自己发邀请必然被上游拒绝。
+function RecipientAccountPicker({
+  selectedEmails,
+  onToggle,
+  excludeEmail,
+  creditsMap,
+  onLoadCredits,
+  onProbeCredits,
+  probing,
+}: {
+  selectedEmails: Set<string>
+  onToggle: (email: string) => void
+  excludeEmail?: string
+  // 与发起方下拉共享同一份积分数据：任一侧探测过的账号，另一侧立即可见。
+  creditsMap: Record<number, InviteGuideAccountPlan>
+  onLoadCredits: (ids: number[]) => void
+  onProbeCredits: (ids: number[]) => void
+  probing: boolean
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [rows, setRows] = useState<AccountRow[]>([])
+  const [loading, setLoading] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // 只在展开时拉取，收起后不做任何后台请求。输入搜索词走 250ms 防抖，
+  // 首次展开立即取；AbortController 取消在途请求，防止慢响应覆盖新词的结果。
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      setLoading(true)
+      void api.getAccountsPage({
+        channel: 'codex',
+        page: 1,
+        pageSize: 100,
+        search: query.trim() || undefined,
+      }, controller.signal)
+        .then((response) => {
+          if (!controller.signal.aborted) setRows(response.accounts ?? [])
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (!controller.signal.aborted) setLoading(false)
+        })
+    }, query ? 250 : 0)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [open, query])
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && containerRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    return () => document.removeEventListener('pointerdown', handlePointerDown)
+  }, [open])
+
+  // 候选可见时回读网关缓存里的积分（纯缓存读，零上游），让「单次 250」这类
+  // 信息直接标在行上——单次收益低的号更适合当受邀方，一眼可辨。
+  useEffect(() => {
+    if (!open || rows.length === 0) return
+    const ids = rows.map((row) => row.id)
+    const timer = window.setTimeout(() => onLoadCredits(ids), 300)
+    return () => window.clearTimeout(timer)
+  }, [open, rows, onLoadCredits])
+
+  const excluded = (excludeEmail ?? '').trim().toLowerCase()
+  const candidates = useMemo(() => {
+    const seen = new Set<string>()
+    const out: AccountRow[] = []
+    for (const row of rows) {
+      const email = row.email?.trim()
+      if (!email) continue
+      const key = email.toLowerCase()
+      if (key === excluded || seen.has(key)) continue
+      seen.add(key)
+      out.push(row)
+    }
+    return out
+  }, [rows, excluded])
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="inline-flex items-center gap-1.5 rounded-lg border bg-background px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Users className="size-3.5" />
+        {t('invite.recipientPicker')}
+        <ChevronDown className={`size-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 z-30 mt-1.5 overflow-hidden rounded-lg border bg-popover text-popover-foreground shadow-lg">
+          <div className="flex items-center gap-2 border-b p-1.5">
+            <Input
+              autoFocus
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  setOpen(false)
+                }
+              }}
+              placeholder={t('invite.recipientSearch')}
+              className="h-8 text-sm"
+            />
+            {loading && <Loader2 className="mr-1 size-3.5 shrink-0 animate-spin text-muted-foreground" />}
+          </div>
+          <div role="listbox" aria-multiselectable="true" className="max-h-[min(52dvh,26rem)] overflow-auto p-1">
+            {candidates.length > 0 ? (
+              candidates.map((row) => {
+                const email = row.email?.trim() ?? ''
+                const checked = selectedEmails.has(email.toLowerCase())
+                return (
+                  <button
+                    key={row.id}
+                    type="button"
+                    role="option"
+                    aria-selected={checked}
+                    // preventDefault 保住输入框焦点，连续勾选时不触发下拉外的失焦。
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => onToggle(email)}
+                    className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors hover:bg-accent/70 hover:text-accent-foreground"
+                  >
+                    <span
+                      className={`flex size-4 shrink-0 items-center justify-center rounded border transition-colors ${
+                        checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input'
+                      }`}
+                    >
+                      {checked && <Check className="size-3" />}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{email}</span>
+                    <RecipientCreditsHint plan={creditsMap[row.id]} />
+                    {row.plan_type && (
+                      <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        {row.plan_type}
+                      </span>
+                    )}
+                  </button>
+                )
+              })
+            ) : (
+              <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                {loading ? t('invite.recipientLoading') : t('invite.noAccountMatches')}
+              </div>
+            )}
+          </div>
+          <div className="flex items-center justify-between gap-2 border-t bg-muted/30 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+            <span className="min-w-0 truncate">{t('invite.recipientToggleHint')}</span>
+            <button
+              type="button"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => onProbeCredits(candidates.map((row) => row.id))}
+              disabled={probing}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-0.5 font-medium transition-colors hover:text-foreground disabled:opacity-50"
+            >
+              {probing && <Loader2 className="size-3 animate-spin" />}
+              {probing ? t('invite.creditsProbing') : t('invite.creditsProbe')}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// RecipientCreditsHint 在收件人候选行上标注该账号「作为发起方」的单次邀请收益。
+// 这是挑受邀方的核心依据：单次只有 250 的号当发起方不划算，牺牲它当受邀方最优；
+// 「无资格」的号自己发不了邀请，当受邀方毫无机会成本。没探测过则留白，不编 0。
+function RecipientCreditsHint({ plan }: { plan?: InviteGuideAccountPlan }) {
+  const { t } = useTranslation()
+  if (!plan || plan.state === 'pending') return null
+  if (plan.state === 'ineligible') {
+    return (
+      <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        {t('invite.creditsIneligible')}
+      </span>
+    )
+  }
+  if (plan.state === 'exhausted') {
+    return (
+      <span className="shrink-0 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+        {t('invite.creditsExhausted')}
+      </span>
+    )
+  }
+  if (typeof plan.grant_amount === 'number' && plan.grant_amount > 0) {
+    return (
+      <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">
+        {t('invite.statPerInvite', { amount: Math.round(plan.grant_amount).toLocaleString() })}
+      </span>
+    )
+  }
+  return null
 }
 
 function RefreshButton({ onClick }: { onClick: () => void }) {

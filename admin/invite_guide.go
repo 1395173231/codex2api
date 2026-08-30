@@ -50,10 +50,47 @@ type inviteGuideAccountPlan struct {
 	Title            string  `json:"title,omitempty"`
 	IneligibleReason string  `json:"ineligible_reason,omitempty"`
 
+	// 本月发送用量，来自 time_frame_rules 的 send 规则。与下面的 Invites* 不是
+	// 同一个窗口：这是「月」，那是跟踪端点的 90 天，混用会给出错误的数字。
+	MonthlySent      *int `json:"monthly_sent,omitempty"`
+	MonthlySendTotal *int `json:"monthly_send_total,omitempty"`
+
+	// 近 90 天的实际邀请记录，来自 tracking 快照。指针区分「没有跟踪数据」与
+	// 「确实是 0」——导入时只探资格不探记录，多数账号这里就是没有数据。
+	InvitesSent     *int `json:"invites_sent,omitempty"`
+	InvitesAccepted *int `json:"invites_accepted,omitempty"`
+	InvitesPending  *int `json:"invites_pending,omitempty"`
+
 	// SuggestedInvites 是分配建议：这个号建议发几封。没有传 emails 预算时等于
 	// 剩余奖励次数；传了则按「单次收益高的号优先」贪心分配。
 	SuggestedInvites int        `json:"suggested_invites"`
 	ObservedAt       *time.Time `json:"observed_at,omitempty"`
+}
+
+// inviteTrackingCounts 汇总一份跟踪快照里的发送/接受/在途数量。
+// 实测状态取值：redeemed（已兑换）、expired（发出但受邀人未在有效期内使用）。
+// expired 既不算接受也不算在途，但仍计入「已发」。
+func inviteTrackingCounts(items []proxy.CodexInviteTrackingItem) (sent, accepted, pending int) {
+	sent = len(items)
+	for _, item := range items {
+		switch strings.ToLower(strings.TrimSpace(item.Status)) {
+		case "redeemed", "accepted":
+			accepted++
+		case "pending", "sent":
+			pending++
+		}
+	}
+	return sent, accepted, pending
+}
+
+// findSendCapacityRule 取 send 维度的月度配额规则（发送次数，与奖励次数不同）。
+func findSendCapacityRule(rules []proxy.CodexInviteTimeFrameRule) *proxy.CodexInviteTimeFrameRule {
+	for i := range rules {
+		if strings.EqualFold(strings.TrimSpace(rules[i].CapacityType), "send") {
+			return &rules[i]
+		}
+	}
+	return nil
 }
 
 // inviteGuidePlanResponse 是引导弹窗的完整数据。
@@ -116,8 +153,12 @@ func referrerGrantAmount(grants []proxy.CodexInviteGrant) float64 {
 }
 
 // probeInviteEligibilityForGuide 探测单个账号的邀请资格并写入快照。
-// 失败只记日志：引导是锦上添花，探不到就在弹窗里显示为未知，不影响导入本身。
-func (h *Handler) probeInviteEligibilityForGuide(ctx context.Context, accountID int64) {
+// includeTracking 为真时顺带抓已发邀请记录（已发/已接受计数的唯一来源）。
+//
+// 导入路径刻意传 false：跟踪记录对「先用哪个号发」的排序没有影响，为它把导入的
+// 上游请求数翻倍不划算。用户在下拉里显式点「探测积分」时才传 true。
+// 失败只记日志：引导是锦上添花，探不到就显示为未知，不影响导入本身。
+func (h *Handler) probeInviteEligibilityForGuide(ctx context.Context, accountID int64, includeTracking bool) {
 	account := h.lookupInviteAccount(accountID)
 	if !inviteGuideCandidate(account) {
 		return
@@ -148,11 +189,36 @@ func (h *Handler) probeInviteEligibilityForGuide(ctx context.Context, accountID 
 		h.writeInviteCache(ctx, inviteEligibilityCacheNamespace, database.CodexInviteSnapshotEligibility,
 			accountID, generation, scope, result.StatusCode, inviteEligibilitySnapshotTTL, result)
 	}
+	if !includeTracking {
+		return
+	}
+
+	// 跟踪记录串在资格之后而不是并发：上游在 Cloudflare bot 管理后面，第一个请求
+	// 拿到的 __cf_bm 能让第二个少被挑战——与邀请页的取数顺序一致。
+	period, limit := proxy.NormalizeInviteTracking("", 0)
+	trackingScope := inviteTrackingScope(programID, period, limit)
+	var cachedTracking proxy.CodexInviteTracking
+	if h.readInviteCache(ctx, inviteTrackingCacheNamespace, database.CodexInviteSnapshotTracking,
+		accountID, generation, trackingScope, &cachedTracking) != nil {
+		return
+	}
+	trackingCtx, trackingCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer trackingCancel()
+	tracking, err := proxy.QueryCodexInviteTracking(trackingCtx, account,
+		h.store.ResolveProxyForAccount(account), programID, period, limit)
+	if err != nil {
+		log.Printf("邀请记录探测失败: account=%d err=%v", accountID, err)
+		return
+	}
+	if tracking.OK && !tracking.Challenged {
+		h.writeInviteCache(ctx, inviteTrackingCacheNamespace, database.CodexInviteSnapshotTracking,
+			accountID, generation, trackingScope, tracking.StatusCode, inviteTrackingSnapshotTTL, tracking)
+	}
 }
 
 // enqueueInviteGuideProbes 把账号排进导入探测闸门。返回实际排队数与被封顶挡下的数量。
 // 复用 runImportProbeTask 是关键：它带自适应并发许可，不会在大批量导入时瞬时打爆上游。
-func (h *Handler) enqueueInviteGuideProbes(ids []int64, limit int) (queued int, skipped int) {
+func (h *Handler) enqueueInviteGuideProbes(ids []int64, limit int, includeTracking bool) (queued int, skipped int) {
 	if h == nil || limit <= 0 {
 		return 0, len(ids)
 	}
@@ -162,7 +228,7 @@ func (h *Handler) enqueueInviteGuideProbes(ids []int64, limit int) (queued int, 
 		}
 		accountID := id
 		h.runImportProbeTask(func(ctx context.Context) {
-			h.probeInviteEligibilityForGuide(ctx, accountID)
+			h.probeInviteEligibilityForGuide(ctx, accountID, includeTracking)
 		})
 		queued++
 	}
@@ -184,7 +250,7 @@ func (h *Handler) scheduleInviteGuideProbes(ctx context.Context, ids []int64) {
 	if len(candidates) == 0 {
 		return
 	}
-	queued, skipped := h.enqueueInviteGuideProbes(candidates, inviteGuideProbeCap)
+	queued, skipped := h.enqueueInviteGuideProbes(candidates, inviteGuideProbeCap, false)
 	log.Printf("邀请引导: 导入 %d 个账号，排队探测 %d 个，封顶跳过 %d 个", len(ids), queued, skipped)
 }
 
@@ -206,6 +272,8 @@ func (h *Handler) inviteGuideEnabled(ctx context.Context) bool {
 func (h *Handler) buildInviteGuidePlan(ctx context.Context, ids []int64, emailBudget int) inviteGuidePlanResponse {
 	programID, entrypoint := proxy.NormalizeInviteProgram("", "")
 	scope := inviteEligibilityScope(programID, entrypoint)
+	trackingPeriod, trackingLimit := proxy.NormalizeInviteTracking("", 0)
+	trackingScope := inviteTrackingScope(programID, trackingPeriod, trackingLimit)
 
 	resp := inviteGuidePlanResponse{
 		Enabled:     h.inviteGuideEnabled(ctx),
@@ -246,6 +314,19 @@ func (h *Handler) buildInviteGuidePlan(ctx context.Context, ids []int64, emailBu
 		item.OfferID = elig.OfferID
 		item.Title = elig.Title
 		item.GrantAmount = referrerGrantAmount(elig.Grants)
+		if rule := findSendCapacityRule(elig.TimeFrameRules); rule != nil {
+			sent, total := rule.InvitesSent, rule.InvitesTotal
+			item.MonthlySent, item.MonthlySendTotal = &sent, &total
+		}
+
+		// 已发/已接受来自跟踪快照。只读缓存，没有就不填——导入探测只写资格，
+		// 多数账号这里本来就没有数据，编一个 0 会被读成「一封都没发过」。
+		var tracking proxy.CodexInviteTracking
+		if h.readInviteCache(ctx, inviteTrackingCacheNamespace, database.CodexInviteSnapshotTracking,
+			id, account.GetCredentialGeneration(), trackingScope, &tracking) != nil {
+			sent, accepted, pending := inviteTrackingCounts(tracking.Items)
+			item.InvitesSent, item.InvitesAccepted, item.InvitesPending = &sent, &accepted, &pending
+		}
 
 		switch {
 		case !elig.ShouldShow:
@@ -383,7 +464,7 @@ func (h *Handler) ProbeInviteGuidePlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "没有可探测的 Codex 账号")
 		return
 	}
-	queued, skipped := h.enqueueInviteGuideProbes(candidates, inviteGuideProbeBatch)
+	queued, skipped := h.enqueueInviteGuideProbes(candidates, inviteGuideProbeBatch, true)
 	c.JSON(http.StatusOK, gin.H{"queued": queued, "skipped": skipped})
 }
 

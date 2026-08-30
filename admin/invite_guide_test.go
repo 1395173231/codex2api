@@ -183,7 +183,7 @@ func TestEnqueueInviteGuideProbesCap(t *testing.T) {
 		ids[i] = int64(i + 1)
 	}
 
-	queued, skipped := h.enqueueInviteGuideProbes(ids, inviteGuideProbeCap)
+	queued, skipped := h.enqueueInviteGuideProbes(ids, inviteGuideProbeCap, false)
 	if queued != inviteGuideProbeCap {
 		t.Fatalf("queued = %d, want %d", queued, inviteGuideProbeCap)
 	}
@@ -192,14 +192,14 @@ func TestEnqueueInviteGuideProbesCap(t *testing.T) {
 	}
 
 	t.Run("under cap queues everything", func(t *testing.T) {
-		q, s := h.enqueueInviteGuideProbes(ids[:10], inviteGuideProbeCap)
+		q, s := h.enqueueInviteGuideProbes(ids[:10], inviteGuideProbeCap, false)
 		if q != 10 || s != 0 {
 			t.Fatalf("queued=%d skipped=%d, want 10/0", q, s)
 		}
 	})
 
 	t.Run("non-positive limit queues nothing", func(t *testing.T) {
-		q, s := h.enqueueInviteGuideProbes(ids[:5], 0)
+		q, s := h.enqueueInviteGuideProbes(ids[:5], 0, false)
 		if q != 0 || s != 5 {
 			t.Fatalf("queued=%d skipped=%d, want 0/5", q, s)
 		}
@@ -223,5 +223,51 @@ func TestImportEventCreatedIDsSerialization(t *testing.T) {
 	}
 	if strings.Contains(string(empty), "created_ids") {
 		t.Fatalf("empty created_ids must be omitted: %s", empty)
+	}
+}
+
+// 状态取值取自实测跟踪响应：redeemed / expired。expired 是「发出了但受邀人没在
+// 有效期内使用」——仍算已发，但既不算接受也不算在途，混进任何一边都会给出错数。
+func TestInviteTrackingCounts(t *testing.T) {
+	items := []proxy.CodexInviteTrackingItem{
+		{Status: "redeemed"},
+		{Status: "expired"},
+		{Status: "expired"},
+		{Status: "pending"},
+		{Status: "ACCEPTED"}, // 大小写不敏感
+		{Status: ""},         // 上游没给状态：只计入已发
+	}
+	sent, accepted, pending := inviteTrackingCounts(items)
+	if sent != 6 {
+		t.Fatalf("sent = %d, want 6 (每条记录都算已发)", sent)
+	}
+	if accepted != 2 {
+		t.Fatalf("accepted = %d, want 2 (redeemed + ACCEPTED)", accepted)
+	}
+	if pending != 1 {
+		t.Fatalf("pending = %d, want 1", pending)
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		s, a, p := inviteTrackingCounts(nil)
+		if s != 0 || a != 0 || p != 0 {
+			t.Fatalf("got %d/%d/%d, want 0/0/0", s, a, p)
+		}
+	})
+}
+
+// send 与 reward 是两条独立的配额规则，取错会把「本月已发 7/10」显示成
+// 「1/3」（那是奖励次数）。
+func TestFindSendCapacityRule(t *testing.T) {
+	rules := []proxy.CodexInviteTimeFrameRule{
+		{CapacityType: "reward", InvitesSent: 1, InvitesTotal: 3},
+		{CapacityType: "send", InvitesSent: 7, InvitesTotal: 10},
+	}
+	got := findSendCapacityRule(rules)
+	if got == nil || got.InvitesSent != 7 || got.InvitesTotal != 10 {
+		t.Fatalf("got %+v, want send rule 7/10", got)
+	}
+	if findSendCapacityRule(nil) != nil {
+		t.Fatal("missing rules must yield nil, not a zero-valued rule")
 	}
 }
