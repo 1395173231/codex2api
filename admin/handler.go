@@ -163,15 +163,6 @@ type Handler struct {
 	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
 	// 防止并发请求在“检查不存在”后同时建号。
 	agentIdentityImportMu sync.Mutex
-
-	// Paid subscription mutations are experimental and disabled by default.
-	// 开关由管理后台设置持有：数据库显式值优先，未设置过才回落到环境变量。
-	subscriptionUpgradeEnabled       atomic.Bool
-	subscriptionUpgradeEnvDefault    bool
-	subscriptionUpgradeClientFactory func(*auth.Account, string) subscriptionUpgradeUpstream
-	subscriptionUpgradeQuoteMu       sync.Mutex
-	subscriptionUpgradeQuotes        map[string]subscriptionUpgradeQuoteRecord
-	subscriptionUpgradeLocks         sync.Map
 }
 
 type responseCacheSettingsStore interface {
@@ -947,28 +938,23 @@ func parseUsageChannel(c *gin.Context) string {
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:                     store,
-		cache:                     tc,
-		db:                        db,
-		cacheCfgStore:             db,
-		rateLimiter:               rl,
-		cpuSampler:                newCPUSampler(),
-		startedAt:                 time.Now(),
-		databaseDriver:            db.Driver(),
-		databaseLabel:             db.Label(),
-		cacheDriver:               tc.Driver(),
-		cacheLabel:                tc.Label(),
-		adminSecretEnv:            adminSecretEnv,
-		imageProxy:                proxy.NewHandler(store, db, nil, nil),
-		chartCacheData:            make(map[string]*chartCacheEntry),
-		accountListCache:          make(map[string]*accountListSnapshot),
-		accountAnalysisCache:      make(map[string]*accountAnalysisCacheEntry),
-		subscriptionUpgradeQuotes: make(map[string]subscriptionUpgradeQuoteRecord),
-		subscriptionUpgradeClientFactory: func(account *auth.Account, proxyURL string) subscriptionUpgradeUpstream {
-			return proxy.NewChatGPTSubscriptionUpgradeClient(account, proxyURL)
-		},
+		store:                store,
+		cache:                tc,
+		db:                   db,
+		cacheCfgStore:        db,
+		rateLimiter:          rl,
+		cpuSampler:           newCPUSampler(),
+		startedAt:            time.Now(),
+		databaseDriver:       db.Driver(),
+		databaseLabel:        db.Label(),
+		cacheDriver:          tc.Driver(),
+		cacheLabel:           tc.Label(),
+		adminSecretEnv:       adminSecretEnv,
+		imageProxy:           proxy.NewHandler(store, db, nil, nil),
+		chartCacheData:       make(map[string]*chartCacheEntry),
+		accountListCache:     make(map[string]*accountListSnapshot),
+		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
 	}
-	handler.initSubscriptionUpgradeGate()
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
@@ -1046,11 +1032,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/page-stats", h.GetAccountPageStats)
 	api.GET("/accounts/live", h.GetAccountLiveState)
 	api.GET("/accounts/:id", h.GetAccount)
-	api.GET("/accounts/:id/subscription", h.GetAccountSubscription)
-	api.POST("/accounts/:id/subscription/upgrade-quotes", h.CreateSubscriptionUpgradeQuote)
-	api.POST("/accounts/:id/subscription/upgrades", h.CreateSubscriptionUpgrade)
-	api.GET("/subscription-upgrades/:operation_id", h.GetSubscriptionUpgradeOperation)
-	api.POST("/subscription-upgrades/:operation_id/verify", h.VerifySubscriptionUpgradeOperation)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)
@@ -8386,8 +8367,6 @@ type settingsResponse struct {
 	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
-	SubscriptionUpgradesEnabled         bool   `json:"subscription_upgrades_enabled"`
-	SubscriptionUpgradesEnvDefault      bool   `json:"subscription_upgrades_env_default"`
 	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
 	CodexRequestCompression             bool   `json:"codex_request_compression"`
@@ -8564,7 +8543,6 @@ type updateSettingsReq struct {
 	AutoActivate5hWindowEnabled         *bool                            `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool                            `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                *bool                            `json:"fast_scheduler_enabled"`
-	SubscriptionUpgradesEnabled         *bool                            `json:"subscription_upgrades_enabled"`
 	SchedulerEngine                     *string                          `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool                            `json:"codex_force_websocket"`
 	CodexRequestCompression             *bool                            `json:"codex_request_compression"`
@@ -9346,8 +9324,6 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
-		SubscriptionUpgradesEnabled:         h.subscriptionUpgradesEnabled(),
-		SubscriptionUpgradesEnvDefault:      h.subscriptionUpgradeEnvDefault,
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
 		BackgroundImage:                     bgCfg.Image,
@@ -10424,22 +10400,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: antigravity_oauth_clients = %d 个 client, active_key=%q", len(normalized.Clients), normalized.ActiveKey)
 	}
 
-	if req.SubscriptionUpgradesEnabled != nil {
-		// 订阅升级会对账号真实扣款，开关必须落库：写入后数据库值即为权威，
-		// 环境变量不再能把它顶回开启状态。
-		if h.db == nil {
-			writeError(c, http.StatusInternalServerError, "订阅升级开关存储不可用")
-			return
-		}
-		enabled := *req.SubscriptionUpgradesEnabled
-		if saveErr := h.db.SaveSubscriptionUpgradesEnabled(c.Request.Context(), enabled); saveErr != nil {
-			writeError(c, http.StatusInternalServerError, "保存订阅升级开关失败："+saveErr.Error())
-			return
-		}
-		h.setSubscriptionUpgradeEnabled(enabled)
-		log.Printf("设置已更新: subscription_upgrades_enabled = %t", enabled)
-	}
-
 	if req.MaxRetries != nil {
 		v := *req.MaxRetries
 		if v < 0 {
@@ -11162,8 +11122,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	c.JSON(http.StatusOK, settingsResponse{
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
-		SubscriptionUpgradesEnabled:         h.subscriptionUpgradesEnabled(),
-		SubscriptionUpgradesEnvDefault:      h.subscriptionUpgradeEnvDefault,
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,
 		BackgroundImage:                     bgCfg.Image,
