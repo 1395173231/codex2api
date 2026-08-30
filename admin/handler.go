@@ -1101,6 +1101,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/invite/eligibility", h.GetInviteEligibility)
 	api.GET("/accounts/:id/invite/tracking", h.GetInviteTracking)
+	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
+	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/:id/usage/refresh", h.RefreshAccountUsage)
@@ -1155,6 +1157,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
+	api.GET("/settings/invite-guide", h.GetInviteGuideSettings)
+	api.PUT("/settings/invite-guide", h.UpdateInviteGuideSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -3233,6 +3237,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		msg += "，但分组绑定失败: " + err.Error()
 	}
 
+	newAccountIDs := createdIDs.snapshot()
+	h.scheduleInviteGuideProbes(ctx, newAccountIDs)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":      msg,
 		"success":      successCount,
@@ -3240,6 +3247,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		"failed":       failCount,
 		"bound_groups": boundGroups,
 		"group_ids":    groupIDs,
+		"created_ids":  newAccountIDs,
 	})
 }
 
@@ -3314,9 +3322,13 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			Warning: "账号已添加，但分组绑定失败: " + err.Error(),
 		})
 	}
+	newAccountIDs := createdIDs.snapshot()
+	h.scheduleInviteGuideProbes(ctx, newAccountIDs)
+
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: successCount, Duplicate: duplicateCount, Failed: failCount,
+		CreatedIDs: newAccountIDs,
 	})
 }
 
@@ -4942,6 +4954,9 @@ type importEvent struct {
 	// Warning 用于「账号已入库、但收尾动作出了问题」这类必须告知却不该当成失败的情况，
 	// 例如导入成功但分组绑定失败。空值时序列化省略，老前端不受影响。
 	Warning string `json:"warning,omitempty"`
+	// CreatedIDs 只在 complete 事件下发，供前端拉取本次导入账号的邀请收益评估。
+	// 空值时省略，老前端不受影响。
+	CreatedIDs []int64 `json:"created_ids,omitempty"`
 }
 
 // sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
@@ -5430,9 +5445,15 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			Warning: "账号已导入，但分组绑定失败: " + err.Error(),
 		})
 	}
+	// 邀请资格探测排在 complete 之前入队，但不等待结果：探测走导入闸门的后台
+	// worker，前端拿到 created_ids 后自行轮询方案接口。阻塞在这里会把一次导入
+	// 的响应拖长到几十秒。
+	h.scheduleInviteGuideProbes(c.Request.Context(), newAccountIDs)
+
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
+		CreatedIDs: newAccountIDs,
 	})
 
 	log.Printf("导入完成: success=%d, updated=%d, duplicate=%d, failed=%d, total=%d", suc, upd, duplicateCount, fai, total)

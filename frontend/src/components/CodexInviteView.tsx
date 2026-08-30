@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
   ArrowLeft,
   Check,
   ChevronDown,
+  Clock,
   Copy,
   Gift,
   History,
@@ -20,7 +22,14 @@ import PageHeader from './PageHeader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { api } from '../api'
-import type { AccountRow, InviteEligibility, InviteResult, InviteTrackingItem } from '../types'
+import type {
+  AccountRow,
+  InviteCacheMeta,
+  InviteEligibility,
+  InviteGuideAccountPlan,
+  InviteResult,
+  InviteTrackingItem,
+} from '../types'
 import { getErrorMessage } from '../utils/error'
 import { useToast } from '../hooks/useToast'
 
@@ -168,6 +177,12 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   const { t } = useTranslation()
   const { showToast } = useToast()
 
+  // 引导弹窗跳转过来时会带 ?account=<邮箱>。用邮箱而不是 ID：选择器是服务端分页
+  // 搜索，邮箱当查询词能把目标账号捞进候选集；传 ID 的话账号若不在首页 100 条里，
+  // 会被下面「不在候选集就清空」的 effect 抹掉。
+  const [searchParams] = useSearchParams()
+  const presetAccount = (searchParams.get('account') ?? '').trim()
+
   const [pickerAccounts, setPickerAccounts] = useState<AccountRow[]>(accounts)
   const [pickerLoading, setPickerLoading] = useState(loading)
 
@@ -179,11 +194,12 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   const firstAccount = codexAccounts[0] ?? null
 
   const [accountId, setAccountId] = useState<number | null>(firstAccount?.id ?? null)
-  const [accountQuery, setAccountQuery] = useState(() => firstAccount ? accountDisplayName(firstAccount) : '')
+  const [accountQuery, setAccountQuery] = useState(() =>
+    presetAccount || (firstAccount ? accountDisplayName(firstAccount) : ''))
   const [accountOpen, setAccountOpen] = useState(false)
   // accountTyping 区分「用户正在输入搜索」与「输入框只是回显已选账号」。仅在输入时
   // 才按文本过滤，否则展开下拉应显示全部账号（否则会被已选账号的邮箱过滤成只剩一条）。
-  const [accountTyping, setAccountTyping] = useState(false)
+  const [accountTyping, setAccountTyping] = useState(Boolean(presetAccount))
   // 下拉键盘导航的高亮项索引（指向 filteredAccounts）。-1 表示未高亮任何项。
   const [activeIndex, setActiveIndex] = useState(-1)
   const [emailsText, setEmailsText] = useState('')
@@ -197,6 +213,15 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   const [infoLoading, setInfoLoading] = useState(false)
   const [eligibilityError, setEligibilityError] = useState<string | null>(null)
   const [trackingError, setTrackingError] = useState<string | null>(null)
+  // 网关下发的数据新鲜度。source=upstream 是刚拉的，其余来自缓存，要把观测时刻
+  // 显示出来——否则用户看到的剩余次数可能是十几分钟前的，却毫无提示。
+  const [eligibilityMeta, setEligibilityMeta] = useState<InviteCacheMeta | null>(null)
+  const [trackingMeta, setTrackingMeta] = useState<InviteCacheMeta | null>(null)
+  // 下拉里每个账号的邀请积分。只读网关缓存，绝不在展开时顺手探测——一次下拉最多
+  // 100 个账号，自动探测等于开合一次就打 100 个 Cloudflare 防护端点。没有缓存的
+  // 账号不显示徽标，由用户点「探测积分」显式触发。
+  const [creditsMap, setCreditsMap] = useState<Record<number, InviteGuideAccountPlan>>({})
+  const [creditsProbing, setCreditsProbing] = useState(false)
   const accountPickerRef = useRef<HTMLDivElement>(null)
   // 代理走 ref：它只是查询时的可选参数，不该让每次输入都重新拉取上游。
   const proxyUrlRef = useRef(proxyUrl)
@@ -317,6 +342,19 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
     }
   }
 
+  // URL 预设账号只解析一次：等服务端搜索把它带回候选集后按精确匹配选中。
+  // 用 ref 上锁，避免用户随后手动改选时被这个 effect 拽回预设值。
+  const presetAppliedRef = useRef(false)
+  useEffect(() => {
+    if (presetAppliedRef.current || !presetAccount || accountId != null) return
+    const matched = resolveAccountInput(codexAccounts, presetAccount)
+    if (!matched) return
+    presetAppliedRef.current = true
+    setAccountId(matched.id)
+    setAccountQuery(accountDisplayName(matched))
+    setAccountTyping(false)
+  }, [presetAccount, codexAccounts, accountId])
+
   useEffect(() => {
     if (accountId == null) return
     if (codexAccounts.some((a) => a.id === accountId)) return
@@ -331,7 +369,9 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   // 拉取资格与已发邀请。两个请求串行发出而非并发：上游端点在 Cloudflare bot 管理后面，
   // 后端按账号复用 cookie，第一个请求拿到的 __cf_bm 能让第二个请求少被挑战。
   // 一个失败不影响另一个展示。
-  const loadInviteInfo = useCallback(async (id: number) => {
+  // force=true 让网关绕过资格/记录缓存直连上游：手动刷新与发送邀请后的重拉都要带，
+  // 否则刚被消耗掉的配额会继续按缓存值显示。
+  const loadInviteInfo = useCallback(async (id: number, force = false) => {
     const seq = ++infoSeqRef.current
     setInfoLoading(true)
     setEligibilityError(null)
@@ -339,23 +379,27 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
     const proxy = proxyUrlRef.current.trim() || undefined
 
     try {
-      const res = await api.getInviteEligibility(id, { proxy_url: proxy })
+      const res = await api.getInviteEligibility(id, { proxy_url: proxy, refresh: force })
       if (seq !== infoSeqRef.current) return
       setEligibility(res.result)
+      setEligibilityMeta(res.cache ?? null)
     } catch (err) {
       if (seq !== infoSeqRef.current) return
       setEligibility(null)
+      setEligibilityMeta(null)
       setEligibilityError(getErrorMessage(err))
     }
 
     try {
-      const res = await api.getInviteTracking(id, { proxy_url: proxy })
+      const res = await api.getInviteTracking(id, { proxy_url: proxy, refresh: force })
       if (seq !== infoSeqRef.current) return
       setTracking(res.result.challenged ? null : res.result.items ?? [])
+      setTrackingMeta(res.result.challenged ? null : res.cache ?? null)
       setTrackingError(res.result.challenged ? t('invite.challengedRetry') : null)
     } catch (err) {
       if (seq !== infoSeqRef.current) return
       setTracking(null)
+      setTrackingMeta(null)
       setTrackingError(getErrorMessage(err))
     }
 
@@ -363,19 +407,66 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
     setInfoLoading(false)
   }, [t])
 
-  // 切换账号时重新拉取；未选中账号则清空，避免显示上一个账号的配额。
+  // 切换账号时重新拉取。清空必须发生在发起请求之前：序号守卫只防「后到的旧响应
+  // 覆盖新数据」，防不住「新账号还在路上时页面仍渲染着上一个账号的配额和记录」——
+  // 那一两秒里账号名已经变了，剩余次数却还是上一个号的，用户会照着错的数字发。
   useEffect(() => {
+    infoSeqRef.current++
+    setEligibility(null)
+    setTracking(null)
+    setEligibilityMeta(null)
+    setTrackingMeta(null)
+    setEligibilityError(null)
+    setTrackingError(null)
     if (accountId == null) {
-      infoSeqRef.current++
-      setEligibility(null)
-      setTracking(null)
-      setEligibilityError(null)
-      setTrackingError(null)
       setInfoLoading(false)
       return
     }
     void loadInviteInfo(accountId)
   }, [accountId, loadInviteInfo])
+
+  // 合并而不是替换：翻页/改搜索词时保留已取到的值，避免徽标闪烁消失。
+  const loadVisibleCredits = useCallback(async (ids: number[]) => {
+    if (ids.length === 0) return
+    try {
+      const plan = await api.getInviteGuidePlan(ids)
+      setCreditsMap((prev) => {
+        const next = { ...prev }
+        for (const item of plan.accounts) next[item.id] = item
+        return next
+      })
+    } catch {
+      /* 积分是附加信息，取不到就不显示，不打扰主流程 */
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!accountOpen || filteredAccounts.length === 0) return
+    const ids = filteredAccounts.map((a) => a.id)
+    const timer = window.setTimeout(() => void loadVisibleCredits(ids), 300)
+    return () => window.clearTimeout(timer)
+  }, [accountOpen, filteredAccounts, loadVisibleCredits])
+
+  // 只探当前可见且还没有结果的账号。后端按 50 封顶并走导入闸门排队，
+  // 这里探完后轮询几次回读，不做无限等待。
+  const probeVisibleCredits = async () => {
+    const ids = filteredAccounts
+      .map((a) => a.id)
+      .filter((id) => !creditsMap[id] || creditsMap[id].state === 'pending')
+    if (ids.length === 0 || creditsProbing) return
+    setCreditsProbing(true)
+    try {
+      await api.probeInviteGuidePlan(ids)
+      for (let i = 0; i < 5; i++) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2500))
+        await loadVisibleCredits(ids)
+      }
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setCreditsProbing(false)
+    }
+  }
 
   useEffect(() => {
     const handlePointerDown = (event: PointerEvent) => {
@@ -420,7 +511,8 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
         showToast(t('invite.sendUpstreamFailed', { code: res.result.status_code }), 'error')
       }
       // 无论成败都刷新配额与记录：成功要扣减剩余次数，失败也可能是配额已被别处用掉。
-      void loadInviteInfo(account.id)
+      // 强制回上游——网关侧虽然在发送后已清缓存，但这里再兜一次，避免任何一层残留。
+      void loadInviteInfo(account.id, true)
     } catch (err) {
       setError(getErrorMessage(err))
       showToast(t('invite.sendFailed', { error: getErrorMessage(err) }), 'error')
@@ -504,10 +596,11 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                       </button>
                     </div>
                     {accountOpen && (
+                      <div className="absolute z-30 mt-1.5 w-full overflow-hidden rounded-lg border bg-popover text-popover-foreground shadow-lg">
                       <div
                         id="codex-invite-account-list"
                         role="listbox"
-                        className="absolute z-30 mt-1.5 max-h-72 w-full overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
+                        className="max-h-72 overflow-auto p-1"
                       >
                         {filteredAccounts.length > 0 ? (
                           filteredAccounts.map((account, index) => {
@@ -548,6 +641,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                                       .join(' · ') || '-'}
                                   </span>
                                 </span>
+                                <InviteCreditsBadge plan={creditsMap[account.id]} />
                                 {active && <Check className="size-4 shrink-0 text-primary" />}
                               </button>
                             )
@@ -557,6 +651,23 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                             {t('invite.noAccountMatches')}
                           </div>
                         )}
+                      </div>
+                      {filteredAccounts.length > 0 && (
+                        <div className="flex items-center justify-between gap-2 border-t bg-muted/30 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+                          <span>{t('invite.creditsHint')}</span>
+                          <button
+                            type="button"
+                            // preventDefault 保持输入框焦点，否则点一下就把下拉关了。
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => void probeVisibleCredits()}
+                            disabled={creditsProbing}
+                            className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-0.5 font-medium transition-colors hover:text-foreground disabled:opacity-50"
+                          >
+                            {creditsProbing && <Loader2 className="size-3 animate-spin" />}
+                            {creditsProbing ? t('invite.creditsProbing') : t('invite.creditsProbe')}
+                          </button>
+                        </div>
+                      )}
                       </div>
                     )}
                   </div>
@@ -582,7 +693,8 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                   eligibility={eligibility}
                   loading={infoLoading}
                   error={eligibilityError}
-                  onRefresh={() => void loadInviteInfo(accountId)}
+                  meta={eligibilityMeta}
+                  onRefresh={() => void loadInviteInfo(accountId, true)}
                   className="min-h-0 flex-1"
                 />
               ) : (
@@ -708,7 +820,8 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                   items={tracking}
                   loading={infoLoading}
                   error={trackingError}
-                  onRefresh={() => void loadInviteInfo(accountId)}
+                  meta={trackingMeta}
+                  onRefresh={() => void loadInviteInfo(accountId, true)}
                   className="h-full min-h-[22rem]"
                 />
               ) : (
@@ -736,12 +849,14 @@ function EligibilityPanel({
   eligibility,
   loading,
   error,
+  meta,
   onRefresh,
   className,
 }: {
   eligibility: InviteEligibility | null
   loading: boolean
   error: string | null
+  meta: InviteCacheMeta | null
   onRefresh: () => void
   className?: string
 }) {
@@ -814,7 +929,10 @@ function EligibilityPanel({
         {loading ? (
           <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground" />
         ) : (
-          <RefreshButton onClick={onRefresh} />
+          <div className="flex shrink-0 items-center gap-1.5">
+            <FreshnessHint meta={meta} />
+            <RefreshButton onClick={onRefresh} />
+          </div>
         )}
       </div>
 
@@ -901,12 +1019,14 @@ function TrackingCard({
   items,
   loading,
   error,
+  meta,
   onRefresh,
   className,
 }: {
   items: InviteTrackingItem[] | null
   loading: boolean
   error: string | null
+  meta: InviteCacheMeta | null
   onRefresh: () => void
   className?: string
 }) {
@@ -922,8 +1042,9 @@ function TrackingCard({
           <h4 className="text-sm font-semibold leading-tight">{t('invite.trackingTitle')}</h4>
           <p className="text-xs text-muted-foreground">{t('invite.trackingDescription')}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
           {loading && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
+          {!loading && <FreshnessHint meta={meta} />}
           <RefreshButton onClick={onRefresh} />
         </div>
       </div>
@@ -977,6 +1098,59 @@ function TrackingCard({
         )}
       </div>
     </div>
+  )
+}
+
+// FreshnessHint 只在数据来自缓存时出现。刚打过上游（source=upstream）不提示——
+// 那是默认预期，多挂一个「刚刚」标签只是噪音。
+function FreshnessHint({ meta }: { meta: InviteCacheMeta | null }) {
+  const { t } = useTranslation()
+  if (!meta || meta.source === 'upstream' || !meta.observed_at) return null
+  const observed = new Date(meta.observed_at)
+  if (Number.isNaN(observed.getTime())) return null
+  return (
+    <span
+      title={t('invite.cachedHint')}
+      className="inline-flex shrink-0 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+    >
+      <Clock className="size-3" />
+      {observed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+    </span>
+  )
+}
+
+// InviteCreditsBadge 显示该账号还能拿到多少邀请积分（单次奖励额度 × 剩余奖励次数）。
+// 没探测过（pending / 无数据）时不渲染任何东西——留白比显示一个「0」诚实，
+// 后者会被读成「这个号没积分了」。
+function InviteCreditsBadge({ plan }: { plan?: InviteGuideAccountPlan }) {
+  const { t } = useTranslation()
+  if (!plan || plan.state === 'pending') return null
+
+  if (plan.state === 'ineligible') {
+    return (
+      <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        {t('invite.creditsIneligible')}
+      </span>
+    )
+  }
+  // 还能发但本月奖励次数已用尽：发了也拿不到积分，与「无资格」是两回事。
+  if (plan.state === 'exhausted') {
+    return (
+      <span className="shrink-0 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+        {t('invite.creditsExhausted')}
+      </span>
+    )
+  }
+  return (
+    <span
+      title={t('invite.creditsTooltip', {
+        amount: Math.round(plan.grant_amount ?? 0).toLocaleString(),
+        count: plan.remaining_reward_capacity ?? 0,
+      })}
+      className="shrink-0 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-emerald-600"
+    >
+      +{Math.round(plan.potential_credits).toLocaleString()}
+    </span>
   )
 }
 

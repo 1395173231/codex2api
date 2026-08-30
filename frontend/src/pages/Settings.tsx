@@ -1556,6 +1556,32 @@ export default function Settings() {
   const autoSaveStatusTimerRef = useRef<number | null>(null)
   const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
+  // 邀请引导开关走独立端点(system_settings.invite_guide_config),不进主设置
+  // 表单——那条 UPSERT 的占位符已经排到 $119,每加一列都要整体顺移。
+  // null 表示还没加载出来,此时开关不渲染,避免先闪一个错误的默认态。
+  const [inviteGuideEnabled, setInviteGuideEnabled] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void api.getInviteGuideSettings()
+      .then((res) => { if (!cancelled) setInviteGuideEnabled(res.enabled) })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [])
+
+  // 乐观更新 + 失败回滚：开关是本地独立状态，写失败必须回到真实值，
+  // 否则界面显示开着、后端其实是关的。
+  const saveInviteGuideEnabled = async (next: boolean) => {
+    const previous = inviteGuideEnabled
+    setInviteGuideEnabled(next)
+    try {
+      await api.updateInviteGuideSettings(next)
+      showToast(t('settings.autoSaved'), 'success', AUTO_SAVE_TOAST_MS)
+    } catch (error) {
+      setInviteGuideEnabled(previous)
+      showToast(getErrorMessage(error), 'error')
+    }
+  }
 
   useEffect(() => {
     settingsFormRef.current = settingsForm
@@ -2408,6 +2434,19 @@ export default function Settings() {
                       }}
                     />
                   </SettingField>
+                  {inviteGuideEnabled !== null && (
+                    <SettingField
+                      label={t('settings.inviteGuide')}
+                      description={t('settings.inviteGuideDesc')}
+                      layout="switch"
+                    >
+                      <Switch
+                        aria-label={t('settings.inviteGuide')}
+                        checked={inviteGuideEnabled}
+                        onCheckedChange={(checked) => void saveInviteGuideEnabled(checked)}
+                      />
+                    </SettingField>
+                  )}
                 </div>
               </div>
             </SettingsCard>
