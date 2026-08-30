@@ -1666,6 +1666,7 @@
     "trackingLoadFailed": "Could not load invites: {{error}}",
     "trackingEmpty": "No invites sent yet",
     "trackingEmptyHint": "Invites you send will appear here with their redemption status.",
+    "trackingSelectAccount": "Select an account on the left to see its sent invites.",
     "trackingCreatedAt": "Sent {{time}}",
     "trackingExpiresAt": "Expires {{time}}",
     "challengedRetry": "Cloudflare blocked this request with a bot challenge (not an eligibility problem, and nothing was sent). Retry in a moment.",

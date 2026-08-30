@@ -716,7 +716,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
                     <History className="size-5" />
                   </div>
                   <p className="text-sm font-medium text-foreground">{t('invite.trackingTitle')}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{t('invite.accountHint')}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{t('invite.trackingSelectAccount')}</p>
                 </div>
               )}
             </section>
