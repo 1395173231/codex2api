@@ -143,7 +143,7 @@
     "codexWSRotationMaxAge": "WS 輪替最長存活時間",
     "codexWSRotationMaxAgeDesc": "連線進入淘汰狀態前的最長時間，單位秒（300–3600）。舊連線排空期間，新請求使用兄弟連線。",
     "codexWSMaxSiblings": "最大 WS 兄弟連線數",
-    "codexWSMaxSiblingsDesc": "每個帳號／快取鍵允許保持的持久 WebSocket 連線數上限（1–16）。",
+    "codexWSMaxSiblingsDesc": "每個帳號／快取鍵在請求結束後保留的持久 WebSocket 兄弟連線數（1–16）；活躍請求可暫時超過，結束後自動收斂。",
     "codexWSMaxProxyRoutes": "最大代理線路數",
     "codexWSMaxProxyRoutesDesc": "每個帳號的兄弟連線最多使用多少條不同代理線路（1–3）。",
     "schedulerEngine": "調度引擎",

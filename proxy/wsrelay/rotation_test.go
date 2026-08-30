@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 )
@@ -76,6 +77,52 @@ func TestRotationModeCreatesSiblingInsteadOfBusyWait(t *testing.T) {
 	}
 	got.session.RemovePendingRequest(pr.RequestID)
 	manager.DiscardConnection(got)
+}
+
+func TestRotationSiblingLimitDoesNotRejectSessionRequest(t *testing.T) {
+	enableRotationForTest(t)
+	t.Setenv("CODEX_WS_MAX_SIBLINGS", "3")
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+
+	account := &auth.Account{DBID: 42, DynamicConcurrencyLimit: 4}
+	wsURL := rotationTestServer(t)
+	group := "session-visible-in-old-limit-error"
+	for i := 0; i < 3; i++ {
+		poolKey := manager.poolKey(account.ID(), wsURL, group+"#existing-"+string(rune('a'+i)), "")
+		session := NewSession(account.ID(), manager)
+		session.SetConnected(true)
+		wc := &WsConnection{session: session, URL: wsURL, PoolKey: poolKey, groupKey: group}
+		wc.SetState(StateConnected)
+		wc.Touch()
+		manager.connections.Store(poolKey, wc)
+		manager.sessions.Store(poolKey, session)
+		pending := session.AddPendingRequest(group)
+		t.Cleanup(func() {
+			session.RemovePendingRequest(pending.RequestID)
+			manager.DiscardConnection(wc)
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, pending, err := manager.AcquireConnection(ctx, account, wsURL, group, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("AcquireConnection() rejected a request at the soft sibling target: %v", err)
+	}
+	if got == nil || pending == nil {
+		t.Fatal("AcquireConnection() did not create the temporary fourth sibling")
+	}
+	if connections := manager.rotationGroupConnections(account.ID(), wsURL, group); len(connections) != 4 {
+		t.Fatalf("live siblings during request = %d, want 4", len(connections))
+	}
+
+	got.session.RemovePendingRequest(pending.RequestID)
+	manager.ReleaseConnection(got)
+	if connections := manager.rotationGroupConnections(account.ID(), wsURL, group); len(connections) != 3 {
+		t.Fatalf("live siblings after release = %d, want retention target 3", len(connections))
+	}
 }
 
 func TestRotationAgeDrainsThenCloses(t *testing.T) {
@@ -172,19 +219,42 @@ func TestRotationProxyCandidatesUseSelectorAndLimit(t *testing.T) {
 	}
 }
 
-func TestLegacyModeIgnoresConfigurableRotationAge(t *testing.T) {
+func TestPersistedRotationSettingsOverrideEnvironment(t *testing.T) {
 	previous := proxy.CurrentRuntimeSettings()
 	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previous) })
 	t.Setenv("CODEX_WS_CONNECTION_MODE", "busy")
 	t.Setenv("CODEX_WS_ROTATION_MAX_AGE", "1ms")
-	next := proxy.DefaultRuntimeSettings()
-	next.CodexWSRotationEnabled = true
-	proxy.ApplyRuntimeSettings(next)
-	if wsRotationModeEnabled() {
-		t.Fatal("explicit legacy mode should disable rotation")
+	t.Setenv("CODEX_WS_MAX_SIBLINGS", "3")
+	t.Setenv("CODEX_WS_MAX_PROXY_ROUTES", "1")
+	proxy.ApplyRuntimeSettingsFromSystem(&database.SystemSettings{
+		CodexWSRotationEnabled:   true,
+		CodexWSRotationMaxAgeSec: 600,
+		CodexWSMaxSiblings:       5,
+		CodexWSMaxProxyRoutes:    3,
+	})
+	if !wsRotationModeEnabled() {
+		t.Fatal("persisted admin setting should override legacy mode environment variable")
 	}
-	if got := connectionRotationAge(); got != connectionMaxLifetime() {
-		t.Fatalf("legacy rotation age = %s, want hard lifetime %s", got, connectionMaxLifetime())
+	if got := connectionRotationAge(); got != 10*time.Minute {
+		t.Fatalf("persisted rotation age = %s, want 10m", got)
+	}
+	if got := wsMaxSiblingConnections(); got != 5 {
+		t.Fatalf("persisted sibling limit = %d, want 5", got)
+	}
+	if got := wsMaxProxyRoutes(); got != 3 {
+		t.Fatalf("persisted route limit = %d, want 3", got)
+	}
+}
+
+func TestApplyRotationEnvironmentDefaultsSeedsNewSettings(t *testing.T) {
+	t.Setenv("CODEX_WS_CONNECTION_MODE", "rotation")
+	t.Setenv("CODEX_WS_ROTATION_MAX_AGE", "10m")
+	t.Setenv("CODEX_WS_MAX_SIBLINGS", "5")
+	t.Setenv("CODEX_WS_MAX_PROXY_ROUTES", "3")
+	settings := &database.SystemSettings{}
+	ApplyRotationEnvironmentDefaults(settings)
+	if !settings.CodexWSRotationEnabled || settings.CodexWSRotationMaxAgeSec != 600 || settings.CodexWSMaxSiblings != 5 || settings.CodexWSMaxProxyRoutes != 3 {
+		t.Fatalf("seeded rotation settings = enabled:%t age:%d siblings:%d routes:%d", settings.CodexWSRotationEnabled, settings.CodexWSRotationMaxAgeSec, settings.CodexWSMaxSiblings, settings.CodexWSMaxProxyRoutes)
 	}
 }
 
@@ -200,6 +270,7 @@ func TestRotationModeReadsRuntimeSettingsWhenEnvUnset(t *testing.T) {
 	next.CodexWSRotationMaxAgeSec = 600
 	next.CodexWSMaxSiblings = 5
 	next.CodexWSMaxProxyRoutes = 3
+	next.CodexWSRotationSettingsAuthoritative = true
 	proxy.ApplyRuntimeSettings(next)
 	if !wsRotationModeEnabled() {
 		t.Fatal("rotation mode should follow runtime setting when env is unset")

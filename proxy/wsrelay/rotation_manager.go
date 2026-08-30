@@ -84,6 +84,50 @@ func (m *Manager) rotationGroupConnections(accountID int64, wsURL, groupKey stri
 	return connections
 }
 
+// trimIdleRotationGroup 把逻辑组的空闲连接收敛回配置的 sibling 目标。
+//
+// sibling 数量只约束连接池在请求结束后保留多少条连接，不能成为请求准入条件：
+// 同组连接都在 busy/draining 时，新请求仍可在账号物理容量允许的范围内临时扩容；
+// 请求结束后再优先关闭最旧的空闲连接。这样既避免连接池长期膨胀，也不会因为本地
+// 的池大小设置主动拒绝客户端请求。
+func (m *Manager) trimIdleRotationGroup(wc *WsConnection) {
+	if m == nil || wc == nil || wc.session == nil || !wc.IsConnected() {
+		return
+	}
+	groupKey := rotationConnectionGroup(wc)
+	if groupKey == "" {
+		return
+	}
+	limit := wsMaxSiblingConnections()
+	lock := m.keyLock(rotationGroupLockKey(wc.session.AccountID, wc.URL, groupKey))
+	lock.Lock()
+	defer lock.Unlock()
+
+	connections := m.rotationGroupConnections(wc.session.AccountID, wc.URL, groupKey)
+	if len(connections) <= limit {
+		return
+	}
+	idle := make([]*WsConnection, 0, len(connections)-limit)
+	for _, candidate := range connections {
+		if candidate != nil && candidate.session != nil && candidate.session.PendingCount() == 0 && !candidate.IsDraining() {
+			idle = append(idle, candidate)
+		}
+	}
+	sort.SliceStable(idle, func(i, j int) bool {
+		if idle[i].createdAt != idle[j].createdAt {
+			return idle[i].createdAt < idle[j].createdAt
+		}
+		return idle[i].lastUsed.Load() < idle[j].lastUsed.Load()
+	})
+	for _, candidate := range idle {
+		if len(connections) <= limit {
+			break
+		}
+		m.DiscardConnection(candidate)
+		connections = connections[:len(connections)-1]
+	}
+}
+
 func rotationRouteRank(routes []string) map[string]int {
 	ranks := make(map[string]int, len(routes))
 	for i, route := range routes {
@@ -440,9 +484,6 @@ func (m *Manager) acquireConnectionWithRotation(
 		}
 	}
 	connections = m.rotationGroupConnections(account.ID(), wsURL, groupKey)
-	if len(connections) >= wsMaxSiblingConnections() {
-		return nil, nil, fmt.Errorf("websocket session %q has %d busy/draining siblings (limit %d)", sessionKey, len(connections), wsMaxSiblingConnections())
-	}
 
 	usage := make(map[string]int, len(routes))
 	for _, route := range routes {
@@ -505,8 +546,10 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 	}
 
 	// Second pass: no idle slot exists, so allocate a rotated sibling on the
-	// least-used slot/route. A bounded sibling cap avoids recreating the old
-	// per-request one-shot fallback under sustained load.
+	// least-used slot/route. The sibling setting is a post-request retention
+	// target, not an admission limit: active demand may temporarily exceed it,
+	// then ReleaseConnection trims the group after requests finish.
+	var schedulerPressureErr error
 	for i := 0; i < slots; i++ {
 		slotKey := fmt.Sprintf("%s#%d", baseKey, i)
 		groupLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, slotKey))
@@ -518,10 +561,6 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 			}
 		}
 		connections = m.rotationGroupConnections(account.ID(), wsURL, slotKey)
-		if len(connections) >= wsMaxSiblingConnections() {
-			groupLock.Unlock()
-			continue
-		}
 		usage := m.rotationRouteUsage(account.ID(), wsURL, baseKey, routes)
 		route := chooseRotationRoute(routes, usage)
 		poolSessionKey := slotKey
@@ -534,6 +573,7 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 			// Capacity or route reservations can be consumed by a sibling slot
 			// between the two passes; keep scanning before returning an error.
 			if errors.Is(err, errRotationCapacityExhausted) || errors.Is(err, errRotationRouteLimit) {
+				schedulerPressureErr = err
 				continue
 			}
 			return nil, nil, "", err
@@ -541,9 +581,11 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 		return wc, pr, poolSessionKey, nil
 	}
 
-	// Rotation mode deliberately avoids per-request one-shot fallback. A
-	// one-shot connection defeats the sibling pool and increases handshake
-	// churn; callers can still retry another account when the account is at
-	// physical capacity.
-	return nil, nil, "", fmt.Errorf("all websocket sibling slots for %q are busy (fallback %q disabled in rotation mode)", baseKey, fallbackKey)
+	if schedulerPressureErr != nil {
+		// Preserve the typed capacity/route signal so the outer scheduler can
+		// immediately try another account instead of surfacing a session-specific
+		// local pool-limit error to the client.
+		return nil, nil, "", schedulerPressureErr
+	}
+	return nil, nil, "", fmt.Errorf("%w: no websocket slot became available for %q (fallback %q)", errRotationCapacityExhausted, baseKey, fallbackKey)
 }

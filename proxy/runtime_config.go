@@ -96,10 +96,13 @@ type RuntimeSettings struct {
 	CodexWSStatelessSlots int
 	// CodexWSRotationEnabled 启用按连接年龄轮换的兄弟 WebSocket 调度。
 	// 到龄连接停止接收新请求，等待在途请求排空后优雅关闭。
-	CodexWSRotationEnabled   bool // 按连接年龄轮换，默认关闭（环境变量 CODEX_WS_CONNECTION_MODE 可强制覆盖）
+	CodexWSRotationEnabled   bool // 按连接年龄轮换，默认关闭
 	CodexWSRotationMaxAgeSec int  // 轮换年龄（秒），默认 2700，范围 300-3600
 	CodexWSMaxSiblings       int  // 每个逻辑组的兄弟连接上限，默认 3，范围 1-16
 	CodexWSMaxProxyRoutes    int  // 每个账号的 Resin/代理线路上限，默认 2，范围 1-3
+	// CodexWSRotationSettingsAuthoritative 仅标记运行时来源，不写入数据库。
+	// true 表示上述四项已从数据库/管理页面加载，必须优先于旧环境变量。
+	CodexWSRotationSettingsAuthoritative bool
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升 API 限流配额；
 	// 只发给 api.github.com，绝不发给镜像或其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -347,6 +350,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 
 	next := DefaultRuntimeSettings()
 	if settings != nil {
+		next.CodexWSRotationSettingsAuthoritative = true
 		next.ClientCompatMode = settings.ClientCompatMode
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.CodexUserAgentConfig = settings.CodexUserAgentConfig

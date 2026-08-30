@@ -3577,7 +3577,7 @@
     "codexWSRotationMaxAge": "WS Rotation Max Age",
     "codexWSRotationMaxAgeDesc": "Maximum connection age before retirement, in seconds (300–3600). New requests use sibling connections while the old one drains.",
     "codexWSMaxSiblings": "Maximum WS Siblings",
-    "codexWSMaxSiblingsDesc": "Maximum persistent WebSocket connections per account/cache key (1–16).",
+    "codexWSMaxSiblingsDesc": "Persistent WebSocket siblings retained per account/cache key after requests finish (1–16). Active requests may temporarily exceed this target and are trimmed afterward.",
     "codexWSMaxProxyRoutes": "Maximum Proxy Routes",
     "codexWSMaxProxyRoutesDesc": "Maximum distinct proxy routes used by sibling connections per account (1–3).",
     "codexWSStatelessSlots": "Stateless Connection Slots",

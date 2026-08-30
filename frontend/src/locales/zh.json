@@ -3577,7 +3577,7 @@
     "codexWSRotationMaxAge": "WS 轮换最长存活时间",
     "codexWSRotationMaxAgeDesc": "连接进入淘汰状态前的最长时间，单位秒（300–3600）。旧连接排空期间，新请求使用兄弟连接。",
     "codexWSMaxSiblings": "最大 WS 兄弟连接数",
-    "codexWSMaxSiblingsDesc": "每个账号/缓存键允许保持的持久 WebSocket 连接数上限（1–16）。",
+    "codexWSMaxSiblingsDesc": "每个账号/缓存键在请求结束后保留的持久 WebSocket 兄弟连接数（1–16）；活跃请求可临时超过，结束后自动收敛。",
     "codexWSMaxProxyRoutes": "最大代理线路数",
     "codexWSMaxProxyRoutesDesc": "每个账号的兄弟连接最多使用多少条不同代理线路（1–3）。",
     "codexWSStatelessSlots": "无状态连接槽位数",

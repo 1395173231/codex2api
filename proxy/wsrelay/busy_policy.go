@@ -8,8 +8,8 @@ import (
 )
 
 // Legacy busy policy（issue #413）：一个逻辑 session 独占一条 WS 连接，同会话的并发
-// 请求会在 busy 轮询里排队。设置 CODEX_WS_CONNECTION_MODE=rotation 后，新的
-// drain-and-sibling 调度器接管 acquire，下面的 busy 设置仅作为兼容回退。
+// 请求会在 busy 轮询里排队。通过管理面板（或首次初始化环境变量）启用轮换后，
+// 新的 drain-and-sibling 调度器接管 acquire，下面的 busy 设置仅作为兼容回退。
 // 以下三个管理界面设置项（系统设置，热更新生效）控制旧路径的分级降级：
 //
 //	codex_ws_busy_acquire_max_wait_sec  busy/账号容量等待的累计上限秒数，

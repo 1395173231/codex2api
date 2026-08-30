@@ -61,7 +61,7 @@ Codex2API 采用三层配置架构：
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_WS_CONNECTION_MODE` | 否 | `busy` | `busy` 保持旧的同 key 等待；`rotation` 按连接年龄停止接新请求，交给兄弟连接并在 pending 清空后关闭 |
 | `CODEX_WS_ROTATION_MAX_AGE` | 否 | `45m`（管理面板默认） | Go duration（如 `45m`）；连接到龄后进入 draining，且不会超过现有硬寿命上限 |
-| `CODEX_WS_MAX_SIBLINGS` | 否 | `3` | 单个逻辑会话/无状态槽位允许的轮转代数上限，范围 `1-16` |
+| `CODEX_WS_MAX_SIBLINGS` | 否 | `3` | 单个逻辑会话/无状态槽位在请求结束后保留的兄弟连接目标，范围 `1-16`；活跃请求可临时超过，结束后自动收敛 |
 | `CODEX_WS_MAX_PROXY_ROUTES` | 否 | `2` | 轮转兄弟允许使用的不同代理路由上限，范围 `1-3`；候选来自账号组/代理池。启用 Resin 时会把同一账号映射为 `account_id`（数据库账号 ID）、`account_id-1`、`account_id-2` 等粘性用户名，以获得不同绑定 IP |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
@@ -71,6 +71,8 @@ Codex2API 采用三层配置架构：
 | `CODEX_REQUEST_COMPRESSION` | 否 | 跟随系统设置 | 覆盖系统设置「Codex HTTP 请求体压缩」。`zstd`/`on`/`true`/`1` 强制开启，`off`/`false`/`0` 强制关闭，未设置或取值无法识别时以系统设置为准。作为部署级逃生阀存在：DB 不可达或后台打不开时仍可整机切换 |
 | `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |
 | `CODEX_SESSION_HEADER_ALIGN_CONVERGED` | 否 | `false` | 开启后 `session-id` 头改用指纹收敛后的会话身份，与 turn metadata 的 `session_id` 对齐。默认关：请求体 `prompt_cache_key` 始终独立隔离，但上游是否也拿该头参与缓存分组无法从客户端源码确认 |
+
+上述四个 `CODEX_WS_*` 轮换变量只在首次初始化、数据库尚无系统设置时用于播种默认值。管理面板保存后，数据库/网页配置优先，环境变量不再覆盖开关、轮换时长、兄弟连接数或代理线路数。
 
 > `CODEX_UPSTREAM_TRANSPORT` 控制普通 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`；Remote Compaction v2 默认由 `CODEX_REMOTE_COMPACTION_TRANSPORT=http` 覆盖。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 

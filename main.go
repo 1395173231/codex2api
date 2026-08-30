@@ -131,6 +131,7 @@ func main() {
 			AutoResetCreditsBeforeExpiryMin:   60,
 			UTLSShutdownTimeoutMinutes:        30,
 		}
+		wsrelay.ApplyRotationEnvironmentDefaults(settings)
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
@@ -182,6 +183,7 @@ func main() {
 			AutoResetCreditsBeforeExpiryMin:   60,
 			UTLSShutdownTimeoutMinutes:        30,
 		}
+		wsrelay.ApplyRotationEnvironmentDefaults(settings)
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)

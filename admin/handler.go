@@ -10098,6 +10098,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
 	}
 
+	rotationSettingsChanged := req.CodexWSRotationEnabled != nil ||
+		req.CodexWSRotationMaxAgeSec != nil ||
+		req.CodexWSMaxSiblings != nil ||
+		req.CodexWSMaxProxyRoutes != nil
+	if rotationSettingsChanged {
+		runtimeCfg.CodexWSRotationSettingsAuthoritative = true
+	}
 	if req.CodexWSRotationEnabled != nil {
 		runtimeCfg.CodexWSRotationEnabled = *req.CodexWSRotationEnabled
 		log.Printf("设置已更新: codex_ws_rotation_enabled = %t", *req.CodexWSRotationEnabled)

@@ -1397,6 +1397,9 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 		return
 	}
 	wc.Touch()
+	if wsRotationModeEnabled() {
+		m.trimIdleRotationGroup(wc)
+	}
 }
 
 // RemoveConnection 移除连接
