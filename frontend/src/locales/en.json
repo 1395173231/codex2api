@@ -135,6 +135,8 @@
     "permissionAllowed": "Allowed",
     "permissionBlocked": "Blocked",
     "permissionUnknown": "Unknown",
+    "submitAppeal": "Submit appeal",
+    "verifyAccount": "Verify account",
     "permissionsTitle": "Code Assist permissions",
     "permissionsDescription": "Latest sanitized access and subscription observation from Google.",
     "projectId": "Project ID",

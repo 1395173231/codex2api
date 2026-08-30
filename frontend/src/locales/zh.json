@@ -135,6 +135,8 @@
     "permissionAllowed": "允许访问",
     "permissionBlocked": "禁止访问",
     "permissionUnknown": "未知",
+    "submitAppeal": "提交申诉",
+    "verifyAccount": "验证账号",
     "permissionsTitle": "Code Assist 权限",
     "permissionsDescription": "Google 上游返回的最新脱敏访问权限与订阅信息。",
     "projectId": "项目 ID",
