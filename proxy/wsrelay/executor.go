@@ -3,6 +3,8 @@ package wsrelay
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,25 +55,17 @@ func statelessOneShotEnabled() bool {
 	}
 }
 
-// resolveHandshakeSessionID 决定 WS 握手头 Session_id/Conversation_id 的取值。
-// 该头是逐连接冻结的：建连时发送一次，连接复用时永不更新。因此对会在多个请求
-// （乃至共享同一 API Key 的多个终端用户）间复用的 stateless 连接，绝不能携带任何
-// "单个请求的身份"（如每请求随机 prompt_cache_key）——若上游按连接级
-// Conversation_id 绑定会话状态，第一个请求的对话身份会泄漏给后续复用该连接的
-// 所有用户，造成跨用户上下文污染（issue #268/#308 同类，"用户2串到用户1的上下文"）。
-//
-//   - 显式会话（非 stateless）：连接按会话专用，头 = 会话 ID（原行为）。
-//   - stateless + 默认隔离（poolRouteKey 非空）：返回空串 → 不发送该组头，
-//     上游没有任何可绑定的连接级会话身份；逐请求身份完全由帧体内每请求唯一的
-//     prompt_cache_key 承担。
-//   - stateless + per-api-key 模式（poolRouteKey 为空）：沿用帧体的确定性
-//     cache key（该模式显式选择按 Key 共享上游缓存，头与帧体一致才有缓存收益）。
+// resolveHandshakeSessionID 决定逐连接冻结的 WS 握手 Session-Id。显式会话保留
+// 调用方隔离后的会话键；stateless 请求优先使用帧内 client_metadata.session_id，
+// 其次使用 prompt_cache_key。连接池会再按完整握手兼容指纹分组，因此这里可以像
+// 官方 Codex 一样发送会话头，而不会把后续不同身份的请求塞进首个连接。
 func resolveHandshakeSessionID(sessionID, poolRouteKey string, wsBody []byte) string {
+	_ = poolRouteKey // 保留参数以兼容调用链；复用隔离现由握手兼容指纹负责。
 	if !proxy.IsStatelessWebsocketSessionID(sessionID) {
 		return sessionID
 	}
-	if strings.TrimSpace(poolRouteKey) != "" {
-		return ""
+	if metadataSessionID := strings.TrimSpace(gjson.GetBytes(wsBody, "client_metadata.session_id").String()); metadataSessionID != "" {
+		return metadataSessionID
 	}
 	if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
 		return cacheKey
@@ -139,6 +134,10 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
+	// 握手身份与每个 response.create 帧必须使用同一组 session/thread/window。
+	// 账号自定义头已经生效，因此这里以最终握手头为准同步帧内副本。
+	wsBody = synchronizeWebsocketRequestIdentity(wsBody, headers)
+	compatibilityKey := websocketConnectionCompatibilityKey(headers, wsBody)
 	// Record the attempted handshake UA immediately so failed handshakes are
 	// still auditable. A reused connection replaces this below with the UA that
 	// was actually sent when that connection was established.
@@ -147,28 +146,24 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
 	//
-	// 连接池 baseKey 必须按 API Key 稳定，绝不能等于每请求唯一的上游身份键，否则
-	// 默认隔离模式下每请求都变 → 槽位池失效 → 逐请求握手触发 503。
-	// poolRouteKey（来自上游确定性键）非空时优先用它作 baseKey：连接复用按 API Key
-	// 稳定命中同一组 8 槽。
-	//
-	// 隔离说明：默认隔离模式下，每请求的上游身份隔离由写入每个 response.create 帧体的
-	// 每请求唯一 prompt_cache_key 保证（见 proxy/executor.go 注入处）。握手头里的
-	// Session_id/Conversation_id 是逐连接冻结的，绝不能携带任何单个请求的身份
-	// （见 resolveHandshakeSessionID）。
+	// poolRouteKey（来自上游确定性键）先提供按 API Key 稳定的路由种子，再叠加
+	// websocketConnectionCompatibilityKey。这样相同握手身份可命中同一组 8 槽，
+	// session/thread/window/model/tier 任一不同则进入另一组并创建独立连接。
+	// 默认隔离模式下，每请求唯一 prompt_cache_key 仍负责帧级缓存隔离；它不替代
+	// 连接级握手身份检查。
 	//
 	// CODEX_WS_STATELESS_ONESHOT=1 时禁用槽位复用：每个无会话请求独享一条连接、
 	// 用完即毁（彻底杜绝任何连接级状态跨请求泄漏，代价是逐请求握手）。
 	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
 	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
 	// 否则落到随机槽位会触发上游 "previous response not found"。
-	poolSessionID := sessionID
+	poolSessionID := websocketPoolSessionKey(sessionID, compatibilityKey)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, compatibilityKey); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
@@ -176,11 +171,12 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if baseKey == "" && headerSessionID != sessionID {
 		baseKey = headerSessionID
 	}
+	baseKey = websocketPoolSessionKey(baseKey, compatibilityKey)
 	if wc == nil {
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, proxyOverride)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, poolSessionID, statelessConnectionSlots(), headers, proxyOverride)
 		} else {
-			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		}
 	}
 	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）
@@ -278,6 +274,9 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	// 4. 设置请求类型和 stream
 	wsBody, _ = sjson.SetBytes(wsBody, "type", "response.create")
 	wsBody, _ = sjson.SetBytes(wsBody, "stream", true)
+	// 官方 Codex 在每个 response.create 帧发送字符串形态的毫秒时间戳；它是逐帧
+	// 字段，不属于连接兼容身份，也不能沿用建连时的旧值。
+	wsBody, _ = sjson.SetBytes(wsBody, "client_metadata.x-codex-ws-stream-request-start-ms", strconv.FormatInt(time.Now().UnixMilli(), 10))
 
 	return wsBody
 }
@@ -325,7 +324,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	}
 	// X-Oai-Attestation：DeviceCheck 设备认证头（上游 openai/codex#20619），
 	// 仅在下游携带时透传，本代理不伪造（假 token 服务端验证必败，反而暴露）。
-	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics", "X-Oai-Attestation"} {
+	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "Thread-Id", "X-Client-Request-Id", "X-Codex-Window-Id", "X-Responsesapi-Include-Timing-Metrics", "X-Oai-Attestation"} {
 		if value := strings.TrimSpace(ginHeaders.Get(name)); value != "" {
 			headers.Set(name, value)
 		}
@@ -346,12 +345,28 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
 		proxy.ApplyCodexSessionHeaders(headers, account, sessionID, ginHeaders, true)
 	}
+	// 官方握手中 Thread-Id 与 X-Client-Request-Id 严格相等。优先保留已经过
+	// 指纹收敛的 X-Client-Request-Id；只有客户端未发送它时才回落到 Thread-Id。
+	if clientRequestID := strings.TrimSpace(headers.Get("X-Client-Request-Id")); clientRequestID != "" {
+		headers.Set("Thread-Id", clientRequestID)
+	} else if threadID := strings.TrimSpace(headers.Get("Thread-Id")); threadID != "" {
+		headers.Set("X-Client-Request-Id", threadID)
+	}
+	customThreadID := false
+	customClientRequestID := false
 	for name, value := range account.GetCustomHeaders() {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
 		headers.Set(name, value)
+		customThreadID = customThreadID || strings.EqualFold(name, "Thread-Id")
+		customClientRequestID = customClientRequestID || strings.EqualFold(name, "X-Client-Request-Id")
+	}
+	if customClientRequestID && !customThreadID {
+		headers.Set("Thread-Id", headers.Get("X-Client-Request-Id"))
+	} else if threadID := strings.TrimSpace(headers.Get("Thread-Id")); threadID != "" {
+		headers.Set("X-Client-Request-Id", threadID)
 	}
 
 	// routing hint 由网关按最终 WS 帧体合成，在账号自定义头之后设置。
@@ -359,6 +374,237 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	proxy.ApplyCodexRoutingHint(headers, account, wsBody)
 
 	return headers
+}
+
+const websocketPoolCompatibilityMarker = "#ws-profile="
+
+// websocketPoolSessionKey makes a handshake profile part of the local-only pool
+// identity. Different models, tiers, sessions, threads or windows therefore get
+// separate sockets while identical requests can still reuse an idle sibling.
+func websocketPoolSessionKey(baseKey, compatibilityKey string) string {
+	baseKey = strings.TrimSpace(baseKey)
+	compatibilityKey = strings.TrimSpace(compatibilityKey)
+	if baseKey == "" || compatibilityKey == "" {
+		return baseKey
+	}
+	suffix := websocketPoolCompatibilityMarker + compatibilityKey
+	if strings.HasSuffix(baseKey, suffix) {
+		return baseKey
+	}
+	return baseKey + suffix
+}
+
+func websocketCompatibilityFromPoolSessionKey(sessionKey string) string {
+	idx := strings.LastIndex(sessionKey, websocketPoolCompatibilityMarker)
+	if idx < 0 {
+		return ""
+	}
+	value := strings.TrimSpace(sessionKey[idx+len(websocketPoolCompatibilityMarker):])
+	// Reusable slots and rotation siblings append #0 / #rot-N after the profile.
+	// Those scheduler suffixes are not part of the handshake fingerprint.
+	if suffix := strings.IndexByte(value, '#'); suffix >= 0 {
+		value = value[:suffix]
+	}
+	return value
+}
+
+// websocketConnectionCompatibilityKey hashes every connection-scoped identity
+// visible to the upstream. Per-turn IDs and the per-frame start timestamp are
+// deliberately excluded: official Codex changes those while keeping one socket.
+func websocketConnectionCompatibilityKey(headers http.Header, body []byte) string {
+	digest := sha256.New()
+	writeField := func(name, value string) {
+		value = strings.TrimSpace(value)
+		_, _ = fmt.Fprintf(digest, "%d:%s=%d:%s\n", len(name), name, len(value), value)
+	}
+	for _, name := range []string{
+		"Authorization",
+		"Chatgpt-Account-Id",
+		"Session-Id",
+		"Session_id",
+		"Thread-Id",
+		"X-Client-Request-Id",
+		"X-Codex-Window-Id",
+		"X-Codex-Routing-Hint",
+		"User-Agent",
+		"Version",
+		"Originator",
+		"OpenAI-Beta",
+		"X-Codex-Beta-Features",
+		"X-Oai-Attestation",
+	} {
+		writeField("header."+strings.ToLower(name), headers.Get(name))
+	}
+	for _, path := range []string{
+		"model",
+		"service_tier",
+		"client_metadata.x-codex-installation-id",
+		"client_metadata.session_id",
+		"client_metadata.thread_id",
+		"client_metadata.x-codex-window-id",
+	} {
+		writeField("body."+path, gjson.GetBytes(body, path).String())
+	}
+
+	stableMetadataPaths := []string{
+		"installation_id",
+		"session_id",
+		"thread_id",
+		"window_id",
+		"window_number",
+		"context_window_id",
+		"parent_thread_id",
+		"forked_from_thread_id",
+		"sandbox",
+		"approval_policy",
+		"workspaces",
+	}
+	metadataSources := []struct {
+		name string
+		raw  string
+	}{
+		{name: "header.turn_metadata", raw: headers.Get("X-Codex-Turn-Metadata")},
+		{name: "body.turn_metadata", raw: gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()},
+	}
+	for _, source := range metadataSources {
+		raw := strings.TrimSpace(source.raw)
+		if !gjson.Valid(raw) {
+			writeField(source.name+".raw", raw)
+			continue
+		}
+		for _, path := range stableMetadataPaths {
+			value := gjson.Get(raw, path)
+			writeField(source.name+"."+path, value.Raw)
+		}
+	}
+	sum := digest.Sum(nil)
+	return hex.EncodeToString(sum)
+}
+
+// synchronizeWebsocketRequestIdentity makes all copies of the connection
+// identity agree after forwarding, fingerprint convergence and custom headers.
+func synchronizeWebsocketRequestIdentity(body []byte, headers http.Header) []byte {
+	if headers == nil || !gjson.ValidBytes(body) {
+		return body
+	}
+	sessionID := strings.TrimSpace(headers.Get("Session-Id"))
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(headers.Get("Session_id"))
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(gjson.GetBytes(body, "client_metadata.session_id").String())
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	}
+	threadID := strings.TrimSpace(headers.Get("Thread-Id"))
+	if threadID == "" {
+		threadID = strings.TrimSpace(headers.Get("X-Client-Request-Id"))
+	}
+	if threadID == "" {
+		threadID = strings.TrimSpace(gjson.GetBytes(body, "client_metadata.thread_id").String())
+	}
+	if threadID == "" {
+		threadID = sessionID
+	}
+	windowID := strings.TrimSpace(headers.Get("X-Codex-Window-Id"))
+	if windowID == "" {
+		windowID = strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-window-id").String())
+	}
+	if windowID == "" {
+		windowID = strings.TrimSpace(gjson.Get(headers.Get("X-Codex-Turn-Metadata"), "window_id").String())
+	}
+	if windowID == "" && threadID != "" {
+		windowID = threadID + ":" + strconv.Itoa(websocketWindowNumber(headers, body))
+	}
+
+	if headers.Get("Session-Id") != "" && sessionID != "" {
+		headers.Set("Session-Id", sessionID)
+	}
+	if threadID != "" {
+		headers.Set("Thread-Id", threadID)
+		headers.Set("X-Client-Request-Id", threadID)
+	}
+	if windowID != "" {
+		headers.Set("X-Codex-Window-Id", windowID)
+	}
+	if raw := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); raw != "" {
+		headers.Set("X-Codex-Turn-Metadata", synchronizeWebsocketTurnMetadata(raw, sessionID, threadID, windowID))
+	}
+
+	// prepareWebsocketBody always creates client_metadata for the frame timestamp,
+	// so the three official identity copies can be populated without changing the
+	// event envelope shape a second time.
+	if sessionID != "" {
+		body, _ = sjson.SetBytes(body, "client_metadata.session_id", sessionID)
+	}
+	if threadID != "" {
+		body, _ = sjson.SetBytes(body, "client_metadata.thread_id", threadID)
+	}
+	if windowID != "" {
+		body, _ = sjson.SetBytes(body, "client_metadata.x-codex-window-id", windowID)
+	}
+	const embeddedPath = "client_metadata.x-codex-turn-metadata"
+	if embedded := gjson.GetBytes(body, embeddedPath); embedded.Type == gjson.String {
+		body, _ = sjson.SetBytes(body, embeddedPath, synchronizeWebsocketTurnMetadata(embedded.String(), sessionID, threadID, windowID))
+	}
+	return body
+}
+
+func websocketWindowNumber(headers http.Header, body []byte) int {
+	windowIDs := []string{
+		headers.Get("X-Codex-Window-Id"),
+		gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(),
+		gjson.Get(headers.Get("X-Codex-Turn-Metadata"), "window_id").String(),
+		gjson.Get(gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String(), "window_id").String(),
+	}
+	for _, windowID := range windowIDs {
+		windowID = strings.TrimSpace(windowID)
+		if idx := strings.LastIndexByte(windowID, ':'); idx >= 0 && idx+1 < len(windowID) {
+			if slot, err := strconv.Atoi(windowID[idx+1:]); err == nil && slot >= 0 {
+				return slot
+			}
+		}
+	}
+	for _, raw := range []string{
+		headers.Get("X-Codex-Turn-Metadata"),
+		gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String(),
+	} {
+		if value := gjson.Get(raw, "window_number"); value.Exists() && value.Int() >= 0 {
+			return int(value.Int())
+		}
+	}
+	return 0
+}
+
+func synchronizeWebsocketTurnMetadata(raw, sessionID, threadID, windowID string) string {
+	if !gjson.Valid(raw) {
+		return raw
+	}
+	for _, field := range []struct{ path, value string }{
+		{path: "session_id", value: sessionID},
+		{path: "thread_id", value: threadID},
+		{path: "window_id", value: windowID},
+	} {
+		if field.value == "" || !gjson.Get(raw, field.path).Exists() {
+			continue
+		}
+		if updated, err := sjson.Set(raw, field.path, field.value); err == nil {
+			raw = updated
+		}
+	}
+	if existing := gjson.Get(raw, "window_number"); existing.Exists() {
+		if idx := strings.LastIndexByte(windowID, ':'); idx >= 0 && idx+1 < len(windowID) {
+			if slot, err := strconv.Atoi(windowID[idx+1:]); err == nil && slot >= 0 {
+				if existing.Type == gjson.String {
+					raw, _ = sjson.Set(raw, "window_number", strconv.Itoa(slot))
+				} else {
+					raw, _ = sjson.Set(raw, "window_number", slot)
+				}
+			}
+		}
+	}
+	return raw
 }
 
 // sendRequest 发送 WebSocket 请求

@@ -231,6 +231,21 @@ func TestResolveCodexFingerprintIDsSessionModeKeepsDistinctClientThreads(t *test
 	}
 }
 
+func TestResolveCodexFingerprintIDsPreservesWindowNumber(t *testing.T) {
+	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
+	headers := codexClientHeaders(`{"session_id":"client-session","thread_id":"client-thread","window_id":"client-thread:2","window_number":2}`, "client-session")
+	headers.Set("Thread-Id", "client-thread")
+	headers.Set("X-Codex-Window-Id", "client-thread:2")
+
+	ids := resolveCodexFingerprintIDs(account, headers)
+	if ids == nil {
+		t.Fatal("session mode returned nil")
+	}
+	if want := ids.threadID + ":2"; ids.windowID != want {
+		t.Fatalf("window id = %q, want %q", ids.windowID, want)
+	}
+}
+
 func TestResolveCodexFingerprintIDsIsolatesAccounts(t *testing.T) {
 	headers := codexClientHeaders("", "client-session-1")
 	first := resolveCodexFingerprintIDs(&auth.Account{DBID: 1, CodexFingerprintMode: auth.CodexFingerprintModeSession}, headers)

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,8 +168,8 @@ func TestPrepareWebsocketHeadersSendsUserAgentByDefault(t *testing.T) {
 	if got := headers.Get("Session-Id"); got != "session-123" {
 		t.Fatalf("Session-Id = %q", got)
 	}
-	if got := headers.Get("Thread-Id"); got != "session-123" {
-		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	if got := headers.Get("Thread-Id"); got != "req-123" {
+		t.Fatalf("Thread-Id = %q, want 与 X-Client-Request-Id 同值", got)
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty（真实握手头里没有这个头）", got)
@@ -241,6 +242,13 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 	if !gjson.GetBytes(got, "stream").Bool() {
 		t.Fatalf("stream should be true; body=%s", got)
+	}
+	startedAt := gjson.GetBytes(got, "client_metadata.x-codex-ws-stream-request-start-ms")
+	if startedAt.Type != gjson.String {
+		t.Fatalf("x-codex-ws-stream-request-start-ms type = %v, want string; body=%s", startedAt.Type, got)
+	}
+	if millis, err := strconv.ParseInt(startedAt.String(), 10, 64); err != nil || millis <= 0 {
+		t.Fatalf("x-codex-ws-stream-request-start-ms = %q, want decimal unix milliseconds", startedAt.String())
 	}
 }
 
@@ -394,19 +402,27 @@ func TestExecuteRequestViaWebsocketSendFailureRemovesEffectiveProxyConnection(t 
 		ProxyURL:    "http://account-proxy.test:8080",
 	}
 	sessionID := "session-1"
+	requestBody := []byte(`{"model":"gpt-5.4","input":"hi"}`)
 	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
 	if err != nil {
 		t.Fatalf("buildWebsocketURL: %v", err)
 	}
 	effectiveProxy := effectiveProxyURL(account, "")
-	key := manager.poolKey(account.ID(), wsURL, sessionID, effectiveProxy)
+	exec := NewExecutorWithManager(manager)
+	wsBody := exec.prepareWebsocketBody(requestBody, sessionID)
+	handshakeHeaders := exec.prepareWebsocketHeaders("token-123", account, "", sessionID, "", nil, http.Header{}, wsBody)
+	wsBody = synchronizeWebsocketRequestIdentity(wsBody, handshakeHeaders)
+	compatibilityKey := websocketConnectionCompatibilityKey(handshakeHeaders, wsBody)
+	poolSessionID := websocketPoolSessionKey(sessionID, compatibilityKey)
+	key := manager.poolKey(account.ID(), wsURL, poolSessionID, effectiveProxy)
 	session := NewSession(account.ID(), manager)
 	session.SetConnected(true)
 	conn := &WsConnection{
-		conn:    newClosedTestWebsocketConn(t),
-		session: session,
-		URL:     wsURL,
-		PoolKey: key,
+		conn:                      newClosedTestWebsocketConn(t),
+		session:                   session,
+		URL:                       wsURL,
+		PoolKey:                   key,
+		handshakeCompatibilityKey: compatibilityKey,
 	}
 	conn.SetState(StateConnected)
 	conn.Touch()
@@ -416,8 +432,7 @@ func TestExecuteRequestViaWebsocketSendFailureRemovesEffectiveProxyConnection(t 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	exec := NewExecutorWithManager(manager)
-	_, err = exec.ExecuteRequestViaWebsocket(ctx, account, []byte(`{"model":"gpt-5.4","input":"hi"}`), sessionID, "", "", nil, http.Header{}, "")
+	_, err = exec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, "", "", nil, http.Header{}, "")
 	if err == nil {
 		t.Fatal("expected final send failure")
 	}
@@ -477,10 +492,8 @@ func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
 	}
 }
 
-// TestResolveHandshakeSessionID 验证握手头 Session_id/Conversation_id 的取值策略。
-// 该头逐连接冻结、复用连接时永不更新，因此 stateless 复用连接绝不能携带任何
-// 单个请求的身份，否则第一个请求的会话身份会泄漏给后续复用该连接的所有用户
-// （跨用户上下文污染，"用户2串到用户1的上下文"）。
+// TestResolveHandshakeSessionID 验证握手 Session-Id 与帧内身份对齐；连接复用由
+// websocketConnectionCompatibilityKey 隔离，身份不同会创建另一条连接。
 func TestResolveHandshakeSessionID(t *testing.T) {
 	t.Run("explicit session keeps original behavior", func(t *testing.T) {
 		got := resolveHandshakeSessionID("session-123", "route-key", []byte(`{"prompt_cache_key":"whatever"}`))
@@ -489,12 +502,17 @@ func TestResolveHandshakeSessionID(t *testing.T) {
 		}
 	})
 
-	t.Run("stateless isolated mode must not send any session identity", func(t *testing.T) {
-		// 默认隔离模式：帧体是每请求随机 prompt_cache_key，poolRouteKey 非空。
-		// 若把随机 key 冻结进握手头，复用连接的后续用户都会顶着第一个请求的身份。
+	t.Run("stateless isolated mode binds prompt cache identity", func(t *testing.T) {
 		got := resolveHandshakeSessionID("stateless-abc", "route-key", []byte(`{"prompt_cache_key":"per-request-random-uuid"}`))
-		if got != "" {
-			t.Fatalf("headerSessionID = %q, want empty (no connection-level session identity)", got)
+		if got != "per-request-random-uuid" {
+			t.Fatalf("headerSessionID = %q, want per-request-random-uuid", got)
+		}
+	})
+
+	t.Run("stateless prefers client metadata session", func(t *testing.T) {
+		got := resolveHandshakeSessionID("stateless-abc", "route-key", []byte(`{"prompt_cache_key":"cache-key","client_metadata":{"session_id":"metadata-session"}}`))
+		if got != "metadata-session" {
+			t.Fatalf("headerSessionID = %q, want metadata-session", got)
 		}
 	})
 
@@ -606,6 +624,16 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 	if got, want := headers.Get("Thread-Id"), headers.Get("X-Client-Request-Id"); got != want {
 		t.Fatalf("Thread-Id = %q, want 等于 X-Client-Request-Id %q", got, want)
 	}
+	windowID := headers.Get("X-Codex-Window-Id")
+	if windowID == "" {
+		t.Fatal("X-Codex-Window-Id was dropped from the websocket handshake")
+	}
+	if got := gjson.Get(headers.Get("X-Codex-Turn-Metadata"), "window_id").String(); got != windowID {
+		t.Fatalf("turn metadata window_id = %q, want handshake X-Codex-Window-Id %q", got, windowID)
+	}
+	if want := headers.Get("Thread-Id") + ":0"; windowID != want {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", windowID, want)
+	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty", got)
 	}
@@ -624,5 +652,89 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 		if strings.Contains(dump.String(), leaked) {
 			t.Fatalf("original identifier %q survived the websocket handshake headers:\n%s", leaked, dump.String())
 		}
+	}
+}
+
+func TestPrepareWebsocketHeadersForwardsWindowIDWhenFingerprintOff(t *testing.T) {
+	exec := NewExecutor()
+	account := &auth.Account{DBID: 42, AccountID: "42", CodexFingerprintMode: auth.CodexFingerprintModeOff}
+	ginHeaders := http.Header{}
+	ginHeaders.Set("X-Codex-Window-Id", "client-thread:2")
+
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "client-session", "api-key-1", nil, ginHeaders, []byte(`{"model":"gpt-5.6-sol"}`))
+	if got := headers.Get("X-Codex-Window-Id"); got != "client-thread:2" {
+		t.Fatalf("X-Codex-Window-Id = %q, want downstream value preserved", got)
+	}
+	if got := headers.Get("X-Codex-Installation-Id"); got != "" {
+		t.Fatalf("X-Codex-Installation-Id = %q, want unset", got)
+	}
+}
+
+func TestSynchronizeWebsocketRequestIdentityKeepsHeaderAndFrameEqual(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Session-Id", "session-a")
+	headers.Set("Thread-Id", "thread-a")
+	headers.Set("X-Client-Request-Id", "stale-thread")
+	headers.Set("X-Codex-Window-Id", "thread-a:2")
+	headers.Set("X-Codex-Turn-Metadata", `{"session_id":"old","thread_id":"old","window_id":"old:0","window_number":0,"turn_id":"turn-1"}`)
+	body := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"session_id":"old","thread_id":"old","x-codex-window-id":"old:0","x-codex-turn-metadata":"{\"session_id\":\"old\",\"thread_id\":\"old\",\"window_id\":\"old:0\",\"window_number\":0,\"turn_id\":\"turn-2\"}"}}`)
+
+	got := synchronizeWebsocketRequestIdentity(body, headers)
+	if headers.Get("X-Client-Request-Id") != "thread-a" {
+		t.Fatalf("X-Client-Request-Id = %q, want thread-a", headers.Get("X-Client-Request-Id"))
+	}
+	for _, tc := range []struct{ path, want string }{
+		{"client_metadata.session_id", "session-a"},
+		{"client_metadata.thread_id", "thread-a"},
+		{"client_metadata.x-codex-window-id", "thread-a:2"},
+	} {
+		if value := gjson.GetBytes(got, tc.path).String(); value != tc.want {
+			t.Fatalf("%s = %q, want %q; body=%s", tc.path, value, tc.want, got)
+		}
+	}
+	if raw := headers.Get("X-Codex-Turn-Metadata"); gjson.Get(raw, "window_number").Int() != 2 || gjson.Get(raw, "turn_id").String() != "turn-1" {
+		t.Fatalf("handshake turn metadata was not synchronized without changing turn_id: %s", raw)
+	}
+	embedded := gjson.GetBytes(got, "client_metadata.x-codex-turn-metadata").String()
+	if gjson.Get(embedded, "window_number").Int() != 2 || gjson.Get(embedded, "turn_id").String() != "turn-2" {
+		t.Fatalf("frame turn metadata was not synchronized without changing turn_id: %s", embedded)
+	}
+}
+
+func TestWebsocketConnectionCompatibilityKeySeparatesModelAndWindow(t *testing.T) {
+	baseHeaders := http.Header{}
+	baseHeaders.Set("Session-Id", "session-a")
+	baseHeaders.Set("Thread-Id", "thread-a")
+	baseHeaders.Set("X-Client-Request-Id", "thread-a")
+	baseHeaders.Set("X-Codex-Window-Id", "thread-a:0")
+	baseHeaders.Set("X-Codex-Routing-Hint", "model=gpt-5.6-sol")
+	solBody := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"session_id":"session-a","thread_id":"thread-a","x-codex-window-id":"thread-a:0","x-codex-ws-stream-request-start-ms":"100"}}`)
+	solKey := websocketConnectionCompatibilityKey(baseHeaders, solBody)
+
+	// 逐帧时间戳变化不应拆连接。
+	solNextBody := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"session_id":"session-a","thread_id":"thread-a","x-codex-window-id":"thread-a:0","x-codex-ws-stream-request-start-ms":"200"}}`)
+	if got := websocketConnectionCompatibilityKey(baseHeaders, solNextBody); got != solKey {
+		t.Fatalf("per-frame timestamp changed compatibility key: %q != %q", got, solKey)
+	}
+
+	lunaHeaders := baseHeaders.Clone()
+	lunaHeaders.Set("X-Codex-Routing-Hint", "model=gpt-5.6-luna")
+	lunaBody := []byte(`{"model":"gpt-5.6-luna","client_metadata":{"session_id":"session-a","thread_id":"thread-a","x-codex-window-id":"thread-a:0"}}`)
+	if got := websocketConnectionCompatibilityKey(lunaHeaders, lunaBody); got == solKey {
+		t.Fatal("gpt-5.6-sol and gpt-5.6-luna produced the same websocket compatibility key")
+	}
+
+	windowHeaders := baseHeaders.Clone()
+	windowHeaders.Set("X-Codex-Window-Id", "thread-a:2")
+	windowBody := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"session_id":"session-a","thread_id":"thread-a","x-codex-window-id":"thread-a:2"}}`)
+	if got := websocketConnectionCompatibilityKey(windowHeaders, windowBody); got == solKey {
+		t.Fatal("different Codex windows produced the same websocket compatibility key")
+	}
+
+	if solPool, lunaPool := websocketPoolSessionKey("api-key-pool", solKey), websocketPoolSessionKey("api-key-pool", websocketConnectionCompatibilityKey(lunaHeaders, lunaBody)); solPool == lunaPool {
+		t.Fatal("sol and luna were assigned the same websocket pool")
+	}
+	if got := websocketCompatibilityFromPoolSessionKey(websocketPoolSessionKey("api-key-pool", solKey) + "#3#rot-9"); got != solKey {
+		t.Fatalf("compatibility parsed from reusable rotation slot = %q, want %q", got, solKey)
 	}
 }

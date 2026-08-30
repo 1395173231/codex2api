@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -209,8 +210,42 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 			ids.threadID = deriveStableCodexUUIDv7(threadSeed, codexIdentityUnixMilli(account, threadSeed))
 		}
 	}
-	ids.windowID = ids.threadID + ":0"
+	windowNumber := extractClientCodexWindowNumber(downstreamHeaders)
+	ids.windowID = ids.threadID + ":" + strconv.Itoa(windowNumber)
 	return ids
+}
+
+// extractClientCodexWindowNumber preserves the real Codex window slot when
+// convergence replaces the thread UUID. A window id is <thread-id>:<slot>;
+// hard-coding :0 makes a captured window_number=2 contradict its rewritten
+// window_id. Invalid or absent values safely fall back to the primary window.
+func extractClientCodexWindowNumber(headers http.Header) int {
+	if headers == nil {
+		return 0
+	}
+	windowIDs := []string{
+		strings.TrimSpace(headers.Get(codexWindowIDHeader)),
+	}
+	raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader))
+	if gjson.Valid(raw) {
+		windowIDs = append(windowIDs, strings.TrimSpace(gjson.Get(raw, "window_id").String()))
+	}
+	for _, windowID := range windowIDs {
+		if idx := strings.LastIndexByte(windowID, ':'); idx >= 0 && idx+1 < len(windowID) {
+			if slot, err := strconv.Atoi(windowID[idx+1:]); err == nil && slot >= 0 {
+				return slot
+			}
+		}
+	}
+	if gjson.Valid(raw) {
+		windowNumber := gjson.Get(raw, "window_number")
+		if windowNumber.Exists() {
+			if slot := int(windowNumber.Int()); slot >= 0 {
+				return slot
+			}
+		}
+	}
+	return 0
 }
 
 // resolveConvergedInstallationID 返回账号级恒定的 installation_id。

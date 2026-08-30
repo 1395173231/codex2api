@@ -51,6 +51,9 @@ type WsConnection struct {
 	// 不能用当前配置重新推导，否则设置变更后会记录并未发送的 UA。
 	upstreamUserAgent      string
 	upstreamUserAgentKnown bool
+	// handshakeCompatibilityKey 是建连时绑定的本地兼容指纹。它不发送上游；
+	// previous_response_id 续链只有在当前请求指纹完全相同时才可取回旧连接。
+	handshakeCompatibilityKey string
 
 	// 创建/复用该连接的账号。仅用于读取当前动态并发上限，让 response_id
 	// 续链复用路径也能在账号上限下调后收敛空闲连接数。
@@ -1376,6 +1379,7 @@ func (m *Manager) createConnectionForRoute(
 	wc.PoolKey = poolKey
 	wc.groupKey = normalizeRotationGroupKey(groupKey)
 	wc.proxyURL = strings.TrimSpace(proxyURL)
+	wc.handshakeCompatibilityKey = websocketCompatibilityFromPoolSessionKey(poolSessionKey)
 	wc.upstreamUserAgent = strings.TrimSpace(headers.Get("User-Agent"))
 	wc.upstreamUserAgentKnown = true
 	wc.httpResp = resp
@@ -1503,9 +1507,14 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 // 成功返回 (连接, pendingRequest, 池内 sessionKey)；绑定失效或连接忙时返回 nil，
 // 调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
 // 阻塞在前一个长响应后面，且该场景（同会话并发续链）极少，退化为缓存 miss 更稳。
-func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string) {
+func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string, compatibilityKey ...string) (*WsConnection, *PendingRequest, string) {
 	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
 	if wc == nil {
+		return nil, nil, ""
+	}
+	if len(compatibilityKey) > 0 && strings.TrimSpace(compatibilityKey[0]) != wc.handshakeCompatibilityKey {
+		// 绑定仍保留给真正匹配的后续请求；本次回落到带新兼容指纹的常规池，
+		// 绝不能为追求 previous_response_id 亲和而跨模型/窗口复用旧握手。
 		return nil, nil, ""
 	}
 	accountLock := m.accountLock(accountID)

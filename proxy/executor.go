@@ -370,6 +370,7 @@ var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
+	"X-Codex-Window-Id",
 	"X-Codex-Beta-Features",
 	codexResponsesLiteHeader,
 	// DeviceCheck 设备认证头（上游 openai/codex#20619）。仅在下游真实 Codex

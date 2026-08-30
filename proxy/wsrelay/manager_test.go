@@ -627,6 +627,76 @@ func TestAcquireReusableConnectionReusesIdleSlot(t *testing.T) {
 	got.session.RemovePendingRequest(pr.RequestID)
 }
 
+func TestReusablePoolCreatesSeparateConnectionsForHandshakeProfiles(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var handshakes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	account := &auth.Account{DBID: 42, DynamicConcurrencyLimit: 4}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	profileKey := func(model string) string {
+		headers := http.Header{}
+		headers.Set("Session-Id", "session-a")
+		headers.Set("Thread-Id", "thread-a")
+		headers.Set("X-Client-Request-Id", "thread-a")
+		headers.Set("X-Codex-Window-Id", "thread-a:0")
+		headers.Set("X-Codex-Routing-Hint", "model="+model)
+		body := []byte(fmt.Sprintf(`{"model":%q,"client_metadata":{"session_id":"session-a","thread_id":"thread-a","x-codex-window-id":"thread-a:0"}}`, model))
+		return websocketConnectionCompatibilityKey(headers, body)
+	}
+	acquireAndRelease := func(baseKey, compatibilityKey string) *WsConnection {
+		t.Helper()
+		poolBase := websocketPoolSessionKey(baseKey, compatibilityKey)
+		wc, pending, _, err := manager.AcquireReusableConnection(context.Background(), account, wsURL, poolBase, "fallback-"+poolBase, 4, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("AcquireReusableConnection(%s): %v", baseKey, err)
+		}
+		wc.session.RemovePendingRequest(pending.RequestID)
+		state := wc.ensureReadState()
+		state.mu.Lock()
+		state.activeLease = ""
+		state.leasePhase = readLeaseIdle
+		state.leaseWrite = nil
+		state.leaseTerminalQueued = false
+		state.mu.Unlock()
+		manager.ReleaseConnection(wc)
+		return wc
+	}
+
+	solKey := profileKey("gpt-5.6-sol")
+	lunaKey := profileKey("gpt-5.6-luna")
+	sol := acquireAndRelease("shared-task", solKey)
+	luna := acquireAndRelease("shared-task", lunaKey)
+	if sol == luna {
+		t.Fatal("sol and luna reused the same physical websocket connection")
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("websocket handshakes = %d, want 2 for two incompatible profiles", got)
+	}
+	if solAgain := acquireAndRelease("shared-task", solKey); solAgain != sol {
+		t.Fatal("matching sol profile did not reuse its original websocket connection")
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("websocket handshakes after matching reuse = %d, want still 2", got)
+	}
+}
+
 func TestAcquireReusableConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
@@ -799,6 +869,24 @@ func TestAcquirePreferredConnection(t *testing.T) {
 	got2, pr2, _ := manager.AcquirePreferredConnection("resp_chain", 7, "key-A")
 	if got2 != nil || pr2 != nil {
 		t.Fatal("busy preferred connection must not be acquired")
+	}
+}
+
+func TestAcquirePreferredConnectionRejectsHandshakeProfileMismatch(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	wc := newBoundTestConn(t, manager, 7, "base#3")
+	wc.handshakeCompatibilityKey = "model-sol-window-0"
+	manager.BindResponseConn("resp_chain", wc, "base#3", 7, "key-A")
+
+	got, pending, _ := manager.AcquirePreferredConnection("resp_chain", 7, "key-A", "model-luna-window-0")
+	if got != nil || pending != nil {
+		t.Fatal("preferred connection with a different handshake profile must not be reused")
+	}
+	if !wc.IsConnected() {
+		t.Fatal("mismatched connection should stay available for requests with its original profile")
 	}
 }
 
