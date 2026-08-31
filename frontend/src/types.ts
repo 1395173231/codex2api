@@ -896,6 +896,8 @@ export interface UpdateAntigravityAccountRequest {
 export interface AntigravityImportRequest {
   files: string[]
   proxy_url?: string
+  /** 把文件内携带的代理注册进代理池（该渠道一直会采用文件内代理，开关只控制是否入表）。 */
+  import_proxy?: boolean
   group_ids?: number[]
 }
 
@@ -919,6 +921,10 @@ export interface AntigravityImportResponse {
   group_ids?: number[]
   warning?: string
   items: AntigravityImportItem[]
+  /** 以下三项仅在 import_proxy=true 时返回。 */
+  proxies_imported?: number
+  proxies_skipped?: number
+  proxy_warning?: string
 }
 
 export interface AntigravityCreateResponse extends MessageResponse {
@@ -1170,6 +1176,8 @@ export interface GrokBatchImportRequest {
   base_url?: string
   models?: string[]
   proxy_url?: string
+  /** 采用文件内携带的代理，并把它们注册进代理池。 */
+  import_proxy?: boolean
   /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
   group_ids?: number[]
 }
@@ -1180,6 +1188,10 @@ export interface GrokBatchImportResponse {
   imported: number
   failed: number
   items: GrokSSOImportItem[]
+  /** 以下三项仅在 import_proxy=true 时返回。 */
+  proxies_imported?: number
+  proxies_skipped?: number
+  proxy_warning?: string
 }
 
 export interface UpdateAccountSchedulerRequest {
@@ -2770,6 +2782,13 @@ export interface CPAExportEntry {
   access_token: string
   last_refresh: string
   refresh_token: string
+  /**
+   * 代理三件套只在导出时勾选「包含代理配置」才出现。proxy_enabled 用可选布尔
+   * 区分「文件没带这个字段」（老文件，按启用处理）与「源端显式禁用」。
+   */
+  proxy_url?: string
+  proxy_label?: string
+  proxy_enabled?: boolean
 }
 
 export interface UsageStats {
