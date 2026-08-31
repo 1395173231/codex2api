@@ -1679,6 +1679,7 @@
     "statMonthlySent": "本月已发 {{sent}}",
     "statMonthlySentOf": "本月已发 {{sent}}/{{total}}",
     "recipientPicker": "从账号列表选择",
+    "clearEmails": "清空",
     "recipientSearch": "搜索账号邮箱…",
     "recipientLoading": "加载账号中…",
     "recipientChecking": "正在检查邮箱是否已被邀请…",

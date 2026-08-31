@@ -1679,6 +1679,7 @@
     "statMonthlySent": "{{sent}} sent this month",
     "statMonthlySentOf": "{{sent}}/{{total}} sent this month",
     "recipientPicker": "Pick from account list",
+    "clearEmails": "Clear",
     "recipientSearch": "Search account emails…",
     "recipientLoading": "Loading accounts…",
     "recipientChecking": "Checking whether these emails were already invited…",
