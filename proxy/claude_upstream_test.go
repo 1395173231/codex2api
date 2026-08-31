@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 )
 
@@ -65,7 +67,9 @@ func TestInjectClaudeCodeSystemPrompt_PreservesOtherFields(t *testing.T) {
 func TestMergeAnthropicBeta(t *testing.T) {
 	h := http.Header{}
 	h.Set("anthropic-beta", "foo-1, bar-2")
-	got := mergeAnthropicBeta(h)
+	cfg := auth.DefaultClaudeSecurityConfig()
+	cfg.AllowedBetaHeaders = []string{"foo-1", "bar-2"}
+	got := mergeAnthropicBetaWithConfig(h, cfg)
 	// 必须包含 oauth beta 且入站的两个 beta 都在
 	for _, want := range []string{"oauth-2025-04-20", "foo-1", "bar-2"} {
 		if !strings.Contains(got, want) {
@@ -77,7 +81,7 @@ func TestMergeAnthropicBeta(t *testing.T) {
 func TestMergeAnthropicBeta_Dedup(t *testing.T) {
 	h := http.Header{}
 	h.Set("anthropic-beta", "oauth-2025-04-20")
-	got := mergeAnthropicBeta(h)
+	got := mergeAnthropicBetaWithConfig(h, auth.DefaultClaudeSecurityConfig())
 	if strings.Count(got, "oauth-2025-04-20") != 1 {
 		t.Fatalf("oauth beta 应去重, got=%s", got)
 	}
@@ -135,8 +139,8 @@ func TestApplyClaudeMessagesHeaders_PreservesIncoming(t *testing.T) {
 func TestApplyClaudeMessagesHeaders_UsesFingerprintWhenAbsent(t *testing.T) {
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
 	fp := map[string]string{
-		"User-Agent":    "claude-cli/2.1.220 (external, cli)",
-		"X-App":         "cli",
+		"User-Agent":     "claude-cli/2.1.220 (external, cli)",
+		"X-App":          "cli",
 		"X-Stainless-OS": "Linux",
 	}
 	applyClaudeMessagesHeaders(req, "tok", http.Header{}, false, fp, "")
@@ -164,5 +168,55 @@ func TestApplyClaudeMessagesHeaders_ForceOverridesIncoming(t *testing.T) {
 	}
 	if req.Header.Get("X-Stainless-Os") != "Linux" {
 		t.Fatalf("force 应用指纹 x-stainless-os, got %s", req.Header.Get("X-Stainless-Os"))
+	}
+}
+
+func TestApplyClaudeMessagesHeadersRecordsFinalUserAgent(t *testing.T) {
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	req = req.WithContext(withUserAgentAudit(context.Background()))
+	incoming := http.Header{}
+	incoming.Set("User-Agent", "curl/8.7.1")
+	fingerprint := map[string]string{"User-Agent": "claude-cli/2.1.220 (external, cli)"}
+
+	applyClaudeMessagesHeaders(req, "tok", incoming, false, fingerprint, "force")
+
+	got, ok := upstreamUserAgentAudit(req.Context())
+	if !ok {
+		t.Fatal("Claude 出站请求应记录最终 User-Agent")
+	}
+	if got != "claude-cli/2.1.220 (external, cli)" {
+		t.Fatalf("审计的 upstream User-Agent = %q, want stable fingerprint", got)
+	}
+}
+
+func TestExecuteClaudeMessagesRequestClearsStaleUserAgentAudit(t *testing.T) {
+	ctx := withUserAgentAudit(context.Background())
+	RecordUpstreamUserAgent(ctx, "stale-client/1.0")
+	account := &auth.Account{UpstreamType: auth.UpstreamClaude}
+	_, _ = ExecuteClaudeMessagesRequest(ctx, account, []byte(`{"model":"claude-haiku-4-5","messages":[]}`), "", nil, "force")
+
+	if _, ok := upstreamUserAgentAudit(ctx); ok {
+		t.Fatal("Claude attempt should clear a previous attempt's User-Agent audit before transport")
+	}
+}
+
+func TestApplyClaudeMessagesHeadersForceCompletesPartialFingerprint(t *testing.T) {
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	incoming := http.Header{}
+	incoming.Set("User-Agent", "curl/8.7.1")
+	incoming.Set("X-Stainless-OS", "MacOS")
+	fingerprint := map[string]string{"User-Agent": "claude-cli/2.1.220 (external, cli)"}
+
+	applyClaudeMessagesHeaders(req, "tok", incoming, false, fingerprint, "force")
+	if req.Header.Get("User-Agent") != "claude-cli/2.1.220 (external, cli)" {
+		t.Fatalf("force UA = %q", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("X-Stainless-OS") == "MacOS" || strings.TrimSpace(req.Header.Get("X-Stainless-OS")) == "" {
+		t.Fatalf("force must not inherit a partial fingerprint's inbound OS: %q", req.Header.Get("X-Stainless-OS"))
+	}
+	for _, name := range auth.ClaudeIdentityHeaderNames {
+		if strings.TrimSpace(req.Header.Get(name)) == "" {
+			t.Fatalf("force fingerprint missing %s", name)
+		}
 	}
 }

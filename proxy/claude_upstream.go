@@ -17,6 +17,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -36,6 +37,10 @@ const (
 	claudeAnthropicVersion = "2023-06-01"
 	// claudeCodeSystemPreamble 是 OAuth 凭据要求的首个 system 块文本。
 	claudeCodeSystemPreamble = "You are Claude Code, Anthropic's official CLI for Claude."
+	// Sub2API protects integer conversion with math.MaxInt32/2. Keep the same
+	// protocol-level guard while leaving normal model-specific limits to the
+	// upstream provider (and the optional operator cap below).
+	claudeMaxTokensProtocolLimit int64 = math.MaxInt32 / 2
 )
 
 // claudeCodeSystemBlockJSON 是注入到 system 数组首位的块(带 ephemeral 缓存标记,
@@ -119,10 +124,14 @@ func markClaudeNativeRoute(resp *http.Response) {
 
 // ExecuteClaudeMessagesRequest 把入站 Anthropic Messages 请求透传给 Claude Code
 // OAuth 账号对应的上游,返回原始上游响应。
-func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header, fingerprintMode string) (*http.Response, error) {
+func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header, fingerprintMode string, securityConfigs ...auth.ClaudeSecurityConfig) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// A retry can reuse the request context. Clear any previous attempt's
+	// observation before building this attempt so a transport failure cannot
+	// make UsageLog attribute the old upstream User-Agent to the new request.
+	resetUpstreamUserAgentAudit(ctx)
 	if account == nil {
 		return nil, ErrNoAvailableAccount()
 	}
@@ -140,9 +149,17 @@ func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, re
 		return nil, ErrNoAvailableAccount()
 	}
 
-	// 安全净化:去零宽/控制字符 + NFC 归一。不改变可见文字与语义,只让请求更"正常"。
-	body := sanitizeClaudeRequestText(requestBody)
-	body = injectClaudeCodeSystemPrompt(body)
+	securityConfig := auth.DefaultClaudeSecurityConfig()
+	if len(securityConfigs) > 0 {
+		securityConfig = auth.NormalizeClaudeSecurityConfig(securityConfigs[0])
+	}
+	// Canonicalize before sending so the handler can run the exact same body
+	// through Prompt Filter. The ingress body retained in gin remains untouched
+	// for NewAPI signature verification and audit correlation.
+	body, err := prepareClaudeRequestBody(requestBody, securityConfig)
+	if err != nil {
+		return nil, ErrBadRequest(err.Error())
+	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
 	client := getPooledClient(account, proxyURL)
@@ -150,7 +167,7 @@ func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, re
 	if err != nil {
 		return nil, ErrInternalError("创建 Claude 请求失败", err)
 	}
-	applyClaudeMessagesHeaders(req, accessToken, headers, stream, fingerprint, fingerprintMode)
+	applyClaudeMessagesHeaders(req, accessToken, headers, stream, fingerprint, fingerprintMode, securityConfig)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -171,7 +188,11 @@ func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, re
 //     同一套 Claude Code 身份(强制替换,防跨客户端指纹漂移)。
 //
 // fingerprint 为账号绑定指纹头(规范化头名→值),来自 credentials.custom_headers。
-func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming http.Header, stream bool, fingerprint map[string]string, fingerprintMode string) {
+func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming http.Header, stream bool, fingerprint map[string]string, fingerprintMode string, securityConfigs ...auth.ClaudeSecurityConfig) {
+	securityConfig := auth.DefaultClaudeSecurityConfig()
+	if len(securityConfigs) > 0 {
+		securityConfig = auth.NormalizeClaudeSecurityConfig(securityConfigs[0])
+	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	// anthropic-version:优先保留入站真实客户端的值。
@@ -180,7 +201,7 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	} else {
 		req.Header.Set("anthropic-version", claudeAnthropicVersion)
 	}
-	req.Header.Set("anthropic-beta", mergeAnthropicBeta(incoming))
+	req.Header.Set("anthropic-beta", mergeAnthropicBetaWithConfig(incoming, securityConfig))
 	// OAuth 凭据不带 x-api-key;若入站客户端塞了，务必剔除避免冲突。
 	req.Header.Del("x-api-key")
 	if stream {
@@ -199,8 +220,17 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	force := auth.NormalizeClaudeFingerprintMode(fingerprintMode) == auth.ClaudeFingerprintModeForce
 	for _, name := range auth.ClaudeIdentityHeaderNames {
 		fpVal := strings.TrimSpace(fpLower[name])
-		if force && fpVal != "" {
-			req.Header.Set(name, fpVal)
+		if force {
+			// Legacy accounts may contain only a partial fingerprint. In force
+			// mode every identity header must still be deterministic; otherwise
+			// the missing field would inherit a different downstream client and
+			// silently defeat the stable-account contract.
+			if fpVal == "" {
+				fpVal = defaultClaudeIdentityHeader(name)
+			}
+			if fpVal != "" {
+				req.Header.Set(name, fpVal)
+			}
 			continue
 		}
 		if v := strings.TrimSpace(incoming.Get(name)); v != "" {
@@ -214,6 +244,38 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	// 保底:连指纹都没有(老账号未生成指纹)时,给一个稳定的默认 UA,避免空 UA 破绽。
 	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
 		req.Header.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+	}
+	// Keep Claude on the same request-scoped User-Agent audit path as Codex,
+	// Grok, and WebSocket transports. Record only the final sanitized header
+	// after preserve/force resolution so the Usage page can show whether the
+	// upstream identity was actually rewritten.
+	RecordUpstreamUserAgent(req.Context(), req.Header.Get("User-Agent"))
+}
+
+// defaultClaudeIdentityHeader is a deterministic compatibility fallback for
+// legacy accounts whose persisted fingerprint predates one of the current
+// Claude Code identity headers. It is deliberately a fixed, provider-shaped
+// value rather than a per-request random value, so force mode cannot drift.
+func defaultClaudeIdentityHeader(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "user-agent":
+		return "claude-cli/2.1.220 (external, cli)"
+	case "x-app":
+		return "cli"
+	case "x-stainless-lang":
+		return "js"
+	case "x-stainless-package-version":
+		return "0.68.0"
+	case "x-stainless-os":
+		return "Linux"
+	case "x-stainless-arch":
+		return "x64"
+	case "x-stainless-runtime":
+		return "node"
+	case "x-stainless-runtime-version":
+		return "v22.11.0"
+	default:
+		return ""
 	}
 }
 
@@ -271,18 +333,181 @@ func sanitizeClaudeRequestText(body []byte) []byte {
 	return out
 }
 
+// normalizeClaudeRequestBody applies the same canonicalization and egress
+// safety policy used for native Claude requests. It intentionally does not
+// inject the trusted Claude Code system preamble; callers may do that after
+// Prompt Filter has captured the user-visible request text.
+func normalizeClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byte, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, nil
+	}
+	cfg = auth.NormalizeClaudeSecurityConfig(cfg)
+	out := sanitizeClaudeRequestText(body)
+	root := gjson.ParseBytes(out)
+	if !root.IsObject() {
+		return nil, fmt.Errorf("Claude request body must be a JSON object")
+	}
+	for field, allowed := range map[string]bool{
+		"service_tier":      cfg.AllowServiceTier,
+		"inference_geo":     cfg.AllowInferenceGeo,
+		"speed":             cfg.AllowSpeed,
+		"safety_identifier": cfg.AllowSafetyIdentifier,
+		"stream_options":    true,
+	} {
+		if allowed {
+			continue
+		}
+		var err error
+		out, err = sjson.DeleteBytes(out, field)
+		if err != nil {
+			return nil, fmt.Errorf("remove Claude field %s: %w", field, err)
+		}
+	}
+	if includeObfuscation := gjson.GetBytes(out, "stream_options.include_obfuscation"); includeObfuscation.Exists() {
+		var err error
+		out, err = sjson.DeleteBytes(out, "stream_options.include_obfuscation")
+		if err != nil {
+			return nil, fmt.Errorf("remove Claude stream option: %w", err)
+		}
+		if streamOptions := gjson.GetBytes(out, "stream_options"); streamOptions.IsObject() && len(streamOptions.Map()) == 0 {
+			out, err = sjson.DeleteBytes(out, "stream_options")
+			if err != nil {
+				return nil, fmt.Errorf("remove empty Claude stream_options: %w", err)
+			}
+		}
+	}
+	// Sub2API accepts the legacy max_tokens_to_sample alias. Anthropic's
+	// Messages endpoint expects max_tokens, so normalize the alias before the
+	// request reaches Prompt Filter or the upstream. A conflicting pair is
+	// rejected instead of silently choosing one value.
+	legacyMaxTokens := gjson.GetBytes(out, "max_tokens_to_sample")
+	currentMaxTokens := gjson.GetBytes(out, "max_tokens")
+	if legacyMaxTokens.Exists() {
+		if legacyMaxTokens.Type == gjson.Null {
+			var err error
+			out, err = sjson.DeleteBytes(out, "max_tokens_to_sample")
+			if err != nil {
+				return nil, fmt.Errorf("remove null max_tokens_to_sample: %w", err)
+			}
+		} else if currentMaxTokens.Exists() {
+			legacyValue, legacyErr := parseClaudeMaxTokens(legacyMaxTokens, cfg)
+			currentValue, currentErr := parseClaudeMaxTokens(currentMaxTokens, cfg)
+			if legacyErr != nil {
+				return nil, legacyErr
+			}
+			if currentErr != nil {
+				return nil, currentErr
+			}
+			if legacyValue != currentValue {
+				return nil, fmt.Errorf("max_tokens and max_tokens_to_sample must match")
+			}
+			var err error
+			out, err = sjson.DeleteBytes(out, "max_tokens_to_sample")
+			if err != nil {
+				return nil, fmt.Errorf("remove max_tokens_to_sample: %w", err)
+			}
+		} else {
+			var err error
+			out, err = sjson.SetRawBytes(out, "max_tokens", []byte(legacyMaxTokens.Raw))
+			if err != nil {
+				return nil, fmt.Errorf("normalize max_tokens_to_sample: %w", err)
+			}
+			out, err = sjson.DeleteBytes(out, "max_tokens_to_sample")
+			if err != nil {
+				return nil, fmt.Errorf("remove max_tokens_to_sample: %w", err)
+			}
+		}
+	}
+	if maxTokens := gjson.GetBytes(out, "max_tokens"); maxTokens.Exists() {
+		if _, err := parseClaudeMaxTokens(maxTokens, cfg); err != nil {
+			return nil, err
+		}
+	}
+	// Claude Code currently sends context_management for its own stateful
+	// client, but the OAuth Messages endpoint rejects it with
+	// "Extra inputs are not permitted". It is not representable by the
+	// stateless gateway, so drop it while preserving all standard Messages
+	// controls (thinking/output_config/output_format/metadata/tools/etc.).
+	if gjson.GetBytes(out, "context_management").Exists() {
+		var err error
+		out, err = sjson.DeleteBytes(out, "context_management")
+		if err != nil {
+			return nil, fmt.Errorf("remove unsupported context_management: %w", err)
+		}
+	}
+	tools := gjson.GetBytes(out, "tools")
+	if tools.Exists() {
+		if !tools.IsArray() {
+			return nil, fmt.Errorf("tools must be an array")
+		}
+		items := tools.Array()
+		if cfg.MaxToolCount > 0 && len(items) > cfg.MaxToolCount {
+			return nil, fmt.Errorf("tools exceeds ClaudeCode safety limit (%d)", cfg.MaxToolCount)
+		}
+		var schemaBytes int64
+		for _, item := range items {
+			schemaBytes += int64(len(item.Raw))
+			if cfg.MaxToolSchemaBytes > 0 && schemaBytes > cfg.MaxToolSchemaBytes {
+				return nil, fmt.Errorf("tool schema exceeds ClaudeCode safety limit (%d bytes)", cfg.MaxToolSchemaBytes)
+			}
+		}
+	}
+	return out, nil
+}
+
+func parseClaudeMaxTokens(result gjson.Result, cfg auth.ClaudeSecurityConfig) (int64, error) {
+	value, parseErr := strconv.ParseInt(strings.TrimSpace(result.Raw), 10, 64)
+	if result.Type != gjson.Number || parseErr != nil || value < 0 {
+		return 0, fmt.Errorf("max_tokens must be a non-negative integer")
+	}
+	if value > claudeMaxTokensProtocolLimit {
+		return 0, fmt.Errorf("max_tokens exceeds Claude protocol limit (%d)", claudeMaxTokensProtocolLimit)
+	}
+	cfg = auth.NormalizeClaudeSecurityConfig(cfg)
+	if cfg.MaxOutputTokens > 0 && value > cfg.MaxOutputTokens {
+		return 0, fmt.Errorf("max_tokens exceeds ClaudeCode safety limit (%d)", cfg.MaxOutputTokens)
+	}
+	return value, nil
+}
+
+// prepareClaudeRequestBody is the canonical body used by both Prompt Filter
+// and the native Claude transport. Trusted Claude Code system metadata is
+// injected only after user-controlled fields have been normalized and bounded.
+func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byte, error) {
+	normalized, err := normalizeClaudeRequestBody(body, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return injectClaudeCodeSystemPrompt(normalized), nil
+}
+
 // mergeAnthropicBeta 把入站声明的 anthropic-beta 与 OAuth 必需的 oauth-2025-04-20
 // 合并去重,保证 OAuth 头始终在列。
 func mergeAnthropicBeta(incoming http.Header) string {
+	return mergeAnthropicBetaWithConfig(incoming, auth.DefaultClaudeSecurityConfig())
+}
+
+func mergeAnthropicBetaWithConfig(incoming http.Header, cfg auth.ClaudeSecurityConfig) string {
+	cfg = auth.NormalizeClaudeSecurityConfig(cfg)
+	allowed := make(map[string]struct{}, len(cfg.AllowedBetaHeaders)+1)
+	allowed[strings.ToLower(auth.ClaudeOAuthBeta)] = struct{}{}
+	for _, token := range cfg.AllowedBetaHeaders {
+		allowed[strings.ToLower(strings.TrimSpace(token))] = struct{}{}
+	}
 	seen := map[string]struct{}{}
 	ordered := make([]string, 0, 4)
-	add := func(raw string) {
+	add := func(raw string, filter bool) {
 		for _, part := range strings.Split(raw, ",") {
 			v := strings.TrimSpace(part)
 			if v == "" {
 				continue
 			}
 			key := strings.ToLower(v)
+			if filter {
+				if _, ok := allowed[key]; !ok {
+					continue
+				}
+			}
 			if _, ok := seen[key]; ok {
 				continue
 			}
@@ -290,10 +515,10 @@ func mergeAnthropicBeta(incoming http.Header) string {
 			ordered = append(ordered, v)
 		}
 	}
+	add(auth.ClaudeOAuthBeta, false)
 	if incoming != nil {
-		add(strings.Join(incoming.Values("anthropic-beta"), ","))
+		add(strings.Join(incoming.Values("anthropic-beta"), ","), true)
 	}
-	add(auth.ClaudeOAuthBeta)
 	return strings.Join(ordered, ",")
 }
 
@@ -502,6 +727,49 @@ func SyncClaudeUsageState(store *auth.Store, account *auth.Account, resp *http.R
 			store.MarkCooldown(account, claudeGenericRateLimitBackoff(h), "rate_limited")
 		}
 	}
+}
+
+// claudeCreditsRequiredCooldown 是「模型需购买 usage credits」被拒时对该**模型**的冷却时长。
+// credits_required 是模型级、需人工买 credits 才解除的计费门槛,不是账号级限流:
+// 若按账号冷却会连累该号其它可用模型;用模型级冷却既避免反复打上游又不误伤别的模型。
+const claudeCreditsRequiredCooldown = 30 * time.Minute
+
+// HandleClaudeModelBillingRejection 处理 Claude 的**模型级计费拒绝**(429 credits_required):
+// 只冷却被拒的那个模型(不动账号),已处理返回 true,调用方据此**跳过账号级用量/限流同步**。
+// 非该类错误返回 false,调用方继续走正常的 SyncClaudeUsageState。
+func HandleClaudeModelBillingRejection(store *auth.Store, account *auth.Account, model string, statusCode int, errBody []byte) bool {
+	if store == nil || account == nil || statusCode != http.StatusTooManyRequests || len(errBody) == 0 {
+		return false
+	}
+	code := strings.TrimSpace(gjson.GetBytes(errBody, "error.details.error_code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(errBody, "error.code").String())
+	}
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(errBody, "details.error_code").String())
+	}
+	message := strings.ToLower(strings.Join([]string{
+		gjson.GetBytes(errBody, "error.message").String(),
+		gjson.GetBytes(errBody, "message").String(),
+		string(errBody),
+	}, " "))
+	if !strings.EqualFold(code, "credits_required") &&
+		!(strings.Contains(message, "usage credits") && strings.Contains(message, "required")) {
+		return false
+	}
+	m := strings.TrimSpace(gjson.GetBytes(errBody, "error.details.model").String())
+	if m == "" {
+		m = strings.TrimSpace(gjson.GetBytes(errBody, "error.model").String())
+	}
+	if m == "" {
+		m = strings.TrimSpace(model)
+	}
+	if m == "" {
+		return false
+	}
+	// 模型级冷却,原因 credits_required;不做退避升级(固定窗口周期性复探,买 credits 后自然恢复)。
+	store.MarkModelCooldownWithBackoff(account, m, claudeCreditsRequiredCooldown, "credits_required", false)
+	return true
 }
 
 // claudeGenericRateLimitBackoff 返回通用限流(非窗口耗尽)的短冷却时长:

@@ -31,6 +31,37 @@ export interface ClaudeImportTokenRequest {
   timezone?: string
 }
 
+/** Versioned, provider-scoped Claude OAuth export. Secret-bearing fields are
+ * only returned by the administrator-only Claude export endpoint. */
+export interface ClaudeCredentialExportEntry extends ClaudeImportTokenRequest {
+  type: 'claude'
+  version: number
+  auth_kind: 'oauth'
+  plan_type?: string
+  models?: string[]
+  claude_fingerprint_mode?: 'preserve' | 'force' | ''
+  claude_user_agent?: string
+  fingerprint_headers?: Record<string, string>
+  tags?: string[]
+  group_refs?: Array<{ name: string; channel: 'claude' }>
+  enabled?: boolean
+}
+
+export interface ClaudeImportBundleItem {
+  id?: number
+  email?: string
+  ok: boolean
+  error?: string
+  warnings?: string[]
+}
+
+export interface ClaudeImportBundleResponse {
+  total: number
+  imported: number
+  failed: number
+  items: ClaudeImportBundleItem[]
+}
+
 export interface ClaudeAddAccountResponse {
   message: string
   id: number
@@ -147,6 +178,8 @@ export interface AccountRow {
   antigravity_auth_kind?: 'oauth' | 'api_key' | string
   agent_identity?: boolean
   grok_auth_kind?: string
+  /** Safe, allowlisted User-Agent observed/generated for Claude upstream calls. */
+  claude_user_agent?: string
   grok_plan?: GrokPlanInfo
   grok_billing?: GrokBillingDetail
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
@@ -3586,4 +3619,12 @@ export interface ClaudeGlobalConfig {
   fingerprint_mode: 'preserve' | 'force' | ''
   default_timezone: string
   session_window_limit: number
+  allow_service_tier: boolean
+  allow_inference_geo: boolean
+  allow_speed: boolean
+  allow_safety_identifier: boolean
+  allowed_beta_headers: string[]
+  max_output_tokens: number
+  max_tool_count: number
+  max_tool_schema_bytes: number
 }

@@ -1070,6 +1070,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/claude/oauth/auth-url", h.GenerateClaudeAuthURL)
 	api.POST("/accounts/claude/oauth/exchange-code", h.ExchangeClaudeOAuthCode)
 	api.POST("/accounts/claude/import", h.ImportClaudeToken)
+	api.GET("/accounts/claude/export", h.ExportClaudeAccounts)
 	api.POST("/accounts/:id/claude/models", h.RefreshClaudeModels)
 	api.POST("/accounts/claude/models/refresh", h.RefreshAllClaudeModels)
 	api.POST("/accounts/antigravity", h.AddAntigravityAccount)
@@ -1566,6 +1567,7 @@ type accountResponse struct {
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
 	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
 	ClaudeFingerprintMode         string                      `json:"claude_fingerprint_mode,omitempty"`
+	ClaudeUserAgent               string                      `json:"claude_user_agent,omitempty"`
 	Timezone                      string                      `json:"timezone,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
@@ -2369,6 +2371,38 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			}
 		}
 	}
+	if update.Timezone.Set {
+		if update.CredentialUpdates == nil {
+			update.CredentialUpdates = make(map[string]interface{})
+		}
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+			return
+		}
+		applied, err := prepareClaudeTimezoneCredentialUpdateWithHeaders(row, update.Timezone.Value, update.CredentialUpdates, func() map[string]string {
+			if update.CustomHeaders.Set {
+				return update.CustomHeaders.Values
+			}
+			return nil
+		}())
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if applied {
+			if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+				// The timezone path owns the final safe identity snapshot even
+				// when the request also supplied custom_headers; use that same
+				// snapshot for duplicate checks and immediate runtime updates.
+				update.CustomHeaders = optionalCustomHeaders{Set: true, Values: headers}
+			}
+		}
+	}
 
 	if update.CustomHeaders.Set {
 		h.mergeDuplicateMu.Lock()
@@ -2472,6 +2506,13 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	} else if update.Timezone.Set {
+		// A Claude timezone edit rebuilds the restricted identity headers in
+		// CredentialUpdates; publish the same snapshot immediately instead of
+		// waiting for the scheduler outbox/restart to refresh runtime state.
+		if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+			h.store.ApplyAccountCustomHeaders(id, headers)
+		}
 	}
 	if update.ClaudeFingerprintMode.Set {
 		h.store.ApplyAccountClaudeFingerprintMode(id, update.ClaudeFingerprintMode.Value)
@@ -11850,7 +11891,11 @@ func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
-	catalog.ClaudeModels = h.claudeChannelModels()
+	// The request-facing catalog must not advertise models contributed only by
+	// disabled/banned accounts or models currently marked credits_required.
+	// Keep claudeChannelModels for pricing/history, where those entries remain
+	// useful to operators.
+	catalog.ClaudeModels = h.claudeAvailableChannelModels()
 	c.JSON(http.StatusOK, catalog)
 }
 

@@ -11,6 +11,12 @@ import type { AntigravityOAuthClientSetting, HealthResponse, ModelInfo, SiteBran
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import {
+  CLAUDE_TIMEZONE_CUSTOM,
+  CLAUDE_TIMEZONE_OPTIONS,
+  claudeTimezoneLabel,
+  findClaudeTimezoneOption,
+} from '../lib/claudeAccountOptions'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
   buildContinuousRetryCatchAllPatch,
@@ -699,7 +705,16 @@ function ClaudeCodeSettingsCard() {
   const { showToast } = useToast()
   const [fingerprintMode, setFingerprintMode] = useState<'preserve' | 'force' | ''>('')
   const [timezone, setTimezone] = useState('')
+  const [timezoneCustom, setTimezoneCustom] = useState(false)
   const [sessionWindow, setSessionWindow] = useState('')
+  const [allowServiceTier, setAllowServiceTier] = useState(false)
+  const [allowInferenceGeo, setAllowInferenceGeo] = useState(false)
+  const [allowSpeed, setAllowSpeed] = useState(false)
+  const [allowSafetyIdentifier, setAllowSafetyIdentifier] = useState(false)
+  const [allowedBetaHeaders, setAllowedBetaHeaders] = useState('')
+  const [maxOutputTokens, setMaxOutputTokens] = useState('0')
+  const [maxToolCount, setMaxToolCount] = useState('0')
+  const [maxToolSchemaBytes, setMaxToolSchemaBytes] = useState('0')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
 
@@ -711,7 +726,16 @@ function ClaudeCodeSettingsCard() {
         if (cancelled) return
         setFingerprintMode((cfg.fingerprint_mode as 'preserve' | 'force' | '') ?? '')
         setTimezone(cfg.default_timezone ?? '')
+        setTimezoneCustom(Boolean(cfg.default_timezone && !findClaudeTimezoneOption(cfg.default_timezone)))
         setSessionWindow(cfg.session_window_limit ? String(cfg.session_window_limit) : '')
+        setAllowServiceTier(Boolean(cfg.allow_service_tier))
+        setAllowInferenceGeo(Boolean(cfg.allow_inference_geo))
+        setAllowSpeed(Boolean(cfg.allow_speed))
+        setAllowSafetyIdentifier(Boolean(cfg.allow_safety_identifier))
+        setAllowedBetaHeaders((cfg.allowed_beta_headers ?? []).join(', '))
+        setMaxOutputTokens(String(cfg.max_output_tokens ?? 0))
+        setMaxToolCount(String(cfg.max_tool_count ?? 0))
+        setMaxToolSchemaBytes(String(cfg.max_tool_schema_bytes ?? 0))
       })
       .catch(() => {
         /* 读取失败保持默认空 */
@@ -728,10 +752,21 @@ function ClaudeCodeSettingsCard() {
     setSaving(true)
     try {
       const n = Number(sessionWindow.trim())
+      const maxOutputValue = Number(maxOutputTokens.trim())
+      const maxToolValue = Number(maxToolCount.trim())
+      const maxToolSchemaValue = Number(maxToolSchemaBytes.trim())
       await api.updateClaudeConfig({
         fingerprint_mode: fingerprintMode,
         default_timezone: timezone.trim(),
         session_window_limit: Number.isFinite(n) && n > 0 ? Math.floor(n) : 0,
+        allow_service_tier: allowServiceTier,
+        allow_inference_geo: allowInferenceGeo,
+        allow_speed: allowSpeed,
+        allow_safety_identifier: allowSafetyIdentifier,
+        allowed_beta_headers: allowedBetaHeaders.split(',').map((item) => item.trim()).filter(Boolean),
+        max_output_tokens: Number.isFinite(maxOutputValue) && maxOutputValue >= 0 ? Math.floor(maxOutputValue) : 0,
+        max_tool_count: Number.isFinite(maxToolValue) && maxToolValue >= 0 ? Math.floor(maxToolValue) : 0,
+        max_tool_schema_bytes: Number.isFinite(maxToolSchemaValue) && maxToolSchemaValue >= 0 ? Math.floor(maxToolSchemaValue) : 0,
       })
       showToast(t('settings.claudeSaved'), 'success')
     } catch (error) {
@@ -739,7 +774,7 @@ function ClaudeCodeSettingsCard() {
     } finally {
       setSaving(false)
     }
-  }, [fingerprintMode, timezone, sessionWindow, showToast, t])
+  }, [allowInferenceGeo, allowSafetyIdentifier, allowServiceTier, allowSpeed, allowedBetaHeaders, fingerprintMode, maxOutputTokens, maxToolCount, maxToolSchemaBytes, sessionWindow, showToast, t, timezone])
 
   const selectCls =
     'h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none focus-visible:border-ring'
@@ -774,9 +809,65 @@ function ClaudeCodeSettingsCard() {
           </select>
         </SettingField>
         <SettingField label={t('settings.claudeDefaultTimezone')} description={t('settings.claudeDefaultTimezoneDesc')}>
-          <Input value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="Asia/Shanghai" />
+          <div className="space-y-1.5">
+            <Select
+              value={timezoneCustom ? CLAUDE_TIMEZONE_CUSTOM : (findClaudeTimezoneOption(timezone)?.value ?? (timezone ? CLAUDE_TIMEZONE_CUSTOM : ''))}
+              onValueChange={(value) => {
+                if (value === CLAUDE_TIMEZONE_CUSTOM) {
+                  setTimezoneCustom(true)
+                  if (findClaudeTimezoneOption(timezone)) setTimezone('')
+                  return
+                }
+                setTimezoneCustom(false)
+                setTimezone(value)
+              }}
+              options={[
+                { value: '', label: t('settings.claudeTimezoneUnset') },
+                ...CLAUDE_TIMEZONE_OPTIONS,
+                { value: CLAUDE_TIMEZONE_CUSTOM, label: t('settings.claudeTimezoneCustom') },
+              ]}
+            />
+            {timezoneCustom ? <Input value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="Asia/Shanghai" /> : null}
+            {timezone ? <p className="text-[10px] text-muted-foreground">{claudeTimezoneLabel(timezone)}</p> : null}
+          </div>
         </SettingField>
       </div>
+      <details className="mt-4 rounded-lg border border-primary/20 bg-primary/5">
+        <summary className="cursor-pointer px-3 py-2.5 text-sm font-semibold text-foreground">
+          {t('settings.claudeSecurityTitle')}
+        </summary>
+        <div className="space-y-4 border-t border-primary/10 px-3 pb-3 pt-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.claudeSecurityDesc')}</p>
+          <div className={SETTINGS_SWITCH_GRID}>
+            <SettingField label={t('settings.claudeAllowServiceTier')} description={t('settings.claudeAllowServiceTierDesc')} layout="switch">
+              <Switch checked={allowServiceTier} onCheckedChange={setAllowServiceTier} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowInferenceGeo')} description={t('settings.claudeAllowInferenceGeoDesc')} layout="switch">
+              <Switch checked={allowInferenceGeo} onCheckedChange={setAllowInferenceGeo} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowSpeed')} description={t('settings.claudeAllowSpeedDesc')} layout="switch">
+              <Switch checked={allowSpeed} onCheckedChange={setAllowSpeed} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowSafetyIdentifier')} description={t('settings.claudeAllowSafetyIdentifierDesc')} layout="switch">
+              <Switch checked={allowSafetyIdentifier} onCheckedChange={setAllowSafetyIdentifier} />
+            </SettingField>
+          </div>
+          <div className={SETTINGS_FIELD_GRID}>
+            <SettingField label={t('settings.claudeAllowedBetaHeaders')} description={t('settings.claudeAllowedBetaHeadersDesc')}>
+              <Input value={allowedBetaHeaders} onChange={(event) => setAllowedBetaHeaders(event.target.value)} placeholder="token-efficient-tools-2025-02-19" />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxOutputTokens')} description={t('settings.claudeMaxOutputTokensDesc')}>
+              <Input value={maxOutputTokens} onChange={(event) => setMaxOutputTokens(event.target.value)} inputMode="numeric" min={0} type="number" placeholder={t('settings.claudeUnlimitedPlaceholder')} />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxToolCount')} description={t('settings.claudeMaxToolCountDesc')}>
+              <Input value={maxToolCount} onChange={(event) => setMaxToolCount(event.target.value)} inputMode="numeric" min={0} type="number" />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxToolSchemaBytes')} description={t('settings.claudeMaxToolSchemaBytesDesc')}>
+              <Input value={maxToolSchemaBytes} onChange={(event) => setMaxToolSchemaBytes(event.target.value)} inputMode="numeric" min={0} type="number" />
+            </SettingField>
+          </div>
+        </div>
+      </details>
     </SettingsCard>
   )
 }
