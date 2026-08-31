@@ -27,6 +27,8 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../api";
+import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import type {
   AccountGroup,
   AccountListSummary,
@@ -476,6 +478,7 @@ function GroupChips({ account, groups }: { account: AccountRow; groups: AccountG
 function AccountMetadataFields({
   proxyUrl,
   onProxyUrlChange,
+  proxies = [],
   groupIds,
   onGroupIdsChange,
   groups,
@@ -483,6 +486,7 @@ function AccountMetadataFields({
 }: {
   proxyUrl: string;
   onProxyUrlChange: (value: string) => void;
+  proxies?: ProxyRow[];
   groupIds: number[];
   onGroupIdsChange: (value: number[]) => void;
   groups: AccountGroup[];
@@ -500,6 +504,8 @@ function AccountMetadataFields({
           onChange={(event) => onProxyUrlChange(event.target.value)}
           placeholder={t("antigravity.proxyUrlPlaceholder")}
         />
+        {/* 从代理池选择：展示每条代理已绑定账号数/空闲，选中写入上面的输入框。 */}
+        <ProxyPoolSelect proxies={proxies} onSelect={onProxyUrlChange} />
       </label>
       <div className="space-y-1.5">
         <span className="text-xs font-semibold text-muted-foreground">
@@ -905,6 +911,22 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 代理池：账号弹窗"从代理池选择"下拉的数据源，随页面加载一次；失败静默留空。
+  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listProxies()
+      .then((res) => {
+        if (!cancelled) setProxyPool(res.proxies ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setProxyPool([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const antigravityGroups = useMemo(
     () => allGroups.filter((group) => group.channel === "antigravity"),
     [allGroups],
@@ -2207,6 +2229,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
               </label>
               <AccountMetadataFields
                 proxyUrl={oauthDraft.proxyUrl}
+                proxies={proxyPool}
                 onProxyUrlChange={(proxyUrl) =>
                   setOAuthDraft((current) => ({ ...current, proxyUrl }))
                 }
@@ -2533,6 +2556,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
 
           <AccountMetadataFields
             proxyUrl={importDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setImportDraft((current) => ({ ...current, proxyUrl }))
             }
@@ -2738,6 +2762,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
           )}
           <AccountMetadataFields
             proxyUrl={editDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setEditDraft((current) => ({ ...current, proxyUrl }))
             }
