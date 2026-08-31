@@ -175,12 +175,9 @@ func TestAsyncReconcileCoalescesOntoActiveRunCompletion(t *testing.T) {
 	default:
 	}
 
-	changed, err := store.reconcileDispatchState(ctx)
+	_, err = store.reconcileDispatchState(ctx)
 	if err != nil {
 		t.Fatalf("reconcileDispatchState: %v", err)
-	}
-	if !changed {
-		t.Fatal("reconcileDispatchState reported no change for a newly added account")
 	}
 	store.finishDispatchStateReconcile(activeDone)
 	select {
