@@ -33,6 +33,10 @@ import type {
 } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { useToast } from '../hooks/useToast'
+import {
+  inviteRecipientCandidates,
+  isCodexInviteSenderCandidate,
+} from '../lib/inviteAccountSelection'
 
 interface Props {
   accounts: AccountRow[]
@@ -93,14 +97,6 @@ function accountSearchText(account: AccountRow): string {
     .toLowerCase()
 }
 
-function isCodexInviteCandidate(account: AccountRow): boolean {
-  // 仅排除发不出邀请的硬条件：中转 / AT-only 账号没有可用于 referral 的 Codex OAuth 凭证。
-  // enabled / locked / status 只是调度开关与健康状态，不影响 access token 是否可用——
-  // 后端 SendCodexInvite 只要求账号有 access token，不校验这些字段，故前端不在此过滤，
-  // 否则会把仅被禁用调度或临时异常、但凭证仍可用的账号从下拉中隐藏（见 issue #281）。
-  return !account.openai_responses_api && !account.at_only
-}
-
 // 状态圆点配色，与全局 StatusBadge 保持一致。
 const STATUS_DOT_COLOR: Record<string, string> = {
   active: 'bg-emerald-500',
@@ -145,14 +141,9 @@ function findCapacityRule(eligibility: InviteEligibility | null, capacityType: s
   return eligibility?.time_frame_rules?.find((rule) => rule.capacity_type === capacityType) ?? null
 }
 
-// 账号是否处于「非正常」状态。仅用于 UI 提示与视觉区分，不影响能否发送邀请——
-// 凭证（access token）可用即可发邀请，这里只是提醒用户当前选的是什么状态的号。
-function accountAbnormalKey(account: AccountRow): 'disabled' | 'locked' | 'unauthorized' | 'error' | null {
-  if (account.enabled === false) return 'disabled'
+// 锁定用于保护账号不被自动清理，并不代表邀请凭证失效，保留提示帮助用户辨认。
+function accountAbnormalKey(account: AccountRow): 'locked' | null {
   if (account.locked) return 'locked'
-  const status = (account.status || '').toLowerCase()
-  if (status === 'unauthorized') return 'unauthorized'
-  if (status === 'error') return 'error'
   return null
 }
 
@@ -187,9 +178,9 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
   const [pickerAccounts, setPickerAccounts] = useState<AccountRow[]>(accounts)
   const [pickerLoading, setPickerLoading] = useState(loading)
 
-  // 仅保留可用于 referral 的 Codex OAuth 账号；选择器由服务端分页搜索驱动。
+  // 仅保留状态正常且可用于 referral 的 Codex OAuth 账号；选择器由服务端分页搜索驱动。
   const codexAccounts = useMemo(
-    () => pickerAccounts.filter(isCodexInviteCandidate),
+    () => pickerAccounts.filter(isCodexInviteSenderCandidate),
     [pickerAccounts],
   )
   const firstAccount = codexAccounts[0] ?? null
@@ -302,7 +293,7 @@ export default function CodexInviteView({ accounts, onClose, loading = false }: 
     !overLimit &&
     !sendCapacityExhausted &&
     !ineligible
-  // 选中账号的非正常状态（禁用/锁定/封禁/错误）；用于提示用户当前选的不是正常号。
+  // 锁定账号仍可邀请，但保留其保护状态提示。
   const selectedAbnormal = useMemo(
     () => (selectedAccount ? accountAbnormalKey(selectedAccount) : null),
     [selectedAccount],
@@ -1223,9 +1214,9 @@ function InviteCreditsBadge({ plan }: { plan?: InviteGuideAccountPlan }) {
 }
 
 // RecipientAccountPicker 从账号列表挑选受邀邮箱，支持单选与连续多选（勾选不关闭
-// 下拉）。候选由服务端分页搜索驱动，与左列账号选择器同一条数据通道；只展示有邮箱
-// 的账号，按邮箱去重（team 空间会让同一登录邮箱出现在多个账号行里），并排除当前
-// 发起账号自己——给自己发邀请必然被上游拒绝。
+// 下拉）。候选由服务端分页搜索驱动，与左列账号选择器同一条数据通道；排除禁用、
+// 错误和封禁账号，只展示有邮箱的账号，按邮箱去重（team 空间会让同一登录邮箱出现
+// 在多个账号行里），并排除当前发起账号自己——给自己发邀请必然被上游拒绝。
 function RecipientAccountPicker({
   selectedEmails,
   onToggle,
@@ -1289,29 +1280,19 @@ function RecipientAccountPicker({
     return () => document.removeEventListener('pointerdown', handlePointerDown)
   }, [open])
 
+  const candidates = useMemo(
+    () => inviteRecipientCandidates(rows, excludeEmail),
+    [rows, excludeEmail],
+  )
+
   // 候选可见时回读网关缓存里的积分（纯缓存读，零上游），让「单次 250」这类
   // 信息直接标在行上——单次收益低的号更适合当受邀方，一眼可辨。
   useEffect(() => {
-    if (!open || rows.length === 0) return
-    const ids = rows.map((row) => row.id)
+    if (!open || candidates.length === 0) return
+    const ids = candidates.map((row) => row.id)
     const timer = window.setTimeout(() => onLoadCredits(ids), 300)
     return () => window.clearTimeout(timer)
-  }, [open, rows, onLoadCredits])
-
-  const excluded = (excludeEmail ?? '').trim().toLowerCase()
-  const candidates = useMemo(() => {
-    const seen = new Set<string>()
-    const out: AccountRow[] = []
-    for (const row of rows) {
-      const email = row.email?.trim()
-      if (!email) continue
-      const key = email.toLowerCase()
-      if (key === excluded || seen.has(key)) continue
-      seen.add(key)
-      out.push(row)
-    }
-    return out
-  }, [rows, excluded])
+  }, [open, candidates, onLoadCredits])
 
   return (
     <div ref={containerRef} className="relative">
