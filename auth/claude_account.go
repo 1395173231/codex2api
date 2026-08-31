@@ -19,6 +19,16 @@ import (
 // UpstreamClaude 是 Claude Code OAuth 账号的 upstream_type 判别值。
 const UpstreamClaude = "claude"
 
+// ClaudeUsageProbeAtCredentialKey and ClaudeUsageProbeErrorCredentialKey are
+// non-sensitive control-plane fields used by the admin account list to show
+// whether an imported Claude account has completed its first native sampling
+// request. They deliberately live alongside credentials so the existing
+// SQLite/PostgreSQL projection remains backward compatible.
+const (
+	ClaudeUsageProbeAtCredentialKey    = "claude_usage_probe_at"
+	ClaudeUsageProbeErrorCredentialKey = "claude_usage_probe_error"
+)
+
 // isClaudeOAuthLocked 判断账号是否为 Claude Code OAuth 账号。调用方需持有 a.mu。
 func (a *Account) isClaudeOAuthLocked() bool {
 	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamClaude)
@@ -95,6 +105,10 @@ func (s *Store) refreshClaudeAccount(ctx context.Context, acc *Account, forceRef
 	if strings.TrimSpace(td.Email) != "" {
 		updates["email"] = td.Email
 	}
+	// 订阅档位随 profile 变化(升降级)时同步更新。
+	if plan := strings.TrimSpace(td.PlanType); plan != "" {
+		updates["plan_type"] = plan
+	}
 	if strings.TrimSpace(td.AccountUUID) != "" {
 		updates["account_id"] = td.AccountUUID
 	}
@@ -116,6 +130,9 @@ func (s *Store) refreshClaudeAccount(ctx context.Context, acc *Account, forceRef
 	}
 	if strings.TrimSpace(td.AccountUUID) != "" {
 		acc.AccountID = td.AccountUUID
+	}
+	if plan := strings.TrimSpace(td.PlanType); plan != "" {
+		acc.PlanType = plan
 	}
 	if !cooldownActive {
 		acc.Status = StatusReady
