@@ -860,6 +860,95 @@ func grokResponseSSEEvents(stream []byte) []gjson.Result {
 	return events
 }
 
+func TestGrokSyntheticResponsesUseConsistentUnixCreatedAt(t *testing.T) {
+	tests := []struct {
+		name          string
+		terminalEvent string
+		reader        func() io.ReadCloser
+	}{
+		{
+			name:          "chat completed",
+			terminalEvent: "response.completed",
+			reader: func() io.ReadCloser {
+				return newChatToResponsesReader(io.NopCloser(strings.NewReader(
+					"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"+
+						"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n")), "grok")
+			},
+		},
+		{
+			name:          "chat failed",
+			terminalEvent: "response.failed",
+			reader: func() io.ReadCloser {
+				return newChatToResponsesReader(io.NopCloser(strings.NewReader(
+					"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n")), "grok")
+			},
+		},
+		{
+			name:          "messages completed",
+			terminalEvent: "response.completed",
+			reader: func() io.ReadCloser {
+				return newMessagesToResponsesReader(io.NopCloser(strings.NewReader(
+					"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"grok\",\"usage\":{\"input_tokens\":1}}}\n\n"+
+						"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"+
+						"data: {\"type\":\"message_stop\"}\n\n")), "grok")
+			},
+		},
+		{
+			name:          "messages failed",
+			terminalEvent: "response.failed",
+			reader: func() io.ReadCloser {
+				return newMessagesToResponsesReader(io.NopCloser(strings.NewReader(
+					"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"grok\",\"usage\":{\"input_tokens\":1}}}\n\n"+
+						"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n")), "grok")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream, err := io.ReadAll(test.reader())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSyntheticResponseCreatedAt(t, stream, test.terminalEvent)
+		})
+	}
+}
+
+func assertSyntheticResponseCreatedAt(t *testing.T, stream []byte, terminalEvent string) {
+	t.Helper()
+	var createdAt, terminalAt gjson.Result
+	for _, frame := range bytes.Split(stream, []byte("\n\n")) {
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if !gjson.ValidBytes(payload) {
+				continue
+			}
+			event := gjson.ParseBytes(payload)
+			switch event.Get("type").String() {
+			case "response.created":
+				createdAt = event.Get("response.created_at")
+			case terminalEvent:
+				terminalAt = event.Get("response.created_at")
+			}
+		}
+	}
+	if createdAt.Type != gjson.Number || terminalAt.Type != gjson.Number {
+		t.Fatalf("created_at missing from created/terminal events: %s", stream)
+	}
+	now := time.Now().Unix()
+	if createdAt.Int() <= 0 || createdAt.Int() > now || createdAt.Float() != float64(createdAt.Int()) {
+		t.Fatalf("created_at = %s, want Unix seconds", createdAt.Raw)
+	}
+	if terminalAt.Int() != createdAt.Int() {
+		t.Fatalf("created_at changed within one response: created=%s terminal=%s", createdAt.Raw, terminalAt.Raw)
+	}
+}
+
 func TestChatAdapterFinalOutputPreservesFirstEventOrderAndToolIdentity(t *testing.T) {
 	source := io.NopCloser(bytes.NewBufferString(
 		"data: {\"choices\":[{\"delta\":{\"content\":\"before\"},\"finish_reason\":null}]}\n\n" +

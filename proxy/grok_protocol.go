@@ -685,6 +685,7 @@ type chatToResponsesReader struct {
 	queue       bytes.Buffer
 	responseID  string
 	model       string
+	createdAt   int64
 	created     bool
 	terminal    bool
 	output      []chatResponseOutputRef
@@ -723,7 +724,18 @@ type chatResponseTool struct {
 }
 
 func newChatToResponsesReader(source io.ReadCloser, model string) io.ReadCloser {
-	return &chatToResponsesReader{source: source, reader: bufio.NewReader(source), responseID: "resp_" + uuid.NewString(), model: model, tools: make(map[int]*chatResponseTool)}
+	return &chatToResponsesReader{
+		source: source, reader: bufio.NewReader(source),
+		responseID: "resp_" + uuid.NewString(), model: model, createdAt: time.Now().Unix(),
+		tools: make(map[int]*chatResponseTool),
+	}
+}
+
+func (r *chatToResponsesReader) response(status string) map[string]any {
+	return map[string]any{
+		"id": r.responseID, "object": "response", "created_at": r.createdAt,
+		"status": status, "model": r.model,
+	}
 }
 
 func (r *chatToResponsesReader) ensureReasoningOutput() {
@@ -798,7 +810,7 @@ func (r *chatToResponsesReader) enqueueCreated() {
 		return
 	}
 	r.created = true
-	r.queue.Write(responseEvent("response.created", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "in_progress", "model": r.model}}))
+	r.queue.Write(responseEvent("response.created", map[string]any{"response": r.response("in_progress")}))
 }
 
 func chatFinishReasonStatus(reason string) string {
@@ -830,7 +842,9 @@ func (r *chatToResponsesReader) translate(data []byte) {
 		if message == "" {
 			message = "upstream Chat Completions stream failed"
 		}
-		r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "failed", "model": r.model, "error": map[string]any{"code": code, "message": message}}}))
+		response := r.response("failed")
+		response["error"] = map[string]any{"code": code, "message": message}
+		r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 		r.terminal = true
 		return
 	}
@@ -944,7 +958,9 @@ func (r *chatToResponsesReader) emitChatTerminal(status string) {
 			output = append(output, chatResponseToolItem(tool, "incomplete"))
 		}
 	}
-	response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
+	response := r.response(status)
+	response["output"] = output
+	response["usage"] = usage
 	if status == "completed" || status == "incomplete" {
 		if status == "incomplete" {
 			response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
@@ -996,7 +1012,9 @@ func (r *chatToResponsesReader) Read(p []byte) (int, error) {
 					break
 				}
 				r.enqueueCreated()
-				r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "status": "failed", "model": r.model, "error": map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}}}))
+				response := r.response("failed")
+				response["error"] = map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}
+				r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 				r.terminal = true
 				break
 			}
@@ -1025,6 +1043,7 @@ type messagesToResponsesReader struct {
 	queue      bytes.Buffer
 	responseID string
 	model      string
+	createdAt  int64
 	created    bool
 	terminal   bool
 	blocks     map[int]*messagesResponseBlock
@@ -1047,7 +1066,18 @@ type messagesResponseBlock struct {
 }
 
 func newMessagesToResponsesReader(source io.ReadCloser, model string) io.ReadCloser {
-	return &messagesToResponsesReader{source: source, reader: bufio.NewReader(source), responseID: "resp_" + uuid.NewString(), model: model, blocks: make(map[int]*messagesResponseBlock), usage: make(map[string]int64)}
+	return &messagesToResponsesReader{
+		source: source, reader: bufio.NewReader(source),
+		responseID: "resp_" + uuid.NewString(), model: model, createdAt: time.Now().Unix(),
+		blocks: make(map[int]*messagesResponseBlock), usage: make(map[string]int64),
+	}
+}
+
+func (r *messagesToResponsesReader) response(status string) map[string]any {
+	return map[string]any{
+		"id": r.responseID, "object": "response", "created_at": r.createdAt,
+		"status": status, "model": r.model,
+	}
 }
 
 func (r *messagesToResponsesReader) ensureBlock(index int, blockType string) *messagesResponseBlock {
@@ -1112,7 +1142,7 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 		}
 		r.usage["input_tokens"] = event.Get("message.usage.input_tokens").Int()
 		r.usage["cached_tokens"] = event.Get("message.usage.cache_read_input_tokens").Int()
-		r.queue.Write(responseEvent("response.created", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "in_progress", "model": r.model}}))
+		r.queue.Write(responseEvent("response.created", map[string]any{"response": r.response("in_progress")}))
 	case "content_block_start":
 		index := int(event.Get("index").Int())
 		blockType := event.Get("content_block.type").String()
@@ -1213,14 +1243,18 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 				output = append(output, messagesResponseToolItem(block, "incomplete"))
 			}
 		}
-		response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
+		response := r.response(status)
+		response["output"] = output
+		response["usage"] = usage
 		if status == "incomplete" {
 			response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 		}
 		r.queue.Write(responseEvent("response.completed", map[string]any{"response": response}))
 		r.terminal = true
 	case "error":
-		r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "failed", "model": r.model, "error": map[string]any{"code": event.Get("error.type").String(), "message": event.Get("error.message").String()}}}))
+		response := r.response("failed")
+		response["error"] = map[string]any{"code": event.Get("error.type").String(), "message": event.Get("error.message").String()}
+		r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 		r.terminal = true
 	}
 }
@@ -1230,7 +1264,9 @@ func (r *messagesToResponsesReader) Read(p []byte) (int, error) {
 		data, err := readSSEDataLine(r.reader)
 		if err != nil {
 			if err == io.EOF && !r.terminal {
-				r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "status": "failed", "model": r.model, "error": map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}}}))
+				response := r.response("failed")
+				response["error"] = map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}
+				r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 				r.terminal = true
 				break
 			}
