@@ -4176,7 +4176,14 @@
         "custom": "自定义",
         "synced": "已同步",
         "default": "代码默认"
-      }
+      },
+      "catalogTitle": "模型目录",
+      "catalogSearch": "搜索模型…",
+      "catalogCount": "共 {{count}} 个模型",
+      "catalogRefresh": "刷新账号模型",
+      "catalogRefreshed": "已刷新,可用模型共 {{count}} 个",
+      "catalogMarkSeen": "标记已读",
+      "newBadge": "新"
     },
     "modelRegistryDesc": "同步 OpenAI 官方 Codex 模型页，合并到本地模型列表。",
     "modelsEnabled": "启用模型",
@@ -5482,6 +5489,22 @@
     "authUrlFailed": "生成授权链接失败",
     "exchangeFailed": "换取 token 失败",
     "deleteConfirm": "确认删除该 Claude 账号？",
-    "timezonePlaceholder": "时区,如 Asia/Shanghai(留空=不指定)"
+    "timezonePlaceholder": "时区,如 Asia/Shanghai(留空=不指定)",
+    "refreshModels": "刷新模型",
+    "modelsRefreshed": "已更新可用模型（{{count}} 个）",
+    "emptyFiltered": "没有符合筛选的账号",
+    "schedulingView": "调度视图",
+    "searchPlaceholder": "搜索邮箱、名称或模型…",
+    "modelCount": "{{count}} 个模型",
+    "statAll": "全部",
+    "statNormal": "正常",
+    "statRateLimited": "限流",
+    "statAbnormal": "异常",
+    "statError": "错误",
+    "statDisabled": "已禁用",
+    "statLocked": "已锁定",
+    "healthHealthy": "健康",
+    "healthWarm": "预热",
+    "healthRisky": "风险"
   }
 }

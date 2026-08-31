@@ -490,16 +490,23 @@ func modelMatchesRule(model string, rule string) bool {
 func claudeFamilyPricing(model string) *ModelPricing {
 	switch {
 	case strings.Contains(model, "opus"):
-		if strings.Contains(model, "4.7") || strings.Contains(model, "4-7") ||
-			strings.Contains(model, "4.6") || strings.Contains(model, "4-6") ||
-			strings.Contains(model, "4.5") || strings.Contains(model, "4-5") {
-			return &ModelPricing{InputPricePerMToken: 5.0, OutputPricePerMToken: 25.0}
+		// 传统 Opus(3 / 4 / 4.1)为 $15/$75;自 4.5 起 Opus 降至 $5/$25,更新的版本
+		// (4.6/4.7/4.8/5…)默认沿用现代档,避免新模型误套旧高价。
+		legacyOpus := strings.Contains(model, "opus-3") || strings.Contains(model, "3-opus") ||
+			strings.Contains(model, "opus-4-1") || strings.Contains(model, "opus-4.1") ||
+			strings.Contains(model, "opus-4-0") || strings.Contains(model, "opus-4-2025")
+		if legacyOpus {
+			return &ModelPricing{InputPricePerMToken: 15.0, OutputPricePerMToken: 75.0}
 		}
-		return &ModelPricing{InputPricePerMToken: 15.0, OutputPricePerMToken: 75.0}
+		return &ModelPricing{InputPricePerMToken: 5.0, OutputPricePerMToken: 25.0}
 	case strings.Contains(model, "sonnet"):
 		return &ModelPricing{InputPricePerMToken: 3.0, OutputPricePerMToken: 15.0}
 	case strings.Contains(model, "haiku"):
-		if strings.Contains(model, "3-5") || strings.Contains(model, "3.5") {
+		// 3.5 与 4.x Haiku 均为 $1/$5;仅初代 claude-3-haiku 为 $0.25/$1.25。
+		if strings.Contains(model, "3-5") || strings.Contains(model, "3.5") ||
+			strings.Contains(model, "4-5") || strings.Contains(model, "4.5") ||
+			strings.Contains(model, "4-6") || strings.Contains(model, "4.6") ||
+			strings.Contains(model, "4-7") || strings.Contains(model, "4.7") {
 			return &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 5.0}
 		}
 		return &ModelPricing{InputPricePerMToken: 0.25, OutputPricePerMToken: 1.25}

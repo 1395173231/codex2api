@@ -4176,7 +4176,14 @@
         "custom": "Custom",
         "synced": "Synced",
         "default": "Default"
-      }
+      },
+      "catalogTitle": "Model catalog",
+      "catalogSearch": "Search models…",
+      "catalogCount": "{{count}} models",
+      "catalogRefresh": "Refresh account models",
+      "catalogRefreshed": "Refreshed, {{count}} models available",
+      "catalogMarkSeen": "Mark seen",
+      "newBadge": "NEW"
     },
     "modelRegistryDesc": "Sync the official OpenAI Codex models page and merge it into the local model list.",
     "modelsEnabled": "Enabled Models",
@@ -5482,6 +5489,22 @@
     "authUrlFailed": "Failed to generate auth link",
     "exchangeFailed": "Token exchange failed",
     "deleteConfirm": "Delete this Claude account?",
-    "timezonePlaceholder": "Timezone, e.g. Asia/Shanghai (empty = none)"
+    "timezonePlaceholder": "Timezone, e.g. Asia/Shanghai (empty = none)",
+    "refreshModels": "Refresh models",
+    "modelsRefreshed": "Updated available models ({{count}})",
+    "emptyFiltered": "No accounts match the filter",
+    "schedulingView": "Scheduling",
+    "searchPlaceholder": "Search email, name or model…",
+    "modelCount": "{{count}} models",
+    "statAll": "All",
+    "statNormal": "Normal",
+    "statRateLimited": "Rate-limited",
+    "statAbnormal": "Abnormal",
+    "statError": "Error",
+    "statDisabled": "Disabled",
+    "statLocked": "Locked",
+    "healthHealthy": "Healthy",
+    "healthWarm": "Warm",
+    "healthRisky": "Risky"
   }
 }
