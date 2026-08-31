@@ -2,9 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  alreadyInvitedEmails,
   inviteRecipientCandidates,
+  inviteRecipientRecord,
   isCodexInviteSenderCandidate,
   isInviteAccountSelectable,
+  mergeInviteRecipientIndex,
+  normalizeInviteEmails,
 } from './inviteAccountSelection.ts'
 
 function account(overrides = {}) {
@@ -59,4 +63,39 @@ test('recipient candidates apply account filtering before email deduplication', 
     inviteRecipientCandidates(rows, ' SENDER@example.com ').map((row) => row.id),
     [3, 6],
   )
+})
+
+test('recipient status queries normalize and deduplicate email keys', () => {
+  assert.deepEqual(
+    normalizeInviteEmails([' First@Example.com ', 'first@example.com', '', 'SECOND@example.com']),
+    ['first@example.com', 'second@example.com'],
+  )
+})
+
+test('recorded recipients remain visible but are found case-insensitively for disabling', () => {
+  const row = account({ id: 9, email: 'Already@Example.com' })
+  const candidates = inviteRecipientCandidates([row])
+  const index = mergeInviteRecipientIndex({}, [{
+    email: ' already@example.com ',
+    state: 'sent',
+    sender_account_id: 3,
+  }])
+
+  assert.deepEqual(candidates.map((candidate) => candidate.id), [9])
+  assert.equal(inviteRecipientRecord(index, row.email)?.state, 'sent')
+  assert.deepEqual(alreadyInvitedEmails(['ALREADY@example.com', 'new@example.com'], index), [
+    'ALREADY@example.com',
+  ])
+})
+
+test('recipient index merge keeps existing entries and ignores blank emails', () => {
+  const current = mergeInviteRecipientIndex({}, [{ email: 'first@example.com', state: 'sent' }])
+  const next = mergeInviteRecipientIndex(current, [
+    { email: ' ', state: 'sent' },
+    { email: 'SECOND@EXAMPLE.COM', state: 'pending' },
+  ])
+
+  assert.equal(inviteRecipientRecord(next, ' first@example.com ')?.state, 'sent')
+  assert.equal(inviteRecipientRecord(next, 'second@example.com')?.state, 'pending')
+  assert.equal(Object.keys(next).length, 2)
 })

@@ -60,6 +60,7 @@ type Handler struct {
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	sendCodexInvite        func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
 	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
@@ -965,6 +966,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
 	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.sendCodexInvite = proxy.SendCodexInvite
 	handler.whamDailyBackfillLast = make(map[int64]time.Time)
 	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
 	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
@@ -1101,6 +1103,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/invite/eligibility", h.GetInviteEligibility)
 	api.GET("/accounts/:id/invite/tracking", h.GetInviteTracking)
+	api.POST("/accounts/invite/recipients/check", h.CheckInviteRecipients)
 	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
