@@ -6704,7 +6704,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 		merged := mergeCredentialMaps(decodeCredentials(currentRaw), map[string]interface{}{
 			"allowed_api_key_ids": normalizePositiveInt64Slice(allowedAPIKeyIDs.Values),
 		})
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -6785,7 +6785,7 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 			current := decodeCredentials(currentRaw)
 			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
 			identityChanged := grokIdentityCredentialChanged(current, merged)
-			credJSON, err := json.Marshal(merged)
+			credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
 			}
@@ -7004,7 +7004,7 @@ func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, cur
 		// generation bump.
 		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
 		identityChanged := grokIdentityCredentialChanged(credentials, merged)
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -7188,7 +7188,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7222,6 +7222,12 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 		for key, value := range credentials {
 			if !sqliteJSONSetKeySupported(key) {
 				return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
+			}
+			// SQLite 逐键写:敏感字段在此处按键加密(密钥未设时 no-op)。
+			if _, sensitive := sensitiveCredentialKeys[key]; sensitive {
+				if s, isStr := value.(string); isStr {
+					value = encryptCredentialValue(key, s)
+				}
 			}
 			valueJSON, err := json.Marshal(value)
 			if err != nil {
@@ -7273,7 +7279,7 @@ func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id i
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7358,7 +7364,7 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
 	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7408,7 +7414,7 @@ func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, crede
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7817,7 +7823,7 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7863,7 +7869,7 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	credentials := map[string]interface{}{
 		"access_token": accessToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7880,7 +7886,7 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7897,7 +7903,7 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7922,7 +7928,7 @@ func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, acc
 	if strings.TrimSpace(accountType) == "" {
 		accountType = "api"
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
