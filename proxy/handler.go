@@ -436,7 +436,7 @@ func antigravityChannelAccountFilter(model string) auth.AccountFilter {
 		if !supported {
 			return false
 		}
-		if account.IsModelRateLimited(model) || account.IsModelRateLimited(wireModel) {
+		if antigravityAccountModelRateLimited(account, model, wireModel) {
 			return false
 		}
 		return true
@@ -484,7 +484,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 				return false
 			}
 			wireModel, supported := antigravityResolvePublicModelForAccount(account, effectiveModel)
-			return supported && !account.IsModelRateLimited(effectiveModel) && !account.IsModelRateLimited(wireModel)
+			return supported && !antigravityAccountModelRateLimited(account, effectiveModel, wireModel)
 		}
 		if account.IsRelayStyle() {
 			routedModel := effectiveModel
@@ -4125,7 +4125,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed {
+				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -6820,7 +6820,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d, endpoint=/v1/chat/completions): %v", account.ID(), refreshErr)
 				}
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
@@ -8003,11 +8003,13 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
 	}
 	// Antigravity 401 is recovered by RefreshAntigravityAccount. Do not apply
-	// Codex subscription/payment semantics, but retain relay-style model
-	// cooldowns for real 429s so repeated requests cannot hammer Google.
+	// Codex subscription/payment semantics. 429/503 carry Google's structured
+	// quota status instead, which sizes the per-(account, model) cooldown from
+	// the upstream retry hint and keeps a shared capacity shortage from being
+	// charged to this credential.
 	if account.IsAntigravityAPI() {
-		if statusCode == http.StatusTooManyRequests {
-			return Apply429Cooldown(h.store, account, body, resp, model)
+		if statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable {
+			return applyAntigravityCooldown(h.store, account, statusCode, body, resp, model)
 		}
 		return codex429Decision{}
 	}
