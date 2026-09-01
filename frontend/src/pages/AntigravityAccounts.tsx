@@ -921,22 +921,6 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
-  // 代理池：账号弹窗"从代理池选择"下拉的数据源，随页面加载一次；失败静默留空。
-  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void api
-      .listProxies()
-      .then((res) => {
-        if (!cancelled) setProxyPool(res.proxies ?? []);
-      })
-      .catch(() => {
-        if (!cancelled) setProxyPool([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
   const antigravityGroups = useMemo(
     () => allGroups.filter((group) => group.channel === "antigravity"),
     [allGroups],
