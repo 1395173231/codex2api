@@ -1,6 +1,72 @@
 export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
-export type UpstreamChannel = 'codex' | 'grok' | 'antigravity'
+export type UpstreamChannel = 'codex' | 'grok' | 'antigravity' | 'claude'
+
+/** Claude Code OAuth：第一步返回授权 URL 与 state。 */
+export interface ClaudeAuthURLResponse {
+  auth_url: string
+  state: string
+}
+
+/** Claude Code OAuth：第二步用 state+code 换取 token 并入库。 */
+export interface ClaudeExchangeCodeRequest {
+  state: string
+  code: string
+  name?: string
+  proxy_url?: string
+  use_proxy_pool?: boolean
+  timezone?: string
+}
+
+/** Claude Code：直接导入 cmd/claude_login 产出的 token JSON。 */
+export interface ClaudeImportTokenRequest {
+  access_token: string
+  refresh_token: string
+  email?: string
+  account_id?: string
+  expires_at?: string
+  name?: string
+  proxy_url?: string
+  use_proxy_pool?: boolean
+  timezone?: string
+}
+
+/** Versioned, provider-scoped Claude OAuth export. Secret-bearing fields are
+ * only returned by the administrator-only Claude export endpoint. */
+export interface ClaudeCredentialExportEntry extends ClaudeImportTokenRequest {
+  type: 'claude'
+  version: number
+  auth_kind: 'oauth'
+  plan_type?: string
+  models?: string[]
+  claude_fingerprint_mode?: 'preserve' | 'force' | ''
+  claude_user_agent?: string
+  fingerprint_headers?: Record<string, string>
+  tags?: string[]
+  group_refs?: Array<{ name: string; channel: 'claude' }>
+  enabled?: boolean
+}
+
+export interface ClaudeImportBundleItem {
+  id?: number
+  email?: string
+  ok: boolean
+  error?: string
+  warnings?: string[]
+}
+
+export interface ClaudeImportBundleResponse {
+  total: number
+  imported: number
+  failed: number
+  items: ClaudeImportBundleItem[]
+}
+
+export interface ClaudeAddAccountResponse {
+  message: string
+  id: number
+  email?: string
+}
 
 export interface ToastState {
   msg: string
@@ -108,9 +174,12 @@ export interface AccountRow {
   openai_responses_api?: boolean
   grok_api?: boolean
   antigravity_api?: boolean
+  claude_api?: boolean
   antigravity_auth_kind?: 'oauth' | 'api_key' | string
   agent_identity?: boolean
   grok_auth_kind?: string
+  /** Safe, allowlisted User-Agent observed/generated for Claude upstream calls. */
+  claude_user_agent?: string
   grok_plan?: GrokPlanInfo
   grok_billing?: GrokBillingDetail
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
@@ -131,6 +200,10 @@ export interface AccountRow {
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
   codex_fingerprint_mode?: CodexFingerprintMode
+  claude_fingerprint_mode?: 'preserve' | 'force' | ''
+  claude_usage_probe_at?: ISODateString
+  claude_usage_probe_error?: string
+  timezone?: string
   custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
@@ -632,6 +705,7 @@ export interface RecycleBinAccountRow {
   at_only?: boolean
   access_token_type?: string
   openai_responses_api?: boolean
+  claude_api?: boolean
   base_url?: string
   models?: string[]
   created_at: ISODateString
@@ -1211,6 +1285,8 @@ export interface UpdateAccountSchedulerRequest {
   scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
   codex_fingerprint_mode?: CodexFingerprintMode | null
+  claude_fingerprint_mode?: 'preserve' | 'force' | '' | null
+  timezone?: string | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -2756,6 +2832,8 @@ export interface ModelsResponse {
   antigravity_models?: string[]
   // Grok 渠道账号声明模型的并集;渠道选 grok 时模型下拉用这份
   grok_models?: string[]
+  // Claude 渠道账号声明模型的并集;渠道选 claude 时模型下拉用这份
+  claude_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
   source_url: string
@@ -3070,6 +3148,7 @@ export interface OfficialPricingSyncConfig {
 	interval_minutes: number
 	include_openai: boolean
 	include_grok: boolean
+	include_claude: boolean
 	last_attempt_at?: string
 	last_success_at?: string
 	last_error?: string
@@ -3555,4 +3634,19 @@ export interface ObservedInstructionsSample {
 
 export interface ObservedInstructionsResponse {
   samples: ObservedInstructionsSample[]
+}
+
+// ClaudeGlobalConfig 是系统设置里的 ClaudeCode 全局配置(全体 Claude 账号默认遵守)。
+export interface ClaudeGlobalConfig {
+  fingerprint_mode: 'preserve' | 'force' | ''
+  default_timezone: string
+  session_window_limit: number
+  allow_service_tier: boolean
+  allow_inference_geo: boolean
+  allow_speed: boolean
+  allow_safety_identifier: boolean
+  allowed_beta_headers: string[]
+  max_output_tokens: number
+  max_tool_count: number
+  max_tool_schema_bytes: number
 }

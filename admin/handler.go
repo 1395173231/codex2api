@@ -45,22 +45,25 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store                  *auth.Store
-	cache                  cache.TokenCache
-	db                     *database.DB
-	cacheCfgStore          responseCacheSettingsStore
-	rateLimiter            *proxy.RateLimiter
-	systemUpdate           *systemUpdater
-	systemUpdateOnce       sync.Once
-	refreshAccount         func(context.Context, int64) error
-	probeUsage             func(context.Context, *auth.Account) error
-	activate5hWindow       func(context.Context, *auth.Account) error
-	executeUsageProbe      usageProbeRequestFunc
-	syncAccountPlanOnReset func(context.Context, *auth.Account) error
-	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
-	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
-	sendCodexInvite        func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
+	store            *auth.Store
+	cache            cache.TokenCache
+	db               *database.DB
+	cacheCfgStore    responseCacheSettingsStore
+	rateLimiter      *proxy.RateLimiter
+	systemUpdate     *systemUpdater
+	systemUpdateOnce sync.Once
+	refreshAccount   func(context.Context, int64) error
+	probeUsage       func(context.Context, *auth.Account) error
+	// executeClaudeUsageProbe is injectable for tests; production uses the
+	// provider-native Anthropic Messages request directly.
+	executeClaudeUsageProbe func(context.Context, *auth.Account, []byte) (*http.Response, error)
+	activate5hWindow        func(context.Context, *auth.Account) error
+	executeUsageProbe       usageProbeRequestFunc
+	syncAccountPlanOnReset  func(context.Context, *auth.Account) error
+	queryResetCredits       func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit      func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	queryWhamDailyUsage     func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	sendCodexInvite         func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
 	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
@@ -129,6 +132,9 @@ type Handler struct {
 	// accountCachesGen 在账号变更时递增;重建协程安装快照前校验代数,
 	// 防止变更前就开始读库的在途重建把旧数据写回缓存。
 	accountCachesGen atomic.Uint64
+	// Claude 用量采样只改变 Claude 列表投影；独立代数避免频繁采样让
+	// Codex/Grok/Antigravity 的大池快照无谓失效。
+	claudeAccountCachesGen atomic.Uint64
 
 	// 分析图表使用固定大小的聚合结果，避免把完整号池传给浏览器。与账号
 	// 快照分开缓存，只有展开分析区或 Dashboard runway 时才会构建。
@@ -324,8 +330,10 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
 		return
 	}
-	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），探针后直接返回。
-	if account.IsCodexAgentIdentity() {
+	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），Claude 也使用
+	// Anthropic account UUID 而非 ChatGPT workspace 身份；两者都不能进入
+	// Codex 的 email+workspace 查重链。
+	if !shouldMergeImportedIdentity(account) {
 		return
 	}
 	// AT / codex_at 账号的 OAuth 身份（email + 有效工作区）在插入时无法从
@@ -335,6 +343,10 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	// 合并按 email + 有效工作区身份进行；Chatgpt-Account-Id 覆盖代表独立路由。
 	// 数据库生命周期 ctx 与串行合并锁（防并发导入互相软删）。
 	h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source)
+}
+
+func shouldMergeImportedIdentity(account *auth.Account) bool {
+	return account != nil && !account.IsCodexAgentIdentity() && !account.IsClaudeOAuth()
 }
 
 func (h *Handler) startDBBackgroundTask(task func(context.Context)) bool {
@@ -932,6 +944,8 @@ func parseUsageChannel(c *gin.Context) string {
 		return database.UpstreamChannelGrok
 	case database.UpstreamChannelAntigravity:
 		return database.UpstreamChannelAntigravity
+	case database.UpstreamChannelClaude:
+		return database.UpstreamChannelClaude
 	}
 	return ""
 }
@@ -1053,6 +1067,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/import", h.BatchImportGrokAccounts)
 	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
+	api.POST("/accounts/claude/oauth/auth-url", h.GenerateClaudeAuthURL)
+	api.POST("/accounts/claude/oauth/exchange-code", h.ExchangeClaudeOAuthCode)
+	api.POST("/accounts/claude/import", h.ImportClaudeToken)
+	api.GET("/accounts/claude/export", h.ExportClaudeAccounts)
+	api.POST("/accounts/:id/claude/models", h.RefreshClaudeModels)
+	api.POST("/accounts/claude/models/refresh", h.RefreshAllClaudeModels)
 	api.POST("/accounts/antigravity", h.AddAntigravityAccount)
 	api.POST("/accounts/antigravity/models", h.FetchAntigravityModels)
 	api.POST("/accounts/antigravity/batch-models", h.BatchUpdateAntigravityModels)
@@ -1159,6 +1179,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/claude-config", h.GetClaudeConfig)
+	api.PUT("/settings/claude-config", h.UpdateClaudeConfig)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.GET("/settings/invite-guide", h.GetInviteGuideSettings)
 	api.PUT("/settings/invite-guide", h.UpdateInviteGuideSettings)
@@ -1383,6 +1405,7 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		database.UpstreamChannelCodex:       {},
 		database.UpstreamChannelGrok:        {},
 		database.UpstreamChannelAntigravity: {},
+		database.UpstreamChannelClaude:      {},
 	}
 	counts.total = len(rows)
 	for _, row := range rows {
@@ -1397,6 +1420,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		} else if strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
 			channel = database.UpstreamChannelAntigravity
+		} else if strings.EqualFold(upstreamType, auth.UpstreamClaude) {
+			channel = database.UpstreamChannelClaude
 		}
 		usingCredits := false
 		acc := runtimeByID[row.ID]
@@ -1410,6 +1435,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			usingCredits = acc.UsingCredits()
 			if acc.IsGrokAPI() {
 				channel = database.UpstreamChannelGrok
+			} else if acc.IsClaudeOAuth() {
+				channel = database.UpstreamChannelClaude
 			}
 		}
 		perChannel := channelCounts[channel]
@@ -1451,6 +1478,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 		if status == "unauthorized" || status == "error" {
 			return false
 		}
+		if acc.IsClaudeOAuth() && row != nil &&
+			strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey)) != "" &&
+			strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey)) == "" {
+			return false
+		}
 		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
 	}
 	if row == nil {
@@ -1464,6 +1496,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 	}
 	status := strings.ToLower(strings.TrimSpace(row.Status))
 	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	if strings.EqualFold(upstreamType, auth.UpstreamClaude) &&
+		strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey)) != "" &&
+		strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey)) == "" {
 		return false
 	}
 	return true
@@ -1509,6 +1546,7 @@ type accountResponse struct {
 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
+	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
@@ -1528,6 +1566,9 @@ type accountResponse struct {
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
 	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
+	ClaudeFingerprintMode         string                      `json:"claude_fingerprint_mode,omitempty"`
+	ClaudeUserAgent               string                      `json:"claude_user_agent,omitempty"`
+	Timezone                      string                      `json:"timezone,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1542,6 +1583,8 @@ type accountResponse struct {
 	UpdatedAt                     string                      `json:"updated_at"`
 	CodexUsageUpdatedAt           string                      `json:"codex_usage_updated_at,omitempty"`
 	Codex5HUsageUpdatedAt         string                      `json:"codex_5h_usage_updated_at,omitempty"`
+	ClaudeUsageProbeAt            string                      `json:"claude_usage_probe_at,omitempty"`
+	ClaudeUsageProbeError         string                      `json:"claude_usage_probe_error,omitempty"`
 	ActiveRequests                int64                       `json:"active_requests"`
 	OccupiedRequests              int64                       `json:"occupied_requests"`
 	SessionSlotBufferEnabled      bool                        `json:"session_slot_buffer_enabled"`
@@ -1892,6 +1935,7 @@ type accountLiteResponse struct {
 	ATOnly             bool   `json:"at_only"`
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
+	ClaudeAPI          bool   `json:"claude_api"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -1915,6 +1959,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		isClaudeAccount := strings.EqualFold(upstreamType, auth.UpstreamClaude)
 		grokAuthKind := ""
 		if isGrokAccount {
 			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
@@ -1943,9 +1988,10 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			Status:             status,
 			Enabled:            row.Enabled,
 			ProxyURL:           row.ProxyURL,
-			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
+			ClaudeAPI:          isClaudeAccount,
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -1970,6 +2016,8 @@ type updateAccountSchedulerReq struct {
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
 	CodexFingerprintMode    json.RawMessage `json:"codex_fingerprint_mode"`
+	ClaudeFingerprintMode   json.RawMessage `json:"claude_fingerprint_mode"`
+	Timezone                json.RawMessage `json:"timezone"`
 }
 
 type accountSchedulerUpdate struct {
@@ -1989,6 +2037,8 @@ type accountSchedulerUpdate struct {
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
 	CodexFingerprintMode    database.OptionalString
+	ClaudeFingerprintMode   database.OptionalString
+	Timezone                database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2060,6 +2110,17 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	claudeFingerprintMode, err := parseOptionalStringField(req.ClaudeFingerprintMode, "claude_fingerprint_mode", validateClaudeFingerprintMode)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if claudeFingerprintMode.Set {
+		claudeFingerprintMode.Value = auth.NormalizeClaudeFingerprintMode(claudeFingerprintMode.Value)
+	}
+	timezoneField, err := parseOptionalStringField(req.Timezone, "timezone", validateAccountTimezone)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
@@ -2069,6 +2130,12 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if codexFingerprintMode.Set {
 		credentialUpdates[auth.CodexFingerprintModeCredentialKey] = codexFingerprintMode.Value
+	}
+	if claudeFingerprintMode.Set {
+		credentialUpdates[auth.ClaudeFingerprintModeCredentialKey] = claudeFingerprintMode.Value
+	}
+	if timezoneField.Set {
+		credentialUpdates["timezone"] = strings.TrimSpace(timezoneField.Value)
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2124,8 +2191,30 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
 		CodexFingerprintMode:    codexFingerprintMode,
+		ClaudeFingerprintMode:   claudeFingerprintMode,
+		Timezone:                timezoneField,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
+}
+
+// validateClaudeFingerprintMode 允许空串(=跟随全局默认),其余必须是 preserve/force。
+func validateClaudeFingerprintMode(value string) error {
+	if auth.IsValidClaudeFingerprintMode(value) {
+		return nil
+	}
+	return fmt.Errorf("claude_fingerprint_mode must be one of: preserve, force")
+}
+
+// validateAccountTimezone 允许空串(=清除);非空必须是可加载的 IANA 时区。
+func validateAccountTimezone(value string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil
+	}
+	if _, err := time.LoadLocation(v); err != nil {
+		return fmt.Errorf("timezone must be a valid IANA timezone, e.g. Asia/Shanghai")
+	}
+	return nil
 }
 
 // validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
@@ -2152,7 +2241,9 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set ||
 		u.CustomHeaders.Set ||
-		u.CodexFingerprintMode.Set
+		u.CodexFingerprintMode.Set ||
+		u.ClaudeFingerprintMode.Set ||
+		u.Timezone.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2280,6 +2371,38 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			}
 		}
 	}
+	if update.Timezone.Set {
+		if update.CredentialUpdates == nil {
+			update.CredentialUpdates = make(map[string]interface{})
+		}
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+			return
+		}
+		applied, err := prepareClaudeTimezoneCredentialUpdateWithHeaders(row, update.Timezone.Value, update.CredentialUpdates, func() map[string]string {
+			if update.CustomHeaders.Set {
+				return update.CustomHeaders.Values
+			}
+			return nil
+		}())
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if applied {
+			if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+				// The timezone path owns the final safe identity snapshot even
+				// when the request also supplied custom_headers; use that same
+				// snapshot for duplicate checks and immediate runtime updates.
+				update.CustomHeaders = optionalCustomHeaders{Set: true, Values: headers}
+			}
+		}
+	}
 
 	if update.CustomHeaders.Set {
 		h.mergeDuplicateMu.Lock()
@@ -2383,6 +2506,16 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	} else if update.Timezone.Set {
+		// A Claude timezone edit rebuilds the restricted identity headers in
+		// CredentialUpdates; publish the same snapshot immediately instead of
+		// waiting for the scheduler outbox/restart to refresh runtime state.
+		if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+			h.store.ApplyAccountCustomHeaders(id, headers)
+		}
+	}
+	if update.ClaudeFingerprintMode.Set {
+		h.store.ApplyAccountClaudeFingerprintMode(id, update.ClaudeFingerprintMode.Value)
 	}
 	if update.CodexFingerprintMode.Set {
 		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
@@ -4051,8 +4184,9 @@ type updateAccountModelsRequest struct {
 	Models []string `json:"models"`
 }
 
-// UpdateAccountModels 设置 Codex OAuth 账号的支持模型白名单。
-// 空数组 = 清空白名单，放行全部模型；非空时调度器只会把白名单内模型的请求派给该账号。
+// UpdateAccountModels 设置 OAuth 账号的支持模型白名单。
+// Claude 账号仅接受 claude-* 原生模型；空数组 = 清空白名单，放行全部模型；
+// 非空时调度器只会把白名单内模型的请求派给该账号。
 func (h *Handler) UpdateAccountModels(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -4081,7 +4215,11 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
-	if account.IsRelayStyle() {
+	if err := validateAccountModelsForAccount(account, models); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if account.IsRelayStyle() && !account.IsClaudeOAuth() {
 		writeError(c, http.StatusBadRequest, "中转/Grok 账号请在账号设置中编辑模型列表")
 		return
 	}
@@ -4095,6 +4233,24 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 	h.store.ApplyAccountModels(id, models)
 	h.db.InsertAccountEventAsync(id, "updated", "account_models")
 	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
+// validateAccountModelsForAccount keeps provider-specific model namespaces
+// out of the shared account-model endpoint. An empty list intentionally clears
+// the override; a non-empty Claude allowlist must contain only native
+// claude-* IDs so a stale Codex/Grok entry can never make a Claude account
+// appear routable for an incompatible protocol.
+func validateAccountModelsForAccount(account *auth.Account, models []string) error {
+	if account == nil || !account.IsClaudeOAuth() {
+		return nil
+	}
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if !strings.HasPrefix(strings.ToLower(model), "claude-") {
+			return fmt.Errorf("Claude 账号模型必须使用 claude-* 原生模型: %s", model)
+		}
+	}
+	return nil
 }
 
 // SyncAccountUpstreamModels 用账号自身凭据实时拉取上游模型清单，
@@ -4127,6 +4283,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 			h.triggerGrokCapabilityProbeForGeneration(id, result.capabilityGeneration)
 		}
 		c.JSON(http.StatusOK, gin.H{"models": result.Models, "state": result.State, "errors": result.Errors})
+		return
+	}
+	if account.IsClaudeOAuth() {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		models, fetchErr := auth.NewClaudeAuth(h.store.ResolveProxyForAccount(account)).FetchModels(ctx, account.GetAccessToken())
+		if fetchErr != nil {
+			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Claude 上游模型清单失败: %s", fetchErr.Error()))
+			return
+		}
+		models = auth.NormalizeAccountModels(models)
+		c.JSON(http.StatusOK, gin.H{"models": models})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -5655,6 +5823,19 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 	if t := account.GetResetSparkAt(); !t.IsZero() {
 		resp["reset_spark_at"] = t.Format(time.RFC3339)
 	}
+	if account.IsClaudeOAuth() && h.db != nil {
+		// The Claude probe records its attempt metadata in credentials. Read the
+		// merged row back so the caller gets the durable timestamp/error even
+		// when the response carried no quota headers.
+		if row, readErr := h.db.GetAccountByID(ctx, id); readErr == nil {
+			if value := row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey); value != "" {
+				resp["claude_usage_probe_at"] = value
+			}
+			if value := row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey); value != "" {
+				resp["claude_usage_probe_error"] = value
+			}
+		}
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -5673,7 +5854,7 @@ type batchUpdateAccountsReq struct {
 
 func (h *Handler) accountOperationIdentity(id int64) (string, string) {
 	h.accountListCacheMu.RLock()
-	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok} {
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok, database.UpstreamChannelAntigravity, database.UpstreamChannelClaude} {
 		snapshot := h.accountListCache[channel]
 		if snapshot == nil {
 			continue
@@ -5739,6 +5920,7 @@ type recycleBinAccountResponse struct {
 	ATOnly             bool     `json:"at_only"`
 	AccessTokenType    string   `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
+	ClaudeAPI          bool     `json:"claude_api"`
 	BaseURL            string   `json:"base_url,omitempty"`
 	Models             []string `json:"models,omitempty"`
 	CreatedAt          string   `json:"created_at"`
@@ -5761,7 +5943,9 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 
 	accounts := make([]recycleBinAccountResponse, 0, len(rows))
 	for _, row := range rows {
-		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		isClaudeAccount := strings.EqualFold(upstreamType, auth.UpstreamClaude)
 		email := row.GetCredential("email")
 		baseURL := row.GetCredential("base_url")
 		if isOpenAIResponsesAccount && email == "" {
@@ -5776,9 +5960,10 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 			Name:               row.Name,
 			Email:              email,
 			PlanType:           planType,
-			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:             !isOpenAIResponsesAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			AccessTokenType:    accountAccessTokenType(row),
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			ClaudeAPI:          isClaudeAccount,
 			BaseURL:            baseURL,
 			Models:             row.GetCredentialStringSlice("models"),
 			CreatedAt:          row.CreatedAt.Format(time.RFC3339),
@@ -8304,6 +8489,10 @@ var knownAPIKeyPlanFilters = map[string]struct{}{
 	"api": {}, "supergrok": {}, "x_basic": {}, "x_premium": {},
 	"x_premium_plus": {}, "supergrok_heavy": {}, "supergrok_lite": {},
 	"supergrok_plus": {},
+	// Claude OAuth profile tiers. Keep these independent from Codex/Grok
+	// labels so a Claude-bound key's plan gate survives normalization.
+	"claude": {}, "max": {}, "max-5x": {}, "max-20x": {},
+	"enterprise": {}, "business": {},
 }
 
 // cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
@@ -11878,6 +12067,11 @@ func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
+	// The request-facing catalog must not advertise models contributed only by
+	// disabled/banned accounts or models currently marked credits_required.
+	// Keep claudeChannelModels for pricing/history, where those entries remain
+	// useful to operators.
+	catalog.ClaudeModels = h.claudeAvailableChannelModels()
 	c.JSON(http.StatusOK, catalog)
 }
 

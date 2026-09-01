@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -126,6 +127,71 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 
 	if got.total != 9 || got.normal != 3 || got.rateLimited != 4 || got.abnormal != 2 || got.disabled != 1 {
 		t.Fatalf("counts = %+v, want total=9 normal=3 rateLimited=4 abnormal=2 disabled=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsIncludesClaudeChannel(t *testing.T) {
+	row := &database.AccountRow{ID: 99, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamClaude}}
+	acc := &auth.Account{DBID: 99, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Status: auth.StatusReady, UsagePercent7dValid: true}
+	_, channels := summarizeDashboardAccounts([]*database.AccountRow{row}, []*auth.Account{acc})
+	got, ok := channels[database.UpstreamChannelClaude]
+	if !ok {
+		t.Fatalf("dashboard channels missing Claude: %#v", channels)
+	}
+	if got.total != 1 || got.normal != 1 {
+		t.Fatalf("Claude dashboard counts = %+v, want total=1 normal=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsTreatsSuccessfulClaudeProbeWithoutQuotaHeadersAsSampled(t *testing.T) {
+	row := &database.AccountRow{ID: 100, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+		"upstream_type":                      auth.UpstreamClaude,
+		auth.ClaudeUsageProbeAtCredentialKey: "2026-08-29T05:00:00Z",
+	}}
+	acc := &auth.Account{DBID: 100, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Status: auth.StatusReady}
+	got, channels := summarizeDashboardAccounts([]*database.AccountRow{row}, []*auth.Account{acc})
+	if got.normal != 1 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("dashboard counts = %+v, want successful Claude probe counted as normal", got)
+	}
+	if channels[database.UpstreamChannelClaude].normal != 1 {
+		t.Fatalf("Claude channel counts = %+v", channels[database.UpstreamChannelClaude])
+	}
+}
+
+func TestClaudeChannelModelsReturnsAccountCatalog(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	defer store.Stop()
+	store.AddAccount(&auth.Account{DBID: 100, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Models: []string{"claude-sonnet-4-5", "claude-opus-4-5"}})
+	h := &Handler{store: store}
+	models := h.claudeChannelModels()
+	if len(models) != 2 || !slices.Contains(models, "claude-sonnet-4-5") || !slices.Contains(models, "claude-opus-4-5") {
+		t.Fatalf("Claude model catalog = %v, want account models", models)
+	}
+}
+
+func TestClaudeAvailableChannelModelsFiltersDisabledAndModelCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	defer store.Stop()
+	enabled := &auth.Account{
+		DBID:         101,
+		UpstreamType: auth.UpstreamClaude,
+		AccessToken:  "claude-enabled",
+		Models:       []string{"claude-fable-5", "claude-sonnet-5"},
+	}
+	enabled.SetModelCooldownUntil("claude-fable-5", "credits_required", time.Now().Add(time.Hour))
+	disabled := &auth.Account{
+		DBID:         102,
+		UpstreamType: auth.UpstreamClaude,
+		AccessToken:  "claude-disabled",
+		Models:       []string{"claude-fable-5"},
+	}
+	atomic.StoreInt32(&disabled.DispatchPaused, 1)
+	store.AddAccount(enabled)
+	store.AddAccount(disabled)
+	h := &Handler{store: store}
+	models := h.claudeAvailableChannelModels()
+	if len(models) != 1 || models[0] != "claude-sonnet-5" {
+		t.Fatalf("request-facing Claude models = %v, want only enabled cooldown-free model", models)
 	}
 }
 

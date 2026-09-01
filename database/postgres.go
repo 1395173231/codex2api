@@ -1216,6 +1216,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				site_logo          TEXT DEFAULT '',
 				background_config  TEXT DEFAULT '{}',
 				grok_config        TEXT DEFAULT '{}',
+				claude_config      TEXT DEFAULT '{}',
 				antigravity_oauth_config TEXT DEFAULT '{}',
 				invite_guide_config TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
@@ -1266,6 +1267,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS grok_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS claude_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS antigravity_oauth_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS invite_guide_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
@@ -1690,7 +1692,8 @@ type APIKeyLimits struct {
 	//   - ""/auto: 不限（默认，按模型路由）
 	//   - codex:   仅 Codex OAuth / OpenAI Responses 中转账号
 	//   - grok:    仅 Grok 账号（此时不再要求账号声明模型，直接透传请求模型）
-	//   - antigravity: 预留的 Antigravity 管理渠道；推理适配完成前 fail closed
+	//   - antigravity: Antigravity 管理渠道
+	//   - claude:      仅 Claude OAuth / Anthropic Messages 账号
 	UpstreamChannel string `json:"upstream_channel,omitempty"`
 	// ScopeLimits 是「该 Key × 某账号分组 / 某账号」维度的用量上限（issue #439）。
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
@@ -1711,6 +1714,7 @@ const (
 	UpstreamChannelCodex       = "codex"
 	UpstreamChannelGrok        = "grok"
 	UpstreamChannelAntigravity = "antigravity"
+	UpstreamChannelClaude      = "claude"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1722,6 +1726,8 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelGrok
 	case UpstreamChannelAntigravity:
 		return UpstreamChannelAntigravity
+	case UpstreamChannelClaude:
+		return UpstreamChannelClaude
 	}
 	return UpstreamChannelAuto
 }
@@ -1734,9 +1740,11 @@ func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
 		return ` AND ` + upstreamTypeExpr + ` = 'grok'`
 	case UpstreamChannelAntigravity:
 		return ` AND ` + upstreamTypeExpr + ` = 'antigravity'`
+	case UpstreamChannelClaude:
+		return ` AND ` + upstreamTypeExpr + ` = 'claude'`
 	case UpstreamChannelCodex:
 		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
-		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity')`
+		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity', 'claude')`
 	default:
 		return ""
 	}
@@ -2173,6 +2181,7 @@ type SystemSettings struct {
 	SiteLogo                           string
 	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
 	GrokConfig                         string // JSON: {"affinity_mode":"strict"}
+	ClaudeConfig                       string // JSON: {"fingerprint_mode":"preserve","default_timezone":"","session_window_limit":0}
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
@@ -2530,7 +2539,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(session_slot_buffer_enabled, false),
 		       COALESCE(session_slot_buffer_seconds, 10),
 		       COALESCE(models_list_read_max_bytes, 8388608),
-		       COALESCE(auto_activate_5h_window_enabled, false)
+		       COALESCE(auto_activate_5h_window_enabled, false),
+		       COALESCE(claude_config, '{}')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2610,6 +2620,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SessionSlotBufferSeconds,
 		&s.ModelsListReadMaxBytes,
 		&s.AutoActivate5hWindowEnabled,
+		&s.ClaudeConfig,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3237,6 +3248,26 @@ func normalizeAffinityMode(mode string) string {
 	default:
 		return "bounded"
 	}
+}
+
+// normalizeClaudeConfig 校验 claude_config JSON,非法或空则回落到默认 {}。
+func normalizeClaudeConfig(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !json.Valid([]byte(raw)) {
+		return "{}"
+	}
+	return raw
+}
+
+// UpdateClaudeConfig 定向更新 claude_config 单列(不回写整行设置,避免触碰大 UPSERT)。
+func (db *DB) UpdateClaudeConfig(ctx context.Context, raw string) error {
+	value := normalizeClaudeConfig(raw)
+	return db.withSQLiteWriteLock(ctx, func() error {
+		_, err := db.conn.ExecContext(ctx, `
+			INSERT INTO system_settings (id, claude_config) VALUES (1, $1)
+			ON CONFLICT (id) DO UPDATE SET claude_config = EXCLUDED.claude_config`, value)
+		return err
+	})
 }
 
 // normalizeGrokConfig 校验 grok_config JSON,非法或空则回落到默认 {}。
@@ -4742,7 +4773,7 @@ type TrafficSnapshot struct {
 // 当 rangeStart 为零值时回落到"今日"(本地 0 点起),与历史行为一致;
 // 当传入显式区间时,today_* 字段语义变为"该区间内的统计",total_* 字段始终是全量累计。
 // rangeEnd 为零值表示"至今"。
-// GetUsageStats 聚合用量统计。channel 非空（codex/grok）时按渠道过滤；
+// GetUsageStats 聚合用量统计。channel 非空（codex/grok/antigravity/claude）时按渠道过滤；
 // 渠道视图下的「累计」只覆盖现存 usage_logs（清空日志前的 baseline 无渠道维度，不计入）。
 func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
 	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, true)
@@ -6699,7 +6730,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 		merged := mergeCredentialMaps(decodeCredentials(currentRaw), map[string]interface{}{
 			"allowed_api_key_ids": normalizePositiveInt64Slice(allowedAPIKeyIDs.Values),
 		})
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -6780,7 +6811,7 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 			current := decodeCredentials(currentRaw)
 			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
 			identityChanged := grokIdentityCredentialChanged(current, merged)
-			credJSON, err := json.Marshal(merged)
+			credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
 			}
@@ -6999,7 +7030,7 @@ func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, cur
 		// generation bump.
 		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
 		identityChanged := grokIdentityCredentialChanged(credentials, merged)
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -7183,7 +7214,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7217,6 +7248,12 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 		for key, value := range credentials {
 			if !sqliteJSONSetKeySupported(key) {
 				return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
+			}
+			// SQLite 逐键写:敏感字段在此处按键加密(密钥未设时 no-op)。
+			if _, sensitive := sensitiveCredentialKeys[key]; sensitive {
+				if s, isStr := value.(string); isStr {
+					value = encryptCredentialValue(key, s)
+				}
 			}
 			valueJSON, err := json.Marshal(value)
 			if err != nil {
@@ -7268,7 +7305,7 @@ func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id i
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7353,7 +7390,7 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
 	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7403,7 +7440,7 @@ func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, crede
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7812,7 +7849,7 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7858,7 +7895,7 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	credentials := map[string]interface{}{
 		"access_token": accessToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7875,7 +7912,7 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7892,7 +7929,7 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7917,7 +7954,7 @@ func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, acc
 	if strings.TrimSpace(accountType) == "" {
 		accountType = "api"
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
