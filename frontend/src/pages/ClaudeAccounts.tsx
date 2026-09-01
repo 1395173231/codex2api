@@ -47,6 +47,12 @@ import AccountQuotaDistributionChart from "../components/AccountQuotaDistributio
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import type { AccountAnalysisResponse } from "../types";
 import { ProxyField } from "../components/ProxyField";
+import AccountProxyBadge from "../components/AccountProxyBadge";
+import AccountProxyQuickEditor from "../components/AccountProxyQuickEditor";
+import {
+  buildProxyBindingContext,
+  type ProxyBindingContext,
+} from "../lib/accountProxyBinding";
 import ChipInput from "../components/ChipInput";
 import { AccountGroupManagerModal, ACCOUNT_GROUP_COLORS } from "../components/AccountGroupManagerModal";
 import { Select } from "../components/ui/select";
@@ -292,6 +298,7 @@ const SORT_MAP: Record<SortKey, { sort: NonNullable<Parameters<typeof api.getAcc
 // 可显隐列(序号/邮箱/操作为固定核心列,不参与切换)。持久化到 localStorage,与 Codex 一致。
 const CLAUDE_TOGGLE_COLUMNS = [
   "groups",
+  "proxy",
   "priority",
   "plan",
   "status",
@@ -437,6 +444,10 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  // 代理池开关 + 全局代理:代理徽章要靠这两个才能把"未自绑"的账号判成继承池/全局/直连。
+  const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
+  const [globalProxyURL, setGlobalProxyURL] = useState("");
+  const [quickProxyAccount, setQuickProxyAccount] = useState<AccountRow | null>(null);
   const [groups, setGroups] = useState<AccountGroup[]>([]);
 
   const [showAdd, setShowAdd] = useState(false);
@@ -921,10 +932,31 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
       .catch(() => {
         if (!cancelled) setProxyPool([]);
       });
+    void api
+      .getSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        setProxyPoolEnabled(Boolean(settings.proxy_pool_enabled));
+        setGlobalProxyURL((settings.proxy_url ?? "").trim());
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
   }, [reloadGroups]);
+
+  // 分组用全量 groups 而非 claudeGroups:后端解析组代理不看渠道,按渠道过滤会把
+  // 跨渠道的存量成员误报成"无组代理"。
+  const proxyBindingCtx = useMemo<ProxyBindingContext>(
+    () =>
+      buildProxyBindingContext({
+        proxies: proxyPool,
+        groups,
+        poolEnabled: proxyPoolEnabled,
+        globalProxy: globalProxyURL,
+      }),
+    [proxyPool, groups, proxyPoolEnabled, globalProxyURL],
+  );
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, claudeGroups));
@@ -1515,6 +1547,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                 <th className="px-2 py-2.5 text-center">{t("accounts.sequence")}</th>
                 <th className="px-2 py-2.5">{t("accounts.email")}</th>
                 {visibleCols.groups ? <th className="px-2 py-2.5 text-center">{t("accounts.groupsLabel")}</th> : null}
+                {visibleCols.proxy ? <th className="px-2 py-2.5 text-center">{t("accounts.proxyColumn")}</th> : null}
                 {visibleCols.priority ? <th className="px-2 py-2.5 text-center">{t("accounts.schedulerPriorityColumn")}</th> : null}
                 {visibleCols.plan ? <th className="px-2 py-2.5 text-center">{t("accounts.plan")}</th> : null}
                 {visibleCols.status ? <th className="px-2 py-2.5 text-center">{t("accounts.status")}</th> : null}
@@ -1539,6 +1572,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                   healthBuckets={healthBars[String(acc.id)]}
                   hideDomainTags={hideDomainTags}
                   columns={visibleCols}
+                  proxyCtx={proxyBindingCtx}
+                  onEditProxy={() => setQuickProxyAccount(acc)}
                   onRefresh={() => void handleRefresh(acc)}
                   onRefreshModels={() => void handleRefreshModels(acc)}
                   onToggleEnabled={() => void handleToggleEnabled(acc)}
@@ -1720,6 +1755,19 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
         />
       ) : null}
 
+      <AccountProxyQuickEditor
+        account={quickProxyAccount}
+        accountLabel={
+          quickProxyAccount
+            ? quickProxyAccount.email || quickProxyAccount.name || `#${quickProxyAccount.id}`
+            : ""
+        }
+        proxies={proxyPool}
+        ctx={proxyBindingCtx}
+        onClose={() => setQuickProxyAccount(null)}
+        onSaved={() => reload({ silent: true })}
+      />
+
       {confirmDialog}
     </div>
   );
@@ -1735,6 +1783,8 @@ function ClaudeAccountRow({
   healthBuckets,
   hideDomainTags,
   columns,
+  proxyCtx,
+  onEditProxy,
   onRefresh,
   onRefreshModels,
   onToggleEnabled,
@@ -1757,6 +1807,8 @@ function ClaudeAccountRow({
   healthBuckets?: AccountHealthBucket[];
   hideDomainTags: boolean;
   columns: ClaudeColVisibility;
+  proxyCtx: ProxyBindingContext;
+  onEditProxy: () => void;
   onRefresh: () => void;
   onRefreshModels: () => void;
   onToggleEnabled: () => void;
@@ -1888,6 +1940,13 @@ function ClaudeAccountRow({
             <Plus className="size-2.5" />
             {t("claude.assignGroups")}
           </button>
+        </div>
+      </td>
+      ) : null}
+      {columns.proxy ? (
+      <td className="min-w-[120px] max-w-[180px] px-2 py-3">
+        <div className="flex items-center justify-center">
+          <AccountProxyBadge account={acc} ctx={proxyCtx} onClick={onEditProxy} />
         </div>
       </td>
       ) : null}
@@ -2095,6 +2154,7 @@ function ColumnsMenu({
 
   const labelFor: Record<ClaudeCol, string> = {
     groups: t("accounts.groupsLabel"),
+    proxy: t("accounts.proxyColumn"),
     priority: t("accounts.schedulerPriorityColumn"),
     plan: t("accounts.plan"),
     status: t("accounts.status"),
