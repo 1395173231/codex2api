@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import type {
   AccountGroup,
   AccountListSummary,
@@ -487,6 +488,7 @@ function GroupChips({ account, groups }: { account: AccountRow; groups: AccountG
 function AccountMetadataFields({
   proxyUrl,
   onProxyUrlChange,
+  proxies = [],
   groupIds,
   onGroupIdsChange,
   groups,
@@ -494,6 +496,7 @@ function AccountMetadataFields({
 }: {
   proxyUrl: string;
   onProxyUrlChange: (value: string) => void;
+  proxies?: ProxyRow[];
   groupIds: number[];
   onGroupIdsChange: (value: number[]) => void;
   groups: AccountGroup[];
@@ -511,6 +514,8 @@ function AccountMetadataFields({
           onChange={(event) => onProxyUrlChange(event.target.value)}
           placeholder={t("antigravity.proxyUrlPlaceholder")}
         />
+        {/* 从代理池选择：展示每条代理已绑定账号数/空闲，选中写入上面的输入框。 */}
+        <ProxyPoolSelect proxies={proxies} onSelect={onProxyUrlChange} />
       </label>
       <div className="space-y-1.5">
         <span className="text-xs font-semibold text-muted-foreground">
@@ -2290,6 +2295,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
               </label>
               <AccountMetadataFields
                 proxyUrl={oauthDraft.proxyUrl}
+                proxies={proxyPool}
                 onProxyUrlChange={(proxyUrl) =>
                   setOAuthDraft((current) => ({ ...current, proxyUrl }))
                 }
@@ -2616,6 +2622,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
 
           <AccountMetadataFields
             proxyUrl={importDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setImportDraft((current) => ({ ...current, proxyUrl }))
             }
@@ -2843,6 +2850,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
           )}
           <AccountMetadataFields
             proxyUrl={editDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setEditDraft((current) => ({ ...current, proxyUrl }))
             }

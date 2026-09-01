@@ -62,6 +62,7 @@ func (h *Handler) buildAccountResponse(
 	isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 	isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
 	isAntigravityAccount := strings.EqualFold(upstreamType, auth.UpstreamAntigravity)
+	isClaudeAccount := strings.EqualFold(upstreamType, auth.UpstreamClaude)
 	antigravityAuthKind := ""
 	if isAntigravityAccount {
 		if strings.TrimSpace(row.GetCredential("api_key")) != "" {
@@ -128,8 +129,15 @@ func (h *Handler) buildAccountResponse(
 	}
 	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
 	codexFingerprintMode := ""
-	if !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount {
+	if !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isClaudeAccount {
 		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
+	}
+	// Claude Code 指纹收敛模式 + 绑定时区,仅 Claude OAuth 账号暴露。
+	claudeFingerprintMode := ""
+	accountTimezone := ""
+	if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamClaude) {
+		claudeFingerprintMode = auth.NormalizeClaudeFingerprintMode(row.GetCredential(auth.ClaudeFingerprintModeCredentialKey))
+		accountTimezone = strings.TrimSpace(row.GetCredential("timezone"))
 	}
 	ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
 	ignoreUsageLimitStatusEffective := h.store.IgnoreUsageLimitStatus()
@@ -139,6 +147,7 @@ func (h *Handler) buildAccountResponse(
 	modelMapping := ""
 	var customHeaders map[string]string
 	var allowedAPIKeyIDs []int64
+	claudeUserAgent := ""
 	// 工作区 ID 不是密钥:Team/K12 徽章悬停要显示空间 ID。当前页
 	// ListActiveByIDs 已带完整凭据;custom_headers 只用来算生效空间,
 	// 摘要响应仍会剥掉原文。
@@ -148,7 +157,21 @@ func (h *Handler) buildAccountResponse(
 	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, headers)
 	if includeDetails {
 		modelMapping = row.GetCredential("model_mapping")
-		customHeaders = headers
+		if isClaudeAccount {
+			// Claude detail responses may be consumed by admin tooling, but must
+			// never expose arbitrary historical custom headers such as
+			// Authorization/Cookie/x-api-key. Keep only the provider identity
+			// headers needed to inspect the stable fingerprint.
+			customHeaders = claudeExportFingerprintHeaders(headers)
+			for name, value := range customHeaders {
+				if strings.EqualFold(strings.TrimSpace(name), "user-agent") {
+					claudeUserAgent = strings.TrimSpace(value)
+					break
+				}
+			}
+		} else {
+			customHeaders = headers
+		}
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
 	}
 	resp := accountResponse{
@@ -165,7 +188,7 @@ func (h *Handler) buildAccountResponse(
 		SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 		Status:                   row.Status,
 		ErrorMessage:             row.ErrorMessage,
-		ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+		ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 		CreditEnabled:            row.CreditEnabled,
 		CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 		SkipWarmTier:             row.SkipWarmTier,
@@ -174,6 +197,7 @@ func (h *Handler) buildAccountResponse(
 		OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 		GrokAPI:                  isGrokAccount,
 		AntigravityAPI:           isAntigravityAccount,
+		ClaudeAPI:                isClaudeAccount,
 		AntigravityAuthKind:      antigravityAuthKind,
 		AgentIdentity:            isAgentIdentityCredentialRow(row),
 		GrokAuthKind:             grokAuthKind,
@@ -191,6 +215,9 @@ func (h *Handler) buildAccountResponse(
 		ModelMapping:             modelMapping,
 		CodexClientMetadataMode:  codexClientMetadataMode,
 		CodexFingerprintMode:     codexFingerprintMode,
+		ClaudeFingerprintMode:    claudeFingerprintMode,
+		ClaudeUserAgent:          claudeUserAgent,
+		Timezone:                 accountTimezone,
 		CustomHeaders:            customHeaders,
 		ProxyURL:                 row.ProxyURL,
 		Enabled:                  row.Enabled,
@@ -206,6 +233,8 @@ func (h *Handler) buildAccountResponse(
 		UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		CodexUsageUpdatedAt:      row.GetCredential("codex_usage_updated_at"),
 		Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
+		ClaudeUsageProbeAt:       row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey),
+		ClaudeUsageProbeError:    row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey),
 		UsageLimitOverride:       ignoreUsageLimitStatusOverride,
 		UsageLimitEffective:      ignoreUsageLimitStatusEffective,
 	}

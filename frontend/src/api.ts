@@ -81,6 +81,12 @@ import type {
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
+  ClaudeAuthURLResponse,
+  ClaudeExchangeCodeRequest,
+  ClaudeImportTokenRequest,
+  ClaudeCredentialExportEntry,
+  ClaudeImportBundleResponse,
+  ClaudeAddAccountResponse,
   OpsErrorSummary,
   OpsOverviewResponse,
   PromptFilterLog,
@@ -127,6 +133,7 @@ import type {
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
   UpstreamChannel,
+  ClaudeGlobalConfig,
 } from './types'
 
 const BASE = '/api/admin'
@@ -594,7 +601,7 @@ export const api = {
     if (params.order) searchParams.set('order', params.order)
     return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
   },
-  getAccountAnalysis: (channel: 'codex' | 'grok' | 'antigravity' = 'codex', signal?: AbortSignal) =>
+  getAccountAnalysis: (channel: 'codex' | 'grok' | 'antigravity' | 'claude' = 'codex', signal?: AbortSignal) =>
     request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
   getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ ids: ids.join(',') })
@@ -725,6 +732,52 @@ export const api = {
     request<void>(`/accounts/antigravity/oauth/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
     }),
+  // Claude Code OAuth：第一步取授权 URL（服务端暂存 state→verifier）。
+  generateClaudeAuthURL: () =>
+    request<ClaudeAuthURLResponse>('/accounts/claude/oauth/auth-url', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      timeoutMs: 15_000,
+    }),
+  // 第二步：用 state+code 换取 token 并入库（可选从代理池分配代理）。
+  exchangeClaudeOAuthCode: (data: ClaudeExchangeCodeRequest) =>
+    request<ClaudeAddAccountResponse>('/accounts/claude/oauth/exchange-code', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 90_000,
+    }),
+  // CLI 直导：吃 cmd/claude_login -out 产出的 token JSON。
+  importClaudeToken: (data: ClaudeImportTokenRequest) =>
+    request<ClaudeAddAccountResponse>('/accounts/claude/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 20_000,
+    }),
+  /** Import a versioned Claude credential object or bundle. */
+  importClaudeCredentialBundle: (
+    data: ClaudeCredentialExportEntry | ClaudeCredentialExportEntry[] | { accounts: ClaudeCredentialExportEntry[] },
+  ) =>
+    request<ClaudeAddAccountResponse | ClaudeImportBundleResponse>('/accounts/claude/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
+    }),
+  /** Download one Claude JSON credential or a ZIP for multiple accounts. */
+  exportClaudeAccounts: (ids?: number[], filter: 'all' | 'healthy' = 'all', format: 'auto' | 'json' | 'zip' = 'auto') => {
+    const params = new URLSearchParams({ filter, format })
+    if (ids && ids.length > 0) params.set('ids', ids.join(','))
+    return requestNamedBlob(`/accounts/claude/export?${params.toString()}`)
+  },
+  refreshClaudeModels: (id: number) =>
+    request<{ message: string; models: string[]; count: number }>(`/accounts/${id}/claude/models`, {
+      method: 'POST',
+      timeoutMs: 30_000,
+    }),
+  refreshAllClaudeModels: () =>
+    request<{ message: string; refreshed: number; failed: number; model_count: number }>('/accounts/claude/models/refresh', {
+      method: 'POST',
+      timeoutMs: 60_000,
+    }),
   batchUpdateGrokModels: (data: BatchUpdateGrokModelsRequest) =>
     request<BatchUpdateGrokModelsResponse>('/accounts/grok/batch-models', {
       method: 'POST',
@@ -772,6 +825,8 @@ export const api = {
       reset_5h_at?: string
       reset_7d_at?: string
       reset_spark_at?: string
+      claude_usage_probe_at?: string
+      claude_usage_probe_error?: string
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
@@ -1149,6 +1204,13 @@ export const api = {
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
+  getClaudeConfig: () =>
+    request<ClaudeGlobalConfig>('/settings/claude-config'),
+  updateClaudeConfig: (data: ClaudeGlobalConfig) =>
+    request<{ message: string } & ClaudeGlobalConfig>('/settings/claude-config', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   getObservedInstructions: () =>
     request<ObservedInstructionsResponse>('/settings/observed-instructions'),
   updateSettings: (data: Partial<SystemSettings>) =>
@@ -1325,6 +1387,7 @@ export const api = {
     request<{
       models: Array<{
         model: string
+        channel?: string
         source: string
         pricing: ModelPricingOverride
         canonical_model?: string
@@ -1347,12 +1410,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ url: url ?? '' }),
     }),
-	updateOfficialPricingSyncConfig: (config: Pick<OfficialPricingSyncConfig, 'enabled' | 'interval_minutes' | 'include_openai' | 'include_grok'>) =>
+	updateOfficialPricingSyncConfig: (config: Pick<OfficialPricingSyncConfig, 'enabled' | 'interval_minutes' | 'include_openai' | 'include_grok' | 'include_claude'>) =>
 		request<OfficialPricingSyncConfig>('/model-pricing/official-sync/config', {
 			method: 'PUT',
 			body: JSON.stringify(config),
 		}),
-	syncOfficialModelPricing: (sources: { include_openai: boolean; include_grok: boolean }) =>
+	syncOfficialModelPricing: (sources: { include_openai: boolean; include_grok: boolean; include_claude?: boolean }) =>
 		request<OfficialPricingSyncResult>('/model-pricing/official-sync', {
 			method: 'POST',
 			body: JSON.stringify(sources),
@@ -1439,7 +1502,7 @@ export const api = {
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   cleanErrorProxies: () =>
     request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
-  autoBalanceProxies: (data: { channel?: 'codex' | 'grok'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+  autoBalanceProxies: (data: { channel?: 'codex' | 'grok' | 'claude'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
     request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
