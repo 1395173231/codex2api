@@ -269,6 +269,32 @@ func (h *Handler) hasNativeClaudeAccountForRequest(c *gin.Context, model string)
 	return false
 }
 
+// claudeNativeRouteContextKey 是本次请求的原生 Claude 路由判定缓存键。
+const claudeNativeRouteContextKey = "codex2api_native_claude_route"
+
+type claudeNativeRouteDecision struct {
+	model  string
+	native bool
+}
+
+// nativeClaudeRouteForRequest 是 hasNativeClaudeAccountForRequest 的按请求记忆版。
+// 判定本身要扫一遍号池,而同一次 /v1/messages 里入站净化与模型路由都得问一次;
+// 万级号池下重复全扫是实打实的热路径开销,所以把结果挂在 gin context 上。
+// 缓存连模型一起存:同一请求内模型是固定的,存下来只是防止将来有人换模型复用。
+func (h *Handler) nativeClaudeRouteForRequest(c *gin.Context, model string) bool {
+	if c == nil {
+		return h.hasNativeClaudeAccountForRequest(nil, model)
+	}
+	if cached, ok := c.Get(claudeNativeRouteContextKey); ok {
+		if decision, ok := cached.(claudeNativeRouteDecision); ok && decision.model == model {
+			return decision.native
+		}
+	}
+	native := h.hasNativeClaudeAccountForRequest(c, model)
+	c.Set(claudeNativeRouteContextKey, claudeNativeRouteDecision{model: model, native: native})
+	return native
+}
+
 // resolveNativeClaudeRequestModel resolves an optional client alias to a
 // Claude-native target for the native Messages path. OpenAI/Codex mappings are
 // intentionally ignored when the requested ID is already claude-*.
@@ -300,7 +326,7 @@ func (h *Handler) resolveMessagesRoutingBodyForRequest(c *gin.Context, rawBody [
 		mappingJSON = h.store.GetModelMapping()
 	}
 	nativeClaudeModel := h.resolveNativeClaudeRequestModel(c, requestedModel)
-	nativeClaudeRoute := h.hasNativeClaudeAccountForRequest(c, requestedModel)
+	nativeClaudeRoute := h.nativeClaudeRouteForRequest(c, requestedModel)
 	mapped := resolveAnthropicModel(requestedModel, mappingJSON, supportedModels)
 	// 原生 Claude 路由:若存在能服务该模型的 Claude Code OAuth 账号,则保持原生
 	// 模型 ID,交由 claude 账号原生透传;否则维持既有 Codex 翻译兜底(claude-* →
@@ -400,11 +426,22 @@ func (h *Handler) Messages(c *gin.Context) {
 	// the reviewed user-controlled bytes are the same bytes sent upstream. The
 	// native OAuth transport adds only its fixed trusted Claude Code preamble
 	// after this point; fallback Codex/relay routes never receive that preamble.
+	//
+	// 该规范化是 **Claude 出站策略**（剥离 service_tier / inference_geo / speed /
+	// safety_identifier、上限校验、双向控制符净化），只对真正会走 Claude 原生透传
+	// 的请求生效。/v1/messages 同时服务 Codex 翻译、Grok 与 Antigravity 中转，无差别
+	// 套用会跨渠道吞掉合法字段——例如 service_tier 默认不放行，Codex 账号的
+	// priority/fast 档位会被静默删掉，连带用量归因一起丢。没有 Claude 账号的部署
+	// 因此拿到的是与改动前逐字节一致的入站体。
 	claudeSecurityConfig := h.store.ClaudeSecurityConfig()
-	canonicalBody, canonicalErr := normalizeClaudeRequestBody(rawBody, claudeSecurityConfig)
-	if canonicalErr != nil {
-		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", canonicalErr.Error())
-		return
+	canonicalBody := rawBody
+	if h.nativeClaudeRouteForRequest(c, gjson.GetBytes(rawBody, "model").String()) {
+		normalized, canonicalErr := normalizeClaudeRequestBody(rawBody, claudeSecurityConfig)
+		if canonicalErr != nil {
+			rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", canonicalErr.Error())
+			return
+		}
+		canonicalBody = normalized
 	}
 
 	// 基本验证

@@ -94,18 +94,44 @@ func TestMergeAnthropicBeta_Empty(t *testing.T) {
 	}
 }
 
-func TestSanitizeClaudeRequestText_StripsZeroWidth(t *testing.T) {
-	// 把字面 UTF-8 零宽空格(U+200B)与 BOM(U+FEFF)直接拼进 JSON 字符串值,
-	// 模拟真实客户端发送的未转义不可见字符(runtime 构造,源码不含 BOM)。
-	content := "he" + string(rune(0x200B)) + "llo" + string(rune(0xFEFF)) + " world"
+func TestSanitizeClaudeRequestText_StripsBidiControls(t *testing.T) {
+	// 双向覆盖符(U+202E)/弹出符(U+202C)是视觉欺骗的经典载体,在提示词里没有
+	// 正当用途,必须剔除(runtime 构造,源码不含控制符)。
+	content := "he" + string(rune(0x202E)) + "llo" + string(rune(0x202C)) + " world"
 	body := []byte(`{"messages":[{"role":"user","content":"` + content + `"}]}`)
 	out := sanitizeClaudeRequestText(body)
 	got := gjson.GetBytes(out, "messages.0.content").String()
 	if got != "hello world" {
-		t.Fatalf("零宽/BOM 未被清理: %q", got)
+		t.Fatalf("双向控制符未被清理: %q", got)
 	}
 	if !gjson.ValidBytes(out) {
 		t.Fatal("净化后应仍是合法 JSON")
+	}
+}
+
+// TestSanitizeClaudeRequestText_KeepsZeroWidthContent 钉住"净化不许改写正文"这条
+// 边界:零宽字符是内容不是控制信号,ZWJ 连着 emoji 序列、ZWNJ 连着波斯语词形,
+// 剔除它们等于静默把 👩‍💻 拆成两个字符、把 می‌روم 改成另一个词。
+func TestSanitizeClaudeRequestText_KeepsZeroWidthContent(t *testing.T) {
+	zwj := string(rune(0x200D))
+	zwnj := string(rune(0x200C))
+	zwsp := string(rune(0x200B))
+	content := "\U0001F469" + zwj + "\U0001F4BB a" + zwsp + "b mi" + zwnj + "ravam"
+	body := []byte(`{"messages":[{"role":"user","content":"` + content + `"}]}`)
+	out := sanitizeClaudeRequestText(body)
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != content {
+		t.Fatalf("零宽正文被改写:\n want %q\n got  %q", content, got)
+	}
+}
+
+// TestSanitizeClaudeRequestText_KeepsDecomposedForm 钉住不做 NFC 归一:Claude Code
+// 会原样送 macOS 的 NFD 文件路径,归一成预组合形态后模型抄回来的路径就打不开了。
+func TestSanitizeClaudeRequestText_KeepsDecomposedForm(t *testing.T) {
+	decomposed := "cafe" + string(rune(0x0301)) + ".txt" // NFD 的 café.txt
+	body := []byte(`{"messages":[{"role":"user","content":"` + decomposed + `"}]}`)
+	out := sanitizeClaudeRequestText(body)
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != decomposed {
+		t.Fatalf("NFD 文本被归一改写:\n want %q\n got  %q", decomposed, got)
 	}
 }
 

@@ -27,7 +27,6 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -293,30 +292,38 @@ func cloneStringMap(m map[string]string) map[string]string {
 // claudeInvisibleRunes 是应从请求文字中剔除的不可见/格式字符:零宽、词连接符、
 // BOM、以及会误导审核/看起来像规避手段的双向控制符。剔除它们让请求更"正常"、
 // 反而降低被标记概率,且不改变可见文字与语义。
+// claudeInvisibleRune 只认双向文本控制符——它们在提示词里没有正当用途,却是
+// "trojan source" 式视觉欺骗的经典载体,剔除后请求更"正常"、降低被标记概率。
+//
+// 刻意**不**剔除零宽字符(U+200B/200C/200D/2060/FEFF/180E):它们是合法正文而非
+// 控制信号。U+200D 是 ZWJ,emoji 序列靠它成词(👩‍💻 = U+1F469 U+200D U+1F4BB);
+// U+200C 是 ZWNJ,波斯语/印地语等靠它区分词形(می‌روم ≠ میروم)。一并剔除会静默
+// 改写用户正文——把 emoji 拆成几个独立字符、把非英语文本改成错误词形。
 func claudeInvisibleRune(r rune) bool {
 	switch r {
-	case 0x200B, 0x200C, 0x200D, // zero-width space / non-joiner / joiner
-		0x2060, 0xFEFF, // word joiner / BOM (zero-width no-break space)
-		0x180E,                                 // mongolian vowel separator
-		0x202A, 0x202B, 0x202C, 0x202D, 0x202E, // bidi embedding / override / pop
+	case 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, // bidi embedding / override / pop
 		0x2066, 0x2067, 0x2068, 0x2069: // bidi isolates
 		return true
 	}
 	return false
 }
 
-// sanitizeClaudeRequestText 对请求体做安全净化:Unicode NFC 归一 + 剔除不可见/双向
-// 控制字符。JSON 的结构字符与键均为 ASCII,不受影响;仅规范化字符串值内的文字。
-// 净化后若不再是合法 JSON(理论上不会),回退原始体。
+// sanitizeClaudeRequestText 对请求体做安全净化:剔除双向文本控制符。JSON 的结构
+// 字符与键均为 ASCII,不受影响;仅影响字符串值内的文字。净化后若不再是合法
+// JSON(理论上不会),回退原始体。
+//
+// 这里刻意不做 Unicode NFC 归一。Claude Code 会把文件路径与文件内容原样送进
+// 请求,而 macOS 文件系统用的是 NFD——归一会把 NFD 路径改写成预组合形态,模型
+// 照抄回来的路径就找不到那个文件了。净化只做纯删除,不改写任何可见文字。
 func sanitizeClaudeRequestText(body []byte) []byte {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
 	}
-	normalized := norm.NFC.String(string(body))
+	text := string(body)
 	var b strings.Builder
-	b.Grow(len(normalized))
-	changed := len(normalized) != len(body)
-	for _, r := range normalized {
+	b.Grow(len(text))
+	changed := false
+	for _, r := range text {
 		if claudeInvisibleRune(r) {
 			changed = true
 			continue
