@@ -1221,7 +1221,7 @@
     "healthWarm": "預熱",
     "healthRisky": "風險",
     "statScheduling": "排程中",
-    "statBanned": "封鎖",
+    "statBanned": "授權失效",
     "statUnsampled": "未取樣",
     "lastSample": "最後取樣",
     "samplingState": {
@@ -1230,7 +1230,7 @@
       "error": "取樣失敗",
       "notSampled": "尚無取樣"
     },
-    "healthBanned": "封鎖",
+    "healthBanned": "已隔離",
     "planAll": "全部方案",
     "authAll": "全部",
     "authOAuth": "OAuth",
