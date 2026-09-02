@@ -1220,6 +1220,7 @@ export const api = {
       builtin_version: string
       updated: boolean
       accounts_refreshed: number
+      warning?: string
     }>('/settings/claude-config/cli-version/sync', { method: 'POST' }),
   getObservedInstructions: () =>
     request<ObservedInstructionsResponse>('/settings/observed-instructions'),
