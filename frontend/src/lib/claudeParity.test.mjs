@@ -174,3 +174,10 @@ test('Claude admin API reference covers import, sampling, probing, and config co
   assert.match(apiReference, /Claude \/ Anthropic 管理 API/)
   assert.match(apiReference, /Messages API/)
 })
+test('Usage page surfaces Anthropic prompt-cache write tokens and costs', () => {
+  assert.match(usage, /cache_write_5m_cost/)
+  assert.match(usage, /cache_write_1h_price_per_mtoken/)
+  assert.match(usage, /cacheWriteBadge/)
+  assert.match(types, /cache_write_1h_tokens: number/)
+  assert.equal(typeof zh.usage?.cacheWrite1hCost, 'string')
+})
