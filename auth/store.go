@@ -3335,6 +3335,8 @@ type Store struct {
 	claudeSecurityConfig     atomic.Value // ClaudeSecurityConfig: ClaudeCode 出站安全策略
 	claudeClientPolicy       atomic.Value // ClaudeClientPolicy: 全局 Claude Code 平台/版本策略快照
 	claudeSessionWindowLimit int64        // Claude 账号默认并发会话窗口数（0=用全局 maxConcurrency）
+	claudeCLIVersionSyncDisabled  atomic.Bool  // Claude CLI 版本自动同步是否关闭（零值=开启）
+	claudeCLIVersionSyncIntervalH atomic.Int64 // Claude CLI 版本同步间隔小时（0=默认 12）
 	grokAffinityMode         atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
 	grokProbeEnabled         atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
 	grokProbeIntervalMin     atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
