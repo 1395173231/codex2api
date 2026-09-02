@@ -430,6 +430,9 @@ function UsageWindow({
   );
 }
 
+// Upper bound on concurrent one-time usage backfill requests per page mount.
+const LEGACY_USAGE_BACKFILL_BATCH = 4;
+
 function ClaudeScopedUsageWindows({ windows }: { windows?: AccountRow["claude_usage_windows"] }) {
   const { t } = useTranslation();
   const scoped = (windows ?? []).filter((window) => window.model_scoped && window.name !== "5h" && window.name !== "7d");
@@ -703,13 +706,15 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
     return () => window.clearInterval(samplingPollTimer);
   }, [pendingSamplingKey, reload]);
 
-  // Older Claude rows may already have a probe timestamp from before the
-  // OAuth usage-window field was introduced. Trigger one bounded, zero-cost
-  // refresh for those rows so the model-scoped Fable window is backfilled and
-  // rendered without requiring the operator to click every row manually.
+  // Older Claude rows were sampled before the OAuth usage-window field
+  // existed. Refresh each such row exactly once so the model-scoped Fable
+  // window is backfilled without the operator clicking every row. The backend
+  // marks the row as probed on every attempt (even with no windows), so rows
+  // whose OAuth endpoint is unavailable never re-qualify and never trigger the
+  // paid Messages fallback again on the next page visit.
   const legacyUsageRefreshKey = useMemo(
     () => accounts
-      .filter((acc) => acc.claude_api && acc.claude_usage_windows === undefined && !acc.claude_usage_probe_error)
+      .filter((acc) => acc.claude_api && Boolean(acc.claude_usage_probe_at) && !acc.claude_usage_windows_probed && !acc.claude_usage_probe_error)
       .map((acc) => acc.id)
       .join(","),
     [accounts],
@@ -721,7 +726,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
       .map(Number)
       .filter((id) => Number.isFinite(id) && !legacyUsageRefreshRef.current.has(id));
     if (pending.length === 0) return undefined;
-    const batch = pending.slice(0, 4);
+    const batch = pending.slice(0, LEGACY_USAGE_BACKFILL_BATCH);
     batch.forEach((id) => legacyUsageRefreshRef.current.add(id));
     let cancelled = false;
     void Promise.all(
@@ -938,8 +943,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                         claude_usage_probe_error: refreshed.claude_usage_probe_error,
                       }
                     : {}),
-                  ...(row.claude_api && refreshed.claude_usage_windows
-                    ? { claude_usage_windows: refreshed.claude_usage_windows }
+                  ...(row.claude_api && refreshed.claude_usage_windows_probed
+                    ? { claude_usage_windows_probed: true, claude_usage_windows: refreshed.claude_usage_windows ?? [] }
                     : {}),
                 }
               : row,

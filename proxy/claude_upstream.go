@@ -122,8 +122,14 @@ func markClaudeNativeRoute(resp *http.Response) {
 	}
 }
 
+// claudeClientPolicyErrorCode marks a request rejected by the gateway-side
+// Claude Code client policy (platform/version), never by the upstream.
+const claudeClientPolicyErrorCode = "claude_client_policy"
+
 // ExecuteClaudeMessagesRequest 把入站 Anthropic Messages 请求透传给 Claude Code
-// OAuth 账号对应的上游,返回原始上游响应。
+// OAuth 账号对应的上游,返回原始上游响应。它不做客户端平台/版本门禁:管理端的
+// 探测/测连/用量采样都走这里,因为它们不是下游客户端流量(见 issue: 开启
+// claude_code_cli_only 后 nil header 探针会被自己的策略拒掉并把整池标错)。
 func ExecuteClaudeMessagesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header, fingerprintMode string, securityConfigs ...auth.ClaudeSecurityConfig) (*http.Response, error) {
 	return ExecuteClaudeMessagesRequestWithPolicy(ctx, account, requestBody, proxyOverride, headers, fingerprintMode, auth.ClaudeClientPolicy{}, securityConfigs...)
 }
@@ -161,18 +167,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 		return nil, ErrBadRequest("Claude 客户端策略无效: " + policyErr.Error())
 	}
 	if !decision.Allowed {
-		status := http.StatusBadRequest
-		if decision.Code == "client_version_too_old" || decision.Code == "client_version_missing" {
-			status = http.StatusUpgradeRequired
-		}
-		message := decision.Message
-		if decision.DetectedVersion != "" {
-			message += fmt.Sprintf(" (detected %s)", decision.DetectedVersion)
-		}
-		if decision.RequiredVersion != "" {
-			message += fmt.Sprintf("; required %s", decision.RequiredVersion)
-		}
-		return nil, &Error{Code: "claude_client_policy", Message: message, Type: ErrorTypeInvalidRequest, Retryable: false, HTTPStatus: status}
+		return nil, &Error{Code: claudeClientPolicyErrorCode, Message: decision.DetailMessage(), Type: ErrorTypeInvalidRequest, Retryable: false, HTTPStatus: decision.HTTPStatus()}
 	}
 
 	securityConfig := auth.DefaultClaudeSecurityConfig()

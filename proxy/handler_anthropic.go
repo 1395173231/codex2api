@@ -37,10 +37,11 @@ func isClaudeClientCompatibilityError(statusCode int, body []byte) bool {
 	if errType != ErrorTypeInvalidRequest {
 		return false
 	}
+	// Only the structured message fields are inspected: scanning the raw body
+	// would let echoed request content steer the classification.
 	message := strings.ToLower(strings.Join([]string{
 		gjson.GetBytes(body, "error.message").String(),
 		gjson.GetBytes(body, "message").String(),
-		string(body),
 	}, " "))
 	return strings.Contains(message, "claude code") &&
 		strings.Contains(message, "does not support this model") &&
@@ -484,32 +485,6 @@ func (h *Handler) Messages(c *gin.Context) {
 		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
-	// Apply the global Claude client gate before scheduler acquisition. This
-	// keeps deterministic platform/version failures fast even when the Claude
-	// account is busy; account-specific overrides are checked again after the
-	// selected OAuth account is known.
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-") {
-		decision, policyErr := auth.ValidateClaudeClientRequest(h.store.ClaudeClientPolicy(), c.GetHeader("User-Agent"), model)
-		if policyErr != nil {
-			rejectAnthropicMessagesRequest(c, http.StatusBadRequest, ErrorTypeInvalidRequest, "Claude 客户端策略无效: "+policyErr.Error())
-			return
-		}
-		if !decision.Allowed {
-			status := http.StatusBadRequest
-			if decision.Code == "client_version_too_old" || decision.Code == "client_version_missing" {
-				status = http.StatusUpgradeRequired
-			}
-			message := decision.Message
-			if decision.DetectedVersion != "" {
-				message += fmt.Sprintf(" (detected %s)", decision.DetectedVersion)
-			}
-			if decision.RequiredVersion != "" {
-				message += fmt.Sprintf("; required %s", decision.RequiredVersion)
-			}
-			rejectAnthropicMessagesRequest(c, status, ErrorTypeInvalidRequest, message)
-			return
-		}
-	}
 	if h.inspectPromptFilterAnthropic(c, canonicalBody, "/v1/messages", model) {
 		return
 	}
@@ -586,6 +561,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	capacityShedRetries := map[int64]int{}
 	var affinityGuard auth.SessionAffinityGuard
 	grokQualityAttempts := 0
+	var lastClaudePolicyErr *Error
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
@@ -594,6 +570,13 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		if account == nil {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
+				return
+			}
+			if lastClaudePolicyErr != nil {
+				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, lastClaudePolicyErr.Message) {
+					return
+				}
+				sendAnthropicError(c, lastClaudePolicyErr.HTTPStatus, ErrorTypeInvalidRequest, lastClaudePolicyErr.Message)
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -801,6 +784,17 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			if !retryable {
 				var structured *Error
+				if errors.As(reqErr, &structured) && structured.Code == claudeClientPolicyErrorCode {
+					// The gateway-side client policy is per account (overrides differ),
+					// so a denial only disqualifies this candidate. Try the remaining
+					// pool before surfacing the policy error to the caller.
+					lastClaudePolicyErr = structured
+					retryExclusions.MarkHard(account.ID())
+					if attempt < maxRetries {
+						log.Printf("Claude 客户端策略拒绝账号 %d，换号重试 (attempt %s, /v1/messages): %s", account.ID(), retryAttemptProgress(attempt, maxRetries), structured.Message)
+						continue
+					}
+				}
 				if errors.As(reqErr, &structured) && (structured.HTTPStatus == http.StatusBadRequest || structured.HTTPStatus == http.StatusUpgradeRequired) {
 					if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", structured.Message) {
 						return

@@ -220,6 +220,8 @@ export interface AccountRow {
   claude_usage_probe_at?: ISODateString
   claude_usage_probe_error?: string
   claude_usage_windows?: ClaudeUsageWindow[]
+  /** True once the OAuth usage probe has run for this row (even with no windows). */
+  claude_usage_windows_probed?: boolean
   timezone?: string
   custom_headers?: Record<string, string> | null
   health_tier?: string

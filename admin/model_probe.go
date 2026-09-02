@@ -273,14 +273,13 @@ func (h *Handler) probeClaudeAccountModel(ctx context.Context, account *auth.Acc
 	if h == nil || h.store == nil {
 		return modelProbeError, "Claude 探测缺少运行时账号池"
 	}
-	resp, err := proxy.ExecuteClaudeMessagesRequestWithPolicy(
+	resp, err := proxy.ExecuteClaudeMessagesRequest(
 		probeCtx,
 		account,
 		buildClaudeModelProbePayload(model),
 		h.store.ResolveProxyForAccount(account),
 		nil,
 		account.EffectiveClaudeFingerprintMode(h.store.ClaudeFingerprintModeDefault()),
-		h.store.ClaudeClientPolicyForAccount(account),
 		h.store.ClaudeSecurityConfig(),
 	)
 	if err != nil {

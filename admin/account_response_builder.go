@@ -268,6 +268,8 @@ func (h *Handler) buildAccountResponse(
 		UsageLimitOverride:       ignoreUsageLimitStatusOverride,
 		UsageLimitEffective:      ignoreUsageLimitStatusEffective,
 	}
+	// 凭据里只要存在 usage 窗口键(哪怕是空数组)就代表 OAuth usage 采样跑过。
+	resp.ClaudeUsageWindowsProbed = strings.TrimSpace(row.GetCredential(auth.ClaudeUsageWindowsCredentialKey)) != ""
 	if isAntigravityAccount {
 		resp.Models = antigravityPublishedModelsOrDefault(row.GetCredentialStringSlice("models"))
 	}

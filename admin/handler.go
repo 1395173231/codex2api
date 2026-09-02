@@ -1592,6 +1592,7 @@ type accountResponse struct {
 	ClaudeUsageProbeAt            string                      `json:"claude_usage_probe_at,omitempty"`
 	ClaudeUsageProbeError         string                      `json:"claude_usage_probe_error,omitempty"`
 	ClaudeUsageWindows            []auth.ClaudeUsageWindow    `json:"claude_usage_windows,omitempty"`
+	ClaudeUsageWindowsProbed      bool                        `json:"claude_usage_windows_probed,omitempty"` // 已跑过 OAuth usage 采样(前端据此只回填从未采样的旧行)
 	ActiveRequests                int64                       `json:"active_requests"`
 	OccupiedRequests              int64                       `json:"occupied_requests"`
 	SessionSlotBufferEnabled      bool                        `json:"session_slot_buffer_enabled"`
@@ -2316,6 +2317,9 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.CustomHeaders.Set ||
 		u.CodexFingerprintMode.Set ||
 		u.ClaudeFingerprintMode.Set ||
+		u.ClaudeClientPlatform.Set ||
+		u.ClaudeVersionPolicy.Set ||
+		u.ClaudeClientVersion.Set ||
 		u.Timezone.Set
 }
 
@@ -5936,8 +5940,8 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 				resp["claude_usage_probe_error"] = value
 			}
 			if value := row.GetCredential(auth.ClaudeUsageWindowsCredentialKey); value != "" {
-				var windows []auth.ClaudeUsageWindow
-				if json.Unmarshal([]byte(value), &windows) == nil && len(windows) > 0 {
+				resp["claude_usage_windows_probed"] = true
+				if windows := parseClaudeUsageWindows(value); len(windows) > 0 {
 					resp["claude_usage_windows"] = windows
 				}
 			}

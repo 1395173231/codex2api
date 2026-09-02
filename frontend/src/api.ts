@@ -828,6 +828,7 @@ export const api = {
       claude_usage_probe_at?: string
       claude_usage_probe_error?: string
       claude_usage_windows?: import('./types').ClaudeUsageWindow[]
+      claude_usage_windows_probed?: boolean
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),

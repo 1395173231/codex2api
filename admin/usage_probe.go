@@ -234,11 +234,8 @@ func (h *Handler) probeUsageViaClaudeMessages(ctx context.Context, account *auth
 			fingerprintMode = account.EffectiveClaudeFingerprintMode(h.store.ClaudeFingerprintModeDefault())
 			securityConfig = h.store.ClaudeSecurityConfig()
 		}
-		clientPolicy := auth.ClaudeClientPolicy{}
-		if h != nil && h.store != nil {
-			clientPolicy = h.store.ClaudeClientPolicyForAccount(account)
-		}
-		resp, err = proxy.ExecuteClaudeMessagesRequestWithPolicy(ctx, account, body, proxyURL, nil, fingerprintMode, clientPolicy, securityConfig)
+		// Operator-originated probe: never apply the downstream client policy.
+		resp, err = proxy.ExecuteClaudeMessagesRequest(ctx, account, body, proxyURL, nil, fingerprintMode, securityConfig)
 	}
 	if err != nil {
 		return err
@@ -350,6 +347,11 @@ func (h *Handler) recordClaudeUsageProbe(account *auth.Account, probeErr error, 
 	if probeErr != nil {
 		fields[auth.ClaudeUsageProbeErrorCredentialKey] = security.SafeTruncate(security.SanitizeLog(strings.TrimSpace(probeErr.Error())), 300)
 	}
+	// Always rewrite the window snapshot together with the probe timestamp so a
+	// probe that produced no OAuth windows (fallback Messages path, endpoint
+	// unavailable) clears stale model-scoped percentages instead of showing them
+	// under a fresh timestamp. The key's presence also marks the row as probed.
+	fields[auth.ClaudeUsageWindowsCredentialKey] = "[]"
 	if len(windows) > 0 {
 		if raw, err := json.Marshal(windows); err == nil {
 			fields[auth.ClaudeUsageWindowsCredentialKey] = string(raw)
