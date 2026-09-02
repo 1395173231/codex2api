@@ -5,6 +5,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
 import type { ProxyRow } from "../api";
 import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
+import { ProxyUrlInput } from "../components/ProxyField";
 import AccountProxyBadge from "../components/AccountProxyBadge";
 import AccountProxyQuickEditor from "../components/AccountProxyQuickEditor";
 import {
@@ -2170,16 +2171,14 @@ export default function Accounts() {
         <label className="block text-sm font-semibold text-muted-foreground">
           {label}
         </label>
-        {/* 第一行：手动填写代理 URL + 测试 */}
+        {/* 第一行：手动填写代理 URL(带清空按钮) + 测试 */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
-          <Input
+          <ProxyUrlInput
             className="min-w-0 flex-1"
             placeholder={placeholder}
             value={value}
             disabled={disabled}
-            onChange={(event: ChangeEvent<HTMLInputElement>) =>
-              onChange(event.target.value)
-            }
+            onChange={onChange}
           />
           <Button
             type="button"
@@ -6093,6 +6092,7 @@ export default function Accounts() {
             description={t("accounts.description")}
             onRefresh={() => void reload()}
             hideTitle
+            actionsBelow
             titleAdornment={
               <div className="flex items-center gap-2">
                 {providerSwitcher}
@@ -7157,6 +7157,7 @@ export default function Accounts() {
               <StateShell
                 variant="section"
                 isEmpty={accounts.length === 0}
+                emptyIcon={<ChannelLogo channel="codex" size={30} />}
                 emptyTitle={t("accounts.noData")}
                 emptyDescription={t("accounts.noDataDesc")}
                 action={

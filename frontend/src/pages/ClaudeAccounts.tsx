@@ -45,6 +45,7 @@ import { CompactStat } from "../components/CompactStat";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
+import StateShell from "../components/StateShell";
 import type { AccountAnalysisResponse } from "../types";
 import { ProxyField } from "../components/ProxyField";
 import AccountProxyBadge from "../components/AccountProxyBadge";
@@ -312,6 +313,24 @@ const CLAUDE_TOGGLE_COLUMNS = [
 type ClaudeCol = (typeof CLAUDE_TOGGLE_COLUMNS)[number];
 type ClaudeColVisibility = Record<ClaudeCol, boolean>;
 const CLAUDE_COLS_KEY = "codex2api:claude-accounts:visible-columns";
+// 分析面板显隐同样持久化,避免切到 Codex 页再切回来时又展开;默认收起。
+const CLAUDE_ANALYSIS_VISIBILITY_KEY = "codex2api:claude-accounts:analysis-visible";
+
+function loadClaudeAnalysisVisibility(): boolean {
+  try {
+    return window.localStorage.getItem(CLAUDE_ANALYSIS_VISIBILITY_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function persistClaudeAnalysisVisibility(visible: boolean) {
+  try {
+    window.localStorage.setItem(CLAUDE_ANALYSIS_VISIBILITY_KEY, visible ? "true" : "false");
+  } catch {
+    /* localStorage 不可用时仅保留会话内状态 */
+  }
+}
 
 function defaultClaudeCols(): ClaudeColVisibility {
   return Object.fromEntries(CLAUDE_TOGGLE_COLUMNS.map((c) => [c, true])) as ClaudeColVisibility;
@@ -473,7 +492,10 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
   const [healthBars, setHealthBars] = useState<Record<string, AccountHealthBucket[]>>({});
   // 额度分布 + 限流恢复分析(号池模式面板,与 Codex 同源接口/组件)。
   const [analysis, setAnalysis] = useState<AccountAnalysisResponse | null>(null);
-  const [showAnalysis, setShowAnalysis] = useState(true);
+  const [showAnalysis, setShowAnalysis] = useState(loadClaudeAnalysisVisibility);
+  useEffect(() => {
+    persistClaudeAnalysisVisibility(showAnalysis);
+  }, [showAnalysis]);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const analysisAbortRef = useRef<AbortController | null>(null);
@@ -1207,6 +1229,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
         title={t("claude.title")}
         description={t("claude.subtitle")}
         hideTitle={Boolean(headerSlot)}
+        actionsBelow
         titleAdornment={headerSlot}
         onRefresh={() => { void reload(); void loadAnalysis(); }}
         actions={
@@ -1523,13 +1546,42 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
           <Button className="mt-3" variant="outline" size="sm" onClick={() => void reload()}>{t("common.retry")}</Button>
         </div>
       ) : total === 0 && !filtersActive ? (
-        <div className="rounded-xl border border-dashed border-border py-16 text-center text-sm text-muted-foreground">
-          {t("claude.empty")}
-        </div>
+        /* 空号池占位卡(与 Antigravity 页同款 StateShell):提示添加账号并直达授权弹窗 */
+        <StateShell
+          variant="page"
+          isEmpty
+          emptyIcon={<ChannelLogo channel="claude" size={30} />}
+          emptyTitle={t("claude.emptyTitle")}
+          emptyDescription={t("claude.emptyDescription")}
+          action={
+            <Button
+              onClick={() => {
+                setAddInitialTab("oauth");
+                setShowAdd(true);
+              }}
+            >
+              <Plus className="size-4" />
+              {t("claude.addAccount")}
+            </Button>
+          }
+        >
+          {null}
+        </StateShell>
       ) : accounts.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-border py-12 text-center text-sm text-muted-foreground">
-          {t("claude.emptyFiltered")}
-        </div>
+        <StateShell
+          variant="page"
+          isEmpty
+          emptyIcon={<ChannelLogo channel="claude" size={30} />}
+          emptyTitle={t("claude.noMatchesTitle")}
+          emptyDescription={t("claude.noMatchesDescription")}
+          action={
+            <Button variant="outline" onClick={clearFilters}>
+              {t("claude.clearFilters")}
+            </Button>
+          }
+        >
+          {null}
+        </StateShell>
       ) : (
         <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
           <table className="w-full border-collapse text-sm">
@@ -3029,14 +3081,18 @@ function ClaudeAddModal({
     [groupIds],
   );
 
+  // 生成授权链接只展示,不自动弹授权页:由用户确认链接后自行打开或复制到别处授权。
+  const [authUrlLoading, setAuthUrlLoading] = useState(false);
   const genAuthUrl = useCallback(async () => {
+    setAuthUrlLoading(true);
     try {
       const res = await api.generateClaudeAuthURL();
       setAuthUrl(res.auth_url);
       setState(res.state);
-      window.open(res.auth_url, "_blank", "noopener,noreferrer");
     } catch (error) {
       showToast(t("claude.authUrlFailed") + ": " + getErrorMessage(error), "error");
+    } finally {
+      setAuthUrlLoading(false);
     }
   }, [showToast, t]);
 
@@ -3223,6 +3279,7 @@ function ClaudeAddModal({
       show
       onClose={onClose}
       title={t("claude.addAccount")}
+      contentClassName="sm:max-w-[680px]"
       footer={
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
@@ -3253,18 +3310,31 @@ function ClaudeAddModal({
         {tab === "oauth" ? (
           <div className="space-y-3">
             <p className="text-xs text-muted-foreground">{t("claude.step1")}</p>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button variant="secondary" size="sm" onClick={() => void genAuthUrl()}>
+            {/* 先生成并展示授权链接(不自动弹授权页),用户核对后自行打开/复制 */}
+            {!authUrl ? (
+              <Button variant="secondary" size="sm" disabled={authUrlLoading} onClick={() => void genAuthUrl()}>
+                {authUrlLoading ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
                 {t("claude.genAuthUrl")}
               </Button>
-              {authUrl ? (
-                <>
-                  <a href={authUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary underline">
-                    <ExternalLink className="size-3" />
+            ) : (
+              <div className="space-y-2 rounded-lg border border-border bg-muted/30 p-3">
+                <p className="text-xs text-muted-foreground">{t("claude.authUrlReady")}</p>
+                {/* 完整 URL 直接作为可点击链接展示:全量换行(break-all)不出滚动条 */}
+                <a
+                  href={authUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block w-full rounded-md border border-input bg-background p-2 font-mono text-[11px] leading-snug break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
+                >
+                  {authUrl}
+                </a>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" onClick={() => window.open(authUrl, "_blank", "noopener,noreferrer")}>
+                    <ExternalLink className="size-3.5" />
                     {t("claude.openAuth")}
-                  </a>
+                  </Button>
                   <Button
-                    variant="ghost"
+                    variant="outline"
                     size="sm"
                     onClick={() => {
                       void navigator.clipboard?.writeText(authUrl);
@@ -3273,19 +3343,13 @@ function ClaudeAddModal({
                   >
                     {t("claude.copyLink")}
                   </Button>
-                </>
-              ) : null}
-            </div>
-            {/* 生成后展示完整授权 URL(可读、可手动复制),而不是只给一个跳转链接 */}
-            {authUrl ? (
-              <textarea
-                readOnly
-                value={authUrl}
-                rows={2}
-                onFocus={(e) => e.currentTarget.select()}
-                className="w-full resize-none rounded-md border border-input bg-muted/40 p-2 font-mono text-[11px] leading-snug text-muted-foreground outline-none"
-              />
-            ) : null}
+                  <Button variant="ghost" size="sm" disabled={authUrlLoading} onClick={() => void genAuthUrl()}>
+                    <RefreshCw className={cn("size-3.5", authUrlLoading && "animate-spin")} />
+                    {t("claude.regenAuthUrl")}
+                  </Button>
+                </div>
+              </div>
+            )}
             <p className="text-xs text-muted-foreground">{t("claude.step2")}</p>
             <Input value={callback} onChange={(e) => setCallback(e.target.value)} placeholder={t("claude.callbackPlaceholder")} />
             {commonFields}
