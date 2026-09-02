@@ -1011,6 +1011,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				copyClaudeNativeResponseHeaders(c, resp.Header)
 			}
 			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+			if account.IsClaudeOAuth() {
+				// Anthropic 的 input_tokens 不含缓存命中/写入，转换成计费层的总输入口径。
+				applyAnthropicUsageSemantics(usage)
+			}
 			outcome = normalizeNativeFailureMessageForAccount(account, outcome)
 			// The native forwarder consumes the body before returning. Synchronize
 			// Anthropic's unified quota headers now, once per attempt, so Claude
@@ -1050,6 +1054,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					retryLog.PromptTokens, retryLog.CompletionTokens, retryLog.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
 					retryLog.InputTokens, retryLog.OutputTokens = usage.InputTokens, usage.OutputTokens
 					retryLog.ReasoningTokens, retryLog.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+					applyUsageCacheWritesToLog(&retryLog, usage)
 				}
 				h.logUsageForRequest(c, &retryLog)
 				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
@@ -1103,6 +1108,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
 				logInput.InputTokens, logInput.OutputTokens = usage.InputTokens, usage.OutputTokens
 				logInput.ReasoningTokens, logInput.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+				applyUsageCacheWritesToLog(logInput, usage)
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.UpstreamErrorKind = outcome.failureKind
@@ -1544,6 +1550,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.OutputTokens = usage.OutputTokens
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
+			applyUsageCacheWritesToLog(logInput, usage)
 		}
 		h.logUsageForRequest(c, logInput)
 

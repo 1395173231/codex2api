@@ -786,7 +786,18 @@ func grokNativeUsage(protocol GrokProtocol, payload []byte) *UsageInfo {
 		input := int(usage.Get("input_tokens").Int())
 		output := int(usage.Get("output_tokens").Int())
 		cached := int(usage.Get("cache_read_input_tokens").Int())
-		return newUsageInfo(input, output, 0, cached)
+		info := newUsageInfo(input, output, 0, cached)
+		writeTotal := int(usage.Get("cache_creation_input_tokens").Int())
+		// 只记录事件里真实给出的 TTL 细分；流式的 message_delta 只带总数，
+		// "无细分则按 5 分钟"的兜底放在落库映射里做，避免与 message_start 的
+		// 细分在合并时被同时计入。
+		write5m := int(usage.Get("cache_creation.ephemeral_5m_input_tokens").Int())
+		write1h := int(usage.Get("cache_creation.ephemeral_1h_input_tokens").Int())
+		if writeTotal < write5m+write1h {
+			writeTotal = write5m + write1h
+		}
+		info.CacheWriteTokens, info.CacheWrite5mTokens, info.CacheWrite1hTokens = writeTotal, write5m, write1h
+		return info
 	default:
 		// Responses 协议：非流式 body 的 usage 在顶层；流式 response.completed /
 		// response.incomplete 事件的 usage 在 response.usage 下。
@@ -921,6 +932,9 @@ func mergeGrokNativeUsage(current, next *UsageInfo) *UsageInfo {
 	current.OutputTokens = max(current.OutputTokens, next.OutputTokens)
 	current.ReasoningTokens = max(current.ReasoningTokens, next.ReasoningTokens)
 	current.CachedTokens = max(current.CachedTokens, next.CachedTokens)
+	current.CacheWriteTokens = max(current.CacheWriteTokens, next.CacheWriteTokens)
+	current.CacheWrite5mTokens = max(current.CacheWrite5mTokens, next.CacheWrite5mTokens)
+	current.CacheWrite1hTokens = max(current.CacheWrite1hTokens, next.CacheWrite1hTokens)
 	current.TotalTokens = max(current.TotalTokens, next.TotalTokens)
 	current.TotalTokens = max(current.TotalTokens, current.InputTokens+current.OutputTokens)
 	if current.CachedTokens > 0 {
