@@ -430,6 +430,25 @@ function UsageWindow({
   );
 }
 
+function ClaudeScopedUsageWindows({ windows }: { windows?: AccountRow["claude_usage_windows"] }) {
+  const { t } = useTranslation();
+  const scoped = (windows ?? []).filter((window) => window.model_scoped && window.name !== "5h" && window.name !== "7d");
+  if (scoped.length === 0) return null;
+  return (
+    <>
+      {scoped.map((window) => (
+        <UsageWindow
+          key={window.name}
+          label={window.model_family === "fable" ? "Fable" : (window.label || window.name)}
+          pct={claudeUsagePct(window.utilization)}
+          reset={window.reset_at}
+          resetLabel={t("claude.resetIn")}
+        />
+      ))}
+    </>
+  );
+}
+
 function ClaudeConcurrencyBadge({ acc }: { acc: AccountRow }) {
   const { t } = useTranslation();
   const active = Math.max(0, acc.active_requests ?? 0);
@@ -555,6 +574,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const reloadAbortRef = useRef<AbortController | null>(null);
   const reloadGenerationRef = useRef(0);
+  const legacyUsageRefreshRef = useRef<Set<number>>(new Set());
 
   // 搜索防抖
   useEffect(() => {
@@ -682,6 +702,37 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
     }, 3000);
     return () => window.clearInterval(samplingPollTimer);
   }, [pendingSamplingKey, reload]);
+
+  // Older Claude rows may already have a probe timestamp from before the
+  // OAuth usage-window field was introduced. Trigger one bounded, zero-cost
+  // refresh for those rows so the model-scoped Fable window is backfilled and
+  // rendered without requiring the operator to click every row manually.
+  const legacyUsageRefreshKey = useMemo(
+    () => accounts
+      .filter((acc) => acc.claude_api && acc.claude_usage_windows === undefined && !acc.claude_usage_probe_error)
+      .map((acc) => acc.id)
+      .join(","),
+    [accounts],
+  );
+  useEffect(() => {
+    if (!legacyUsageRefreshKey) return undefined;
+    const pending = legacyUsageRefreshKey
+      .split(",")
+      .map(Number)
+      .filter((id) => Number.isFinite(id) && !legacyUsageRefreshRef.current.has(id));
+    if (pending.length === 0) return undefined;
+    const batch = pending.slice(0, 4);
+    batch.forEach((id) => legacyUsageRefreshRef.current.add(id));
+    let cancelled = false;
+    void Promise.all(
+      batch.map((id) => api.refreshAccountUsage(id).catch(() => null)),
+    ).finally(() => {
+      if (!cancelled) void reload({ silent: true });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [legacyUsageRefreshKey, reload]);
 
   const mergeLiveStateIntoAccount = useCallback((account: AccountRow): AccountRow => {
     const live = liveState[String(account.id)];
@@ -886,6 +937,9 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                         claude_usage_probe_at: refreshed.claude_usage_probe_at,
                         claude_usage_probe_error: refreshed.claude_usage_probe_error,
                       }
+                    : {}),
+                  ...(row.claude_api && refreshed.claude_usage_windows
+                    ? { claude_usage_windows: refreshed.claude_usage_windows }
                     : {}),
                 }
               : row,
@@ -1747,6 +1801,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
             <div className="space-y-1 rounded-xl border border-border bg-card p-3">
               <UsageWindow label={t("claude.usage5h")} pct={claudeUsagePct(detailTarget.usage_percent_5h)} reset={detailTarget.reset_5h_at} resetLabel={t("claude.resetIn")} detail={detailTarget.usage_5h_detail} />
               <UsageWindow label={t("claude.usage7d")} pct={claudeUsagePct(detailTarget.usage_percent_7d)} reset={detailTarget.reset_7d_at} resetLabel={t("claude.resetIn")} detail={detailTarget.usage_7d_detail} />
+              <ClaudeScopedUsageWindows windows={detailTarget.claude_usage_windows} />
             </div>
           }
           providerSlot={
@@ -1773,6 +1828,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                 <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.subscriptionPlan")}</span><span>{(() => { const badge = claudePlanBadge(detailTarget.plan_type || "claude"); return <span className={badge.cls}>{badge.label}</span>; })()}</span></div>
                 <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.subscriptionExpires")}</span><span className="text-right">{formatShortDateTime(detailTarget.subscription_expires_at)?.label ?? t("claude.metadataUnknown")}</span></div>
                 <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.fingerprintModeLabel")}</span><span className="text-right">{detailTarget.claude_fingerprint_mode === "force" ? t("claude.fpForce") : detailTarget.claude_fingerprint_mode === "preserve" ? t("claude.fpPreserve") : t("claude.fpFollowGlobal")}</span></div>
+                <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.clientPlatformLabel")}</span><span className="text-right">{detailTarget.claude_client_platform === "claude_code_cli_only" ? t("claude.clientPlatformCLIOnly") : t("claude.clientPlatformUnrestricted")}</span></div>
+                <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.versionPolicyLabel")}</span><span className="text-right">{detailTarget.claude_version_policy === "fixed" ? t("claude.versionPolicyFixed") : detailTarget.claude_version_policy === "minimum" ? t("claude.versionPolicyMinimum") : t("claude.versionPolicyPassthrough")}{detailTarget.claude_client_version ? ` · ${detailTarget.claude_client_version}` : ""}</span></div>
                 <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.timezoneLabel")}</span><span className="max-w-[250px] text-right">{detailTarget.timezone ? claudeTimezoneLabel(detailTarget.timezone) : t("claude.metadataUnknown")}</span></div>
                 <div className="flex items-start justify-between gap-3"><span className="shrink-0 text-muted-foreground">{t("claude.upstreamUserAgent")}</span><span className="max-w-[260px] break-all text-right font-mono text-[10px]">{detailTarget.claude_user_agent || t("claude.uaNotConfigured")}</span></div>
                 <div className="flex justify-between gap-3"><span className="text-muted-foreground">{t("claude.modelsLabel")}</span><span className="max-w-[230px] text-right">{detailTarget.models?.length ? t("claude.modelsWhitelistCount", { count: normalizeClaudeModelList(detailTarget.models).length }) : t("claude.modelsWhitelistAll")}</span></div>
@@ -2108,10 +2165,11 @@ function ClaudeAccountRow({
       <td className="px-2 py-3">
         <div className="flex items-center justify-center gap-1.5">
           <div className="min-w-0 space-y-1">
-            {pct5h !== null || pct7d !== null || acc.usage_5h_detail || acc.usage_7d_detail ? (
+            {pct5h !== null || pct7d !== null || acc.usage_5h_detail || acc.usage_7d_detail || (acc.claude_usage_windows ?? []).some((window) => window.model_scoped) ? (
               <>
                 <UsageWindow label={t("claude.usage5h")} pct={pct5h} reset={acc.reset_5h_at} resetLabel={t("claude.resetIn")} detail={acc.usage_5h_detail} />
                 <UsageWindow label={t("claude.usage7d")} pct={pct7d} reset={acc.reset_7d_at} resetLabel={t("claude.resetIn")} detail={acc.usage_7d_detail} />
+                <ClaudeScopedUsageWindows windows={acc.claude_usage_windows} />
               </>
             ) : (
               <span className="text-xs text-muted-foreground/50">-</span>
@@ -2476,6 +2534,13 @@ function EditAccountModal({
   const [fpMode, setFpMode] = useState<"" | "preserve" | "force">(
     (account.claude_fingerprint_mode as "" | "preserve" | "force") ?? "",
   );
+  const [clientPlatform, setClientPlatform] = useState<"" | "any" | "claude_code_cli_only">(
+    (account.claude_client_platform_override as "" | "any" | "claude_code_cli_only") ?? "",
+  );
+  const [versionPolicy, setVersionPolicy] = useState<"" | "passthrough" | "fixed" | "minimum">(
+    (account.claude_version_policy_override as "" | "passthrough" | "fixed" | "minimum") ?? "",
+  );
+  const [clientVersion, setClientVersion] = useState(account.claude_client_version_override ?? "");
   const [timezone, setTimezone] = useState(account.timezone ?? "");
   const [timezoneCustom, setTimezoneCustom] = useState(
     Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
@@ -2501,6 +2566,9 @@ function EditAccountModal({
         auto_pause_5h_threshold: parseNum(pause5h),
         auto_pause_7d_threshold: parseNum(pause7d),
         claude_fingerprint_mode: fpMode,
+        claude_client_platform: clientPlatform || null,
+        claude_version_policy: versionPolicy || null,
+        claude_client_version: clientVersion.trim() || null,
         timezone: timezone.trim(),
       });
       showToast(t("claude.saved"), "success");
@@ -2512,7 +2580,7 @@ function EditAccountModal({
     } finally {
       setBusy(false);
     }
-  }, [account.id, proxyUrl, proxies, confirm, tags, priority, scoreBias, concurrency, pause5h, pause7d, fpMode, timezone, onSaved, showToast, t]);
+  }, [account.id, proxyUrl, proxies, confirm, tags, priority, scoreBias, concurrency, pause5h, pause7d, fpMode, clientPlatform, versionPolicy, clientVersion, timezone, onSaved, showToast, t]);
 
   const field = (label: string, node: ReactNode, hint?: string) => (
     <div className="space-y-1">
@@ -2570,6 +2638,30 @@ function EditAccountModal({
               <option value="force">{t("claude.fpForce")}</option>
             </select>,
             t("claude.fingerprintModeHint"),
+          )}
+          {field(
+            t("claude.clientPlatformLabel"),
+            <select className={selectCls} value={clientPlatform} onChange={(e) => setClientPlatform(e.target.value as "" | "any" | "claude_code_cli_only")}>
+              <option value="">{t("claude.clientPlatformAny")}</option>
+              <option value="any">{t("claude.clientPlatformUnrestricted")}</option>
+              <option value="claude_code_cli_only">{t("claude.clientPlatformCLIOnly")}</option>
+            </select>,
+            t("claude.clientPlatformHint"),
+          )}
+          {field(
+            t("claude.versionPolicyLabel"),
+            <div className="space-y-1.5">
+              <select className={selectCls} value={versionPolicy} onChange={(e) => setVersionPolicy(e.target.value as "" | "passthrough" | "fixed" | "minimum")}>
+                <option value="">{t("claude.versionPolicyPassthrough")}</option>
+                <option value="passthrough">{t("claude.versionPolicyPassthroughExplicit")}</option>
+                <option value="fixed">{t("claude.versionPolicyFixed")}</option>
+                <option value="minimum">{t("claude.versionPolicyMinimum")}</option>
+              </select>
+              {versionPolicy === "fixed" || versionPolicy === "minimum" ? (
+                <Input value={clientVersion} onChange={(e) => setClientVersion(e.target.value)} placeholder="2.1.251" />
+              ) : null}
+            </div>,
+            t("claude.clientVersionHint"),
           )}
           {field(
             t("claude.timezoneLabelEdit"),
