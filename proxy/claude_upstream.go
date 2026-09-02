@@ -21,7 +21,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -207,6 +206,10 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	}
 	applyClaudeMessagesHeadersWithVersion(req, accessToken, headers, stream, fingerprint, fingerprintMode, decision.RewriteVersion, securityConfig)
 
+	if perr := applyClaudeOutboundVersionAlignment(req, claudeOutboundRequiredVersion(decision, model)); perr != nil {
+		return nil, perr
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
@@ -281,7 +284,7 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	}
 	// 保底:连指纹都没有(老账号未生成指纹)时,给一个稳定的默认 UA,避免空 UA 破绽。
 	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
-		req.Header.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+		req.Header.Set("User-Agent", "claude-cli/"+auth.EffectiveClaudeCLIVersion()+" (external, cli)")
 	}
 	// Keep Claude on the same request-scoped User-Agent audit path as Codex,
 	// Grok, and WebSocket transports. Record only the final sanitized header
@@ -304,14 +307,79 @@ func applyClaudeMessagesHeadersWithVersion(req *http.Request, accessToken string
 	}
 }
 
-var claudeCLIUserAgentVersionPattern = regexp.MustCompile(`(?i)(\bclaude(?:-cli|-code)|\bclaude\s+code)([/\s:_-]*)(?:v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)`)
-
 func rewriteClaudeCLIUserAgentVersion(userAgent, version string) string {
-	version = strings.TrimSpace(version)
-	if _, ok := auth.ParseClaudeClientVersion("claude-cli/" + version); !ok {
-		return ""
+	return auth.RewriteClaudeCLIUserAgentVersion(userAgent, version)
+}
+
+// claudeOutboundRequiredVersion 取入站门控得出的 required 与模型下限中的较大者。
+// 入站非 CLI 时 decision.RequiredVersion 为空,但 force 指纹可能把出站改成 CLI UA,
+// 此时仍必须遵守模型下限。
+func claudeOutboundRequiredVersion(decision auth.ClaudeClientDecision, model string) string {
+	required := strings.TrimSpace(decision.RequiredVersion)
+	floor := auth.ClaudeModelMinimumVersion(model)
+	if floor == "" {
+		return required
 	}
-	return claudeCLIUserAgentVersionPattern.ReplaceAllString(userAgent, "${1}${2}"+version)
+	if required == "" {
+		return floor
+	}
+	if cmp, err := auth.CompareClaudeClientVersions(floor, required); err == nil && cmp > 0 {
+		return floor
+	}
+	return required
+}
+
+// alignClaudeOutboundUserAgent 保证最终出站 CLI UA 版本不低于 required。
+// 低于时抬到生效版本;生效版本仍不够则返回拒绝消息(调用方本地 426,不发上游)。
+func alignClaudeOutboundUserAgent(outbound, required string) (string, string) {
+	if strings.TrimSpace(required) == "" {
+		return outbound, ""
+	}
+	outVersion, isCLI := auth.ParseClaudeClientVersion(outbound)
+	if !isCLI {
+		return outbound, ""
+	}
+	// outVersion just came from ParseClaudeClientVersion (always a valid
+	// SemVer when isCLI) and required is always either an already-validated
+	// decision.RequiredVersion or a fixed auth.ClaudeModelMinimumVersion
+	// constant, so a compare error here is unreachable in practice.
+	if cmp, err := auth.CompareClaudeClientVersions(outVersion, required); err != nil || cmp >= 0 {
+		return outbound, ""
+	}
+	effective := auth.EffectiveClaudeCLIVersion()
+	// effective always comes from auth.EffectiveClaudeCLIVersion, which only
+	// ever returns the built-in constant or a previously validated synced
+	// version, so this compare error is likewise unreachable in practice.
+	if cmp, err := auth.CompareClaudeClientVersions(effective, required); err != nil || cmp < 0 {
+		return outbound, fmt.Sprintf("Claude Code CLI outbound version %s is below required %s (effective %s); update client_version or wait for CLI version sync", outVersion, required, effective)
+	}
+	rewritten := auth.RewriteClaudeCLIUserAgentVersion(outbound, effective)
+	if rewritten == "" {
+		// RewriteClaudeCLIUserAgentVersion failed even though outbound was
+		// just confirmed to be a CLI UA and effective a valid version; fail
+		// closed instead of silently keeping the stale, too-old outbound UA
+		// this function exists to reject.
+		return outbound, fmt.Sprintf("Claude Code CLI outbound version %s could not be rewritten to %s", outVersion, effective)
+	}
+	return rewritten, ""
+}
+
+// applyClaudeOutboundVersionAlignment aligns req's outbound User-Agent to the
+// required Claude Code CLI version, recording the final UA on the request's
+// upstream User-Agent audit when it changes. Returns a local 426 *Error
+// (never sent upstream) when the effective CLI version still can't satisfy
+// required.
+func applyClaudeOutboundVersionAlignment(req *http.Request, required string) *Error {
+	outbound := req.Header.Get("User-Agent")
+	finalUA, deny := alignClaudeOutboundUserAgent(outbound, required)
+	if deny != "" {
+		return &Error{Code: "claude_client_policy", Message: deny, Type: ErrorTypeInvalidRequest, Retryable: false, HTTPStatus: http.StatusUpgradeRequired}
+	}
+	if finalUA != outbound {
+		req.Header.Set("User-Agent", finalUA)
+		RecordUpstreamUserAgent(req.Context(), finalUA)
+	}
+	return nil
 }
 
 // defaultClaudeIdentityHeader is a deterministic compatibility fallback for
@@ -321,7 +389,7 @@ func rewriteClaudeCLIUserAgentVersion(userAgent, version string) string {
 func defaultClaudeIdentityHeader(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "user-agent":
-		return "claude-cli/2.1.220 (external, cli)"
+		return "claude-cli/" + auth.EffectiveClaudeCLIVersion() + " (external, cli)"
 	case "x-app":
 		return "cli"
 	case "x-stainless-lang":
