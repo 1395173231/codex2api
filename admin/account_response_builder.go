@@ -264,6 +264,7 @@ func (h *Handler) buildAccountResponse(
 		Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 		ClaudeUsageProbeAt:       row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey),
 		ClaudeUsageProbeError:    row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey),
+		ClaudeUsageWindows:       parseClaudeUsageWindows(row.GetCredential(auth.ClaudeUsageWindowsCredentialKey)),
 		UsageLimitOverride:       ignoreUsageLimitStatusOverride,
 		UsageLimitEffective:      ignoreUsageLimitStatusEffective,
 	}
@@ -463,6 +464,18 @@ func (h *Handler) buildAccountResponse(
 		stripAccountDetailFields(&resp)
 	}
 	return resp
+}
+
+func parseClaudeUsageWindows(raw string) []auth.ClaudeUsageWindow {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var windows []auth.ClaudeUsageWindow
+	if err := json.Unmarshal([]byte(raw), &windows); err != nil {
+		return nil
+	}
+	return windows
 }
 
 func stripAccountDetailFields(resp *accountResponse) {
