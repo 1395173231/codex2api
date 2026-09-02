@@ -203,12 +203,16 @@ func (h *Handler) probeUsageViaClaudeMessages(ctx context.Context, account *auth
 	// weekly limits. Prefer it so refreshing an account never consumes a message
 	// and Fable 5/5.1's shared quota is visible. Keep the Messages probe as a
 	// compatibility fallback for older tokens/proxies that do not expose it.
-	if windows, err := h.fetchClaudeOAuthUsage(ctx, account); err == nil && len(windows) > 0 {
-		oauthWindows = windows
-		h.applyClaudeOAuthUsage(account, windows)
-		return nil
-	} else if err != nil {
-		log.Printf("[账号 %d] Claude OAuth usage 端点不可用，回退 Messages 探针: %v", account.DBID, err)
+	// Tests inject the Messages executor to provide a fully isolated upstream;
+	// skip the real OAuth request in that mode instead of reaching Anthropic.
+	if h != nil && h.executeClaudeUsageProbe == nil {
+		if windows, err := h.fetchClaudeOAuthUsage(ctx, account); err == nil && len(windows) > 0 {
+			oauthWindows = windows
+			h.applyClaudeOAuthUsage(account, windows)
+			return nil
+		} else if err != nil {
+			log.Printf("[账号 %d] Claude OAuth usage 端点不可用，回退 Messages 探针: %v", account.DBID, err)
+		}
 	}
 	model, modelErr := selectClaudeUsageProbeModel(account)
 	if modelErr != nil {
