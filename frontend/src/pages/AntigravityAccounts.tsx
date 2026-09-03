@@ -27,6 +27,9 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../api";
+import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
+import { ProxyUrlInput } from "../components/ProxyField";
 import type {
   AccountGroup,
   AccountListSummary,
@@ -49,6 +52,12 @@ import AccountGroupFilterSelect, {
   type AccountGroupFilterValue,
 } from "../components/AccountGroupFilterSelect";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import AccountProxyBadge from "../components/AccountProxyBadge";
+import AccountProxyQuickEditor from "../components/AccountProxyQuickEditor";
+import {
+  buildProxyBindingContext,
+  type ProxyBindingContext,
+} from "../lib/accountProxyBinding";
 import ChannelLogo from "../components/ChannelLogo";
 import { CompactStat } from "../components/CompactStat";
 import Modal from "../components/Modal";
@@ -144,6 +153,9 @@ interface ImportDraft {
   modelMapping: string;
   proxyUrl: string;
   groupIds: number[];
+  // importFileProxies 只控制"文件内代理是否注册进代理表"。该渠道的导入一直会采用
+  // 文件里的 proxy_url，关掉它只是让那些代理停在账号绑定上、不进代理池。
+  importFileProxies: boolean;
 }
 
 interface EditDraft {
@@ -172,6 +184,7 @@ const EMPTY_IMPORT_DRAFT: ImportDraft = {
   modelMapping: "",
   proxyUrl: "",
   groupIds: [],
+  importFileProxies: false,
 };
 
 const EMPTY_OAUTH_DRAFT: OAuthDraft = {
@@ -362,6 +375,63 @@ function AccountAvatar({ account, size = 36 }: { account: AccountRow; size?: num
   );
 }
 
+const warningURLPattern = /https?:\/\/[^\s;]+/;
+
+function firstWarningURL(text?: string): string | null {
+  if (!text) return null;
+  const match = text.match(warningURLPattern);
+  return match ? match[0] : null;
+}
+
+// 权限列里的操作入口:同步 warning 会带出 Google 的一次性操作链接
+// (TOS 申诉表单 / 账号验证),直接渲染成可点击入口,免得去详情页
+// 复制长 URL。
+function SyncWarningAction({ warning }: { warning?: string }) {
+  const { t } = useTranslation();
+  const url = firstWarningURL(warning);
+  if (!url) return null;
+  const label = /appeal/i.test(warning ?? "")
+    ? t("antigravity.submitAppeal")
+    : t("antigravity.verifyAccount");
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="mt-1 inline-flex max-w-[180px] items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+    >
+      <ExternalLink className="size-3 shrink-0" aria-hidden />
+      <span className="truncate">{label}</span>
+    </a>
+  );
+}
+
+// 详情页 warning 横幅:URL 转成可点击链接,展示文本截短避免长链接刷屏。
+function LinkifiedWarning({ text }: { text: string }) {
+  const parts = text.split(/(https?:\/\/[^\s;]+)/g);
+  return (
+    <span className="break-words">
+      {parts.map((part, index) => {
+        if (!/^https?:\/\//.test(part)) {
+          return part;
+        }
+        const display = part.length > 64 ? part.slice(0, 61) + "…" : part;
+        return (
+          <a
+            key={index}
+            href={part}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-medium underline underline-offset-2"
+          >
+            {display}
+          </a>
+        );
+      })}
+    </span>
+  );
+}
+
 function PermissionBadge({ permissions }: { permissions?: AntigravityPermissionsSnapshot }) {
   const { t } = useTranslation();
   const allowed = permissionAllowed(permissions);
@@ -419,6 +489,7 @@ function GroupChips({ account, groups }: { account: AccountRow; groups: AccountG
 function AccountMetadataFields({
   proxyUrl,
   onProxyUrlChange,
+  proxies = [],
   groupIds,
   onGroupIdsChange,
   groups,
@@ -426,6 +497,7 @@ function AccountMetadataFields({
 }: {
   proxyUrl: string;
   onProxyUrlChange: (value: string) => void;
+  proxies?: ProxyRow[];
   groupIds: number[];
   onGroupIdsChange: (value: number[]) => void;
   groups: AccountGroup[];
@@ -438,11 +510,13 @@ function AccountMetadataFields({
         <span className="text-xs font-semibold text-muted-foreground">
           {t("antigravity.proxyUrl")}
         </span>
-        <Input
+        <ProxyUrlInput
           value={proxyUrl}
-          onChange={(event) => onProxyUrlChange(event.target.value)}
+          onChange={onProxyUrlChange}
           placeholder={t("antigravity.proxyUrlPlaceholder")}
         />
+        {/* 从代理池选择：展示每条代理已绑定账号数/空闲，选中写入上面的输入框。 */}
+        <ProxyPoolSelect proxies={proxies} onSelect={onProxyUrlChange} />
       </label>
       <div className="space-y-1.5">
         <span className="text-xs font-semibold text-muted-foreground">
@@ -541,7 +615,7 @@ function QuotaDetail({ account }: { account: AccountRow }) {
       {account.antigravity_sync_warning ? (
         <div className="flex items-start gap-2 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-          <span className="break-words">{account.antigravity_sync_warning}</span>
+          <LinkifiedWarning text={account.antigravity_sync_warning} />
         </div>
       ) : null}
       <section className="grid gap-3 sm:grid-cols-2">
@@ -869,6 +943,49 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [busy, setBusy] = useState<{ id: number; action: BusyAction } | null>(null);
+
+  // 代理池 + 代理池开关 + 全局代理:代理徽章的判定输入。本页此前只有纯文本代理
+  // 输入框,没接过代理池,这里补上(拉取失败静默留空,不影响手填)。
+  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
+  const [globalProxyURL, setGlobalProxyURL] = useState("");
+  const [quickProxyAccount, setQuickProxyAccount] = useState<AccountRow | null>(
+    null,
+  );
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listProxies()
+      .then((res) => {
+        if (!cancelled) setProxyPool(res.proxies ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setProxyPool([]);
+      });
+    void api
+      .getSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        setProxyPoolEnabled(Boolean(settings.proxy_pool_enabled));
+        setGlobalProxyURL((settings.proxy_url ?? "").trim());
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // 分组用全量而非 antigravityGroups:后端解析组代理不看渠道,按渠道过滤会把
+  // 跨渠道的存量成员误报成"无组代理"。
+  const proxyBindingCtx = useMemo<ProxyBindingContext>(
+    () =>
+      buildProxyBindingContext({
+        proxies: proxyPool,
+        groups: allGroups,
+        poolEnabled: proxyPoolEnabled,
+        globalProxy: globalProxyURL,
+      }),
+    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL],
+  );
 
   const [showImport, setShowImport] = useState(false);
   const [importMode, setImportMode] = useState<ImportMode>("single");
@@ -1378,22 +1495,36 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
           files: credentialFiles.map((file) => file.content),
           proxy_url: importDraft.proxyUrl.trim() || undefined,
           group_ids: importDraft.groupIds,
+          import_proxy: importDraft.importFileProxies || undefined,
         });
         setImportResult(result);
         const needsReview = result.failed > 0 || (result.degraded ?? 0) > 0;
+        const proxyWarning = result.proxy_warning?.trim();
+        // Toast 只有一个槽位,连续调用会互相顶掉——代理结果和告警必须拼进同一条。
+        const summary = needsReview
+          ? t("antigravity.importReview", {
+              imported: result.imported,
+              synced: result.synced ?? 0,
+              degraded: result.degraded ?? 0,
+              failed: result.failed,
+            })
+          : t("antigravity.importDone", {
+              imported: result.imported,
+              total: result.total,
+            });
+        const parts = [summary];
+        if (result.proxies_imported !== undefined) {
+          parts.push(
+            t("accounts.importProxySummary", {
+              imported: result.proxies_imported,
+              skipped: result.proxies_skipped ?? 0,
+            }),
+          );
+          if (proxyWarning) parts.push(proxyWarning);
+        }
         showToast(
-          needsReview
-            ? t("antigravity.importReview", {
-                imported: result.imported,
-                synced: result.synced ?? 0,
-                degraded: result.degraded ?? 0,
-                failed: result.failed,
-              })
-            : t("antigravity.importDone", {
-                imported: result.imported,
-                total: result.total,
-              }),
-          needsReview ? "warning" : "success",
+          parts.join(" "),
+          needsReview || proxyWarning ? "warning" : "success",
         );
         if (result.failed === 0 && (result.degraded ?? 0) === 0) {
           setShowImport(false);
@@ -1762,6 +1893,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
         title={t("antigravity.pageTitle")}
         description={t("antigravity.pageSubtitle")}
         hideTitle
+        actionsBelow
         titleAdornment={headerSlot}
         onRefresh={() => void reload()}
         actions={
@@ -1855,6 +1987,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
         error={accounts.length === 0 ? error : null}
         onRetry={() => void reload()}
         isEmpty={!loading && !error && accounts.length === 0}
+        emptyIcon={<ChannelLogo channel="antigravity" size={30} />}
         loadingTitle={t("antigravity.loadingTitle")}
         loadingDescription={t("antigravity.loadingDescription")}
         errorTitle={t("antigravity.errorTitle")}
@@ -1889,6 +2022,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
                 <TableHead>{t("antigravity.columnProject")}</TableHead>
                 <TableHead>{t("antigravity.columnPermission")}</TableHead>
                 <TableHead>{t("antigravity.columnQuota")}</TableHead>
+                <TableHead>{t("accounts.proxyColumn")}</TableHead>
                 <TableHead>{t("antigravity.columnStatus")}</TableHead>
                 <TableHead>{t("antigravity.columnUpdated")}</TableHead>
                 <TableHead className="w-[184px] text-right">
@@ -1950,11 +2084,19 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
                         {account.antigravity_permissions.reason}
                       </div>
                     ) : null}
+                    <SyncWarningAction warning={account.antigravity_sync_warning} />
                   </TableCell>
                   <TableCell>
                     <CompactQuota
                       account={account}
                       onOpen={() => openDetailAccount(account.id)}
+                    />
+                  </TableCell>
+                  <TableCell className="min-w-[120px] max-w-[180px]">
+                    <AccountProxyBadge
+                      account={account}
+                      ctx={proxyBindingCtx}
+                      onClick={() => setQuickProxyAccount(account)}
                     />
                   </TableCell>
                   <TableCell>
@@ -2053,6 +2195,13 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
                   onOpen={() => openDetailAccount(account.id)}
                 />
               </div>
+              <div className="mt-3 flex border-t border-border pt-3">
+                <AccountProxyBadge
+                  account={account}
+                  ctx={proxyBindingCtx}
+                  onClick={() => setQuickProxyAccount(account)}
+                />
+              </div>
               <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-2">
                 <span className="text-[10px] text-muted-foreground">
                   {formatRelativeTime(account.updated_at, { variant: "compact" })}
@@ -2149,6 +2298,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
               </label>
               <AccountMetadataFields
                 proxyUrl={oauthDraft.proxyUrl}
+                proxies={proxyPool}
                 onProxyUrlChange={(proxyUrl) =>
                   setOAuthDraft((current) => ({ ...current, proxyUrl }))
                 }
@@ -2475,6 +2625,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
 
           <AccountMetadataFields
             proxyUrl={importDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setImportDraft((current) => ({ ...current, proxyUrl }))
             }
@@ -2485,6 +2636,28 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
             groups={antigravityGroups}
             onCreateGroup={createAntigravityGroup}
           />
+
+          {importMode === "files" ? (
+            <div className="space-y-1">
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5"
+                  checked={importDraft.importFileProxies}
+                  onChange={(event) =>
+                    setImportDraft((current) => ({
+                      ...current,
+                      importFileProxies: event.target.checked,
+                    }))
+                  }
+                />
+                {t("accounts.importFileProxies")}
+              </label>
+              <p className="text-[11px] text-muted-foreground">
+                {t("antigravity.importFileProxiesHint")}
+              </p>
+            </div>
+          ) : null}
 
           {importResult && (importResult.failed > 0 || (importResult.degraded ?? 0) > 0) ? (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
@@ -2680,6 +2853,7 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
           )}
           <AccountMetadataFields
             proxyUrl={editDraft.proxyUrl}
+            proxies={proxyPool}
             onProxyUrlChange={(proxyUrl) =>
               setEditDraft((current) => ({ ...current, proxyUrl }))
             }
@@ -2735,6 +2909,22 @@ function AntigravityAccounts({ headerSlot }: { headerSlot?: ReactNode } = {}) {
           </div>
         ) : null}
       </Modal>
+
+      {/* 代理徽章直达的快速绑定弹窗：与 Codex / Grok 账号页共用组件 */}
+      <AccountProxyQuickEditor
+        account={quickProxyAccount}
+        accountLabel={
+          quickProxyAccount
+            ? quickProxyAccount.name ||
+              quickProxyAccount.email ||
+              `#${quickProxyAccount.id}`
+            : ""
+        }
+        proxies={proxyPool}
+        ctx={proxyBindingCtx}
+        onClose={() => setQuickProxyAccount(null)}
+        onSaved={() => reload({ silent: true })}
+      />
 
       {confirmDialog}
     </div>

@@ -307,7 +307,9 @@ func TestPromptRiskProfilesSurviveIncidentClear(t *testing.T) {
 func TestPromptRiskProfilesUseStableTieBreakerAcrossPages(t *testing.T) {
 	db := newPromptPolicySQLiteTestDB(t)
 	ctx := context.Background()
-	createdAt := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	// Keep every row on the same timestamp to exercise the stable tie-breaker,
+	// but place the fixture inside ListPromptRiskProfiles' rolling 30-day window.
+	createdAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	for index := 0; index < 6; index++ {
 		userID := fmt.Sprintf("stable-user-%d", index)
 		subjectKey := PromptRiskNewAPIUserSubjectKey("gateway-a", userID)

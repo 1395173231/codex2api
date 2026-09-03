@@ -250,7 +250,7 @@ const (
 	maxUsageLogFlushIntervalSeconds     = 300
 
 	postgresMaxBindParams       = 65535
-	usageLogInsertColumnCount   = 50
+	usageLogInsertColumnCount   = 52
 	maxUsageLogInsertRowsPerSQL = 1000
 
 	// usageLogBufferHardLimit 内存缓冲的硬上限。PG 长时间不可用时（维护、主从切换、
@@ -327,6 +327,8 @@ type usageLogEntry struct {
 	HasCompactionHistory   bool
 	ViaWebsocket           bool
 	CachedTokens           int
+	CacheWrite5mTokens     int
+	CacheWrite1hTokens     int
 	ServiceTier            string
 	RequestedServiceTier   string
 	ActualServiceTier      string
@@ -1146,6 +1148,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS compact BOOLEAN DEFAULT false;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS has_compaction_history BOOLEAN DEFAULT false;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS cached_tokens INT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS cache_write_5m_tokens INT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS cache_write_1h_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS service_tier VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS requested_service_tier VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS actual_service_tier VARCHAR(100) DEFAULT '';
@@ -1216,8 +1220,9 @@ func (db *DB) migrate(ctx context.Context) error {
 				site_logo          TEXT DEFAULT '',
 				background_config  TEXT DEFAULT '{}',
 				grok_config        TEXT DEFAULT '{}',
+				claude_config      TEXT DEFAULT '{}',
 				antigravity_oauth_config TEXT DEFAULT '{}',
-				subscription_upgrades_enabled BOOLEAN,
+				invite_guide_config TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -1266,8 +1271,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS grok_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS claude_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS antigravity_oauth_config TEXT DEFAULT '{}';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS subscription_upgrades_enabled BOOLEAN;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS invite_guide_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
@@ -1376,6 +1382,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_synced_cli_version TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_interval_hours INT DEFAULT 12;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS claude_synced_cli_version TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_overrides TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_sync_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1621,9 +1628,6 @@ func (db *DB) migrate(ctx context.Context) error {
 	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
 		return err
 	}
-	if err := db.ensureSubscriptionUpgradeSchema(ctx); err != nil {
-		return err
-	}
 	return db.runDataMigrationsWithTimeout()
 }
 
@@ -1698,7 +1702,8 @@ type APIKeyLimits struct {
 	//   - ""/auto: 不限（默认，按模型路由）
 	//   - codex:   仅 Codex OAuth / OpenAI Responses 中转账号
 	//   - grok:    仅 Grok 账号（此时不再要求账号声明模型，直接透传请求模型）
-	//   - antigravity: 预留的 Antigravity 管理渠道；推理适配完成前 fail closed
+	//   - antigravity: Antigravity 管理渠道
+	//   - claude:      仅 Claude OAuth / Anthropic Messages 账号
 	UpstreamChannel string `json:"upstream_channel,omitempty"`
 	// ScopeLimits 是「该 Key × 某账号分组 / 某账号」维度的用量上限（issue #439）。
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
@@ -1719,6 +1724,7 @@ const (
 	UpstreamChannelCodex       = "codex"
 	UpstreamChannelGrok        = "grok"
 	UpstreamChannelAntigravity = "antigravity"
+	UpstreamChannelClaude      = "claude"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1730,6 +1736,8 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelGrok
 	case UpstreamChannelAntigravity:
 		return UpstreamChannelAntigravity
+	case UpstreamChannelClaude:
+		return UpstreamChannelClaude
 	}
 	return UpstreamChannelAuto
 }
@@ -1742,9 +1750,11 @@ func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
 		return ` AND ` + upstreamTypeExpr + ` = 'grok'`
 	case UpstreamChannelAntigravity:
 		return ` AND ` + upstreamTypeExpr + ` = 'antigravity'`
+	case UpstreamChannelClaude:
+		return ` AND ` + upstreamTypeExpr + ` = 'claude'`
 	case UpstreamChannelCodex:
 		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
-		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity')`
+		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity', 'claude')`
 	default:
 		return ""
 	}
@@ -2181,6 +2191,7 @@ type SystemSettings struct {
 	SiteLogo                           string
 	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
 	GrokConfig                         string // JSON: {"affinity_mode":"strict"}
+	ClaudeConfig                       string // JSON: {"fingerprint_mode":"preserve","default_timezone":"","session_window_limit":0}
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
@@ -2548,7 +2559,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(session_slot_buffer_enabled, false),
 		       COALESCE(session_slot_buffer_seconds, 10),
 		       COALESCE(models_list_read_max_bytes, 8388608),
-		       COALESCE(auto_activate_5h_window_enabled, false)
+		       COALESCE(auto_activate_5h_window_enabled, false),
+		       COALESCE(claude_config, '{}')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2629,6 +2641,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SessionSlotBufferSeconds,
 		&s.ModelsListReadMaxBytes,
 		&s.AutoActivate5hWindowEnabled,
+		&s.ClaudeConfig,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3305,6 +3318,26 @@ func normalizeAffinityMode(mode string) string {
 	default:
 		return "bounded"
 	}
+}
+
+// normalizeClaudeConfig 校验 claude_config JSON,非法或空则回落到默认 {}。
+func normalizeClaudeConfig(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !json.Valid([]byte(raw)) {
+		return "{}"
+	}
+	return raw
+}
+
+// UpdateClaudeConfig 定向更新 claude_config 单列(不回写整行设置,避免触碰大 UPSERT)。
+func (db *DB) UpdateClaudeConfig(ctx context.Context, raw string) error {
+	value := normalizeClaudeConfig(raw)
+	return db.withSQLiteWriteLock(ctx, func() error {
+		_, err := db.conn.ExecContext(ctx, `
+			INSERT INTO system_settings (id, claude_config) VALUES (1, $1)
+			ON CONFLICT (id) DO UPDATE SET claude_config = EXCLUDED.claude_config`, value)
+		return err
+	})
 }
 
 // normalizeGrokConfig 校验 grok_config JSON,非法或空则回落到默认 {}。
@@ -4039,6 +4072,8 @@ type UsageLog struct {
 	HasCompactionHistory   bool      `json:"has_compaction_history"`
 	ViaWebsocket           bool      `json:"via_websocket"`
 	CachedTokens           int       `json:"cached_tokens"`
+	CacheWrite5mTokens     int       `json:"cache_write_5m_tokens"`
+	CacheWrite1hTokens     int       `json:"cache_write_1h_tokens"`
 	ServiceTier            string    `json:"service_tier"`
 	RequestedServiceTier   string    `json:"requested_service_tier"`
 	ActualServiceTier      string    `json:"actual_service_tier"`
@@ -4060,6 +4095,10 @@ type UsageLog struct {
 	InputCost              float64   `json:"input_cost"`
 	OutputCost             float64   `json:"output_cost"`
 	CacheReadCost          float64   `json:"cache_read_cost"`
+	CacheWrite5mCost       float64   `json:"cache_write_5m_cost"`
+	CacheWrite1hCost       float64   `json:"cache_write_1h_cost"`
+	CacheWrite5mPrice      float64   `json:"cache_write_5m_price_per_mtoken"`
+	CacheWrite1hPrice      float64   `json:"cache_write_1h_price_per_mtoken"`
 	TotalCost              float64   `json:"total_cost"`
 	InputPrice             float64   `json:"input_price_per_mtoken"`
 	OutputPrice            float64   `json:"output_price_per_mtoken"`
@@ -4182,6 +4221,8 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		HasCompactionHistory:   log.HasCompactionHistory,
 		ViaWebsocket:           log.ViaWebsocket,
 		CachedTokens:           log.CachedTokens,
+		CacheWrite5mTokens:     log.CacheWrite5mTokens,
+		CacheWrite1hTokens:     log.CacheWrite1hTokens,
 		ServiceTier:            clampUsageLogText(serviceTier, usageLogTextMaxLen),
 		RequestedServiceTier:   clampUsageLogText(log.RequestedServiceTier, usageLogTextMaxLen),
 		ActualServiceTier:      clampUsageLogText(log.ActualServiceTier, usageLogTextMaxLen),
@@ -4249,6 +4290,8 @@ type UsageLogInput struct {
 	HasCompactionHistory   bool
 	ViaWebsocket           bool
 	CachedTokens           int
+	CacheWrite5mTokens     int
+	CacheWrite1hTokens     int
 	ServiceTier            string
 	RequestedServiceTier   string
 	ActualServiceTier      string
@@ -4278,10 +4321,14 @@ func (l *UsageLog) populateBillingBreakdown() {
 	if billingServiceTier == "" {
 		billingServiceTier = l.ServiceTier
 	}
-	breakdown := calculateCostBreakdown(l.InputTokens, l.OutputTokens, l.CachedTokens, billingModel, billingServiceTier)
+	breakdown := CalculateCostBreakdownWithCacheWrites(l.InputTokens, l.OutputTokens, l.CachedTokens, l.CacheWrite5mTokens, l.CacheWrite1hTokens, billingModel, billingServiceTier)
 	l.InputCost = breakdown.InputCost
 	l.OutputCost = breakdown.OutputCost
 	l.CacheReadCost = breakdown.CacheReadCost
+	l.CacheWrite5mCost = breakdown.CacheWrite5mCost
+	l.CacheWrite1hCost = breakdown.CacheWrite1hCost
+	l.CacheWrite5mPrice = breakdown.CacheWrite5mPricePerMToken
+	l.CacheWrite1hPrice = breakdown.CacheWrite1hPricePerMToken
 	l.TotalCost = breakdown.TotalCost
 	l.InputPrice = breakdown.InputPricePerMToken
 	l.OutputPrice = breakdown.OutputPricePerMToken
@@ -4299,6 +4346,8 @@ func (l *UsageLog) populateBillingBreakdown() {
 		l.InputCost *= scale
 		l.OutputCost *= scale
 		l.CacheReadCost *= scale
+		l.CacheWrite5mCost *= scale
+		l.CacheWrite1hCost *= scale
 		l.TotalCost = displayTotal
 		l.InputPrice *= scale
 		l.OutputPrice *= scale
@@ -4560,12 +4609,12 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	if len(logsToStore) > 0 {
 		stmt, err := tx.PrepareContext(ctx,
 			`INSERT INTO usage_logs (account_id, credential_generation, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-				  input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, service_tier,
+				  input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, cache_write_5m_tokens, cache_write_1h_tokens, service_tier,
 				  requested_service_tier, actual_service_tier, billing_service_tier,
 				  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 				  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
 				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)`)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52)`)
 		if err != nil {
 			return fmt.Errorf("准备语句: %w", err)
 		}
@@ -4573,7 +4622,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 
 		for _, e := range logsToStore {
 			if _, err := stmt.ExecContext(ctx, e.AccountID, e.CredentialGeneration, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
-				e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.ServiceTier,
+				e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.CacheWrite5mTokens, e.CacheWrite1hTokens, e.ServiceTier,
 				e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 				e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 				e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
@@ -4663,7 +4712,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		}
 		valueStrings = append(valueStrings, "("+strings.Join(placeholders, ", ")+")")
 		valueArgs = append(valueArgs, e.AccountID, e.CredentialGeneration, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
-			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.ServiceTier,
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.CacheWrite5mTokens, e.CacheWrite1hTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
@@ -4672,7 +4721,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, credential_generation, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-		input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, service_tier,
+		input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, cache_write_5m_tokens, cache_write_1h_tokens, service_tier,
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
@@ -4810,7 +4859,7 @@ type TrafficSnapshot struct {
 // 当 rangeStart 为零值时回落到"今日"(本地 0 点起),与历史行为一致;
 // 当传入显式区间时,today_* 字段语义变为"该区间内的统计",total_* 字段始终是全量累计。
 // rangeEnd 为零值表示"至今"。
-// GetUsageStats 聚合用量统计。channel 非空（codex/grok）时按渠道过滤；
+// GetUsageStats 聚合用量统计。channel 非空（codex/grok/antigravity/claude）时按渠道过滤；
 // 渠道视图下的「累计」只覆盖现存 usage_logs（清空日志前的 baseline 无渠道维度，不计入）。
 func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
 	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, true)
@@ -5219,7 +5268,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.ws_acquire_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
-	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.cache_write_5m_tokens, 0), COALESCE(u.cache_write_1h_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.requested_service_tier, ''), COALESCE(u.actual_service_tier, ''), COALESCE(u.billing_service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
@@ -5245,7 +5294,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
-			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.CacheWrite5mTokens, &l.CacheWrite1hTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
 			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &l.ClientUserAgent, &l.UpstreamUserAgent, &l.UserAgentOverridden, &l.Channel,
@@ -5692,7 +5741,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.ws_acquire_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
-	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.cache_write_5m_tokens, 0), COALESCE(u.cache_write_1h_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.requested_service_tier, ''), COALESCE(u.actual_service_tier, ''), COALESCE(u.billing_service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
@@ -5719,7 +5768,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
-			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.CacheWrite5mTokens, &l.CacheWrite1hTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
 			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &l.ClientUserAgent, &l.UpstreamUserAgent, &l.UserAgentOverridden, &l.Channel,
@@ -5957,7 +6006,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.ws_acquire_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
-	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.cache_write_5m_tokens, 0), COALESCE(u.cache_write_1h_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.requested_service_tier, ''), COALESCE(u.actual_service_tier, ''), COALESCE(u.billing_service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
@@ -5984,7 +6033,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
-			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens,
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.CacheWrite5mTokens, &l.CacheWrite1hTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.ClientUserAgent, &l.UpstreamUserAgent, &l.UserAgentOverridden, &l.Channel, &l.InternalReason, &l.ParentRequestID, &l.PromptPolicyIncidentID,
@@ -6013,7 +6062,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 			COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 			COALESCE(u.first_token_ms, 0), COALESCE(u.ws_acquire_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
-			COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+			COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.has_compaction_history, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.cache_write_5m_tokens, 0), COALESCE(u.cache_write_1h_tokens, 0), COALESCE(u.service_tier, ''),
 			COALESCE(u.requested_service_tier, ''), COALESCE(u.actual_service_tier, ''), COALESCE(u.billing_service_tier, ''),
 			COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 			COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
@@ -6039,7 +6088,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
-			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens,
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.WsAcquireMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.HasCompactionHistory, &l.ViaWebsocket, &l.CachedTokens, &l.CacheWrite5mTokens, &l.CacheWrite1hTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.ClientUserAgent, &l.UpstreamUserAgent, &l.UserAgentOverridden, &l.Channel, &l.InternalReason, &l.ParentRequestID, &l.PromptPolicyIncidentID,
@@ -6767,7 +6816,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 		merged := mergeCredentialMaps(decodeCredentials(currentRaw), map[string]interface{}{
 			"allowed_api_key_ids": normalizePositiveInt64Slice(allowedAPIKeyIDs.Values),
 		})
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -6848,7 +6897,7 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 			current := decodeCredentials(currentRaw)
 			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
 			identityChanged := grokIdentityCredentialChanged(current, merged)
-			credJSON, err := json.Marshal(merged)
+			credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
 			}
@@ -7067,7 +7116,7 @@ func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, cur
 		// generation bump.
 		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
 		identityChanged := grokIdentityCredentialChanged(credentials, merged)
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -7251,7 +7300,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7285,6 +7334,12 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 		for key, value := range credentials {
 			if !sqliteJSONSetKeySupported(key) {
 				return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
+			}
+			// SQLite 逐键写:敏感字段在此处按键加密(密钥未设时 no-op)。
+			if _, sensitive := sensitiveCredentialKeys[key]; sensitive {
+				if s, isStr := value.(string); isStr {
+					value = encryptCredentialValue(key, s)
+				}
 			}
 			valueJSON, err := json.Marshal(value)
 			if err != nil {
@@ -7336,7 +7391,7 @@ func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id i
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7421,7 +7476,7 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
 	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7471,7 +7526,7 @@ func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, crede
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(merged))
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7880,7 +7935,7 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7926,7 +7981,7 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	credentials := map[string]interface{}{
 		"access_token": accessToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7943,7 +7998,7 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7960,7 +8015,7 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
@@ -7985,7 +8040,7 @@ func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, acc
 	if strings.TrimSpace(accountType) == "" {
 		accountType = "api"
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}

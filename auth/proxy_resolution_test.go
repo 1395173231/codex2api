@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestResolveProxyForAccountPrefersAccountProxy(t *testing.T) {
 	store := &Store{
@@ -286,5 +289,48 @@ func TestResolveProxyCandidatesForAccountAllowsDirectWhenPoolDisabled(t *testing
 	got := store.ResolveProxyCandidatesForAccount(&Account{DBID: 1}, 2)
 	if len(got) != 1 || got[0] != "" {
 		t.Fatalf("got %v, want one direct candidate", got)
+	}
+}
+
+// UnusableManagedProxies 是导入侧的批量告警依据，语义必须和单条的
+// ResolveProxyForAccount fail-closed 判定完全一致：托管但不在启用集里的代理，
+// 绑定它的账号一律不可调度。
+func TestUnusableManagedProxies(t *testing.T) {
+	const (
+		disabledURL = "http://disabled.example:8080"
+		enabledURL  = "http://enabled.example:8080"
+		customURL   = "http://custom.example:8080"
+	)
+	store := &Store{
+		proxyPoolEnabled: true,
+		proxyPool:        []string{enabledURL},
+		proxyPoolSet:     buildProxyPoolSet([]string{enabledURL}),
+		managedProxySet:  buildProxyPoolSet([]string{disabledURL, enabledURL}),
+	}
+
+	// 只挑出被托管却没启用的那条；启用的、以及压根不在代理表里的自定义代理都不算。
+	got := store.UnusableManagedProxies([]string{enabledURL, " " + disabledURL + " ", customURL, "", disabledURL})
+	want := []string{disabledURL, disabledURL}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("UnusableManagedProxies = %v, want %v", got, want)
+	}
+
+	// 与单条判定对齐：这里报不可用的，ResolveProxyForAccount 就一定 fail-closed。
+	for _, unusable := range got {
+		account := &Account{DBID: 1, ProxyURL: unusable}
+		if store.ResolveProxyForAccount(account) != "" || store.AccountHasUsableEgress(account) {
+			t.Fatalf("proxy %q reported unusable but the account is still schedulable", unusable)
+		}
+	}
+
+	// 代理池关闭时不存在 fail-closed，一条都不该报。
+	store.proxyPoolEnabled = false
+	if got := store.UnusableManagedProxies([]string{disabledURL}); len(got) != 0 {
+		t.Fatalf("UnusableManagedProxies while pool is off = %v, want empty", got)
+	}
+
+	var nilStore *Store
+	if got := nilStore.UnusableManagedProxies([]string{disabledURL}); got != nil {
+		t.Fatalf("nil store returned %v, want nil", got)
 	}
 }

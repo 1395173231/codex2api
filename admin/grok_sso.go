@@ -32,6 +32,10 @@ type grokSSOImportItem struct {
 	ID    int64  `json:"id,omitempty"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+	// Updated/Revived 标记该条命中既有身份:凭据已合并进账号 ID(Revived 表示
+	// 该账号原在回收站,本次已复活),而非新建。
+	Updated bool `json:"updated,omitempty"`
+	Revived bool `json:"revived,omitempty"`
 }
 
 const (
@@ -150,7 +154,10 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 				Email:         email,
 				TokenEndpoint: auth.GrokDefaultTokenURL,
 				Source:        "sso_import",
-				ResinTempID:   resinTempID,
+				// 身份栅栏含回收站账号:命中时合并凭据(回收站复活)而非报错,
+				// 否则删过的号重新导入永远失败(issue #602)。
+				ReauthorizeExisting: true,
+				ResinTempID:         resinTempID,
 			})
 			if createErr != nil {
 				item.Error = createErr.Error()
@@ -160,6 +167,8 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 			id := created.ID
 			item.OK = true
 			item.ID = id
+			item.Updated = created.Updated
+			item.Revived = created.Revived
 			if created.Email != "" {
 				item.Email = created.Email
 			}
@@ -333,7 +342,10 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 				Email:         email,
 				TokenEndpoint: auth.GrokDefaultTokenURL,
 				Source:        "refresh_import",
-				ResinTempID:   resinTempID,
+				// 身份栅栏含回收站账号:命中时合并凭据(回收站复活)而非报错,
+				// 否则删过的号重新导入永远失败(issue #602)。
+				ReauthorizeExisting: true,
+				ResinTempID:         resinTempID,
 			})
 			if createErr != nil {
 				item.Error = createErr.Error()
@@ -343,6 +355,8 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 			id := created.ID
 			item.OK = true
 			item.ID = id
+			item.Updated = created.Updated
+			item.Revived = created.Revived
 			if created.Email != "" {
 				item.Email = created.Email
 			}

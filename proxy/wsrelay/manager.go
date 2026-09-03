@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gorilla/websocket"
 )
 
@@ -138,6 +138,24 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 		proxyURL = proxyOverride
 	}
 	return proxy.EffectiveProxyURLForAccount(account, proxyURL)
+}
+
+// configureWebsocketDialerProxy applies the configured proxy to a Gorilla
+// WebSocket dialer. Gorilla accepts "socks5" but not the curl-style
+// "socks5h" alias. Its SOCKS5 implementation already sends domain names to
+// the proxy, so normalizing the alias preserves remote DNS resolution.
+func configureWebsocketDialerProxy(dialer *websocket.Dialer, rawProxyURL string) error {
+	parsed, err := security.ParseProxyURL(rawProxyURL)
+	if err != nil {
+		return fmt.Errorf("parse proxy URL failed: %w", err)
+	}
+
+	parsed.Scheme = strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if parsed.Scheme == "socks5h" {
+		parsed.Scheme = "socks5"
+	}
+	dialer.Proxy = http.ProxyURL(parsed)
+	return nil
 }
 
 // NewWsConnection 创建 WebSocket 连接
@@ -1374,13 +1392,13 @@ func (m *Manager) createConnectionForRoute(
 	dialerCopy := *m.dialer
 	dialer := &dialerCopy
 
+	// Configure both traditional account proxies and the Resin forward proxy.
+	// Resin is intentionally not skipped here: this repository uses Resin as a
+	// forward proxy for the dial itself, while the upstream branch's reverse
+	// proxy path is not applicable to this transport.
 	if proxyURL != "" {
-		proxyURLParsed, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse proxy URL failed: %w", err)
-		}
-		dialer.Proxy = func(req *http.Request) (*url.URL, error) {
-			return proxyURLParsed, nil
+		if err := configureWebsocketDialerProxy(dialer, proxyURL); err != nil {
+			return nil, err
 		}
 	}
 

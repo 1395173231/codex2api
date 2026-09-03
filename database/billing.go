@@ -11,6 +11,11 @@ type ModelPricing struct {
 	OutputPricePerMTokenPriority    float64
 	CacheReadPricePerMToken         float64
 	CacheReadPricePerMTokenPriority float64
+	// CacheWrite* are Anthropic prompt-cache creation prices (USD / 1M tokens).
+	// They are surfaced for transparent pricing, while cost calculation continues
+	// to use CacheReadPricePerMToken for cached input tokens.
+	CacheWrite5mPricePerMToken float64
+	CacheWrite1hPricePerMToken float64
 
 	LongInputPricePerMToken             float64
 	LongInputPricePerMTokenPriority     float64
@@ -31,16 +36,20 @@ type modelPricingRule struct {
 }
 
 type CostBreakdown struct {
-	InputCost                 float64 `json:"input_cost"`
-	OutputCost                float64 `json:"output_cost"`
-	CacheReadCost             float64 `json:"cache_read_cost"`
-	TotalCost                 float64 `json:"total_cost"`
-	InputPricePerMToken       float64 `json:"input_price_per_mtoken"`
-	OutputPricePerMToken      float64 `json:"output_price_per_mtoken"`
-	CacheReadPricePerMToken   float64 `json:"cache_read_price_per_mtoken"`
-	ServiceTierCostMultiplier float64 `json:"service_tier_cost_multiplier"`
-	LongContext               bool    `json:"long_context"`
-	LongContextThreshold      int     `json:"long_context_threshold"`
+	InputCost                  float64 `json:"input_cost"`
+	OutputCost                 float64 `json:"output_cost"`
+	CacheReadCost              float64 `json:"cache_read_cost"`
+	TotalCost                  float64 `json:"total_cost"`
+	InputPricePerMToken        float64 `json:"input_price_per_mtoken"`
+	OutputPricePerMToken       float64 `json:"output_price_per_mtoken"`
+	CacheReadPricePerMToken    float64 `json:"cache_read_price_per_mtoken"`
+	CacheWrite5mCost           float64 `json:"cache_write_5m_cost"`
+	CacheWrite1hCost           float64 `json:"cache_write_1h_cost"`
+	CacheWrite5mPricePerMToken float64 `json:"cache_write_5m_price_per_mtoken"`
+	CacheWrite1hPricePerMToken float64 `json:"cache_write_1h_price_per_mtoken"`
+	ServiceTierCostMultiplier  float64 `json:"service_tier_cost_multiplier"`
+	LongContext                bool    `json:"long_context"`
+	LongContextThreshold       int     `json:"long_context_threshold"`
 }
 
 var (
@@ -310,10 +319,17 @@ func UsageLogBilledCost(log *UsageLogInput) float64 {
 	if billingModel == "" {
 		billingModel = log.Model
 	}
-	return calculateCost(log.InputTokens, log.OutputTokens, log.CachedTokens, billingModel, usageLogBillingServiceTier(log))
+	return CalculateCostBreakdownWithCacheWrites(log.InputTokens, log.OutputTokens, log.CachedTokens, log.CacheWrite5mTokens, log.CacheWrite1hTokens, billingModel, usageLogBillingServiceTier(log)).TotalCost
 }
 
 func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) CostBreakdown {
+	return CalculateCostBreakdownWithCacheWrites(inputTokens, outputTokens, cachedTokens, 0, 0, model, serviceTier)
+}
+
+// CalculateCostBreakdownWithCacheWrites 在 CalculateCostBreakdown 的基础上计入 Anthropic
+// 提示缓存写入（5 分钟 / 1 小时）。inputTokens 是总输入（未缓存 + 缓存命中 + 缓存写入），
+// 写入价缺省按输入价的 1.25 倍 / 2 倍。
+func CalculateCostBreakdownWithCacheWrites(inputTokens, outputTokens, cachedTokens, cacheWrite5mTokens, cacheWrite1hTokens int, model string, serviceTier string) CostBreakdown {
 	pricing := GetModelPricing(model)
 	threshold := longContextThreshold
 	if pricing.LongContextThresholdTokens > 0 {
@@ -361,27 +377,51 @@ func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model s
 	if cachedTokens > inputTokens {
 		cachedTokens = inputTokens
 	}
+	if cacheWrite5mTokens < 0 {
+		cacheWrite5mTokens = 0
+	}
+	if cacheWrite1hTokens < 0 {
+		cacheWrite1hTokens = 0
+	}
+	cacheWrite5mPrice := pricing.CacheWrite5mPricePerMToken
+	if cacheWrite5mPrice <= 0 {
+		cacheWrite5mPrice = inputPrice * 1.25
+	}
+	cacheWrite1hPrice := pricing.CacheWrite1hPricePerMToken
+	if cacheWrite1hPrice <= 0 {
+		cacheWrite1hPrice = inputPrice * 2
+	}
 
 	uncachedInputTokens := inputTokens
 	if cacheReadPrice > 0 {
 		uncachedInputTokens = inputTokens - cachedTokens
 	}
+	uncachedInputTokens -= cacheWrite5mTokens + cacheWrite1hTokens
+	if uncachedInputTokens < 0 {
+		uncachedInputTokens = 0
+	}
 
 	inputCost := float64(uncachedInputTokens) / 1000000.0 * inputPrice
 	cacheReadCost := float64(cachedTokens) / 1000000.0 * cacheReadPrice
+	cacheWrite5mCost := float64(cacheWrite5mTokens) / 1000000.0 * cacheWrite5mPrice
+	cacheWrite1hCost := float64(cacheWrite1hTokens) / 1000000.0 * cacheWrite1hPrice
 	outputCost := float64(outputTokens) / 1000000.0 * outputPrice
 
 	return CostBreakdown{
-		InputCost:                 inputCost * tierMultiplier,
-		OutputCost:                outputCost * tierMultiplier,
-		CacheReadCost:             cacheReadCost * tierMultiplier,
-		TotalCost:                 (inputCost + cacheReadCost + outputCost) * tierMultiplier,
-		InputPricePerMToken:       inputPrice * tierMultiplier,
-		OutputPricePerMToken:      outputPrice * tierMultiplier,
-		CacheReadPricePerMToken:   cacheReadPrice * tierMultiplier,
-		ServiceTierCostMultiplier: tierMultiplier,
-		LongContext:               longContextApplied,
-		LongContextThreshold:      threshold,
+		InputCost:                  inputCost * tierMultiplier,
+		OutputCost:                 outputCost * tierMultiplier,
+		CacheReadCost:              cacheReadCost * tierMultiplier,
+		CacheWrite5mCost:           cacheWrite5mCost * tierMultiplier,
+		CacheWrite1hCost:           cacheWrite1hCost * tierMultiplier,
+		TotalCost:                  (inputCost + cacheReadCost + cacheWrite5mCost + cacheWrite1hCost + outputCost) * tierMultiplier,
+		InputPricePerMToken:        inputPrice * tierMultiplier,
+		OutputPricePerMToken:       outputPrice * tierMultiplier,
+		CacheReadPricePerMToken:    cacheReadPrice * tierMultiplier,
+		CacheWrite5mPricePerMToken: cacheWrite5mPrice * tierMultiplier,
+		CacheWrite1hPricePerMToken: cacheWrite1hPrice * tierMultiplier,
+		ServiceTierCostMultiplier:  tierMultiplier,
+		LongContext:                longContextApplied,
+		LongContextThreshold:       threshold,
 	}
 }
 
@@ -489,18 +529,34 @@ func modelMatchesRule(model string, rule string) bool {
 
 func claudeFamilyPricing(model string) *ModelPricing {
 	switch {
+	case (strings.Contains(model, "fable-5.1") || strings.Contains(model, "fable-5-1") || strings.Contains(model, "mythos-5.1") || strings.Contains(model, "mythos-5-1")):
+		return &ModelPricing{InputPricePerMToken: 10.0, CacheReadPricePerMToken: 0.25, CacheWrite5mPricePerMToken: 12.5, CacheWrite1hPricePerMToken: 20.0, OutputPricePerMToken: 50.0}
+	case strings.Contains(model, "fable-5") || strings.Contains(model, "mythos-5"):
+		return &ModelPricing{InputPricePerMToken: 10.0, CacheReadPricePerMToken: 1.0, CacheWrite5mPricePerMToken: 12.5, CacheWrite1hPricePerMToken: 20.0, OutputPricePerMToken: 50.0}
 	case strings.Contains(model, "opus"):
-		if strings.Contains(model, "4.7") || strings.Contains(model, "4-7") ||
-			strings.Contains(model, "4.6") || strings.Contains(model, "4-6") ||
-			strings.Contains(model, "4.5") || strings.Contains(model, "4-5") {
-			return &ModelPricing{InputPricePerMToken: 5.0, OutputPricePerMToken: 25.0}
+		// 传统 Opus(3 / 4 / 4.1)为 $15/$75;自 4.5 起 Opus 降至 $5/$25,更新的版本
+		// (4.6/4.7/4.8/5…)默认沿用现代档,避免新模型误套旧高价。
+		legacyOpus := strings.Contains(model, "opus-3") || strings.Contains(model, "3-opus") ||
+			strings.Contains(model, "opus-4-1") || strings.Contains(model, "opus-4.1") ||
+			strings.Contains(model, "opus-4-0") || strings.Contains(model, "opus-4-2025") ||
+			strings.HasSuffix(model, "opus-4")
+		if legacyOpus {
+			return &ModelPricing{InputPricePerMToken: 15.0, CacheReadPricePerMToken: 1.5, CacheWrite5mPricePerMToken: 18.75, CacheWrite1hPricePerMToken: 30.0, OutputPricePerMToken: 75.0}
 		}
-		return &ModelPricing{InputPricePerMToken: 15.0, OutputPricePerMToken: 75.0}
+		return &ModelPricing{InputPricePerMToken: 5.0, CacheReadPricePerMToken: 0.5, CacheWrite5mPricePerMToken: 6.25, CacheWrite1hPricePerMToken: 10.0, OutputPricePerMToken: 25.0}
 	case strings.Contains(model, "sonnet"):
-		return &ModelPricing{InputPricePerMToken: 3.0, OutputPricePerMToken: 15.0}
+		if strings.Contains(model, "sonnet-5") {
+			return &ModelPricing{InputPricePerMToken: 2.0, CacheReadPricePerMToken: 0.2, CacheWrite5mPricePerMToken: 2.5, CacheWrite1hPricePerMToken: 4.0, OutputPricePerMToken: 10.0}
+		}
+		return &ModelPricing{InputPricePerMToken: 3.0, CacheReadPricePerMToken: 0.3, CacheWrite5mPricePerMToken: 3.75, CacheWrite1hPricePerMToken: 6.0, OutputPricePerMToken: 15.0}
 	case strings.Contains(model, "haiku"):
 		if strings.Contains(model, "3-5") || strings.Contains(model, "3.5") {
-			return &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 5.0}
+			return &ModelPricing{InputPricePerMToken: 0.8, CacheReadPricePerMToken: 0.08, CacheWrite5mPricePerMToken: 1.0, CacheWrite1hPricePerMToken: 1.6, OutputPricePerMToken: 4.0}
+		}
+		if strings.Contains(model, "4-5") || strings.Contains(model, "4.5") ||
+			strings.Contains(model, "4-6") || strings.Contains(model, "4.6") ||
+			strings.Contains(model, "4-7") || strings.Contains(model, "4.7") {
+			return &ModelPricing{InputPricePerMToken: 1.0, CacheReadPricePerMToken: 0.1, CacheWrite5mPricePerMToken: 1.25, CacheWrite1hPricePerMToken: 2.0, OutputPricePerMToken: 5.0}
 		}
 		return &ModelPricing{InputPricePerMToken: 0.25, OutputPricePerMToken: 1.25}
 	case strings.Contains(model, "claude"):

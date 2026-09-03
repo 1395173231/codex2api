@@ -27,6 +27,7 @@ const (
 	modelBackingGrok
 	modelBackingRelay
 	modelBackingAntigravity
+	modelBackingClaude
 )
 
 type scopedModelRecord struct {
@@ -76,6 +77,8 @@ func scopedModelOwner(record *scopedModelRecord) string {
 		return "openai"
 	case modelBackingAntigravity:
 		return "google"
+	case modelBackingClaude:
+		return "anthropic"
 	default:
 		return "codex2api"
 	}
@@ -222,6 +225,14 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 				addTarget(id)
 			}
 
+		case account.IsClaudeOAuth():
+			// Claude Code OAuth 账号:账号维度暴露 claude 模型(owner=anthropic),
+			// 供下游客户端发现;调度/透传由 claude 原生路径处理。
+			for _, id := range DefaultClaudeModelIDsForAccount(account) {
+				addScopedModel(records, id, modelBackingClaude, time.Time{}, false)
+				addTarget(id)
+			}
+
 		default:
 			for _, item := range catalog.Items {
 				if !item.Enabled || !account.SupportsCodexModel(item.ID) {
@@ -239,7 +250,8 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 	// Antigravity-only keys intentionally expose exactly the native logical
 	// surface. Global/OpenAI aliases and synthesized effort aliases belong to
 	// other providers and would make Cockpit's catalog diverge again.
-	if row.Limits.ResolveUpstreamChannel() != database.UpstreamChannelAntigravity {
+	channel := row.Limits.ResolveUpstreamChannel()
+	if channel != database.UpstreamChannelAntigravity && channel != database.UpstreamChannelClaude {
 		// Global exact aliases are visible only when their concrete target is
 		// routeable in this key's account snapshot. Wildcards are patterns, not
 		// model IDs, and therefore never appear in /v1/models.

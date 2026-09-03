@@ -30,6 +30,7 @@ import type {
   APIKeyScopeSummaryItem,
   APIKeyRow,
   APIKeyWindowUsage,
+  PromptFilterNewAPIBinding,
   SystemSettings,
 } from "../types";
 import { canStartAPIKeyBulkReset } from "../lib/apiKeyOperationState";
@@ -134,7 +135,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity";
+type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity" | "claude";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -190,6 +191,14 @@ const DEFAULT_ANTIGRAVITY_MODEL_OPTIONS = [
   "gemini-3-pro-preview",
   "gemini-2.5-pro",
   "gemini-2.5-flash",
+];
+// Keep this fallback in lockstep with proxy.defaultClaudeModelIDs. The
+// server catalog normally wins; these aliases are only used when no
+// Claude account has populated a catalog yet.
+const DEFAULT_CLAUDE_MODEL_OPTIONS = [
+  "claude-opus-4-5",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-5",
 ];
 
 function accountGroupsForUpstreamChannel(
@@ -317,7 +326,7 @@ export default function APIKeys() {
   }, []);
 
   const loadKeys = useCallback(async () => {
-    const [keysResponse, groupsResponse, modelsResponse, settingsResponse] = await Promise.all([
+    const [keysResponse, groupsResponse, modelsResponse, settingsResponse, promptBindingsResponse] = await Promise.all([
       api.getAPIKeys(),
       api.listAccountGroups().catch(() => ({ groups: [] })),
       api
@@ -326,8 +335,10 @@ export default function APIKeys() {
         models?: string[];
         grok_models?: string[];
         antigravity_models?: string[];
+        claude_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
+      api.getPromptFilterNewAPIBindings().catch(() => ({ bindings: [] as PromptFilterNewAPIBinding[] })),
     ]);
     return {
       keys: keysResponse.keys ?? [],
@@ -335,7 +346,9 @@ export default function APIKeys() {
       modelOptions: modelsResponse.models ?? [],
       grokModelOptions: modelsResponse.grok_models ?? [],
       antigravityModelOptions: modelsResponse.antigravity_models ?? [],
+      claudeModelOptions: modelsResponse.claude_models ?? [],
       settings: settingsResponse,
+      promptBindings: promptBindingsResponse.bindings ?? [],
     };
   }, []);
 
@@ -345,7 +358,9 @@ export default function APIKeys() {
     modelOptions: string[];
     grokModelOptions: string[];
     antigravityModelOptions: string[];
+    claudeModelOptions: string[];
     settings: SystemSettings | null;
+    promptBindings: PromptFilterNewAPIBinding[];
   }>({
     initialData: {
       keys: [],
@@ -353,13 +368,19 @@ export default function APIKeys() {
       modelOptions: [],
       grokModelOptions: [],
       antigravityModelOptions: [],
+      claudeModelOptions: [],
       settings: null,
+      promptBindings: [],
     },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  const promptBindingsByKey = useMemo(
+    () => new Map(data.promptBindings.map((binding) => [binding.api_key_id, binding])),
+    [data.promptBindings],
+  );
 
   // scope 预算概览单独拉：它需要跨 Key 的用量聚合，不该拖慢 Key 列表本身。
   const anyScopeBudget = keys.some(
@@ -393,14 +414,19 @@ export default function APIKeys() {
     data.antigravityModelOptions.length > 0
       ? data.antigravityModelOptions
       : DEFAULT_ANTIGRAVITY_MODEL_OPTIONS;
+  const claudeModelOptions =
+    data.claudeModelOptions.length > 0
+      ? data.claudeModelOptions
+      : DEFAULT_CLAUDE_MODEL_OPTIONS;
   const modelOptionsForChannel = useCallback(
     (channel: UpstreamChannel): string[] => {
       if (channel === "grok") return grokModelOptions;
       if (channel === "antigravity") return antigravityModelOptions;
       if (channel === "codex") return modelOptions;
+      if (channel === "claude") return claudeModelOptions;
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
       const merged = [...modelOptions];
-      for (const candidate of [...grokModelOptions, ...antigravityModelOptions]) {
+      for (const candidate of [...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions]) {
         if (!seen.has(candidate.toLowerCase())) {
           seen.add(candidate.toLowerCase());
           merged.push(candidate);
@@ -408,7 +434,7 @@ export default function APIKeys() {
       }
       return merged;
     },
-    [modelOptions, grokModelOptions, antigravityModelOptions],
+    [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions],
   );
   const createSelectableGroups = useMemo(
     () =>
@@ -1501,6 +1527,7 @@ export default function APIKeys() {
                                     t={t}
                                   />
                                   <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                   <KeyScopeBudgetBadge
                                     items={scopeSummary[String(keyRow.id)]}
                                     t={t}
@@ -1709,6 +1736,7 @@ export default function APIKeys() {
                                         t={t}
                                       />
                                       <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                       <KeyScopeBudgetBadge
                                         items={scopeSummary[String(keyRow.id)]}
                                         t={t}
@@ -2675,6 +2703,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.upstream_channel === "codex" ||
       limits.upstream_channel === "grok" ||
       limits.upstream_channel === "antigravity"
+      || limits.upstream_channel === "claude"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2764,10 +2793,15 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelAntigravity"),
       icon: <ChannelLogo channel="antigravity" size={18} />,
     },
+    {
+      key: "claude",
+      label: t("apiKeys.limits.upstreamChannelClaude"),
+      icon: <ChannelLogo channel="claude" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-4 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-5 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -3143,6 +3177,18 @@ function KeyChannelBadge({
       </Badge>
     );
   }
+  if (channel === "claude") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelClaude")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="claude" size={12} />
+        Claude
+      </Badge>
+    );
+  }
   // auto：路由图标表示"不限渠道，按模型自动路由"
   return (
     <Badge
@@ -3153,6 +3199,54 @@ function KeyChannelBadge({
       <Waypoints className="size-3" />
       {t("apiKeys.limits.upstreamChannelAutoTab")}
     </Badge>
+  );
+}
+
+// APIKeyPromptPolicyBadge separates the effective Prompt policy from the
+// optional NewAPI identity binding. An unbound key still follows the global
+// Prompt Filter; the badge makes that explicit instead of implying bypass.
+function APIKeyPromptPolicyBadge({
+  binding,
+}: {
+  binding?: PromptFilterNewAPIBinding;
+}) {
+  const { t } = useTranslation();
+  const scope = binding?.prompt_filter_scope ?? "inherit";
+  const scopeLabel =
+    scope === "off"
+      ? t("apiKeys.promptFilterScopeOff")
+      : scope === "local_only"
+        ? t("apiKeys.promptFilterScopeLocal")
+        : t("apiKeys.promptFilterScopeGlobal");
+  const identityLabel = binding
+    ? binding.require_signed_identity
+      ? t("apiKeys.promptFilterIdentityRequired")
+      : t("apiKeys.promptFilterIdentityBound")
+    : t("apiKeys.promptFilterIdentityUnbound");
+  return (
+    <span className="inline-flex max-w-full flex-wrap items-center gap-1">
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-sky-500/10 px-1.5 py-0 text-[10px] font-semibold text-sky-700 dark:text-sky-300",
+          scope === "off" && "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+          scope === "local_only" && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={scopeLabel}
+      >
+        {scopeLabel}
+      </Badge>
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-muted/70 px-1.5 py-0 text-[10px] font-medium text-muted-foreground",
+          !binding && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={identityLabel}
+      >
+        {identityLabel}
+      </Badge>
+    </span>
   );
 }
 
@@ -3784,16 +3878,37 @@ const GROK_PLAN_FILTER_OPTIONS = [
   "supergrok_plus",
 ] as const;
 
+// Claude OAuth profiles expose these normalized plan keys. Keep them
+// separate from the Codex/Grok plan allowlist so a Claude-bound API key
+// cannot accidentally be configured with an unrelated plan.
+const CLAUDE_PLAN_FILTER_OPTIONS = [
+  "claude",
+  "free",
+  "pro",
+  "max",
+  "max-5x",
+  "max-20x",
+  "team",
+  "enterprise",
+  "business",
+] as const;
+
 const PLAN_FILTER_OPTIONS = [
   ...CODEX_PLAN_FILTER_OPTIONS,
   ...GROK_PLAN_FILTER_OPTIONS.filter(
     (plan) => !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+  ...CLAUDE_PLAN_FILTER_OPTIONS.filter(
+    (plan) =>
+      !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan) &&
+      !(GROK_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
   ),
 ];
 
 function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
   if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
   if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
+  if (channel === "claude") return CLAUDE_PLAN_FILTER_OPTIONS;
   return PLAN_FILTER_OPTIONS;
 }
 
