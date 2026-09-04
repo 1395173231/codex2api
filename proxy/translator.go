@@ -2574,19 +2574,21 @@ func modelSupportsMaxReasoningEffort(model string) bool {
 		version = version[:dash]
 	}
 	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return false
-	}
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
+		return false
+	}
+	// 只有大版本号的新一代型号（gpt-6-astra、gpt-6）：官方模型页明确列出
+	// Max 档位，按 major > 5 放行；缺少 ".x" 不能当成旧模型钳掉。
+	if major > 5 {
+		return true
+	}
+	if len(parts) < 2 {
 		return false
 	}
 	minor, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return false
-	}
-	if major > 5 {
-		return true
 	}
 	return major == 5 && minor >= 6
 }

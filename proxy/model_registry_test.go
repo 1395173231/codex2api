@@ -289,6 +289,7 @@ func TestLearnModelsFromManifest_AllKnownIsNoOp(t *testing.T) {
 // 上游同步/学习的模型准入策略：5.4+ 放行，5.3 仅 spark，5.2 及以下下线。
 func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
 	cases := map[string]bool{
+		"gpt-6-astra":         true,
 		"gpt-5.6-sol":         true,
 		"gpt-5.5":             true,
 		"gpt-5.4":             true,

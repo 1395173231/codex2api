@@ -56,6 +56,17 @@ var (
 	defaultModelPricing = &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 2.0}
 
 	modelPricingRules = []modelPricingRule{
+		// gpt-6-astra：官方定价页 standard $10/$50、缓存 $1；≥272K 长上下文
+		// $20/$75、缓存 $2。fast（priority）档恒为 standard 的 2×，由
+		// serviceTierCostMultiplier 兜底自动得出，无需显式配置。
+		{model: "gpt-6-astra", pricing: ModelPricing{
+			InputPricePerMToken:         10.0,
+			OutputPricePerMToken:        50.0,
+			CacheReadPricePerMToken:     1.0,
+			LongInputPricePerMToken:     20.0,
+			LongOutputPricePerMToken:    75.0,
+			LongCacheReadPricePerMToken: 2.0,
+		}},
 		{model: "gpt-5.5", pricing: ModelPricing{
 			InputPricePerMToken:                 5.0,
 			InputPricePerMTokenPriority:         12.5,
@@ -444,6 +455,12 @@ func normalizeBillingModelName(model string) string {
 func normalizeCodexBillingModel(model string) (string, bool) {
 	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(strings.ToLower(model))
 	switch {
+	// gpt-6 世代（官方定价页 2026-09）：目前只有 astra 一个公开型号，
+	// 未知 gpt-6 变体按 astra 兜底，避免掉进 $1/$2 的默认价严重低估。
+	// 只认 gpt-6- / gpt-6. / 裸 gpt-6 前缀，gpt-5.6 不含 "gpt-6" 不会误命中。
+	case strings.HasPrefix(compact, "gpt-6-") || strings.HasPrefix(compact, "gpt-6.") || compact == "gpt-6" ||
+		strings.HasPrefix(compact, "gpt6-") || strings.HasPrefix(compact, "gpt6.") || compact == "gpt6":
+		return "gpt-6-astra", true
 	case strings.Contains(compact, "gpt-5.5-pro") || strings.Contains(compact, "gpt5-5-pro") || strings.Contains(compact, "gpt5.5-pro"):
 		return "gpt-5.5-pro", true
 	case strings.Contains(compact, "gpt-5.5") || strings.Contains(compact, "gpt5-5") || strings.Contains(compact, "gpt5.5"):

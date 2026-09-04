@@ -4087,7 +4087,8 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 	cases := map[string]bool{
 		"gpt-5.6-sol":              true,
 		"gpt-5.6":                  true,
-		"gpt-6-astra":              false, // major-only ids have no minor and stay conservative
+		"gpt-6-astra":              true, // official model page lists Max for Astra; major-only ids follow major > 5
+		"gpt-6":                    true,
 		"gpt-7.0":                  true,
 		"gpt-5.5":                  false,
 		"gpt-5.4-mini":             false,

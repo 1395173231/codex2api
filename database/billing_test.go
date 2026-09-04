@@ -208,6 +208,36 @@ func TestGPT56VariantPricing(t *testing.T) {
 	}
 }
 
+// gpt-6-astra 官方定价（developers.openai.com/api/docs/pricing，2026-09）：
+// standard $10/$50、缓存 $1；≥272K 长上下文 $20/$75、缓存 $2；fast 恒 2×。
+// 变体后缀 / 思考强度别名同价；未知 gpt-6 变体按 astra 兜底，绝不能掉进默认价。
+func TestGPT6AstraPricing(t *testing.T) {
+	for _, model := range []string{"gpt-6-astra", "gpt-6-astra-high", "gpt-6-astra(xhigh)", "GPT-6-Astra", "gpt-6", "gpt-6-nova"} {
+		if got := CanonicalBillingModelKey(model); got != "gpt-6-astra" {
+			t.Fatalf("CanonicalBillingModelKey(%q) = %q, want gpt-6-astra", model, got)
+		}
+		p := GetModelPricing(model)
+		assertFloatEqual(t, p.InputPricePerMToken, 10.0)
+		assertFloatEqual(t, p.OutputPricePerMToken, 50.0)
+		assertFloatEqual(t, p.CacheReadPricePerMToken, 1.0)
+		assertFloatEqual(t, p.LongInputPricePerMToken, 20.0)
+		assertFloatEqual(t, p.LongOutputPricePerMToken, 75.0)
+		assertFloatEqual(t, p.LongCacheReadPricePerMToken, 2.0)
+	}
+
+	// 短上下文 fast 档：2× standard。
+	const n = 100_000
+	assertFloatEqual(t, CalculateCost(n, n, 0, "gpt-6-astra", "fast"), (20.0+100.0)*float64(n)/1_000_000.0)
+	// 长上下文（≥272K）standard 档走 long 价。
+	const long = 300_000
+	assertFloatEqual(t, CalculateCost(long, 1_000, 0, "gpt-6-astra", ""), 20.0*float64(long)/1_000_000.0+75.0*1_000/1_000_000.0)
+
+	// gpt-5.6 家族不得被 gpt-6 前缀误伤。
+	if got := CanonicalBillingModelKey("gpt-5.6-sol"); got != "gpt-5.6-sol" {
+		t.Fatalf("CanonicalBillingModelKey(gpt-5.6-sol) = %q, want gpt-5.6-sol", got)
+	}
+}
+
 func TestSparkPricingUsesGpt51CodexFallback(t *testing.T) {
 	spark := GetModelPricing("gpt-5.3-codex-spark-high")
 
