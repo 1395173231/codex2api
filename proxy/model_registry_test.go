@@ -304,6 +304,17 @@ func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
 		"gpt-4o":              false,
 		"gpt-image-2":         false,
 		"":                    false,
+		// Trusted Access for Cyber（issue #624）：稳定别名没有数字版本号，
+		// 但清单里出现即代表账号真实权益，必须放行；带版本号的 cyber 变体走常规规则。
+		"gpt-daybreak-blue-latest": true,
+		"gpt-daybreak-red-latest":  true,
+		"gpt-5.6-cyber":            true,
+		"gpt-5.5-cyber-preview":    true,
+		"gpt-":                     false,
+		"gpt-4o-mini":              false,
+		"gpt-5o":                   false,
+		"gpt-daybreak-image":       false,
+		"daybreak-blue":            false,
 	}
 	for id, want := range cases {
 		if got := isAllowedUpstreamCodexModel(id); got != want {
@@ -407,5 +418,44 @@ func TestParseOfficialCodexModelIDsIgnoresNonModelContexts(t *testing.T) {
 		if slices.Contains(models, junk) || slices.Contains(skipped, junk) {
 			t.Fatalf("%q should not be extracted at all (models=%v skipped=%v)", junk, models, skipped)
 		}
+	}
+}
+
+// issue #624：Trusted Access for Cyber 账号的清单里带 gpt-daybreak-blue-latest，
+// 学习后必须立刻进入请求侧支持列表，否则 /v1/models 不列、/responses 直接拒绝。
+func TestLearnModelsFromManifest_AdmitsNonVersionedCyberAlias(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	manifest := []byte(`{"models":[
+		{"slug":"gpt-5.5"},
+		{"slug":"gpt-daybreak-blue-latest"},
+		{"slug":"gpt-5.2-codex"}
+	]}`)
+	added, err := LearnModelsFromManifest(ctx, db, manifest, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("LearnModelsFromManifest error: %v", err)
+	}
+	if !slices.Equal(added, []string{"gpt-daybreak-blue-latest"}) {
+		t.Fatalf("added = %v, want [gpt-daybreak-blue-latest] (retired 5.2 must still be rejected)", added)
+	}
+	catalog, err := ListModelCatalog(ctx, db)
+	if err != nil {
+		t.Fatalf("ListModelCatalog: %v", err)
+	}
+	if !slices.Contains(catalog.Models, "gpt-daybreak-blue-latest") {
+		t.Fatalf("learned alias missing from catalog: %v", catalog.Models)
+	}
+	for _, item := range catalog.Items {
+		if item.ID == "gpt-daybreak-blue-latest" {
+			if item.Source != ModelSourceUpstreamManifest || item.Category != ModelCategoryCodex || !item.Enabled {
+				t.Fatalf("learned item = %+v", item)
+			}
+		}
+	}
+	if !slices.Contains(SupportedModelIDs(ctx, db), "gpt-daybreak-blue-latest") {
+		t.Fatal("learned alias must be accepted by the request-side model gate immediately")
+	}
+	if isRetiredCodexModel("gpt-daybreak-blue-latest") {
+		t.Fatal("non-versioned alias must never be treated as retired")
 	}
 }

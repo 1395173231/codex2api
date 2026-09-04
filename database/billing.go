@@ -460,7 +460,13 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 	case strings.Contains(compact, "gpt-5.6-luna") || strings.Contains(compact, "gpt5-6-luna") || strings.Contains(compact, "gpt5.6-luna"):
 		return "gpt-5.6-luna", true
 	case strings.Contains(compact, "gpt-5.6") || strings.Contains(compact, "gpt5-6") || strings.Contains(compact, "gpt5.6"):
-		// 未知 gpt-5.6 变体：按最贵的 sol 兜底，避免低估计费。
+		// 未知 gpt-5.6 变体（含 gpt-5.6-cyber）：按最贵的 sol 兜底，避免低估计费。
+		return "gpt-5.6-sol", true
+	case strings.Contains(compact, "daybreak"):
+		// Trusted Access for Cyber 的稳定别名（issue #624）：官方文档写明
+		// gpt-daybreak-blue-latest 即 gpt-5.6-sol，gpt-daybreak-red-latest 即
+		// gpt-5.6-cyber（无独立公开定价）。两者都归到 5.6 家族最贵的 sol，
+		// 否则会落到 $1/$2 的默认价严重低估。
 		return "gpt-5.6-sol", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true
