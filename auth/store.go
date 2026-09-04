@@ -115,11 +115,16 @@ type Account struct {
 	// successful, generation-fenced sync can safely clear the provider fence.
 	AntigravityHardBlocked     bool
 	AntigravityHardBlockReason string
-	BaseURL                    string
-	APIKey                     string
-	Models                     []string
-	ModelMapping               string
-	CodexClientMetadataMode    string
+	// antigravityQuota* 是 antigravity_quota 凭据投影出的调度排序键（已用百分比），
+	// 见 scheduling_usage_key.go；随控制面同步快照更新。
+	antigravityQuotaUsedPercent float64
+	antigravityQuotaObservedAt  time.Time
+	antigravityQuotaValid       bool
+	BaseURL                     string
+	APIKey                      string
+	Models                      []string
+	ModelMapping                string
+	CodexClientMetadataMode     string
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
@@ -2150,16 +2155,6 @@ func (s *Store) MarkUsage7dRateLimited(acc *Account) bool {
 
 	s.MarkCooldown(acc, duration, "rate_limited")
 	return true
-}
-
-// usagePercentForScheduling 返回调度排序用的用量百分比（7d 窗口有效则返回，否则 0）。
-func (a *Account) usagePercentForScheduling() float64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.UsagePercent7dValid {
-		return a.UsagePercent7d
-	}
-	return 0
 }
 
 // SetUsageSnapshot5h 更新 5h 用量快照
@@ -5286,6 +5281,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.HealthTier = HealthTierRisky
 	}
 	if isAntigravityAccount {
+		account.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
 			account.AntigravityHardBlocked = true
 			account.AntigravityHardBlockReason = reason
@@ -10180,6 +10176,8 @@ func (s *Store) SaveGrokFreeQuotaSnapshot(acc *Account, snap GrokFreeQuotaSnapsh
 		return
 	}
 	acc.SetGrokFreeQuotaSnapshot(snap)
+	// 权威用量变了，调度模式的排序键随之变化。
+	s.fastSchedulerUpdate(acc)
 	if s.db == nil {
 		return
 	}
@@ -11537,6 +11535,7 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.ProxyURL = strings.TrimSpace(row.ProxyURL)
 	acc.AntigravityHardBlocked = hardReason != ""
 	acc.AntigravityHardBlockReason = hardReason
+	acc.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 	if permanentRefresh {
 		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
 	} else if hardReason == "" {
