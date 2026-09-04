@@ -313,6 +313,9 @@ func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
 		"gpt-":                     false,
 		"gpt-4o-mini":              false,
 		"gpt-5o":                   false,
+		"gpt-.foo":                 false,
+		"gpt-_foo":                 false,
+		"gpt-+foo":                 false,
 		"gpt-daybreak-image":       false,
 		"daybreak-blue":            false,
 	}

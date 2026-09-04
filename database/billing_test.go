@@ -539,4 +539,11 @@ func TestCanonicalBillingModelKeyDaybreakAliases(t *testing.T) {
 			t.Fatalf("CanonicalBillingModelKey(%q) = %q, want gpt-5.6-sol", model, got)
 		}
 	}
+	// 只认 gpt-daybreak- 前缀：带版本号的 ID 仍按自身版本计费，无关模型不沾光。
+	if got := CanonicalBillingModelKey("gpt-5.4-daybreak"); got != "gpt-5.4" {
+		t.Fatalf("CanonicalBillingModelKey(gpt-5.4-daybreak) = %q, want gpt-5.4", got)
+	}
+	if got := CanonicalBillingModelKey("daybreak-blue"); got == "gpt-5.6-sol" {
+		t.Fatal("bare daybreak-blue must not resolve to gpt-5.6-sol")
+	}
 }

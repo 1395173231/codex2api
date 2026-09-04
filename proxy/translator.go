@@ -2566,7 +2566,7 @@ func modelSupportsMaxReasoningEffort(model string) bool {
 	if !strings.HasPrefix(model, "gpt-") {
 		return false
 	}
-	if strings.Contains(model, "daybreak") {
+	if strings.HasPrefix(model, "gpt-daybreak-") {
 		return true
 	}
 	version := strings.TrimPrefix(model, "gpt-")

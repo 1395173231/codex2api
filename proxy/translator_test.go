@@ -4094,6 +4094,7 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 		"gpt-daybreak-blue-latest": true, // alias of gpt-5.6-sol (issue #624)
 		"gpt-daybreak-red-latest":  true, // alias of gpt-5.6-cyber
 		"daybreak":                 false,
+		"gpt-5.4-daybreak":         false, // versioned ids follow their own version rule
 		"grok-4.6":                 false,
 	}
 	for model, want := range cases {

@@ -482,8 +482,9 @@ func isAllowedUpstreamCodexModel(id string) bool {
 	if err != nil {
 		// 以字母开头的首段是代号族别名（daybreak 等），无版本可比，按上游清单为准放行；
 		// 与 isRetiredCodexModel 对非数字 ID 恒返回 false（保留）保持一致。
-		// 以数字开头却解析不出的（gpt-4o 这类旧世代写法）仍按退役拒绝。
-		return version != "" && (version[0] < '0' || version[0] > '9')
+		// 以数字开头却解析不出的（gpt-4o 这类旧世代写法）仍按退役拒绝；
+		// 标点开头（gpt-.foo / gpt-_foo）不是任何已知命名，同样拒绝。
+		return version != "" && version[0] >= 'a' && version[0] <= 'z'
 	}
 	minor := 0
 	if len(parts) >= 2 {
