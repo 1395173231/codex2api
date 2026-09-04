@@ -2862,6 +2862,24 @@ export interface ModelsResponse {
   warning?: string
 }
 
+export interface ChannelModelRefreshResult {
+  channel: 'codex' | 'claude' | 'grok' | 'antigravity' | string
+  groups?: number
+  refreshed: number
+  failed: number
+  added: string[]
+  error?: string
+}
+
+export interface RefreshAllModelsResponse {
+  type: 'complete'
+  message: string
+  channels: ChannelModelRefreshResult[]
+  added: string[]
+  model_count: number
+  duration_ms: number
+}
+
 export interface ModelSyncResponse {
   added: number
   updated: number
