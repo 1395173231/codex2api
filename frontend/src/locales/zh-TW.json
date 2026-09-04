@@ -118,7 +118,8 @@
     "providerViewClaude": "Claude",
     "testProxySuccess": "代理可用",
     "testProxyFailed": "代理測試失敗",
-    "proxyPoolEmpty": "代理池為空(可在「代理」頁新增)"
+    "proxyPoolEmpty": "代理池為空(可在「代理」頁新增)",
+    "proxyPoolLinkedHint": "已關聯代理池節點（按位址綁定）：在「代理」頁修改該節點位址會同步到所有綁定帳號，刪除則自動解除綁定。"
   },
   "settings": {
     "pricing": {

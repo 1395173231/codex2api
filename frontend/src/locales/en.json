@@ -1637,7 +1637,8 @@
     "providerViewClaude": "Claude",
     "testProxySuccess": "Proxy OK",
     "testProxyFailed": "Proxy test failed",
-    "proxyPoolEmpty": "Proxy pool is empty (add proxies on the Proxies page)"
+    "proxyPoolEmpty": "Proxy pool is empty (add proxies on the Proxies page)",
+    "proxyPoolLinkedHint": "Linked to a proxy-pool node by URL: editing the node URL on the Proxies page updates every bound account, and deleting it unbinds them."
   },
   "invite": {
     "entry": "Codex Invite",
