@@ -55,3 +55,7 @@ diagrams/
 /data/
 /codex2api_local
 /server.log
+# CDK/账号凭证仅允许保存在本地，不要提交。
+tools/cdk-keys.txt
+tools/*.local.env
+.redeemed-accounts/

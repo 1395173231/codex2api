@@ -469,9 +469,9 @@ func normalizeCodexResponsesLiteBody(requestBody []byte, stripHostedTools bool) 
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
-// poolRouteKey：本地连接池路由键（仅本地、永不发上游）。非空时 wsrelay 用它作 8 槽池的
-// baseKey，从而把"上游会话身份(每请求唯一)"与"连接复用(按 API Key 稳定)"解耦；空时沿用
-// headerSessionID 作 baseKey（显式会话 / per-api-key 模式的原有行为）。
+// poolRouteKey：本地连接池路由种子（仅本地、永不发上游）。wsrelay 会把它与最终握手
+// 兼容指纹组合：同一 API Key 下 session/thread/window/model/tier 相同才可复用，不同则
+// 建立并保留独立连接。
 var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error)
 
 // EnsureCodexAgentIdentityTaskFunc 由启动装配注册（store.EnsureCodexAgentIdentityTask），
@@ -569,9 +569,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 				det := deterministicPromptCacheKey(apiKey, account)
 				if CurrentRuntimeSettings().IsolateRequestsByDefault() {
 					// 默认隔离：每请求唯一的 prompt_cache_key 写入 response.create 帧体，实现上游
-					// 身份隔离（互不串味）；连接池 baseKey 用稳定的确定性键单独传，保住 8 槽复用与
-					// 抗握手限流(503)。注意：上游会话隔离靠帧体 prompt_cache_key，而非握手头
-					// Session_id/Conversation_id（后者对复用连接是逐连接、非逐请求）。
+					// 身份隔离（互不串味）；确定性键只作为连接池路由种子，wsrelay 还会叠加最终
+					// 握手兼容指纹，避免不同会话/窗口/模型复用同一个冻结握手。
 					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", NewUpstreamSessionUUID())
 					poolRouteKey = det
 					if poolRouteKey == "" {
