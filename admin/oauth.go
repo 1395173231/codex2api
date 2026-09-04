@@ -453,9 +453,18 @@ func (h *Handler) reviveReimportedAccount(ctx context.Context, row *database.Acc
 		return false
 	}
 	if h.store != nil {
+		// reloadTokenAccount 先移除再按库重建；重建失败时账号会从运行时池消失。
+		// 那样不能对外报"已复活"——把原来的运行时对象放回去（仍是异常态，与
+		// 未复活的结论一致），返回 false 让调用方按普通重复计数。
+		prev := h.store.FindByID(row.ID)
 		if err := h.reloadTokenAccount(ctx, row.ID, source); err != nil {
-			log.Printf("重复导入复活账号 %d 后重载运行时失败: %v", row.ID, err)
-		} else if acc := h.store.FindByID(row.ID); acc != nil &&
+			log.Printf("重复导入复活账号 %d 后重载运行时失败，保留原运行时状态: %v", row.ID, err)
+			if prev != nil && h.store.FindByID(row.ID) == nil {
+				h.store.AddAccount(prev)
+			}
+			return false
+		}
+		if acc := h.store.FindByID(row.ID); acc != nil &&
 			acc.GetAccessToken() == "" && !acc.IsCodexAgentIdentity() &&
 			!h.store.GetLazyMode() && strings.HasPrefix(source, "import") {
 			// 导入来源的重载不会自动换票（reloadTokenAccount 把 import* 来源
