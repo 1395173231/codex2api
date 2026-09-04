@@ -356,7 +356,12 @@ type usageLogEntry struct {
 func New(driver string, dsn string, schema ...string) (*DB, error) {
 	driver = normalizeDriver(driver)
 	driverName := sqlOpenDriverName(driver)
+	// 测试注册了 schema 模板且目标文件尚不存在时，直接复制模板并跳过迁移。
+	fromSchemaTemplate := false
 	if driver == "sqlite" {
+		if target, ok := sqliteSchemaTemplateTarget(dsn); ok {
+			fromSchemaTemplate = applySQLiteSchemaTemplate(target)
+		}
 		dsn = sqliteConnectDSN(dsn)
 	}
 
@@ -430,31 +435,35 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 			}
 		}
 	}
-	if err := db.migrate(ctx); err != nil {
-		return nil, fmt.Errorf("数据库迁移失败: %w", err)
-	}
-	grokStateCtx, grokStateCancel := grokStateStartupContext(ctx)
-	grokStateErr := db.ensureGrokStateSchema(grokStateCtx)
-	grokStateCancel()
-	if grokStateErr != nil {
-		return nil, fmt.Errorf("初始化 Grok 状态表失败: %w", grokStateErr)
-	}
-	// The detached Grok backfill may legitimately consume minutes. Do not reuse
-	// the original ten-second startup context for the remaining small schemas.
-	postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer postGrokCancel()
-	ctx = postGrokCtx
-	if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
-		return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
-	}
-	if err := db.ensurePromptRuleCandidatesTable(ctx); err != nil {
-		return nil, fmt.Errorf("创建提示词规则候选表失败: %w", err)
-	}
-	if err := db.ensurePromptPolicyIncidentsTable(ctx); err != nil {
-		return nil, fmt.Errorf("创建提示词策略事件表失败: %w", err)
-	}
-	if err := db.ensurePromptConversationLocksTable(ctx); err != nil {
-		return nil, fmt.Errorf("创建提示词会话锁表失败: %w", err)
+	// 模板复制出来的库已经包含下面全部 schema（模板本身就是走完整路径建出来的），
+	// 跳过迁移与各 ensure*：在 -race 下这些幂等 DDL 每次仍要几百毫秒。
+	if !fromSchemaTemplate {
+		if err := db.migrate(ctx); err != nil {
+			return nil, fmt.Errorf("数据库迁移失败: %w", err)
+		}
+		grokStateCtx, grokStateCancel := grokStateStartupContext(ctx)
+		grokStateErr := db.ensureGrokStateSchema(grokStateCtx)
+		grokStateCancel()
+		if grokStateErr != nil {
+			return nil, fmt.Errorf("初始化 Grok 状态表失败: %w", grokStateErr)
+		}
+		// The detached Grok backfill may legitimately consume minutes. Do not reuse
+		// the original ten-second startup context for the remaining small schemas.
+		postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer postGrokCancel()
+		ctx = postGrokCtx
+		if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
+			return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
+		}
+		if err := db.ensurePromptRuleCandidatesTable(ctx); err != nil {
+			return nil, fmt.Errorf("创建提示词规则候选表失败: %w", err)
+		}
+		if err := db.ensurePromptPolicyIncidentsTable(ctx); err != nil {
+			return nil, fmt.Errorf("创建提示词策略事件表失败: %w", err)
+		}
+		if err := db.ensurePromptConversationLocksTable(ctx); err != nil {
+			return nil, fmt.Errorf("创建提示词会话锁表失败: %w", err)
+		}
 	}
 
 	// 启动批量写入后台协程

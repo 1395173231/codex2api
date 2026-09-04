@@ -2867,6 +2867,24 @@ export interface ModelsResponse {
   warning?: string
 }
 
+export interface ChannelModelRefreshResult {
+  channel: 'codex' | 'claude' | 'grok' | 'antigravity' | string
+  groups?: number
+  refreshed: number
+  failed: number
+  added: string[]
+  error?: string
+}
+
+export interface RefreshAllModelsResponse {
+  type: 'complete'
+  message: string
+  channels: ChannelModelRefreshResult[]
+  added: string[]
+  model_count: number
+  duration_ms: number
+}
+
 export interface ModelSyncResponse {
   added: number
   updated: number
@@ -3681,6 +3699,8 @@ export interface ClaudeGlobalConfig {
   session_window_limit: number
   cli_version_sync_enabled: boolean
   cli_version_sync_interval_hours: number
+  first_token_timeout_seconds: number
+  stream_keepalive_enabled: boolean
   synced_cli_version?: string
   builtin_cli_version?: string
   effective_cli_version?: string

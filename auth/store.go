@@ -114,11 +114,16 @@ type Account struct {
 	// successful, generation-fenced sync can safely clear the provider fence.
 	AntigravityHardBlocked     bool
 	AntigravityHardBlockReason string
-	BaseURL                    string
-	APIKey                     string
-	Models                     []string
-	ModelMapping               string
-	CodexClientMetadataMode    string
+	// antigravityQuota* 是 antigravity_quota 凭据投影出的调度排序键（已用百分比），
+	// 见 scheduling_usage_key.go；随控制面同步快照更新。
+	antigravityQuotaUsedPercent float64
+	antigravityQuotaObservedAt  time.Time
+	antigravityQuotaValid       bool
+	BaseURL                     string
+	APIKey                      string
+	Models                      []string
+	ModelMapping                string
+	CodexClientMetadataMode     string
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
@@ -2151,16 +2156,6 @@ func (s *Store) MarkUsage7dRateLimited(acc *Account) bool {
 	return true
 }
 
-// usagePercentForScheduling 返回调度排序用的用量百分比（7d 窗口有效则返回，否则 0）。
-func (a *Account) usagePercentForScheduling() float64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.UsagePercent7dValid {
-		return a.UsagePercent7d
-	}
-	return 0
-}
-
 // SetUsageSnapshot5h 更新 5h 用量快照
 func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
 	a.SetUsageSnapshot5hAt(pct, resetAt, time.Now())
@@ -3336,6 +3331,9 @@ type Store struct {
 	claudeSessionWindowLimit      int64        // Claude 账号默认并发会话窗口数（0=用全局 maxConcurrency）
 	claudeCLIVersionSyncDisabled  atomic.Bool  // Claude CLI 版本自动同步是否关闭（零值=开启）
 	claudeCLIVersionSyncIntervalH atomic.Int64 // Claude CLI 版本同步间隔小时（0=默认 12）
+	claudeFirstTokenTimeoutSec    atomic.Int64 // Claude 路径首字超时秒（0=跟随全局）
+	claudeFirstTokenTimeoutSet    atomic.Bool  // 首字超时是否被显式设置过（否则取默认 120）
+	claudeStreamKeepaliveDisabled atomic.Bool  // Claude 流式首字前 SSE 保活是否关闭（零值=开启）
 	grokAffinityMode              atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
 	grokProbeEnabled              atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
 	grokProbeIntervalMin          atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
@@ -3559,6 +3557,16 @@ func (s *Store) deleteCachedAccountCooldown(accountID int64) {
 	if err := s.tokenCache.DeleteRuntime(ctx, accountCooldownCacheNamespace, accountCooldownRuntimeKey(accountID)); err != nil {
 		log.Printf("[账号 %d] 删除账号冷却缓存失败: %v", accountID, err)
 	}
+}
+
+// ForgetCachedAccountCooldown 清除账号在跨实例冷却缓存里的记录。
+//
+// 管理端在数据库层直接清掉 error / unauthorized 状态（重新导入、重新授权、
+// 合并凭证）并重载运行时账号时必须一并调用：调度器每次挑号都会回读该缓存
+// 并把冷却重新盖回内存账号，只清库不清缓存会让刚复活的账号继续被挡到
+// 缓存 TTL（unauthorized 可达 24h）到期。
+func (s *Store) ForgetCachedAccountCooldown(accountID int64) {
+	s.deleteCachedAccountCooldown(accountID)
 }
 
 func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownRecord) {
@@ -5367,6 +5375,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.HealthTier = HealthTierRisky
 	}
 	if isAntigravityAccount {
+		account.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
 			account.AntigravityHardBlocked = true
 			account.AntigravityHardBlockReason = reason
@@ -10229,6 +10238,8 @@ func (s *Store) SaveGrokFreeQuotaSnapshot(acc *Account, snap GrokFreeQuotaSnapsh
 		return
 	}
 	acc.SetGrokFreeQuotaSnapshot(snap)
+	// 权威用量变了，调度模式的排序键随之变化。
+	s.fastSchedulerUpdate(acc)
 	if s.db == nil {
 		return
 	}
@@ -11590,6 +11601,7 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.ProxyURL = strings.TrimSpace(row.ProxyURL)
 	acc.AntigravityHardBlocked = hardReason != ""
 	acc.AntigravityHardBlockReason = hardReason
+	acc.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 	if permanentRefresh {
 		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
 	} else if hardReason == "" {

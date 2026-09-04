@@ -68,6 +68,10 @@ type ModelSyncResult struct {
 }
 
 var builtinModelInfos = []ModelInfo{
+	// gpt-6-astra：官方模型页与定价页均已收录（$10/$50，长上下文 $20/$75）。
+	// 官方文档同步与 manifest 学习都能发现它，但内置一行保证冷启动 / 未同步的
+	// 部署也能直接调用，不必等一次同步或一次带清单的请求。
+	modelInfoForID("gpt-6-astra", ModelSourceBuiltin),
 	// gpt-5.6 系列（Sol/Terra/Luna）：官网已出现的新模型，先内置兜底，
 	// 官方文档页同步（SyncOfficialCodexModels）上线后会以同步结果为准。
 	modelInfoForID("gpt-5.6-sol", ModelSourceBuiltin),
@@ -85,7 +89,9 @@ var builtinModelInfos = []ModelInfo{
 	// Ref: codex_client_models.json via CLIProxyAPI model registry.
 	modelInfoForID("codex-auto-review", ModelSourceBuiltin),
 	// gpt-reserve — non-versioned model ID; keep as builtin fallback only.
-	// Note: it is not discoverable via upstream sync/manifest learning, which expects gpt-<major>.<minor> IDs.
+	// Note: the official docs sync only extracts gpt-<major>[.<minor>] IDs, so it
+	// would never be discovered there; manifest learning does admit non-versioned
+	// gpt-* slugs (issue #624), but a builtin row is still needed for cold start.
 	modelInfoForID("gpt-reserve", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-2k", ModelSourceBuiltin),
@@ -119,7 +125,7 @@ func modelInfoForID(id string, source string) ModelInfo {
 	switch strings.ToLower(id) {
 	case "gpt-5.3-codex-spark":
 		info.ProOnly = true
-	case "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+	case "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra":
 		info.APIKeyAuthAvailable = false
 	case "gpt-image-2":
 		info.Category = ModelCategoryImage
@@ -397,7 +403,12 @@ var codexModelIDPattern = regexp.MustCompile(`\bgpt-[0-9]+(?:\.[0-9]+)*(?:-[a-z]
 func ParseOfficialCodexModelIDs(html string) (models []string, skipped []string) {
 	seen := map[string]struct{}{}
 	skippedSeen := map[string]struct{}{}
-	for _, match := range codexModelIDPattern.FindAllString(strings.ToLower(html), -1) {
+	lowered := strings.ToLower(html)
+	for _, loc := range codexModelIDPattern.FindAllStringIndex(lowered, -1) {
+		match := lowered[loc[0]:loc[1]]
+		if !isOfficialCodexModelIDContext(lowered, loc[0], loc[1]) {
+			continue
+		}
 		if isAllowedUpstreamCodexModel(match) {
 			if _, ok := seen[match]; !ok {
 				seen[match] = struct{}{}
@@ -417,6 +428,28 @@ func ParseOfficialCodexModelIDs(html string) (models []string, skipped []string)
 	return models, skipped
 }
 
+// isOfficialCodexModelIDContext 只接受官方模型页里"当作模型 ID 使用"的出现位置：
+// 被引号包裹（astro-island props / JSON，如 &quot;gpt-5.5&quot;）或 `codex -m <id>` 命令。
+// 导航文案（"Using GPT-6 Astra"→gpt-6）、锚点（#gpt-6-astra-in-enterprise）、
+// 图片文件名（gpt-6-astra-texture.webp）都不算模型 ID。
+func isOfficialCodexModelIDContext(lowered string, start, end int) bool {
+	before := lowered[:start]
+	after := lowered[end:]
+	if strings.HasSuffix(before, "codex -m ") {
+		return after == "" || !isModelIDByte(after[0])
+	}
+	for _, quote := range []string{"&quot;", "\"", "'"} {
+		if strings.HasSuffix(before, quote) && strings.HasPrefix(after, quote) {
+			return true
+		}
+	}
+	return false
+}
+
+func isModelIDByte(b byte) bool {
+	return b == '-' || b == '.' || b == '_' || b == '/' || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
 func modelSortRank(id string) int {
 	for index, info := range builtinModelInfos {
 		if info.ID == id {
@@ -431,6 +464,9 @@ func modelSortRank(id string) int {
 //   - gpt-5.4 及更高版本：允许
 //   - gpt-5.3：只允许 spark 变体（gpt-5.3-codex-spark），其余 5.3 下线
 //   - gpt-5.2 及更低、image、非 gpt- 前缀：拒绝
+//   - gpt- 后不是数字版本号的代号族（gpt-daybreak-blue-latest 这类稳定别名，
+//     issue #624）：允许——版本退役规则对它们无从判断，而清单里出现即代表
+//     账号真实权益，拒掉只会让探测看得见、调用却 404 的模型永远进不了注册表
 func isAllowedUpstreamCodexModel(id string) bool {
 	id = strings.TrimSpace(strings.ToLower(id))
 	if id == "" || strings.Contains(id, "image") {
@@ -443,17 +479,23 @@ func isAllowedUpstreamCodexModel(id string) bool {
 	if dash := strings.IndexByte(version, '-'); dash >= 0 {
 		version = version[:dash]
 	}
+	// 版本号可能只有大版本（gpt-6-astra、gpt-6），没有小数点时 minor 视为 0，
+	// 不能因为缺少 ".x" 就把新一代型号拒之门外。
 	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return false
-	}
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return false
+		// 以字母开头的首段是代号族别名（daybreak 等），无版本可比，按上游清单为准放行；
+		// 与 isRetiredCodexModel 对非数字 ID 恒返回 false（保留）保持一致。
+		// 以数字开头却解析不出的（gpt-4o 这类旧世代写法）仍按退役拒绝；
+		// 标点开头（gpt-.foo / gpt-_foo）不是任何已知命名，同样拒绝。
+		return version != "" && version[0] >= 'a' && version[0] <= 'z'
 	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return false
+	minor := 0
+	if len(parts) >= 2 {
+		minor, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return false
+		}
 	}
 	if major > 5 {
 		return true

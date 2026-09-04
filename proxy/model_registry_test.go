@@ -54,7 +54,7 @@ func TestParseOfficialCodexModelIDs(t *testing.T) {
 func TestApplyOfficialCodexModelSyncMergesWithBuiltinImageModel(t *testing.T) {
 	db := newTestModelRegistryDB(t)
 	ctx := context.Background()
-	html := `gpt-5.5 gpt-5.4 gpt-5.4-mini gpt-5.3-codex gpt-5.3-codex-spark gpt-5.2 gpt-5.2-codex gpt-4.1`
+	html := `"gpt-5.5" "gpt-5.4" "gpt-5.4-mini" "gpt-5.3-codex" "gpt-5.3-codex-spark" "gpt-5.2" "gpt-5.2-codex" "gpt-4.1"`
 
 	result, err := ApplyOfficialCodexModelSync(ctx, db, html, time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC))
 	if err != nil {
@@ -289,6 +289,7 @@ func TestLearnModelsFromManifest_AllKnownIsNoOp(t *testing.T) {
 // 上游同步/学习的模型准入策略：5.4+ 放行，5.3 仅 spark，5.2 及以下下线。
 func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
 	cases := map[string]bool{
+		"gpt-6-astra":         true,
 		"gpt-5.6-sol":         true,
 		"gpt-5.5":             true,
 		"gpt-5.4":             true,
@@ -304,6 +305,20 @@ func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
 		"gpt-4o":              false,
 		"gpt-image-2":         false,
 		"":                    false,
+		// Trusted Access for Cyber（issue #624）：稳定别名没有数字版本号，
+		// 但清单里出现即代表账号真实权益，必须放行；带版本号的 cyber 变体走常规规则。
+		"gpt-daybreak-blue-latest": true,
+		"gpt-daybreak-red-latest":  true,
+		"gpt-5.6-cyber":            true,
+		"gpt-5.5-cyber-preview":    true,
+		"gpt-":                     false,
+		"gpt-4o-mini":              false,
+		"gpt-5o":                   false,
+		"gpt-.foo":                 false,
+		"gpt-_foo":                 false,
+		"gpt-+foo":                 false,
+		"gpt-daybreak-image":       false,
+		"daybreak-blue":            false,
 	}
 	for id, want := range cases {
 		if got := isAllowedUpstreamCodexModel(id); got != want {
@@ -362,5 +377,89 @@ func TestSyncOfficialCodexModelsEmptyProxyStillAttempts(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "官方模型页面") {
 		t.Fatalf("unexpected error kind: %v", err)
+	}
+}
+
+func TestIsAllowedUpstreamCodexModelAcceptsMajorOnlyVersions(t *testing.T) {
+	// gpt-6-astra 这类没有小数点的新一代型号必须被允许进入注册表。
+	for _, id := range []string{"gpt-6-astra", "gpt-6", "gpt-7-nova"} {
+		if !isAllowedUpstreamCodexModel(id) {
+			t.Fatalf("%s should be allowed", id)
+		}
+	}
+	for _, id := range []string{"gpt-4", "gpt-4-turbo", "gpt-5", "gpt-5-codex"} {
+		if isAllowedUpstreamCodexModel(id) {
+			t.Fatalf("%s should be rejected", id)
+		}
+	}
+	models, _ := ParseOfficialCodexModelIDs(`<code>codex -m gpt-6-astra</code> &quot;gpt-5.4&quot;`)
+	if !slices.Contains(models, "gpt-6-astra") {
+		t.Fatalf("parsed models missing gpt-6-astra: %v", models)
+	}
+}
+
+func TestParseOfficialCodexModelIDsIgnoresNonModelContexts(t *testing.T) {
+	// 真实官方页里的三类"长得像模型 ID"的噪声：导航文案、锚点、图片文件名。
+	html := `
+		<a href="#gpt-6-astra-in-enterprise">Using GPT-6 Astra</a>
+		<img src="/images/api/models/gpt-6-astra-texture.webp" alt="Astra">
+		<img src="/images/api/models/gpt-5.6-sol.webp">
+		<astro-island props="{&quot;name&quot;:[0,&quot;gpt-6-astra&quot;],&quot;wallpaperUrl&quot;:[0,&quot;/images/api/models/gpt-6-astra-texture.webp&quot;]}"></astro-island>
+		<code>codex -m gpt-5.6-sol</code>
+		<script>{"model":"gpt-5.4-mini"}</script>
+	`
+	models, skipped := ParseOfficialCodexModelIDs(html)
+	want := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.4-mini"}
+	if len(models) != len(want) {
+		t.Fatalf("models = %v, want exactly %v (skipped=%v)", models, want, skipped)
+	}
+	for _, model := range want {
+		if !slices.Contains(models, model) {
+			t.Fatalf("parsed models missing %q in %v", model, models)
+		}
+	}
+	for _, junk := range []string{"gpt-6", "gpt-6-astra-in-enterprise", "gpt-6-astra-texture"} {
+		if slices.Contains(models, junk) || slices.Contains(skipped, junk) {
+			t.Fatalf("%q should not be extracted at all (models=%v skipped=%v)", junk, models, skipped)
+		}
+	}
+}
+
+// issue #624：Trusted Access for Cyber 账号的清单里带 gpt-daybreak-blue-latest，
+// 学习后必须立刻进入请求侧支持列表，否则 /v1/models 不列、/responses 直接拒绝。
+func TestLearnModelsFromManifest_AdmitsNonVersionedCyberAlias(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	manifest := []byte(`{"models":[
+		{"slug":"gpt-5.5"},
+		{"slug":"gpt-daybreak-blue-latest"},
+		{"slug":"gpt-5.2-codex"}
+	]}`)
+	added, err := LearnModelsFromManifest(ctx, db, manifest, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("LearnModelsFromManifest error: %v", err)
+	}
+	if !slices.Equal(added, []string{"gpt-daybreak-blue-latest"}) {
+		t.Fatalf("added = %v, want [gpt-daybreak-blue-latest] (retired 5.2 must still be rejected)", added)
+	}
+	catalog, err := ListModelCatalog(ctx, db)
+	if err != nil {
+		t.Fatalf("ListModelCatalog: %v", err)
+	}
+	if !slices.Contains(catalog.Models, "gpt-daybreak-blue-latest") {
+		t.Fatalf("learned alias missing from catalog: %v", catalog.Models)
+	}
+	for _, item := range catalog.Items {
+		if item.ID == "gpt-daybreak-blue-latest" {
+			if item.Source != ModelSourceUpstreamManifest || item.Category != ModelCategoryCodex || !item.Enabled {
+				t.Fatalf("learned item = %+v", item)
+			}
+		}
+	}
+	if !slices.Contains(SupportedModelIDs(ctx, db), "gpt-daybreak-blue-latest") {
+		t.Fatal("learned alias must be accepted by the request-side model gate immediately")
+	}
+	if isRetiredCodexModel("gpt-daybreak-blue-latest") {
+		t.Fatal("non-versioned alias must never be treated as retired")
 	}
 }
