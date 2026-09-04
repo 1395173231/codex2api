@@ -54,7 +54,7 @@ func TestParseOfficialCodexModelIDs(t *testing.T) {
 func TestApplyOfficialCodexModelSyncMergesWithBuiltinImageModel(t *testing.T) {
 	db := newTestModelRegistryDB(t)
 	ctx := context.Background()
-	html := `gpt-5.5 gpt-5.4 gpt-5.4-mini gpt-5.3-codex gpt-5.3-codex-spark gpt-5.2 gpt-5.2-codex gpt-4.1`
+	html := `"gpt-5.5" "gpt-5.4" "gpt-5.4-mini" "gpt-5.3-codex" "gpt-5.3-codex-spark" "gpt-5.2" "gpt-5.2-codex" "gpt-4.1"`
 
 	result, err := ApplyOfficialCodexModelSync(ctx, db, html, time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC))
 	if err != nil {
@@ -362,5 +362,50 @@ func TestSyncOfficialCodexModelsEmptyProxyStillAttempts(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "官方模型页面") {
 		t.Fatalf("unexpected error kind: %v", err)
+	}
+}
+
+func TestIsAllowedUpstreamCodexModelAcceptsMajorOnlyVersions(t *testing.T) {
+	// gpt-6-astra 这类没有小数点的新一代型号必须被允许进入注册表。
+	for _, id := range []string{"gpt-6-astra", "gpt-6", "gpt-7-nova"} {
+		if !isAllowedUpstreamCodexModel(id) {
+			t.Fatalf("%s should be allowed", id)
+		}
+	}
+	for _, id := range []string{"gpt-4", "gpt-4-turbo", "gpt-5", "gpt-5-codex"} {
+		if isAllowedUpstreamCodexModel(id) {
+			t.Fatalf("%s should be rejected", id)
+		}
+	}
+	models, _ := ParseOfficialCodexModelIDs(`<code>codex -m gpt-6-astra</code> &quot;gpt-5.4&quot;`)
+	if !slices.Contains(models, "gpt-6-astra") {
+		t.Fatalf("parsed models missing gpt-6-astra: %v", models)
+	}
+}
+
+func TestParseOfficialCodexModelIDsIgnoresNonModelContexts(t *testing.T) {
+	// 真实官方页里的三类"长得像模型 ID"的噪声：导航文案、锚点、图片文件名。
+	html := `
+		<a href="#gpt-6-astra-in-enterprise">Using GPT-6 Astra</a>
+		<img src="/images/api/models/gpt-6-astra-texture.webp" alt="Astra">
+		<img src="/images/api/models/gpt-5.6-sol.webp">
+		<astro-island props="{&quot;name&quot;:[0,&quot;gpt-6-astra&quot;],&quot;wallpaperUrl&quot;:[0,&quot;/images/api/models/gpt-6-astra-texture.webp&quot;]}"></astro-island>
+		<code>codex -m gpt-5.6-sol</code>
+		<script>{"model":"gpt-5.4-mini"}</script>
+	`
+	models, skipped := ParseOfficialCodexModelIDs(html)
+	want := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.4-mini"}
+	if len(models) != len(want) {
+		t.Fatalf("models = %v, want exactly %v (skipped=%v)", models, want, skipped)
+	}
+	for _, model := range want {
+		if !slices.Contains(models, model) {
+			t.Fatalf("parsed models missing %q in %v", model, models)
+		}
+	}
+	for _, junk := range []string{"gpt-6", "gpt-6-astra-in-enterprise", "gpt-6-astra-texture"} {
+		if slices.Contains(models, junk) || slices.Contains(skipped, junk) {
+			t.Fatalf("%q should not be extracted at all (models=%v skipped=%v)", junk, models, skipped)
+		}
 	}
 }
