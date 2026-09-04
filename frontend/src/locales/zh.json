@@ -1637,7 +1637,8 @@
     "providerViewClaude": "Claude",
     "testProxySuccess": "代理可用",
     "testProxyFailed": "代理测试失败",
-    "proxyPoolEmpty": "代理池为空(可在「代理」页添加)"
+    "proxyPoolEmpty": "代理池为空(可在「代理」页添加)",
+    "proxyPoolLinkedHint": "已关联代理池节点（按地址绑定）：在「代理」页修改该节点地址会同步到所有绑定账号，删除则自动解绑。"
   },
   "invite": {
     "entry": "Codex 邀请",
