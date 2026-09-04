@@ -80,7 +80,8 @@ test('model pricing exposes Anthropic source and distinct cache write fields', (
 
 test('model catalog refresh button refreshes every channel, not only Claude', () => {
   const pricing = readFileSync(new URL('../pages/ModelPricing.tsx', import.meta.url), 'utf8')
-  assert.match(pricing, /api\.refreshAllModels\(\)/)
+  assert.match(pricing, /\/models\/refresh-all\?stream=1/)
+  assert.match(pricing, /readModelRefreshSSE/)
   assert.doesNotMatch(pricing, /api\.refreshAllClaudeModels\(\)/)
   assert.match(pricing, /catalogRefreshChannelFailed/)
   assert.match(types, /RefreshAllModelsResponse/)
@@ -100,6 +101,7 @@ test('Claude account editor exposes per-account client policy overrides', () => 
   assert.match(claude, /claude_client_version|clientVersion/)
   assert.match(claude, /跟随全局|follow.*global/i)
 })
+
 test('Claude model whitelist stays provider-scoped and uses optimistic detail validation', () => {
   assert.match(claude, /CLAUDE_MODEL_ID_RE = \/\^claude-/)
   assert.match(claude, /api\.syncAccountModelsUpstream\(account\.id\)/)

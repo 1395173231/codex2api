@@ -143,7 +143,11 @@
       "catalogRefresh": "重新整理帳號模型",
       "catalogRefreshed": "已重新整理,可用模型共 {{count}} 個（{{detail}}）",
       "catalogRefreshChannelFailed": "失敗",
-      "catalogRefreshChannelAccounts": "{{count}} 個帳號",
+      "catalogRefreshChannelGroups": "{{count}} 組方案",
+      "refreshProbing": "已探測 {{current}}/{{total}} 組方案",
+      "refreshStarting": "準備中…",
+      "refreshNoAccounts": "無帳號",
+      "refreshNoSummary": "重新整理未回傳彙總",
       "catalogMarkSeen": "標記已讀",
       "newBadge": "新"
     },

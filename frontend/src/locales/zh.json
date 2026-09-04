@@ -4235,7 +4235,11 @@
       "catalogRefresh": "刷新账号模型",
       "catalogRefreshed": "已刷新,可用模型共 {{count}} 个（{{detail}}）",
       "catalogRefreshChannelFailed": "失败",
-      "catalogRefreshChannelAccounts": "{{count}} 个账号",
+      "catalogRefreshChannelGroups": "{{count}} 组套餐",
+      "refreshProbing": "已探测 {{current}}/{{total}} 组套餐",
+      "refreshStarting": "准备中…",
+      "refreshNoAccounts": "无账号",
+      "refreshNoSummary": "刷新未返回汇总",
       "catalogMarkSeen": "标记已读",
       "newBadge": "新"
     },

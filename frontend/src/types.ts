@@ -2864,6 +2864,7 @@ export interface ModelsResponse {
 
 export interface ChannelModelRefreshResult {
   channel: 'codex' | 'claude' | 'grok' | 'antigravity' | string
+  groups?: number
   refreshed: number
   failed: number
   added: string[]
@@ -2871,6 +2872,7 @@ export interface ChannelModelRefreshResult {
 }
 
 export interface RefreshAllModelsResponse {
+  type: 'complete'
   message: string
   channels: ChannelModelRefreshResult[]
   added: string[]
