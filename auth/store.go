@@ -3560,6 +3560,16 @@ func (s *Store) deleteCachedAccountCooldown(accountID int64) {
 	}
 }
 
+// ForgetCachedAccountCooldown 清除账号在跨实例冷却缓存里的记录。
+//
+// 管理端在数据库层直接清掉 error / unauthorized 状态（重新导入、重新授权、
+// 合并凭证）并重载运行时账号时必须一并调用：调度器每次挑号都会回读该缓存
+// 并把冷却重新盖回内存账号，只清库不清缓存会让刚复活的账号继续被挡到
+// 缓存 TTL（unauthorized 可达 24h）到期。
+func (s *Store) ForgetCachedAccountCooldown(accountID int64) {
+	s.deleteCachedAccountCooldown(accountID)
+}
+
 func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownRecord) {
 	if s == nil || acc == nil || !record.ResetAt.After(time.Now()) {
 		return
