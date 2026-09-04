@@ -4362,7 +4362,10 @@ func validateAccountModelsForAccount(account *auth.Account, models []string) err
 }
 
 // SyncAccountUpstreamModels 用账号自身凭据实时拉取上游模型清单，
-// 返回该账号真实可用的模型 slug 列表。只读不落库，由管理端确认后再保存为白名单。
+// 返回该账号真实可用的模型 slug 列表。账号白名单本身只读不落库，由管理端确认后再保存；
+// 但清单里注册表尚不认识的模型会顺手学习进注册表（只增不改不删，与客户端刷新
+// 选单时的学习同一实现）：否则 Trusted Access for Cyber 这类只有个别账号才有的模型
+// 探测看得见、保存进白名单后 /v1/models 却不列、调用直接报模型不存在（issue #624）。
 func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -4422,6 +4425,12 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	if len(models) == 0 {
 		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
 		return
+	}
+	// 学习失败只记日志，不影响本次探测结果的返回。
+	if added, learnErr := proxy.LearnModelsFromManifest(ctx, h.db, manifest.Body, time.Now().UTC()); learnErr != nil {
+		log.Printf("[账号 %d] 模型清单学习失败（不影响探测结果）: %v", id, learnErr)
+	} else if len(added) > 0 {
+		log.Printf("[账号 %d] 已从上游模型清单学习 %d 个新模型进注册表: %s", id, len(added), strings.Join(added, ", "))
 	}
 	c.JSON(http.StatusOK, gin.H{"models": models})
 }

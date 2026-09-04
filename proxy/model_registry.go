@@ -85,7 +85,9 @@ var builtinModelInfos = []ModelInfo{
 	// Ref: codex_client_models.json via CLIProxyAPI model registry.
 	modelInfoForID("codex-auto-review", ModelSourceBuiltin),
 	// gpt-reserve — non-versioned model ID; keep as builtin fallback only.
-	// Note: it is not discoverable via upstream sync/manifest learning, which expects gpt-<major>.<minor> IDs.
+	// Note: the official docs sync only extracts gpt-<major>[.<minor>] IDs, so it
+	// would never be discovered there; manifest learning does admit non-versioned
+	// gpt-* slugs (issue #624), but a builtin row is still needed for cold start.
 	modelInfoForID("gpt-reserve", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-2k", ModelSourceBuiltin),
@@ -458,6 +460,9 @@ func modelSortRank(id string) int {
 //   - gpt-5.4 及更高版本：允许
 //   - gpt-5.3：只允许 spark 变体（gpt-5.3-codex-spark），其余 5.3 下线
 //   - gpt-5.2 及更低、image、非 gpt- 前缀：拒绝
+//   - gpt- 后不是数字版本号的代号族（gpt-daybreak-blue-latest 这类稳定别名，
+//     issue #624）：允许——版本退役规则对它们无从判断，而清单里出现即代表
+//     账号真实权益，拒掉只会让探测看得见、调用却 404 的模型永远进不了注册表
 func isAllowedUpstreamCodexModel(id string) bool {
 	id = strings.TrimSpace(strings.ToLower(id))
 	if id == "" || strings.Contains(id, "image") {
@@ -475,7 +480,11 @@ func isAllowedUpstreamCodexModel(id string) bool {
 	parts := strings.Split(version, ".")
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return false
+		// 以字母开头的首段是代号族别名（daybreak 等），无版本可比，按上游清单为准放行；
+		// 与 isRetiredCodexModel 对非数字 ID 恒返回 false（保留）保持一致。
+		// 以数字开头却解析不出的（gpt-4o 这类旧世代写法）仍按退役拒绝；
+		// 标点开头（gpt-.foo / gpt-_foo）不是任何已知命名，同样拒绝。
+		return version != "" && version[0] >= 'a' && version[0] <= 'z'
 	}
 	minor := 0
 	if len(parts) >= 2 {
