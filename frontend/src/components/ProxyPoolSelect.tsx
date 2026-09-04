@@ -93,11 +93,11 @@ export function ProxyPoolSelect({
       if (rootRef.current?.contains(target) || dropdownRef.current?.contains(target)) return;
       setOpen(false);
     };
+    // Radix Dialog 在 capture 阶段就处理了 Escape;这里只负责收起下拉,
+    // "按 Esc 不要顺带关掉弹窗"由 DialogContent 的 onEscapeKeyDown 依据
+    // data-select-dropdown 是否在场来阻止。
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        setOpen(false);
-      }
+      if (e.key === "Escape") setOpen(false);
     };
     const onReposition = () => computePosition();
     const onWheel = (e: WheelEvent) => {
