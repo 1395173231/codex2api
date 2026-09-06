@@ -32,6 +32,7 @@ type autoResetCreditsScanStats struct {
 
 type autoResetCreditsConfig struct {
 	Enabled         bool
+	OnLimitEnabled  bool
 	BeforeExpiryMin int
 }
 
@@ -122,13 +123,13 @@ func (h *Handler) triggerAutoResetCreditsScan() {
 
 func (h *Handler) runAutoResetCreditsScan(ctx context.Context, now time.Time) autoResetCreditsScanStats {
 	settings, settingsErr := h.loadAutoResetCreditsConfig(ctx)
-	stats := autoResetCreditsScanStats{Enabled: settings.Enabled}
+	stats := autoResetCreditsScanStats{Enabled: settings.Enabled || settings.OnLimitEnabled}
 	if settingsErr != nil {
 		stats.Failed = 1
 		log.Printf("[auto-reset-credits] 读取系统设置失败，已跳过本轮扫描: %v", settingsErr)
 		return stats
 	}
-	if !settings.Enabled || h == nil || h.store == nil {
+	if !stats.Enabled || h == nil || h.store == nil {
 		return stats
 	}
 
@@ -142,7 +143,7 @@ func (h *Handler) runAutoResetCreditsScan(ctx context.Context, now time.Time) au
 			continue
 		}
 		stats.Scanned++
-		if !isAutoResetCreditsPlan(account.GetPlanType()) || strings.TrimSpace(account.GetAccessToken()) == "" {
+		if !autoResetCreditsAccountEligible(account) {
 			continue
 		}
 
@@ -185,6 +186,8 @@ func (h *Handler) runAutoResetCreditsScan(ctx context.Context, now time.Time) au
 }
 
 func (h *Handler) autoResetCreditsForAccount(ctx context.Context, account *auth.Account, now time.Time, settings autoResetCreditsConfig) (queried, candidate, consumed bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, autoResetCreditsAccountTimeout)
+	defer cancel()
 	lock := h.resetCreditLock(account)
 	lock.Lock()
 	defer lock.Unlock()
@@ -195,8 +198,52 @@ func (h *Handler) autoResetCreditsForAccount(ctx context.Context, account *auth.
 	if coolingDown {
 		return false, false, false, nil
 	}
-	if !settings.Enabled || !isAutoResetCreditsPlan(account.GetPlanType()) || strings.TrimSpace(account.GetAccessToken()) == "" {
+	if (!settings.Enabled && !settings.OnLimitEnabled) || !autoResetCreditsAccountEligible(account) {
 		return false, false, false, nil
+	}
+	// 从主额度复查到预写冷却、消费都在同一工作区租约内；其他实例不能用旧查询抢跑。
+	acquired, release, err := h.acquireResetCreditLease(ctx, account)
+	if err != nil || !acquired {
+		return false, false, false, err
+	}
+	defer release()
+	if cooling, err := h.resetCreditCooldownActive(ctx, account); err != nil || cooling {
+		return false, false, false, err
+	}
+	settings, err = h.loadAutoResetCreditsConfig(ctx)
+	if err != nil || (!settings.Enabled && !settings.OnLimitEnabled) {
+		return false, false, false, err
+	}
+	mainLimited := false
+	if settings.OnLimitEnabled {
+		observedAt := time.Now()
+		usage, usageErr := h.queryResetUsageWithRefresh(ctx, account)
+		if usageErr != nil {
+			return true, false, false, usageErr
+		}
+		if usage.PlanType != "" && !isAutoResetCreditsPlan(usage.PlanType) {
+			return true, false, false, nil
+		}
+		var recovered bool
+		mainLimited, recovered = resetCreditMainUsageState(usage, time.Now())
+		if recovered {
+			if err := h.clearResetCreditLimitAttempt(ctx, account, observedAt); err != nil {
+				return true, false, false, err
+			}
+		}
+		if mainLimited {
+			pending, err := h.resetCreditLimitAttemptPending(ctx, account)
+			if err != nil || pending {
+				return true, false, false, err
+			}
+			// WHAM 明确报告不可应用时不冒险消耗（包括 credits-only 账号）。
+			if usage.RateLimitResetCredits != nil && usage.RateLimitResetCredits.ApplicableAvailableCount <= 0 {
+				return true, false, false, nil
+			}
+		}
+		if !mainLimited && !settings.Enabled {
+			return true, false, false, nil
+		}
 	}
 
 	list, err := h.queryResetCreditsWithRefresh(ctx, account)
@@ -213,34 +260,44 @@ func (h *Handler) autoResetCreditsForAccount(ctx context.Context, account *auth.
 		return true, false, false, nil
 	}
 
-	if !isAutoResetCreditsPlan(account.GetPlanType()) || strings.TrimSpace(account.GetAccessToken()) == "" {
+	if !autoResetCreditsAccountEligible(account) {
 		return true, false, false, nil
 	}
-	decisionNow := autoResetCreditsDecisionTime(now)
-	lead := time.Duration(settings.BeforeExpiryMin) * time.Minute
-	credit, expiresAt, ok := earliestAutoResetCredit(credits, decisionNow, lead)
-	if !ok {
-		return true, false, false, nil
+	if mainLimited {
+		// 查卡片期间主窗口可能自然恢复；临消费前再取一次权威主额度。
+		usage, err := h.queryResetUsageWithRefresh(ctx, account)
+		if err != nil {
+			return true, false, false, err
+		}
+		limited, _ := resetCreditMainUsageState(usage, time.Now())
+		if !limited || (usage.PlanType != "" && !isAutoResetCreditsPlan(usage.PlanType)) ||
+			(usage.RateLimitResetCredits != nil && usage.RateLimitResetCredits.ApplicableAvailableCount <= 0) {
+			return true, false, false, nil
+		}
 	}
-	candidate = true
-
 	// 真正消费前再次读取完整配置：管理员在查询/排队期间关闭功能或缩短
 	// 提前窗口后，旧扫描不能继续按旧阈值执行不可逆消费。
 	settings, settingsErr := h.loadAutoResetCreditsConfig(ctx)
 	if settingsErr != nil {
-		return true, true, false, fmt.Errorf("reload system settings before consume: %w", settingsErr)
+		return true, false, false, fmt.Errorf("reload system settings before consume: %w", settingsErr)
 	}
-	if !settings.Enabled {
-		return true, true, false, nil
+	mainLimited = mainLimited && settings.OnLimitEnabled
+	if !settings.Enabled && !mainLimited {
+		return true, false, false, nil
 	}
-	decisionNow = autoResetCreditsDecisionTime(now)
-	lead = time.Duration(settings.BeforeExpiryMin) * time.Minute
-	credit, expiresAt, ok = earliestAutoResetCredit(credits, decisionNow, lead)
+	decisionNow := autoResetCreditsDecisionTime(now)
+	lead := time.Duration(settings.BeforeExpiryMin) * time.Minute
+	source := "auto"
+	if mainLimited {
+		lead = time.Duration(1<<63 - 1)
+		source = "auto_limit"
+	}
+	credit, expiresAt, ok := earliestAutoResetCredit(credits, decisionNow, lead)
 	if !ok {
-		return true, true, false, nil
+		return true, false, false, nil
 	}
 	redeemRequestID := stableAutoResetCreditRequestID(account, credit)
-	outcome, failure := h.consumeResetCreditLocked(ctx, account, redeemRequestID, "auto")
+	outcome, failure := h.consumeResetCreditUnderLease(ctx, account, redeemRequestID, source)
 	if failure != nil {
 		return true, true, false, autoResetCreditFailureError(failure)
 	}
@@ -250,8 +307,8 @@ func (h *Handler) autoResetCreditsForAccount(ctx context.Context, account *auth.
 	if outcome.InProgress {
 		return true, true, false, nil
 	}
-	log.Printf("[auto-reset-credits] 账号 %d 临期额度已自动消耗: expires_at=%s windows_reset=%d remaining=%d",
-		account.DBID, expiresAt.UTC().Format(time.RFC3339), outcome.WindowsReset, outcome.Remaining)
+	log.Printf("[auto-reset-credits] 账号 %d 已自动消耗: source=%s expires_at=%s windows_reset=%d remaining=%d",
+		account.DBID, source, expiresAt.UTC().Format(time.RFC3339), outcome.WindowsReset, outcome.Remaining)
 	return true, true, true, nil
 }
 
@@ -259,6 +316,7 @@ func (h *Handler) loadAutoResetCreditsConfig(ctx context.Context) (autoResetCred
 	runtimeSettings := proxy.CurrentRuntimeSettings()
 	config := autoResetCreditsConfig{
 		Enabled:         runtimeSettings.AutoResetCreditsEnabled,
+		OnLimitEnabled:  runtimeSettings.AutoResetCreditsOnLimitEnabled,
 		BeforeExpiryMin: runtimeSettings.AutoResetCreditsBeforeExpiryMin,
 	}
 	if h == nil || h.db == nil {
@@ -273,6 +331,7 @@ func (h *Handler) loadAutoResetCreditsConfig(ctx context.Context) (autoResetCred
 	}
 	return autoResetCreditsConfig{
 		Enabled:         settings.AutoResetCreditsEnabled,
+		OnLimitEnabled:  settings.AutoResetCreditsOnLimitEnabled,
 		BeforeExpiryMin: settings.AutoResetCreditsBeforeExpiryMin,
 	}, nil
 }

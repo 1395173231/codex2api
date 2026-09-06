@@ -20,6 +20,9 @@ import (
 
 const resetCreditLeaseTTL = 45 * time.Second
 
+// 独立于扫描周期；超时也可能已经扣卡，所有消费尝试都保留一小时冷却。
+const resetCreditCooldown = time.Hour
+
 const resetCreditCooldownNamespace = "reset-credit-cooldown"
 
 const autoResetCreditHandledIDRetention = 8 * 24 * time.Hour
@@ -156,6 +159,10 @@ func (h *Handler) ResetCredits(c *gin.Context) {
 		writeError(c, http.StatusConflict, "该工作区正在执行额度重置，请稍后重试")
 		return
 	}
+	if outcome.AlreadyHandled {
+		writeError(c, http.StatusConflict, "该工作区的重置卡处于冷却中，请在上次尝试一小时后重试")
+		return
+	}
 	log.Printf("[账号 %d] 主动重置额度成功，windows_reset=%d，剩余次数=%d", account.DBID, outcome.WindowsReset, outcome.Remaining)
 
 	// 等用量探针落地再响应：重置已经改变了上游的窗口，但本地快照与冷却状态要等这次
@@ -194,15 +201,8 @@ type resetCreditConsumeFailure struct {
 // consumeResetCreditLocked 执行一次共享的重置消费流程。调用方必须持有工作区级
 // resetCreditLock，确保手动与自动路径不会在同一进程内并发消耗。
 func (h *Handler) consumeResetCreditLocked(ctx context.Context, account *auth.Account, redeemRequestID, source string) (resetCreditConsumeOutcome, *resetCreditConsumeFailure) {
-	if source == "auto" && strings.TrimSpace(redeemRequestID) != "" {
-		if h.autoResetCreditRequestHandled(redeemRequestID, time.Now()) {
-			remaining := -1
-			if count, ok := account.GetRateLimitResetCredits(); ok {
-				remaining = count
-			}
-			return resetCreditConsumeOutcome{Remaining: remaining, AlreadyHandled: true}, nil
-		}
-	}
+	ctx, cancel := context.WithTimeout(ctx, autoResetCreditsAccountTimeout)
+	defer cancel()
 	acquired, releaseLease, leaseErr := h.acquireResetCreditLease(ctx, account)
 	if leaseErr != nil {
 		return resetCreditConsumeOutcome{}, &resetCreditConsumeFailure{RequestErr: fmt.Errorf("acquire reset-credit lease: %w", leaseErr)}
@@ -211,14 +211,34 @@ func (h *Handler) consumeResetCreditLocked(ctx context.Context, account *auth.Ac
 		return resetCreditConsumeOutcome{InProgress: true}, nil
 	}
 	defer releaseLease()
-	if source == "auto" {
-		coolingDown, cooldownErr := h.resetCreditCooldownActive(ctx, account)
-		if cooldownErr != nil {
-			return resetCreditConsumeOutcome{}, &resetCreditConsumeFailure{RequestErr: fmt.Errorf("recheck reset-credit cooldown: %w", cooldownErr)}
+	return h.consumeResetCreditUnderLease(ctx, account, redeemRequestID, source)
+}
+
+// 调用方同时持有本地工作区锁和共享租约，且 context 的截止时间早于租约到期。
+func (h *Handler) consumeResetCreditUnderLease(ctx context.Context, account *auth.Account, redeemRequestID, source string) (resetCreditConsumeOutcome, *resetCreditConsumeFailure) {
+	automatic := source == "auto" || source == "auto_limit"
+	if automatic && strings.TrimSpace(redeemRequestID) != "" {
+		if h.autoResetCreditRequestHandled(redeemRequestID, time.Now()) {
+			remaining := -1
+			if count, ok := account.GetRateLimitResetCredits(); ok {
+				remaining = count
+			}
+			return resetCreditConsumeOutcome{Remaining: remaining, AlreadyHandled: true}, nil
 		}
-		if coolingDown {
-			return resetCreditConsumeOutcome{AlreadyHandled: true}, nil
-		}
+	}
+	coolingDown, cooldownErr := h.resetCreditCooldownActive(ctx, account)
+	if cooldownErr != nil {
+		return resetCreditConsumeOutcome{}, &resetCreditConsumeFailure{RequestErr: fmt.Errorf("recheck reset-credit cooldown: %w", cooldownErr)}
+	}
+	if coolingDown {
+		return resetCreditConsumeOutcome{AlreadyHandled: true}, nil
+	}
+	// 先写保护，后消费；共享缓存故障时禁止发请求，任何结果都不提前释放冷却。
+	if err := h.markResetCreditAttempt(ctx, account); err != nil {
+		return resetCreditConsumeOutcome{}, &resetCreditConsumeFailure{RequestErr: err}
+	}
+	if err := h.markResetCreditLimitAttempt(ctx, account); err != nil {
+		return resetCreditConsumeOutcome{}, &resetCreditConsumeFailure{RequestErr: err}
 	}
 	proxyURL := h.store.ResolveProxyForAccount(account)
 	result, resp, err := h.consumeResetCreditUpstream(ctx, account, proxyURL, redeemRequestID)
@@ -248,10 +268,9 @@ func (h *Handler) consumeResetCreditLocked(ctx context.Context, account *auth.Ac
 	if result != nil {
 		outcome.WindowsReset = result.WindowsReset
 	}
-	if source == "auto" && strings.TrimSpace(redeemRequestID) != "" {
+	if automatic && strings.TrimSpace(redeemRequestID) != "" {
 		h.rememberAutoResetCreditRequest(redeemRequestID, time.Now())
 	}
-	h.markResetCreditSuccess(account)
 	h.recordResetCreditEvent(account.DBID, source)
 	outcome.UsageRefreshed = h.refreshUsageAfterReset(account)
 	return outcome, nil
@@ -306,24 +325,13 @@ func (h *Handler) acquireResetCreditLease(ctx context.Context, account *auth.Acc
 	}, nil
 }
 
-func (h *Handler) resetCreditConsumedRecently(account *auth.Account, now time.Time, window time.Duration) bool {
-	if h == nil || account == nil || window <= 0 {
-		return false
-	}
-	value, ok := h.resetCreditLastSuccess.Load(resetCreditLockKey(account))
-	if !ok {
-		return false
-	}
-	consumedAt, ok := value.(time.Time)
-	if !ok {
-		return false
-	}
-	return consumedAt.After(now) || now.Sub(consumedAt) < window
-}
-
 func (h *Handler) resetCreditCooldownActive(ctx context.Context, account *auth.Account) (bool, error) {
-	if h.resetCreditConsumedRecently(account, time.Now(), autoResetCreditsScanInterval) {
-		return true, nil
+	if h != nil {
+		if value, ok := h.resetCreditCooldownUntil.Load(resetCreditLockKey(account)); ok {
+			if until, ok := value.(time.Time); ok && until.After(time.Now()) {
+				return true, nil
+			}
+		}
 	}
 	if h == nil || h.cache == nil {
 		return false, nil
@@ -332,20 +340,19 @@ func (h *Handler) resetCreditCooldownActive(ctx context.Context, account *auth.A
 	return found, err
 }
 
-func (h *Handler) markResetCreditSuccess(account *auth.Account) {
+func (h *Handler) markResetCreditAttempt(ctx context.Context, account *auth.Account) error {
 	if h == nil || account == nil {
-		return
+		return fmt.Errorf("missing reset-credit account")
 	}
 	key := resetCreditLockKey(account)
-	h.resetCreditLastSuccess.Store(key, time.Now())
+	h.resetCreditCooldownUntil.Store(key, time.Now().Add(resetCreditCooldown))
 	if h.cache == nil {
-		return
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := h.cache.SetRuntime(ctx, resetCreditCooldownNamespace, key, json.RawMessage(`true`), autoResetCreditsScanInterval); err != nil {
-		log.Printf("[账号 %d] 写入主动重置冷却标记失败: %v", account.DBID, err)
+	if err := h.cache.SetRuntime(ctx, resetCreditCooldownNamespace, key, json.RawMessage(`true`), resetCreditCooldown); err != nil {
+		return fmt.Errorf("reserve reset-credit cooldown: %w", err)
 	}
+	return nil
 }
 
 func (h *Handler) writeManualResetCreditFailure(c *gin.Context, account *auth.Account, failure *resetCreditConsumeFailure) {

@@ -2053,6 +2053,7 @@ export default function Settings() {
     fast_scheduler_enabled: false,
     scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
+    auto_reset_credits_on_limit_enabled: false,
     codex_analytics_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     auto_activate_5h_window_enabled: false,
@@ -3097,6 +3098,17 @@ export default function Settings() {
                 icon={<RefreshCw className="size-4" />}
               >
                 <div className={cn(SETTINGS_SWITCH_GRID, 'items-stretch')}>
+                  <SettingField
+                    label="额度耗尽自动使用重置卡"
+                    description="每 5 分钟检查 Plus/Pro 的主要 5h 和 7d 额度，耗尽时自动使用，忽略 5.3-codex-spark 限额。每次尝试后冷却 60 分钟，失败也冷却；确认主额度恢复后才允许新一轮触发。与临期自动使用独立。"
+                    layout="switch"
+                    className="h-full"
+                  >
+                    <Switch
+                      checked={settingsForm.auto_reset_credits_on_limit_enabled}
+                      onCheckedChange={(checked) => autoSaveBooleanField('auto_reset_credits_on_limit_enabled', checked)}
+                    />
+                  </SettingField>
                   <SettingField
                     label={t('settings.autoResetCreditsEnabled')}
                     description={t('settings.autoResetCreditsEnabledDesc')}
