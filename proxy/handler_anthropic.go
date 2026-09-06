@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -111,7 +112,7 @@ func (h *Handler) applyClaudeNativeFailureCooldown(account *auth.Account, outcom
 	if h == nil || h.store == nil || account == nil || !account.IsClaudeOAuth() || len(outcome.failurePayload) == 0 || outcome.logStatusCode == http.StatusOK {
 		return outcome
 	}
-	if isClaudeClientCompatibilityError(outcome.logStatusCode, responseFailedErrorBody(outcome.failurePayload)) {
+	if !account.IsClaudeAPIKey() && isClaudeClientCompatibilityError(outcome.logStatusCode, responseFailedErrorBody(outcome.failurePayload)) {
 		// A provider compatibility gate is deterministic for the caller, not a
 		// transient upstream/account failure. Keep it out of all cooldown paths.
 		outcome.failureKind = "client_compatibility"
@@ -258,6 +259,10 @@ func (h *Handler) hasNativeClaudeAccountForModel(model string) bool {
 // 原生账号。Claude 模型优先原生，但只有在当前 API Key 能看到至少一个健康
 // 账号时才锁定原生路由；否则保留既有 Codex 翻译兜底。
 func (h *Handler) hasNativeClaudeAccountForRequest(c *gin.Context, model string) bool {
+	return h.hasNativeClaudeAccountMatching(c, model, false)
+}
+
+func (h *Handler) hasNativeClaudeAccountMatching(c *gin.Context, model string, apiKeyOnly bool) bool {
 	if h == nil || h.store == nil {
 		return false
 	}
@@ -283,7 +288,7 @@ func (h *Handler) hasNativeClaudeAccountForRequest(c *gin.Context, model string)
 		accountFilter = applyAffinityGroupRouting(c, identity, accountFilter)
 	}
 	for _, account := range h.store.Accounts() {
-		if account == nil || !account.IsClaudeOAuth() || !claudeAccountSupportsModel(account, model) {
+		if account == nil || !account.IsClaudeOAuth() || (apiKeyOnly && !account.IsClaudeAPIKey()) || !claudeAccountSupportsModel(account, model) {
 			continue
 		}
 		if accountFilter != nil && !accountFilter(account) {
@@ -466,7 +471,8 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 因此拿到的是与改动前逐字节一致的入站体。
 	claudeSecurityConfig := h.store.ClaudeSecurityConfig()
 	canonicalBody := rawBody
-	if h.nativeClaudeRouteForRequest(c, gjson.GetBytes(rawBody, "model").String()) {
+	nativeClaudeRoute := h.nativeClaudeRouteForRequest(c, gjson.GetBytes(rawBody, "model").String())
+	if nativeClaudeRoute && !h.hasNativeClaudeAccountMatching(c, gjson.GetBytes(rawBody, "model").String(), true) {
 		normalized, canonicalErr := normalizeClaudeRequestBody(rawBody, claudeSecurityConfig)
 		if canonicalErr != nil {
 			rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", canonicalErr.Error())
@@ -535,10 +541,19 @@ func (h *Handler) Messages(c *gin.Context) {
 	serviceTier := extractServiceTier(routingBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
+	if nativeClaudeRoute {
+		sessionIdentity = resolveClaudeRequestSessionIdentity(c.Request.Header, rawBody)
+	}
 	var codexTranslation anthropicCodexTranslation
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	// 与 ccbridge 的请求级身份一致性设计相同：在换号循环外确定一次，
+	// 但保留本项目的 API Key 隔离和无显式会话时的每请求隔离语义。
+	claudeSessionID := ""
+	if nativeClaudeRoute {
+		claudeSessionID = claudeUpstreamSessionID(resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false))
+	}
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -658,6 +673,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
+		if account.IsClaudeOAuth() {
+			if claudeSessionID == "" {
+				claudeSessionID = claudeUpstreamSessionID(upstreamSessionID)
+			}
+			upstreamCtx = WithClaudeSessionID(upstreamCtx, claudeSessionID)
+		}
 		lastUpstreamCancel = upstreamCancel
 		attemptFirstTokenTimeout := claudeFirstTokenTimeoutFor(h.store, account)
 		ttftGuard := newFirstTokenTimeoutGuard(attemptFirstTokenTimeout, upstreamCancel)
@@ -670,8 +691,25 @@ func (h *Handler) Messages(c *gin.Context) {
 			// 直接把原始入站 body 透传到 api.anthropic.com/v1/messages；返回的响应
 			// 已是原生 Anthropic SSE，打上原生路由标记复用既有透传链路。
 			claudeRequestBody := canonicalBody
+			if account.IsClaudeAPIKey() {
+				claudeRequestBody = rawBody
+			} else {
+				normalized, normalizeErr := normalizeClaudeRequestBody(claudeRequestBody, claudeSecurityConfig)
+				if normalizeErr != nil {
+					ttftGuard.Stop()
+					h.store.Release(account)
+					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", normalizeErr.Error())
+					return
+				}
+				claudeRequestBody = normalized
+			}
+			if !bytes.Equal(claudeRequestBody, canonicalBody) && h.inspectPromptFilterAnthropic(c, claudeRequestBody, "/v1/messages", model) {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				return
+			}
 			if nativeModel := h.resolveNativeClaudeRequestModel(c, model); nativeModel != "" && !strings.EqualFold(nativeModel, model) {
-				if rewritten, rewriteErr := sjson.SetBytes(canonicalBody, "model", nativeModel); rewriteErr == nil {
+				if rewritten, rewriteErr := sjson.SetBytes(claudeRequestBody, "model", nativeModel); rewriteErr == nil {
 					claudeRequestBody = rewritten
 				}
 			}
@@ -680,9 +718,16 @@ func (h *Handler) Messages(c *gin.Context) {
 				clientPolicy := h.store.ClaudeClientPolicyForAccount(account)
 				// 上游以无效 thinking 签名拒绝时，剥离 thinking 块后在同一账号重试一次，
 				// 不进入换号重试（换号无法修复客户端带来的坏签名）。
-				r, e := executeClaudeWithThinkingSignatureRetry(upstreamCtx, claudeRequestBody, func(ctx context.Context, body []byte) (*http.Response, error) {
+				execute := func(ctx context.Context, body []byte) (*http.Response, error) {
 					return ExecuteClaudeMessagesRequestWithPolicy(ctx, account, body, proxyURL, downstreamHeaders, claudeFpMode, clientPolicy, claudeSecurityConfig)
-				})
+				}
+				var r *http.Response
+				var e error
+				if account.IsClaudeAPIKey() {
+					r, e = execute(upstreamCtx, claudeRequestBody)
+				} else {
+					r, e = executeClaudeWithThinkingSignatureRetry(upstreamCtx, claudeRequestBody, execute)
+				}
 				if e == nil {
 					markClaudeNativeRoute(r)
 				}
@@ -741,6 +786,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if apiKeyModelRequestError(reqErr) != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				sendAPIKeyModelRequestQuotaError(c, reqErr)
+				return
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			if timedOut {
@@ -855,7 +906,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			// Anthropic's Claude Code model gate is a client compatibility issue,
 			// not an account failure. Stop before ReportRequestFailure,
 			// SyncClaudeUsageState, retry exclusions, or model/account cooldowns.
-			if account.IsClaudeOAuth() && isClaudeClientCompatibilityError(resp.StatusCode, errBody) {
+			if account.IsClaudeOAuth() && !account.IsClaudeAPIKey() && isClaudeClientCompatibilityError(resp.StatusCode, errBody) {
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				message := usageLogErrorMessage(resp.StatusCode, errBody)
@@ -1178,12 +1229,49 @@ func (h *Handler) Messages(c *gin.Context) {
 			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
 			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
+			// downstreamMu 串行化翻译写路径与其共享状态(writeErr/wroteAnyBody/
+			// streamWriter):下面的下游保活 goroutine 与翻译回调并发写同一个
+			// ResponseWriter,必须互斥,否则注释可能插进半个 SSE 事件里。
+			var downstreamMu sync.Mutex
+			// 首个内容帧之后上游长推理/等工具边界期间可能数十秒无可转发帧,与
+			// /v1/responses 一样定期写标准 SSE 注释,避免反代/CDN/隧道把健康长流
+			// 当空闲连接掐断(issue #623)。缓冲式持续重试下 streamWriter 写的是
+			// 私有缓冲,真实下游心跳由 request 级 keepalive 负责,不再起第二个。
+			stopDownstreamKeepalive := func() {}
+			if !continuousRetryBuffersAttempts(continuousRetryPolicy) {
+				stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
+					downstreamMu.Lock()
+					defer downstreamMu.Unlock()
+					if writeErr != nil || c.Request.Context().Err() != nil {
+						return false
+					}
+					// 首个真实字节前不能写注释,否则会提前提交 HTTP 200,
+					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
+					if !wroteAnyBody {
+						return true
+					}
+					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
+						// 下游已断:翻译回调只会在下一帧到达时才发现,上游静默期间
+						// 会一直阻塞在读上,这里主动取消上游读让本 attempt 尽快收尾。
+						writeErr = err
+						upstreamCancel()
+						return false
+					}
+					return true
+				})
+			}
 			// contentStarted 用严格口径（isFirstTokenResult）跟踪"首个真实内容帧"，
 			// 专供流提交决策（缓冲/重试窗口/failed 抑制）使用；ttftRecorded 按
 			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
 			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
 			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
 			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+				downstreamMu.Lock()
+				defer downstreamMu.Unlock()
+				// 保活写失败已判定下游断开:不再翻译/写入,停止读取。
+				if writeErr != nil {
+					return false
+				}
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 
@@ -1315,6 +1403,8 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return !isResponsesTerminalEvent(eventType)
 			})
+			// stop 会等保活 goroutine 完整退出,之后的收尾写入不再有并发方。
+			stopDownstreamKeepalive()
 			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
 			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
 			if writeErr == nil && wroteAnyBody {
@@ -1568,6 +1658,9 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		resp.Body.Close()
 		syncAnthropicUsageStateForAccount(h.store, account, resp)
+		if !outcome.penalize && outcome.logStatusCode == http.StatusOK && account.IsClaudeOAuth() {
+			NoteClaudeGatedModelSuccess(h.store, account, attemptEffectiveModel)
+		}
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
 			h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)

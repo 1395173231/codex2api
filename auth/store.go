@@ -89,8 +89,12 @@ func NormalizeTestContent(content string) string {
 
 // Account 运行时账号状态
 type Account struct {
-	mu          sync.RWMutex
-	usageSyncMu sync.Mutex
+	codexLiteSupport          map[string]bool
+	codexCapabilityGeneration int64
+	codexCapabilityObservedAt int64
+	UpstreamRequestIDHeader   string
+	mu                        sync.RWMutex
+	usageSyncMu               sync.Mutex
 	// grokRuntimeFactsMu serializes inference-response observations for this
 	// account. The sink performs generation-fenced database writes before it
 	// publishes any hard gate or routing invalidation back to memory.
@@ -130,6 +134,9 @@ type Account struct {
 	// ClaudeFingerprintMode 见 claude_fingerprint_mode.go:Claude Code 出站身份头
 	// 收敛模式(preserve/force;空=跟随全局默认)。
 	ClaudeFingerprintMode string
+	// ClaudeAuthKind 见 claude_auth_kind.go:Claude 凭据形态(oauth / setup_token / api_key)。
+	ClaudeAuthKind string
+	ClaudeBaseURL  string
 	// Claude Code platform/version policy overrides. Empty values inherit the
 	// corresponding global policy from Store.
 	ClaudeClientPlatformOverride string
@@ -2956,7 +2963,7 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	defer a.mu.RUnlock()
 	now := time.Now()
 
-	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
+	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError || a.isClaudeAPIKeyLocked() {
 		return false
 	}
 	if a.isRelayStyleLocked() && !a.isClaudeOAuthLocked() {
@@ -3184,6 +3191,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
+	proxyAuditLabels                   map[string]ProxyAuditLabel
 	mu                                 sync.RWMutex
 	accountMutationMu                  sync.Mutex // serializes account-set and scheduler mutations without nesting their locks
 	accounts                           []*Account
@@ -3967,7 +3975,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.smartPacingWindows = normalizeSmartPacingWindows(settings.SmartPacingWindows)
 
 	// 加载代理池（含全部托管 URL，供禁用后 fail-closed 识别）
-	if settings.ProxyPoolEnabled && s.proxyPoolLoader != nil {
+	if s.proxyPoolLoader != nil {
 		if err := s.ReloadProxyPool(); err != nil {
 			log.Printf("代理池加载失败: %v", err)
 		}
@@ -4811,17 +4819,29 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	enabledURLs := collectProxyURLs(proxies)
 	managedURLs := enabledURLs
+	auditRows := proxies
 	if inventory := s.proxyInventoryLoader; inventory != nil {
 		allProxies, invErr := inventory(ctx)
 		if invErr != nil {
 			return invErr
 		}
 		managedURLs = collectProxyURLs(allProxies)
+		auditRows = allProxies
 	}
 	s.mu.Lock()
 	s.proxyPool = enabledURLs
 	s.proxyPoolSet = buildProxyPoolSet(enabledURLs)
 	s.managedProxySet = buildProxyPoolSet(managedURLs)
+	s.proxyAuditLabels = make(map[string]ProxyAuditLabel, len(auditRows))
+	for _, row := range auditRows {
+		if row != nil {
+			name := strings.TrimSpace(row.Label)
+			if name == "" {
+				name = "proxy"
+			}
+			s.proxyAuditLabels[row.URL] = ProxyAuditLabel{ID: row.ID, Name: name}
+		}
+	}
 	s.mu.Unlock()
 	log.Printf("代理池已重新加载: %d 个活跃代理", len(enabledURLs))
 	return nil
@@ -5219,11 +5239,12 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	codexFingerprintMode := NormalizeCodexFingerprintMode(row.GetCredential(CodexFingerprintModeCredentialKey))
 	claudeFingerprintMode := NormalizeClaudeFingerprintMode(row.GetCredential(ClaudeFingerprintModeCredentialKey))
-	var claudeClientPlatformOverride, claudeVersionPolicyOverride, claudeClientVersionOverride string
+	var claudeClientPlatformOverride, claudeVersionPolicyOverride, claudeClientVersionOverride, claudeAuthKind string
 	if strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamClaude) {
 		claudeClientPlatformOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeClientPlatformCredentialKey)))
 		claudeVersionPolicyOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeVersionPolicyCredentialKey)))
 		claudeClientVersionOverride = strings.TrimSpace(row.GetCredential(ClaudeClientVersionCredentialKey))
+		claudeAuthKind = InferClaudeAuthKind(row.GetCredential(ClaudeAuthKindCredentialKey), at, rt)
 	}
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
@@ -5245,6 +5266,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		SessionToken:                 st,
 		ProxyURL:                     strings.TrimSpace(row.ProxyURL),
 		CustomHeaders:                row.GetCredentialStringMap("custom_headers"),
+		UpstreamRequestIDHeader:      row.GetCredential(UpstreamRequestIDHeaderCredentialKey),
 		HealthTier:                   HealthTierWarm,
 		AddedAt:                      row.CreatedAt.UnixNano(),
 		UpstreamType:                 upstreamType,
@@ -5256,6 +5278,8 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		CodexClientMetadataMode:      codexClientMetadataMode,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
+		ClaudeAuthKind:               claudeAuthKind,
+		ClaudeBaseURL:                row.GetCredential(ClaudeBaseURLCredentialKey),
 		ClaudeClientPlatformOverride: claudeClientPlatformOverride,
 		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
@@ -5423,6 +5447,11 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 				log.Printf("[账号 %d] 解析 expires_at 失败: %v", row.ID, err)
 			}
 		}
+	}
+	if account.isClaudeAPIKeyLocked() {
+		account.RefreshToken = ""
+		account.SessionToken = ""
+		account.ExpiresAt = time.Time{}
 	}
 	if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
 		if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
@@ -5673,6 +5702,7 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 			groupIDs := normalizeAllowedGroupIDs(memberships[row.ID])
 			allowedAPIKeyIDs := normalizeAllowedAPIKeyIDs(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 			acc.mu.Lock()
+			acc.UpstreamRequestIDHeader = row.GetCredential(UpstreamRequestIDHeaderCredentialKey)
 			accountMetadataChanged := !int64SliceEqual(normalizeAllowedGroupIDs(acc.GroupIDs), groupIDs) ||
 				!int64SliceEqual(normalizeAllowedAPIKeyIDs(acc.AllowedAPIKeyIDs), allowedAPIKeyIDs)
 			if accountMetadataChanged {
@@ -6772,7 +6802,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -6811,7 +6841,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}

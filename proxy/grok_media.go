@@ -287,7 +287,7 @@ func doGrokMediaRequest(ctx context.Context, account *auth.Account, profile grok
 		}
 	}
 	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
-	resp, err := getPooledClient(account, effectiveProxyURL).Do(req)
+	resp, err := doTracedUpstreamRequest(getPooledClient(account, effectiveProxyURL), req, account, proxyURL)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, effectiveProxyURL)
@@ -1337,7 +1337,7 @@ func (h *Handler) streamGrokVideoAsset(c *gin.Context, account *auth.Account, pr
 	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 	client := *getPooledClient(account, effectiveProxyURL)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
+	resp, err := doTracedUpstreamRequest(&client, req, account, proxyURL)
 	if err != nil {
 		return false
 	}

@@ -57,10 +57,12 @@ type ModelCatalog struct {
 
 // ModelSyncResult is returned after a manual upstream sync.
 type ModelSyncResult struct {
-	Added        int         `json:"added"`
-	Updated      int         `json:"updated"`
-	Unchanged    int         `json:"unchanged"`
-	Skipped      []string    `json:"skipped"`
+	Added     int      `json:"added"`
+	Updated   int      `json:"updated"`
+	Unchanged int      `json:"unchanged"`
+	Skipped   []string `json:"skipped"`
+	// Removed 是本次同步删掉的 official_codex_docs 来源行（官方页已不存在）。
+	Removed      []string    `json:"removed,omitempty"`
 	Models       []string    `json:"models"`
 	Items        []ModelInfo `json:"items"`
 	LastSyncedAt time.Time   `json:"last_synced_at"`
@@ -239,30 +241,102 @@ func mergeModelInfos(rows []database.ModelRegistryRow) []ModelInfo {
 		if info.ID == "" {
 			continue
 		}
-		// 退役模型（5.3 非 spark、5.2 及以下、gpt-4*）即使注册表里有残留行也不再暴露，
-		// 保证升级后 DB 旧行不会让它们复现。
-		if isRetiredCodexModel(info.ID) {
+		// 退役模型（5.3 非 spark、5.2 及以下、gpt-4*）与内部变体（-wm）即使注册表里
+		// 有残留行也不再暴露，保证升级后 DB 旧行不会让它们复现。
+		if isRetiredCodexModel(info.ID) || isInternalCodexModelVariant(info.ID) {
 			continue
 		}
 		byID[info.ID] = info
 	}
 
-	result := make([]ModelInfo, 0, len(byID))
+	builtins := make([]ModelInfo, 0, len(builtinModelInfos))
 	for _, info := range builtinModelInfos {
 		if merged, ok := byID[info.ID]; ok {
-			result = append(result, merged)
+			builtins = append(builtins, merged)
 			delete(byID, info.ID)
 		}
 	}
+	// 同步/学习进来的非内置模型排在最前，按版本新→旧（gpt-6-x > gpt-5.6-x > …），
+	// 同版本按 ID 字典序；没有数字版本的代号族（daybreak 等）排在数字版本之后。
+	// 内置列表本身已是手工维护的新→旧顺序，接在后面；否则新发布的型号会被
+	// 压到 gpt-image-2-4k 之后、按字母序埋在列表末尾。
 	extras := make([]ModelInfo, 0, len(byID))
 	for _, info := range byID {
 		extras = append(extras, info)
 	}
 	sort.Slice(extras, func(i, j int) bool {
-		return extras[i].ID < extras[j].ID
+		return compareModelIDsNewestFirst(extras[i].ID, extras[j].ID) < 0
 	})
-	result = append(result, extras...)
-	return result
+	return append(extras, builtins...)
+}
+
+// compareModelIDsNewestFirst 按"版本新→旧"比较两个模型 ID：先比 ID 中的数字序列
+// （逐段数值比较，长者视为更细的版本），有数字的排在无数字的前面，
+// 完全相同时按 ID 字典序。返回 <0 表示 a 应排在 b 前面。
+func compareModelIDsNewestFirst(a, b string) int {
+	if a == b {
+		return 0
+	}
+	pa, pb := modelIDVersionParts(a), modelIDVersionParts(b)
+	switch {
+	case len(pa) == 0 && len(pb) > 0:
+		return 1
+	case len(pa) > 0 && len(pb) == 0:
+		return -1
+	}
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		if pa[i] != pb[i] {
+			if pa[i] > pb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if len(pa) != len(pb) {
+		if len(pa) > len(pb) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+var modelIDVersionNumberPattern = regexp.MustCompile(`\d+`)
+
+func modelIDVersionParts(id string) []int {
+	matches := modelIDVersionNumberPattern.FindAllString(strings.ToLower(id), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	parts := make([]int, 0, len(matches))
+	for _, m := range matches {
+		n, err := strconv.Atoi(m)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+// internalCodexModelVariantSuffixes 是上游清单里会出现、但不该对外暴露的内部变体后缀。
+// gpt-5.6-sol-wm 这类 slug 只在个别账号的清单里出现，官方模型页与定价页都没有，
+// 学进注册表只会让 /v1/models 多出一个用户不认识、计费也只能按 sol 兜底的条目。
+var internalCodexModelVariantSuffixes = []string{"-wm"}
+
+// isInternalCodexModelVariant 判断是否为内部变体 slug：准入时拒绝，注册表里已有的
+// 残留行也不再暴露（与退役模型同一处过滤）。
+func isInternalCodexModelVariant(id string) bool {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if !strings.HasPrefix(id, "gpt-") {
+		return false
+	}
+	for _, suffix := range internalCodexModelVariantSuffixes {
+		if strings.HasSuffix(id, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRetiredCodexModel 判断模型是否已下线（不再对外暴露 / 不参与校验）：
@@ -428,18 +502,33 @@ func ParseOfficialCodexModelIDs(html string) (models []string, skipped []string)
 	return models, skipped
 }
 
-// isOfficialCodexModelIDContext 只接受官方模型页里"当作模型 ID 使用"的出现位置：
-// 被引号包裹（astro-island props / JSON，如 &quot;gpt-5.5&quot;）或 `codex -m <id>` 命令。
+// officialCodexModelCatalogContexts 是官方模型页里模型卡片承载 ID 的结构化属性
+// （小写；astro-island props 里的引号是 HTML 实体 &quot;，服务端渲染的 DOM 属性是裸引号）：
+//   - data-model-slug="<id>"          卡片容器属性
+//   - "slug":[0,"<id>"] / "name":[0,"<id>"]   卡片组件 props
+var officialCodexModelCatalogContexts = []string{
+	`data-model-slug="`,
+	`"slug":[0,"`,
+	`&quot;slug&quot;:[0,&quot;`,
+	`"name":[0,"`,
+	`&quot;name&quot;:[0,&quot;`,
+}
+
+// isOfficialCodexModelIDContext 只接受官方模型页里**模型目录卡片**承载 ID 的位置
+// （见 officialCodexModelCatalogContexts）。页面上其它"长得像模型 ID"的位置一律不算：
 // 导航文案（"Using GPT-6 Astra"→gpt-6）、锚点（#gpt-6-astra-in-enterprise）、
-// 图片文件名（gpt-6-astra-texture.webp）都不算模型 ID。
+// 图片文件名（gpt-6-astra-texture.webp），以及**用法示例代码里的占位模型名**——
+// `codex --model gpt-5.6` / `model = "gpt-5.6"` 这类示例写的是家族名，不是可调用的
+// 模型 ID，之前"引号包裹即算 ID"的宽松规则会把裸 gpt-5.6 学进注册表。
+// 页面改版导致一个都解析不到时，同步会报错并保留本地列表，不会静默学到噪声。
 func isOfficialCodexModelIDContext(lowered string, start, end int) bool {
 	before := lowered[:start]
 	after := lowered[end:]
-	if strings.HasSuffix(before, "codex -m ") {
-		return after == "" || !isModelIDByte(after[0])
+	if after == "" || isModelIDByte(after[0]) {
+		return false
 	}
-	for _, quote := range []string{"&quot;", "\"", "'"} {
-		if strings.HasSuffix(before, quote) && strings.HasPrefix(after, quote) {
+	for _, prefix := range officialCodexModelCatalogContexts {
+		if strings.HasSuffix(before, prefix) {
 			return true
 		}
 	}
@@ -470,6 +559,9 @@ func modelSortRank(id string) int {
 func isAllowedUpstreamCodexModel(id string) bool {
 	id = strings.TrimSpace(strings.ToLower(id))
 	if id == "" || strings.Contains(id, "image") {
+		return false
+	}
+	if isInternalCodexModelVariant(id) {
 		return false
 	}
 	if !strings.HasPrefix(id, "gpt-") {
@@ -566,7 +658,9 @@ func ApplyOfficialCodexModelSync(ctx context.Context, db *database.DB, html stri
 		Skipped:   skipped,
 		SourceURL: OfficialCodexModelsURL,
 	}
+	parsed := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
+		parsed[id] = struct{}{}
 		info := modelInfoForID(id, ModelSourceOfficialCodexDocs)
 		row := modelInfoToRow(info, syncedAt)
 		if previous, ok := existing[id]; ok {
@@ -582,8 +676,38 @@ func ApplyOfficialCodexModelSync(ctx context.Context, db *database.DB, html stri
 		rows = append(rows, row)
 	}
 
+	// 官方页是 official_codex_docs 来源行的唯一真值：页面上已经不存在的行
+	// （早期解析噪声如裸 gpt-5.6，或官方下线的型号）随本次同步一并删除，
+	// 否则注册表没有删除入口，噪声会永久留在 /v1/models 里。只动本来源的
+	// 非内置行；manifest 学习、手工来源与内置模型不受影响。
+	builtin := make(map[string]struct{}, len(builtinModelInfos))
+	for _, info := range builtinModelInfos {
+		builtin[strings.ToLower(info.ID)] = struct{}{}
+	}
+	stale := make([]string, 0)
+	for _, row := range existingRows {
+		if row.Source != ModelSourceOfficialCodexDocs {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(row.ID))
+		if _, ok := parsed[key]; ok {
+			continue
+		}
+		if _, ok := builtin[key]; ok {
+			continue
+		}
+		stale = append(stale, row.ID)
+	}
+	sort.Strings(stale)
+
 	if err := db.UpsertModelRegistryRows(ctx, rows); err != nil {
 		return nil, err
+	}
+	if len(stale) > 0 {
+		if err := db.DeleteModelRegistryRows(ctx, stale); err != nil {
+			return nil, err
+		}
+		result.Removed = stale
 	}
 	if err := db.UpdateModelRegistrySyncState(ctx, OfficialCodexModelsURL, syncedAt); err != nil {
 		return nil, err

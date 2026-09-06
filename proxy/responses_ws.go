@@ -78,7 +78,9 @@ func isPreviousResponseNotFoundBody(payload []byte) bool {
 		}
 	}
 	for _, path := range []string{"error.message", "message"} {
-		if strings.Contains(strings.ToLower(gjson.GetBytes(body, path).String()), "previous response with id") {
+		message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String()))
+		if message == "previous_response_id is not available for this user" ||
+			strings.Contains(message, "previous response with id") {
 			return true
 		}
 	}
@@ -332,6 +334,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	resetPromptRequestSecurityFrame(c)
 	resetPromptPolicyRequestCorrelationID(c)
 	resetAnalyticsResponseObservation(c)
+	resetUpstreamRequestTrace(c)
+	quotaParentRequest := c.Request
+	if err := h.refreshAPIKeyModelRequestQuotaTurn(c); err != nil {
+		return writeResponsesWSError(conn, apiKeyModelRequestError(err).apiErr)
+	}
+	defer func() { c.Request = quotaParentRequest }()
 	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
@@ -699,6 +707,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 
 		if reqErr != nil {
+			if quotaErr := apiKeyModelRequestError(reqErr); quotaErr != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				// A model-specific budget must not close the connection for other models.
+				return writeResponsesWSError(conn, quotaErr.apiErr)
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			if timedOut {

@@ -46,6 +46,8 @@ import type {
   APIKeyTokenStat,
   APIKeyAccountStatsResponse,
   APIKeyScopeUsageItem,
+  APIKeyLimits,
+  APIKeyModelRequestUsage,
   APIKeyScopeSummaryItem,
   AccountsResponse,
   AccountAnalysisResponse,
@@ -83,6 +85,9 @@ import type {
   OAuthExchangeResponse,
   OAuthURLResponse,
   ClaudeAuthURLResponse,
+  ClaudeAuthKind,
+  ClaudeSessionKeyExchangeRequest,
+  ClaudeSetupTokenImportRequest,
   ClaudeExchangeCodeRequest,
   ClaudeImportTokenRequest,
   ClaudeCredentialExportEntry,
@@ -135,6 +140,7 @@ import type {
   UpdateAccountGroupRequest,
   UpstreamChannel,
   ClaudeGlobalConfig,
+  VisibleChannelsSettings,
 } from './types'
 
 const BASE = '/api/admin'
@@ -733,12 +739,27 @@ export const api = {
     request<void>(`/accounts/antigravity/oauth/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
     }),
-  // Claude Code OAuth：第一步取授权 URL（服务端暂存 state→verifier）。
-  generateClaudeAuthURL: () =>
+  // Claude Code OAuth：第一步取授权 URL（服务端暂存 state→verifier）。mode=setup_token
+  // 申请长效 Setup Token(仅推理 scope,1 年有效,无 RT)。
+  generateClaudeAuthURL: (mode: ClaudeAuthKind = 'oauth') =>
     request<ClaudeAuthURLResponse>('/accounts/claude/oauth/auth-url', {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ mode }),
       timeoutMs: 15_000,
+    }),
+  // claude.ai sessionKey(cookie)一键换号:服务端代跑 OAuth 三步。
+  exchangeClaudeSessionKey: (data: ClaudeSessionKeyExchangeRequest) =>
+    request<ClaudeAddAccountResponse>('/accounts/claude/oauth/exchange-session-key', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
+    }),
+  // 批量粘贴 sk-ant-oat01- Setup Token。
+  importClaudeSetupTokens: (data: ClaudeSetupTokenImportRequest) =>
+    request<ClaudeImportBundleResponse>('/accounts/claude/import-setup-tokens', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
     }),
   // 第二步：用 state+code 换取 token 并入库（可选从代理池分配代理）。
   exchangeClaudeOAuthCode: (data: ClaudeExchangeCodeRequest) =>
@@ -747,12 +768,12 @@ export const api = {
       body: JSON.stringify(data),
       timeoutMs: 90_000,
     }),
-  // CLI 直导：吃 cmd/claude_login -out 产出的 token JSON。
+  // Claude 凭据导入：OAuth、Setup Token 或 Base URL + API Key。
   importClaudeToken: (data: ClaudeImportTokenRequest) =>
     request<ClaudeAddAccountResponse>('/accounts/claude/import', {
       method: 'POST',
       body: JSON.stringify(data),
-      timeoutMs: 20_000,
+      timeoutMs: 60_000,
     }),
   /** Import a versioned Claude credential object or bundle. */
   importClaudeCredentialBundle: (
@@ -951,6 +972,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ ids }),
     }),
+  getVisibleChannels: () => request<VisibleChannelsSettings>('/settings/visible-channels'),
+  updateVisibleChannels: (channels: readonly UpstreamChannel[]) =>
+    request<VisibleChannelsSettings>('/settings/visible-channels', {
+      method: 'PUT',
+      body: JSON.stringify({ channels }),
+    }),
   getInviteGuideSettings: () => request<{ enabled: boolean }>('/settings/invite-guide'),
   updateInviteGuideSettings: (enabled: boolean) =>
     request<{ enabled: boolean }>('/settings/invite-guide', {
@@ -1145,7 +1172,7 @@ export const api = {
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
-    request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<MessageResponse & { limits?: APIKeyLimits }>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   resetAPIKeyQuota: (id: number) =>
     request<MessageResponse>(`/keys/${id}/reset-quota`, { method: 'POST' }),
   resetAllAPIKeyQuotas: () =>
@@ -1153,6 +1180,8 @@ export const api = {
   // 分组 / 账号维度限额的当前用量（issue #439）。
   getAPIKeyScopeUsage: (id: number) =>
     request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
+  getAPIKeyModelRequestUsage: (id: number) =>
+    request<{ model_request_usage: APIKeyModelRequestUsage[] }>(`/keys/${id}/model-request-usage`),
   // 列表页用的全量概览：一次拿到所有 Key 的 scope 预算占比。
   getAPIKeysScopeSummary: () =>
     request<{ summary: Record<string, APIKeyScopeSummaryItem[]> }>('/keys-scope-summary'),

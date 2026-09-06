@@ -10,11 +10,17 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
 )
+
+// ClaudeDeviceIDCredentialKey 是 credentials.custom_headers 中可选的显式 device_id
+// 覆盖键;缺省时由 ClaudeDeviceID 从账号身份确定性派生。
+const ClaudeDeviceIDCredentialKey = "claude_device_id"
 
 // UpstreamClaude 是 Claude Code OAuth 账号的 upstream_type 判别值。
 const UpstreamClaude = "claude"
@@ -35,7 +41,7 @@ func (a *Account) isClaudeOAuthLocked() bool {
 	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamClaude)
 }
 
-// IsClaudeOAuth 判断账号是否为 Claude Code OAuth 账号。
+// IsClaudeOAuth 是历史命名的 Claude 渠道判定,也包括 Setup Token 和 API Key。
 func (a *Account) IsClaudeOAuth() bool {
 	if a == nil {
 		return false
@@ -43,6 +49,47 @@ func (a *Account) IsClaudeOAuth() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.isClaudeOAuthLocked()
+}
+
+// ClaudeAccountUUID 返回登录/刷新时写入的 Anthropic 账号 uuid（account_id 凭据）。
+// 真实 CLI 的 metadata.user_id 里携带该值，缺失时返回空串。
+func (a *Account) ClaudeAccountUUID() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimSpace(a.AccountID)
+}
+
+// ClaudeDeviceID 返回该账号用于 metadata.user_id.device_id 的稳定 64-hex 值：
+// 优先取显式配置的 claude_device_id，否则按账号身份确定性派生（同账号跨请求/
+// 跨重启恒定，避免引入新的持久化字段）。真实 CLI 的 device_id 也是稳定设备指纹。
+func (a *Account) ClaudeDeviceID() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if v := strings.TrimSpace(a.CustomHeaders[ClaudeDeviceIDCredentialKey]); v != "" {
+		return v
+	}
+	// The admin custom-header normalizer canonicalizes this metadata key to
+	// Claude_device_id. Accept historical/mixed-case keys as well as the
+	// original lowercase spelling, without making it an outbound HTTP header.
+	for name, value := range a.CustomHeaders {
+		if strings.EqualFold(strings.TrimSpace(name), ClaudeDeviceIDCredentialKey) {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	seed := strings.TrimSpace(a.AccountID)
+	if seed == "" {
+		seed = fmt.Sprintf("db-%d", a.DBID)
+	}
+	sum := sha256.Sum256([]byte("claude-code-device:" + seed))
+	return hex.EncodeToString(sum[:])
 }
 
 // refreshClaudeAccount 刷新一个 Claude Code OAuth 账号的 access token。
@@ -57,8 +104,21 @@ func (s *Store) refreshClaudeAccount(ctx context.Context, acc *Account, forceRef
 	proxyURL := strings.TrimSpace(acc.ProxyURL)
 	lockedAccessToken := acc.AccessToken
 	cooldownActive := acc.Status == StatusCooldown && time.Now().Before(acc.CooldownUtil)
+	setupToken := acc.isClaudeSetupTokenLocked()
+	apiKey := acc.isClaudeAPIKeyLocked()
+	expiresAt := acc.ExpiresAt
 	acc.mu.RUnlock()
 
+	if apiKey {
+		return nil
+	}
+	if setupToken {
+		// Setup Token 是长效 AT,没有可刷新的 RT:未到期无需任何动作,到期只能重新授权。
+		if !expiresAt.IsZero() && time.Now().After(expiresAt) {
+			return fmt.Errorf("claude setup token 已过期,请重新授权或导入新的 Setup Token")
+		}
+		return nil
+	}
 	if rt == "" {
 		return fmt.Errorf("claude refresh_token 为空")
 	}

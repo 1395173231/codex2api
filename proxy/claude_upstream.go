@@ -4,12 +4,21 @@ package proxy
 //
 // 与其它 relay 账号不同:Grok / OpenAI-Responses 中转都会把请求翻译成 Codex
 // "Responses" 协议再出站,而 Claude 账号本身就说 Anthropic Messages API,因此这里
-// 采用近乎透传——把入站的原始 Anthropic body 直接发往 api.anthropic.com/v1/messages,
-// 仅注入 OAuth 凭据要求的三件套:
+// 采用近乎透传——把入站的原始 Anthropic body 直接发往 api.anthropic.com/v1/messages?beta=true,
+// 并按真实 Claude Code CLI 2.1.259 抓包补齐 OAuth 凭据必需项与 CLI 特征:
 //   - Authorization: Bearer <access_token>
-//   - anthropic-beta: oauth-2025-04-20（与入站已声明的 beta 合并去重）
-//   - system 数组首块必须是 "You are Claude Code, Anthropic's official CLI for Claude."
-//     否则 Anthropic 会拒绝 OAuth token 的推理请求。
+//   - anthropic-beta: claude-code-20250219(非 haiku) + oauth-2025-04-20 核心标记,
+//     再按 body 实际字段补齐成对 beta(thinking/context_management/tools/effort/
+//     1h 缓存等),最后按白名单过滤透传入站 beta(见 buildClaudeBetaHeader)
+//   - system 数组前两块整理为计费块(x-anthropic-billing-header: cc_version=…;
+//     cc_entrypoint=cli;)与 "You are Claude Code, Anthropic's official CLI for Claude."
+//     声明块，保留已有块的扩展属性。
+//   - metadata.user_id = JSON 字符串 {device_id, account_uuid, session_id},
+//     device_id 按账号稳定派生(可用 custom_headers.claude_device_id 覆盖)。
+//   - X-Claude-Code-Session-Id:使用统一解析、隔离后的请求级会话身份，
+//     与 Claude 结构化 metadata.user_id.session_id 同值，跨换号重试稳定。
+//   - SDK 固定行为头:X-Stainless-Retry-Count / X-Stainless-Timeout /
+//     anthropic-dangerous-direct-browser-access。
 //
 // 返回原始 *http.Response 交由调用方按 SSE 流式回传,响应本身已是 Anthropic 格式,
 // 无需再做协议翻译。
@@ -17,22 +26,29 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
-	// claudeMessagesEndpoint 是 Anthropic 官方 Messages API 端点。
-	claudeMessagesEndpoint = "https://api.anthropic.com/v1/messages"
+	// claudeMessagesEndpoint 是 Anthropic 官方 Messages API 端点。真实 Claude Code
+	// CLI 的 SDK 恒带 ?beta=true 查询参数(逆向 chunk-0017 抓包确认),保持逐字节一致。
+	claudeMessagesEndpoint = "https://api.anthropic.com/v1/messages?beta=true"
 	// claudeAnthropicVersion 是 Messages API 版本头。
 	claudeAnthropicVersion = "2023-06-01"
 	// claudeCodeSystemPreamble 是 OAuth 凭据要求的首个 system 块文本。
@@ -171,6 +187,9 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	if account == nil {
 		return nil, ErrNoAvailableAccount()
 	}
+	if account.IsClaudeAPIKey() {
+		return executeClaudeAPIKeyMessages(ctx, account, requestBody, proxyOverride, headers)
+	}
 
 	account.Mu().RLock()
 	accessToken := strings.TrimSpace(account.AccessToken)
@@ -197,10 +216,26 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	if len(securityConfigs) > 0 {
 		securityConfig = auth.NormalizeClaudeSecurityConfig(securityConfigs[0])
 	}
+	// 会话身份:handler 已按请求会话派生稳定 UUIDv7 放入 ctx;管理端探针等
+	// 无会话上下文的调用方这里兜底生成,保证 X-Claude-Code-Session-Id 恒存在。
+	sessionID := claudeSessionIDFromContext(ctx)
+	if sessionID == "" {
+		// 管理端等直接调用方没有 handler 上下文，仍统一解析头/body 的来源。
+		identity := resolveClaudeRequestSessionIdentity(headers, requestBody)
+		sessionID = claudeUpstreamSessionID(identity.explicitUpstreamID)
+		if sessionID == "" {
+			sessionID = NewUpstreamSessionUUID()
+		}
+		ctx = WithClaudeSessionID(ctx, sessionID)
+	}
 	// Canonicalize before sending so the handler can run the exact same body
 	// through Prompt Filter. The ingress body retained in gin remains untouched
 	// for NewAPI signature verification and audit correlation.
-	body, err := prepareClaudeRequestBody(requestBody, securityConfig)
+	body, err := prepareClaudeRequestBody(requestBody, securityConfig, claudeBodyIdentity{
+		deviceID:    account.ClaudeDeviceID(),
+		accountUUID: account.ClaudeAccountUUID(),
+		sessionID:   sessionID,
+	})
 	if err != nil {
 		return nil, ErrBadRequest(err.Error())
 	}
@@ -211,13 +246,25 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	if err != nil {
 		return nil, ErrInternalError("创建 Claude 请求失败", err)
 	}
-	applyClaudeMessagesHeadersWithVersion(req, accessToken, headers, stream, fingerprint, fingerprintMode, decision.RewriteVersion, securityConfig)
+	applyClaudeMessagesHeadersWithVersion(req, accessToken, headers, stream, body, fingerprint, fingerprintMode, decision.RewriteVersion, securityConfig)
 
 	if perr := applyClaudeOutboundVersionAlignment(req, claudeOutboundRequiredVersion(decision, model)); perr != nil {
 		return nil, perr
 	}
 
-	resp, err := client.Do(req)
+	if aligned := alignClaudeBillingBlock(body, req.Header.Get("User-Agent")); !bytes.Equal(aligned, body) {
+		req.Body = io.NopCloser(bytes.NewReader(aligned))
+		req.ContentLength = int64(len(aligned))
+		req.Header.Set("Content-Length", strconv.Itoa(len(aligned)))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(aligned)), nil
+		}
+	}
+
+	if err := ConsumeAPIKeyModelRequestQuota(ctx, model); err != nil {
+		return nil, err
+	}
+	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, proxyURL)
@@ -225,6 +272,96 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 		return nil, ErrUpstream(0, "请求 Anthropic Messages API 失败", err)
 	}
 	return resp, nil
+}
+
+type claudeSessionIDContextKey struct{}
+
+// WithClaudeSessionID 把本次请求的稳定会话 UUID 放入 ctx,用于保证
+// X-Claude-Code-Session-Id 头与 metadata.user_id.session_id 字段同值
+// (真实 Claude Code 两者恒为同一会话 ID)。
+func WithClaudeSessionID(ctx context.Context, sessionID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, claudeSessionIDContextKey{}, strings.TrimSpace(sessionID))
+}
+
+// claudeSessionIDFromContext 读取 ctx 中的稳定会话 UUID;不存在返回空串。
+func claudeSessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(claudeSessionIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// claudeUpstreamSessionID 把 handler 解析出的上游会话键归一为 UUID 形态:
+// 已是 UUID 则原样透传,否则确定性派生 UUIDv7(真实 CLI 的会话 ID 恒为 UUID)。
+func claudeUpstreamSessionID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if _, err := uuid.Parse(raw); err == nil {
+		return raw
+	}
+	return DeriveStableSessionUUIDv7("codex2api:claude-session:" + raw)
+}
+
+// resolveClaudeRequestSessionIdentity 仅在 Claude 原生路径识别 CLI 身份：
+// 专用会话头 > 结构化 user_id.session_id > 既有通用会话来源。
+// 仍交给既有解析器处理本地 affinity，并由 handler 按 API Key 隔离上游身份。
+func resolveClaudeRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {
+	raw := strings.TrimSpace(headers.Get("X-Claude-Code-Session-Id"))
+	if raw == "" {
+		if metadata := claudeMetadataIdentity(body); metadata != nil {
+			_ = json.Unmarshal(metadata["session_id"], &raw)
+			raw = strings.TrimSpace(raw)
+		}
+	}
+	if raw == "" {
+		return resolveRequestSessionIdentity(headers, body)
+	}
+	normalized := headers.Clone()
+	if normalized == nil {
+		normalized = make(http.Header)
+	}
+	normalized.Set("Session-Id", raw)
+	return resolveRequestSessionIdentity(normalized, body)
+}
+
+// claudeMetadataIdentity 只识别 Claude 的结构化身份，业务字符串/其他 JSON 不改写。
+func claudeMetadataIdentity(body []byte) map[string]json.RawMessage {
+	userID := gjson.GetBytes(body, "metadata.user_id")
+	if userID.Type != gjson.String {
+		return nil
+	}
+	var identity map[string]json.RawMessage
+	if json.Unmarshal([]byte(userID.String()), &identity) != nil || identity == nil {
+		return nil
+	}
+	for _, key := range []string{"device_id", "account_uuid", "session_id"} {
+		if _, ok := identity[key]; ok {
+			return identity
+		}
+	}
+	return nil
+}
+
+// setIfAbsentFromIncoming 在入站未携带该头时给 req 设置默认值(真实客户端的值优先)。
+func setIfAbsentFromIncoming(reqHeader http.Header, incoming http.Header, name, value string) {
+	if incoming != nil {
+		if v := strings.TrimSpace(incoming.Get(name)); v != "" {
+			reqHeader.Set(name, v)
+			return
+		}
+	}
+	reqHeader.Set(name, value)
 }
 
 // applyClaudeMessagesHeaders 设置透传请求头。
@@ -236,7 +373,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 //     同一套 Claude Code 身份(强制替换,防跨客户端指纹漂移)。
 //
 // fingerprint 为账号绑定指纹头(规范化头名→值),来自 credentials.custom_headers。
-func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming http.Header, stream bool, fingerprint map[string]string, fingerprintMode string, securityConfigs ...auth.ClaudeSecurityConfig) {
+func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming http.Header, stream bool, body []byte, fingerprint map[string]string, fingerprintMode string, securityConfigs ...auth.ClaudeSecurityConfig) {
 	securityConfig := auth.DefaultClaudeSecurityConfig()
 	if len(securityConfigs) > 0 {
 		securityConfig = auth.NormalizeClaudeSecurityConfig(securityConfigs[0])
@@ -249,13 +386,24 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	} else {
 		req.Header.Set("anthropic-version", claudeAnthropicVersion)
 	}
-	req.Header.Set("anthropic-beta", mergeAnthropicBetaWithConfig(incoming, securityConfig))
+	req.Header.Set("anthropic-beta", buildClaudeBetaHeader(incoming, securityConfig, body))
 	// OAuth 凭据不带 x-api-key;若入站客户端塞了，务必剔除避免冲突。
 	req.Header.Del("x-api-key")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
+	}
+	// SDK 固定行为头(真实 CLI 抓包恒定值):每次出站请求都带,重试计数按本次
+	// HTTP 请求计为 0(换号/重试会重建请求)。入站已带时优先保留入站值。
+	setIfAbsentFromIncoming(req.Header, incoming, "X-Stainless-Retry-Count", "0")
+	setIfAbsentFromIncoming(req.Header, incoming, "X-Stainless-Timeout", "600")
+	setIfAbsentFromIncoming(req.Header, incoming, "anthropic-dangerous-direct-browser-access", "true")
+	// 使用 handler 已完成隔离的唯一会话身份，不能再被入站头覆盖。
+	if sid := claudeSessionIDFromContext(req.Context()); sid != "" {
+		req.Header.Set("X-Claude-Code-Session-Id", sid)
+	} else if v := strings.TrimSpace(incoming.Get("X-Claude-Code-Session-Id")); v != "" {
+		req.Header.Set("X-Claude-Code-Session-Id", claudeUpstreamSessionID(v))
 	}
 
 	// 指纹 map 键大小写不定(来自 custom_headers),统一小写后按小写头名查。
@@ -266,6 +414,14 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	// force 模式:账号指纹优先,无条件覆盖入站身份头(有指纹才覆盖,避免抹成空)。
 	// preserve 模式:入站有则保留,无则用账号指纹补齐。
 	force := auth.NormalizeClaudeFingerprintMode(fingerprintMode) == auth.ClaudeFingerprintModeForce
+	// preserve 只放行真实 Claude Code CLI 的入站身份(UA 可解析为 CLI 版本)。
+	// 第三方客户端(opencode、curl 等)自带 UA 若原样透传,会与 OAuth 凭据预期的
+	// claude-cli 指纹不一致,因此视同 force,统一呈现账号绑定的 Claude Code 身份。
+	if !force {
+		if _, isCLI := auth.ParseClaudeClientVersion(strings.TrimSpace(incoming.Get("User-Agent"))); !isCLI {
+			force = true
+		}
+	}
 	for _, name := range auth.ClaudeIdentityHeaderNames {
 		fpVal := strings.TrimSpace(fpLower[name])
 		if force {
@@ -303,8 +459,8 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 // applyClaudeMessagesHeadersWithVersion is the policy-aware variant used by
 // ExecuteClaudeMessagesRequestWithPolicy. Keeping the legacy helper signature
 // avoids changing existing callers/tests while still recording the final UA.
-func applyClaudeMessagesHeadersWithVersion(req *http.Request, accessToken string, incoming http.Header, stream bool, fingerprint map[string]string, fingerprintMode, rewriteVersion string, securityConfigs ...auth.ClaudeSecurityConfig) {
-	applyClaudeMessagesHeaders(req, accessToken, incoming, stream, fingerprint, fingerprintMode, securityConfigs...)
+func applyClaudeMessagesHeadersWithVersion(req *http.Request, accessToken string, incoming http.Header, stream bool, body []byte, fingerprint map[string]string, fingerprintMode, rewriteVersion string, securityConfigs ...auth.ClaudeSecurityConfig) {
+	applyClaudeMessagesHeaders(req, accessToken, incoming, stream, body, fingerprint, fingerprintMode, securityConfigs...)
 	if strings.TrimSpace(rewriteVersion) != "" {
 		rewritten := rewriteClaudeCLIUserAgentVersion(req.Header.Get("User-Agent"), rewriteVersion)
 		if rewritten != "" {
@@ -402,15 +558,15 @@ func defaultClaudeIdentityHeader(name string) string {
 	case "x-stainless-lang":
 		return "js"
 	case "x-stainless-package-version":
-		return "0.68.0"
+		return "0.112.1"
 	case "x-stainless-os":
-		return "Linux"
+		return "MacOS"
 	case "x-stainless-arch":
-		return "x64"
+		return "arm64"
 	case "x-stainless-runtime":
 		return "node"
 	case "x-stainless-runtime-version":
-		return "v22.11.0"
+		return "v26.3.0"
 	default:
 		return ""
 	}
@@ -568,18 +724,9 @@ func normalizeClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]b
 			return nil, err
 		}
 	}
-	// Claude Code currently sends context_management for its own stateful
-	// client, but the OAuth Messages endpoint rejects it with
-	// "Extra inputs are not permitted". It is not representable by the
-	// stateless gateway, so drop it while preserving all standard Messages
-	// controls (thinking/output_config/output_format/metadata/tools/etc.).
-	if gjson.GetBytes(out, "context_management").Exists() {
-		var err error
-		out, err = sjson.DeleteBytes(out, "context_management")
-		if err != nil {
-			return nil, fmt.Errorf("remove unsupported context_management: %w", err)
-		}
-	}
+	// context_management 不再无条件剥离:真实 Claude Code CLI 每次请求都携带它,
+	// 且与 context-management-2025-06-27 beta 成对出现(见 buildClaudeBetaHeader)。
+	// 网关自身无状态,透传该字段不影响会话,只影响单次请求内的上下文编辑行为。
 	tools := gjson.GetBytes(out, "tools")
 	if tools.Exists() {
 		if !tools.IsArray() {
@@ -615,10 +762,18 @@ func parseClaudeMaxTokens(result gjson.Result, cfg auth.ClaudeSecurityConfig) (i
 	return value, nil
 }
 
+// claudeBodyIdentity 是出站 body 注入所需的账号/会话身份。deviceID/accountUUID
+// 来自账号,sessionID 是本次请求级稳定会话 UUIDv7(与 X-Claude-Code-Session-Id 同值)。
+type claudeBodyIdentity struct {
+	deviceID    string
+	accountUUID string
+	sessionID   string
+}
+
 // prepareClaudeRequestBody is the canonical body used by both Prompt Filter
 // and the native Claude transport. Trusted Claude Code system metadata is
 // injected only after user-controlled fields have been normalized and bounded.
-func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byte, error) {
+func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig, id claudeBodyIdentity) ([]byte, error) {
 	normalized, err := normalizeClaudeRequestBody(body, cfg)
 	if err != nil {
 		return nil, err
@@ -634,7 +789,54 @@ func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byt
 		log.Printf("[claude-thinking-signature] 模型 %s 不接受 thinking.type=disabled，已移除该参数", gjson.GetBytes(normalized, "model").String())
 		normalized = cleaned
 	}
-	return injectClaudeCodeSystemPrompt(normalized), nil
+	normalized = injectClaudeCodeSystemPrompt(normalized)
+	return injectClaudeMetadataUserID(normalized, id), nil
+}
+
+// injectClaudeMetadataUserID 按真实 Claude Code CLI 的形态注入
+// metadata.user_id = JSON 字符串 {"device_id","account_uuid","session_id"}。
+// 已有 Claude 身份对象按选中账号和唯一会话更新，保留其余字段；业务 user_id 保留。
+func injectClaudeMetadataUserID(body []byte, id claudeBodyIdentity) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	identity := claudeMetadataIdentity(body)
+	if existing := gjson.GetBytes(body, "metadata.user_id"); existing.Exists() && existing.Type != gjson.Null {
+		if strings.TrimSpace(existing.String()) != "" && identity == nil {
+			return body
+		}
+	}
+	if id.deviceID == "" && id.accountUUID == "" && id.sessionID == "" {
+		return body
+	}
+	if identity == nil {
+		identity = make(map[string]json.RawMessage)
+	}
+	updates := map[string]string{"device_id": id.deviceID, "account_uuid": id.accountUUID, "session_id": id.sessionID}
+	var previousSession, parentSession string
+	_ = json.Unmarshal(identity["session_id"], &previousSession)
+	_ = json.Unmarshal(identity["parent_session_id"], &parentSession)
+	if previousSession != "" && parentSession == previousSession {
+		// 子代理可能把同一会话同时写到 parent_session_id；关联值需一起更新。
+		// 真正不同的父会话保持不变，不能擅自改成当前子会话。
+		updates["parent_session_id"] = id.sessionID
+	}
+	for key, value := range updates {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return body
+		}
+		identity[key] = encoded
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		return body
+	}
+	out, err := sjson.SetBytes(body, "metadata.user_id", string(payload))
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // mergeAnthropicBeta 把入站声明的 anthropic-beta 与 OAuth 必需的 oauth-2025-04-20
@@ -644,97 +846,264 @@ func mergeAnthropicBeta(incoming http.Header) string {
 }
 
 func mergeAnthropicBetaWithConfig(incoming http.Header, cfg auth.ClaudeSecurityConfig) string {
+	return buildClaudeBetaHeader(incoming, cfg, nil)
+}
+
+// buildClaudeBetaHeader 生成贴近真实 Claude Code CLI 抓包顺序的 anthropic-beta:
+//
+//  1. 核心标记(恒定,不受白名单过滤):非 haiku 模型发 claude-code-20250219,
+//     所有 OAuth 请求发 oauth-2025-04-20;
+//  2. body 驱动(按 body 实际携带的功能补声明,保证字段与 beta 成对,
+//     缺失会被上游 400 "required beta"):thinking→interleaved-thinking /
+//     thinking-token-count / redact-thinking;context_management→
+//     context-management;tools→advanced-tool-use;effort→effort;
+//     1h 缓存→extended-cache-ttl;cache scope→prompt-caching-scope;
+//  3. 下游透传:入站 anthropic-beta 按白名单过滤(白名单缺省时用真实 CLI
+//     注册表 DefaultClaudeAllowedBetaHeaders,避免任意第三方 beta 混入)。
+//
+// 顺序对齐真实抓包:核心 → 功能声明 → 其余透传,降低与真实 CLI 的头部指纹差异。
+func buildClaudeBetaHeader(incoming http.Header, cfg auth.ClaudeSecurityConfig, body []byte) string {
 	cfg = auth.NormalizeClaudeSecurityConfig(cfg)
-	allowed := make(map[string]struct{}, len(cfg.AllowedBetaHeaders)+1)
-	allowed[strings.ToLower(auth.ClaudeOAuthBeta)] = struct{}{}
+	allowed := make(map[string]struct{}, len(cfg.AllowedBetaHeaders)+len(auth.DefaultClaudeAllowedBetaHeaders)+2)
+	for _, token := range auth.DefaultClaudeAllowedBetaHeaders {
+		allowed[strings.ToLower(token)] = struct{}{}
+	}
 	for _, token := range cfg.AllowedBetaHeaders {
 		allowed[strings.ToLower(strings.TrimSpace(token))] = struct{}{}
 	}
+	allowed[strings.ToLower(auth.ClaudeCodeBeta)] = struct{}{}
+	allowed[strings.ToLower(auth.ClaudeOAuthBeta)] = struct{}{}
+
 	seen := map[string]struct{}{}
-	ordered := make([]string, 0, 4)
-	add := func(raw string, filter bool) {
-		for _, part := range strings.Split(raw, ",") {
-			v := strings.TrimSpace(part)
-			if v == "" {
-				continue
-			}
-			key := strings.ToLower(v)
-			if filter {
-				if _, ok := allowed[key]; !ok {
-					continue
-				}
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			ordered = append(ordered, v)
+	ordered := make([]string, 0, 16)
+	add := func(v string, filter bool) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
 		}
+		key := strings.ToLower(v)
+		if filter {
+			if _, ok := allowed[key]; !ok {
+				return
+			}
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		ordered = append(ordered, v)
 	}
-	add(auth.ClaudeOAuthBeta, false)
+
+	if body != nil && gjson.ValidBytes(body) {
+		// 核心标记(haiku 不发 claude-code beta,对齐 CLI _re() 行为)。
+		if !strings.Contains(strings.ToLower(gjson.GetBytes(body, "model").String()), "haiku") {
+			add(auth.ClaudeCodeBeta, false)
+		}
+		add(auth.ClaudeOAuthBeta, false)
+
+		// body 驱动的功能声明(恒放行,与字段成对出现)。
+		if thinking := gjson.GetBytes(body, "thinking"); thinking.Exists() && thinking.Type != gjson.Null &&
+			!strings.EqualFold(strings.TrimSpace(thinking.Get("type").String()), "disabled") {
+			add("interleaved-thinking-2025-05-14", false)
+			add("redact-thinking-2026-02-12", false)
+			add("thinking-token-count-2026-05-13", false)
+		}
+		if gjson.GetBytes(body, "context_management").Exists() {
+			add("context-management-2025-06-27", false)
+		}
+		if gjson.GetBytes(body, "tools").Exists() {
+			add("advanced-tool-use-2025-11-20", false)
+		}
+		if gjson.GetBytes(body, "output_config.effort").Exists() || gjson.GetBytes(body, "reasoning_effort").Exists() || gjson.GetBytes(body, "effort").Exists() {
+			add("effort-2025-11-24", false)
+		}
+		if claudeCacheControlHasExtendedTTL(body) {
+			add("extended-cache-ttl-2025-04-11", false)
+		}
+		if claudeCacheControlHasScope(body) {
+			add("prompt-caching-scope-2026-01-05", false)
+		}
+	} else {
+		// 无 body 的兼容路径(如 mergeAnthropicBeta(nil)):仍带核心标记。
+		add(auth.ClaudeCodeBeta, false)
+		add(auth.ClaudeOAuthBeta, false)
+	}
+
+	// 下游透传:按白名单过滤,保持入站原序。
 	if incoming != nil {
-		add(strings.Join(incoming.Values("anthropic-beta"), ","), true)
+		for _, raw := range incoming.Values("anthropic-beta") {
+			for _, part := range strings.Split(raw, ",") {
+				add(part, true)
+			}
+		}
 	}
 	return strings.Join(ordered, ",")
 }
 
-// injectClaudeCodeSystemPrompt 保证请求的 system 数组首块是 Claude Code 声明块。
-// 兼容三种入站形态:无 system / system 为字符串 / system 为块数组;若首块已是该声明
-// 则原样返回,避免重复注入。
+// claudeCacheControlHasExtendedTTL 报告请求中是否存在 ttl=1h 的 cache_control 块
+// (按 Anthropic 处理顺序 tools → system → messages 扫描)。
+func claudeCacheControlHasExtendedTTL(body []byte) bool {
+	found := false
+	visit := func(items gjson.Result) {
+		if found || !items.IsArray() {
+			return
+		}
+		for _, item := range items.Array() {
+			if cc := item.Get("cache_control"); cc.Exists() && cc.Get("ttl").String() == "1h" {
+				found = true
+				return
+			}
+		}
+	}
+	visit(gjson.GetBytes(body, "tools"))
+	visit(gjson.GetBytes(body, "system"))
+	if messages := gjson.GetBytes(body, "messages"); messages.IsArray() {
+		for _, msg := range messages.Array() {
+			visit(msg.Get("content"))
+			if found {
+				return true
+			}
+		}
+	}
+	return found
+}
+
+// claudeCacheControlHasScope 报告请求中是否存在带 scope 的 cache_control 块
+// (prompt-caching-scope beta 的触发条件)。
+func claudeCacheControlHasScope(body []byte) bool {
+	found := false
+	visit := func(items gjson.Result) {
+		if found || !items.IsArray() {
+			return
+		}
+		for _, item := range items.Array() {
+			if cc := item.Get("cache_control"); cc.Exists() && cc.Get("scope").Exists() {
+				found = true
+				return
+			}
+		}
+	}
+	visit(gjson.GetBytes(body, "tools"))
+	visit(gjson.GetBytes(body, "system"))
+	if messages := gjson.GetBytes(body, "messages"); messages.IsArray() {
+		for _, msg := range messages.Array() {
+			visit(msg.Get("content"))
+			if found {
+				return true
+			}
+		}
+	}
+	return found
+}
+
+// claudeBillingHeaderPrefix 是真实 Claude Code 计费块文本的前缀标记。
+const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
+
+// claudeBillingBlockJSON 为缺少计费块的请求构造兼容块，沿用现有的版本派生后缀。
+// 该后缀不是已验证的官方构建号/校验值；已有客户端计费块应保留，不能据此重造。
+// 生成块不带 cache_control，不占用 4 块缓存配额。
+func claudeBillingBlockJSON(version string) string {
+	text := fmt.Sprintf("%s cc_version=%s.%s; cc_entrypoint=cli;", claudeBillingHeaderPrefix, version, claudeBillingBuildNumber(version))
+	b, err := sjson.SetBytes([]byte(`{"type":"text"}`), "text", text)
+	if err != nil {
+		return `{"type":"text","text":"` + claudeBillingHeaderPrefix + ` cc_version=` + version + `; cc_entrypoint=cli;"}`
+	}
+	return string(b)
+}
+
+// claudeBillingBuildNumber 沿用旧函数名，为本地生成块派生稳定后缀(0-9999)。
+// 它不实现 Claude Code 的请求内容校验算法。
+func claudeBillingBuildNumber(version string) string {
+	sum := sha1.Sum([]byte("claude-code-build:" + version))
+	return strconv.FormatUint(uint64(binary.BigEndian.Uint32(sum[:4])%10000), 10)
+}
+
+var claudeBillingVersionPattern = regexp.MustCompile(`cc_version=([0-9]+\.[0-9]+\.[0-9]+)`)
+
+// alignClaudeBillingBlock 把 system 计费块里的 cc_version 校正为最终出站
+// User-Agent 中的 CLI 版本。计费块在 prepareClaudeRequestBody 阶段按
+// EffectiveClaudeCLIVersion 构建,但 preserve 模式下最终 UA 可能是账号指纹
+// 自带的版本(例如更新版本),两者不一致会暴露"计费块与 UA 不同源"的特征。
+// 版本已一致或 UA 非 CLI 形态时原样返回,避免每次请求都做无谓改写。
+func alignClaudeBillingBlock(body []byte, userAgent string) []byte {
+	uaVersion, isCLI := auth.ParseClaudeClientVersion(userAgent)
+	if !isCLI || uaVersion == "" {
+		return body
+	}
+	text := gjson.GetBytes(body, "system.0.text").String()
+	if !strings.HasPrefix(strings.TrimSpace(text), claudeBillingHeaderPrefix) {
+		return body
+	}
+	match := claudeBillingVersionPattern.FindStringSubmatchIndex(text)
+	if match == nil || text[match[2]:match[3]] == uaVersion {
+		return body
+	}
+	// 只替换已识别的 CLI 版本字段，保留 entrypoint、后缀及原块的扩展/缓存属性。
+	// 参考实现的计费后缀算法依赖原始请求，不能在这里假定它只是构建号并重造整个块。
+	text = text[:match[2]] + uaVersion + text[match[3]:]
+	aligned, err := sjson.SetBytes(body, "system.0.text", text)
+	if err != nil {
+		return body
+	}
+	return aligned
+}
+
+// injectClaudeCodeSystemPrompt 保证请求的 system 数组以 Claude Code 的
+// [计费块, 声明块] 开头——与真实 CLI 抓包一致(计费块在前、CLI 声明块紧随其后)。
+// 兼容三种入站形态:无 system / system 为字符串 / system 为块数组;已存在的块
+// 不重复注入。
 func injectClaudeCodeSystemPrompt(body []byte) []byte {
 	if !gjson.ValidBytes(body) {
 		return body
 	}
 	system := gjson.GetBytes(body, "system")
-	preambleBlock := claudeCodeSystemBlockFor(body)
-
+	var blocks []json.RawMessage
 	switch {
 	case !system.Exists() || system.Type == gjson.Null:
-		out, err := sjson.SetRawBytes(body, "system", []byte("["+preambleBlock+"]"))
-		if err != nil {
-			return body
-		}
-		return out
-
 	case system.Type == gjson.String:
-		// 字符串 system → [声明块, {原文本块}]
-		orig := system.String()
-		if strings.HasPrefix(strings.TrimSpace(orig), claudeCodeSystemPreamble) {
-			return body // 已以声明开头,转成数组即可但无需重复
-		}
-		textBlock, err := sjson.SetBytes([]byte(`{"type":"text"}`), "text", orig)
+		block, err := sjson.SetBytes([]byte(`{"type":"text"}`), "text", system.String())
 		if err != nil {
 			return body
 		}
-		raw := "[" + preambleBlock + "," + string(textBlock) + "]"
-		out, err := sjson.SetRawBytes(body, "system", []byte(raw))
-		if err != nil {
-			return body
-		}
-		return out
-
+		blocks = append(blocks, block)
 	case system.IsArray():
-		arr := system.Array()
-		if len(arr) > 0 && strings.HasPrefix(strings.TrimSpace(arr[0].Get("text").String()), claudeCodeSystemPreamble) {
-			return body // 首块已是声明,不重复注入
-		}
-		raw := system.Raw
-		inner := strings.TrimSpace(raw)
-		inner = strings.TrimPrefix(inner, "[")
-		inner = strings.TrimSuffix(inner, "]")
-		var newArr string
-		if strings.TrimSpace(inner) == "" {
-			newArr = "[" + preambleBlock + "]"
-		} else {
-			newArr = "[" + preambleBlock + "," + inner + "]"
-		}
-		out, err := sjson.SetRawBytes(body, "system", []byte(newArr))
-		if err != nil {
+		if json.Unmarshal([]byte(system.Raw), &blocks) != nil {
 			return body
 		}
-		return out
+	default:
+		return body
 	}
-	return body
+	var billing, preamble json.RawMessage
+	others := make([]json.RawMessage, 0, len(blocks))
+	for _, block := range blocks {
+		text := strings.TrimSpace(gjson.GetBytes(block, "text").String())
+		isText := gjson.GetBytes(block, "type").String() == "text"
+		switch {
+		case billing == nil && isText && strings.HasPrefix(text, claudeBillingHeaderPrefix) && claudeBillingVersionPattern.MatchString(text):
+			billing = block
+		case preamble == nil && isText && strings.HasPrefix(text, claudeCodeSystemPreamble):
+			preamble = block
+		default:
+			// 仅提取已有前导块；不删除重复块或改写用户其余内容。
+			others = append(others, block)
+		}
+	}
+	if billing == nil {
+		billing = json.RawMessage(claudeBillingBlockJSON(auth.EffectiveClaudeCLIVersion()))
+	}
+	if preamble == nil {
+		preamble = json.RawMessage(claudeCodeSystemBlockFor(body))
+	}
+	ordered := append([]json.RawMessage{billing, preamble}, others...)
+	encoded, err := json.Marshal(ordered)
+	if err != nil {
+		return body
+	}
+	out, err := sjson.SetRawBytes(body, "system", encoded)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // ── Claude 统一限流头 → 账号用量快照 ─────────────────────────────────────────
@@ -895,7 +1264,7 @@ const claudeCreditsRequiredCooldown = 30 * time.Minute
 // 只冷却被拒的那个模型(不动账号),已处理返回 true,调用方据此**跳过账号级用量/限流同步**。
 // 非该类错误返回 false,调用方继续走正常的 SyncClaudeUsageState。
 func HandleClaudeModelBillingRejection(store *auth.Store, account *auth.Account, model string, statusCode int, errBody []byte) bool {
-	if store == nil || account == nil || statusCode != http.StatusTooManyRequests || len(errBody) == 0 {
+	if store == nil || account == nil || account.IsClaudeAPIKey() || statusCode != http.StatusTooManyRequests || len(errBody) == 0 {
 		return false
 	}
 	code := strings.TrimSpace(gjson.GetBytes(errBody, "error.details.error_code").String())
@@ -935,7 +1304,24 @@ func HandleClaudeModelBillingRejection(store *auth.Store, account *auth.Account,
 	} else if removed {
 		log.Printf("[账号 %d] 上游 credits_required,已把模型 %s 从账号模型白名单移除", account.ID(), m)
 	}
+	// 套餐推断 hook:credits_required 说明当前套餐不含该模型,占位/Max 套餐降为 pro。
+	if previous, current, changed := store.ApplyClaudePlanFromCreditsRequired(dropCtx, account); changed {
+		log.Printf("[账号 %d] 上游 credits_required(模型 %s),套餐由 %q 推断为 %q", account.ID(), m, previous, current)
+	}
 	return true
+}
+
+// NoteClaudeGatedModelSuccess 是套餐推断 hook 的成功侧:高档模型(Fable)成功响应
+// 说明账号至少是 Max,占位/pro 套餐升为 max。非高档模型或非 Claude 账号直接返回。
+func NoteClaudeGatedModelSuccess(store *auth.Store, account *auth.Account, model string) {
+	if store == nil || account == nil || !account.IsClaudeOAuth() || !auth.IsClaudeCreditsGatedModel(model) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if previous, current, changed := store.ApplyClaudePlanFromGatedModelSuccess(ctx, account, model); changed {
+		log.Printf("[账号 %d] 高档模型 %s 调用成功,套餐由 %q 推断为 %q", account.ID(), model, previous, current)
+	}
 }
 
 // claudeGenericRateLimitBackoff 返回通用限流(非窗口耗尽)的短冷却时长:

@@ -71,19 +71,24 @@ import {
 import {
   Activity,
   Brain,
+  Check,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
   CircleHelp,
   Cloud,
   Database,
   ExternalLink,
+  Eye,
   Gauge,
   Globe,
   Image as ImageIcon,
   Layers,
   Link2,
+  Loader2,
   Palette,
   RefreshCw,
+  RotateCcw,
   Save,
   Server,
   Shield,
@@ -101,6 +106,8 @@ import {
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import ChannelLogo from '../components/ChannelLogo'
 import ChannelScopeBadges, { ALL_UPSTREAM_CHANNELS } from '../components/ChannelScopeBadges'
+import { useVisibleChannels } from '../visibleChannels'
+import { ALL_VISIBLE_CHANNEL_OPTIONS, FALLBACK_VISIBLE_CHANNEL, toggleVisibleChannel } from '../lib/visibleChannels'
 
 type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
 
@@ -141,7 +148,7 @@ const RESPONSE_CACHE_BUDGET_KEYS = [
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
   client_name: 'codex-tui',
-  client_version: '0.144.1',
+  client_version: '0.153.3',
   os_name: 'Mac OS',
   os_version: '15.5.0',
   arch: 'arm64',
@@ -179,6 +186,32 @@ const LEGACY_SECTION_TABS: Record<string, SettingsTabKey> = {
   'settings-antigravity': 'antigravity',
   'settings-appearance': 'appearance',
 }
+// 每个 Tab 内的分区目录：多于一个分区的 Tab 渲染侧边目录并按滚动位置高亮。
+// icon 与对应 SettingsSection 的图标保持一致，目录项和分区标题才能互相对上。
+const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: string; labelKey: string; icon: ReactNode }>> = {
+  codex: [
+    { id: 'settings-codex-quota', labelKey: 'settings.nav.codexQuota', icon: <Gauge /> },
+    { id: 'settings-codex-transport', labelKey: 'settings.nav.codexTransport', icon: <Wifi /> },
+    { id: 'settings-codex-client', labelKey: 'settings.nav.codexClient', icon: <Terminal /> },
+    { id: 'settings-models', labelKey: 'settings.nav.models', icon: <Layers /> },
+  ],
+  claude: [{ id: 'settings-claude', labelKey: 'settings.nav.claude', icon: <ChannelLogo channel="claude" size={16} /> }],
+  antigravity: [{ id: 'settings-antigravity', labelKey: 'settings.nav.antigravity', icon: <ChannelLogo channel="antigravity" size={16} /> }],
+  grok: [{ id: 'settings-grok', labelKey: 'settings.nav.grok', icon: <ChannelLogo channel="grok" size={16} /> }],
+  appearance: [{ id: 'settings-appearance', labelKey: 'settings.nav.appearance', icon: <Palette /> }],
+  general: [
+    { id: 'settings-overview', labelKey: 'settings.nav.overview', icon: <Activity /> },
+    { id: 'settings-traffic', labelKey: 'settings.nav.traffic', icon: <Gauge /> },
+    { id: 'settings-runtime', labelKey: 'settings.nav.runtime', icon: <Wrench /> },
+    { id: 'settings-storage', labelKey: 'settings.nav.storage', icon: <ImageIcon /> },
+    { id: 'settings-security', labelKey: 'settings.nav.security', icon: <Shield /> },
+    { id: 'settings-reference', labelKey: 'settings.nav.reference', icon: <Link2 /> },
+  ],
+}
+// 分区滚动高亮的判定线：分区顶部越过视口该高度即视为当前分区（要盖过粘性 Tab 栏）。
+const SETTINGS_SECTION_SPY_OFFSET_PX = 140
+// 手动保存字段的脏检查里跳过的键：生成号是服务端只读，自定义 Prompt 规则由规则页单独保存。
+const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns'])
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -232,6 +265,14 @@ const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof Syst
   return patch as Partial<SystemSettings>
 }
 
+// 脏检查用的宽松相等：null/undefined 同义，数组与对象按 JSON 结构比较。
+const settingsValueEquals = (a: unknown, b: unknown) => {
+  if (a === b) return true
+  if (a == null && b == null) return true
+  if (a == null || b == null) return false
+  if (typeof a === 'object' || typeof b === 'object') return JSON.stringify(a) === JSON.stringify(b)
+  return false
+}
 const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSettings => ({
   ...settings,
   response_cache_local_max_bytes: Number.isFinite(settings.response_cache_local_max_bytes)
@@ -731,6 +772,12 @@ function ReasoningEffortModelsEditor({
 const SETTINGS_FIELD_GRID = 'grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2'
 const SETTINGS_FIELD_GRID_3 = 'grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2 xl:grid-cols-3'
 const SETTINGS_SWITCH_GRID = 'grid grid-cols-1 gap-3 sm:grid-cols-2'
+// 卡片里只有一个开关时用整行，放进双列栅格会挤成半宽、标签折行。
+const SETTINGS_SWITCH_ROW = 'grid grid-cols-1 gap-3'
+// 一组只含开关的相关设置合并成一张卡，用 SettingField layout="row" 逐行排列，说明文字直接外显。
+const SETTINGS_ROW_LIST = 'divide-y divide-border/60'
+// 卡片级双列栅格：卡片高度不一，必须顶对齐，否则矮卡被拉高留下大片空白。
+const SETTINGS_CARD_GRID_2 = 'grid gap-4 lg:grid-cols-2 lg:items-start'
 
 // ClaudeCodeSettingsCard 是 ClaudeCode 全局配置卡片(独立读写 /settings/claude-config)。
 // 全体 Claude 账号默认遵守;个体账号可在「账号管理 → 编辑账号」里覆盖。
@@ -1067,29 +1114,29 @@ function SettingsCard({
   return (
     <Card
       className={cn(
-        'gap-0 py-0 border-border/80 bg-card shadow-2xs transition-all duration-200 hover:border-border',
+        'gap-0 py-0 border-border/60 bg-card shadow-2xs',
         tone === 'danger' && 'border-destructive/30 bg-destructive/[0.02]',
         className,
       )}
     >
       <CardContent className={cn('p-4.5 sm:p-5.5', contentClassName)}>
-        <div className="mb-4.5 flex shrink-0 items-start gap-3.5">
+        <div className="mb-4.5 flex shrink-0 items-start gap-3">
           {icon ? (
             <div
               className={cn(
-                'mt-0.5 flex size-8.5 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset sm:size-9.5',
+                'flex size-8 shrink-0 items-center justify-center rounded-lg ring-1 ring-inset',
                 tone === 'danger'
                   ? 'bg-destructive/10 text-destructive ring-destructive/20'
-                  : 'bg-primary/10 text-primary ring-primary/20',
+                  : 'bg-muted/70 text-muted-foreground ring-border/60',
               )}
               aria-hidden="true"
             >
-              <span className="[&_svg]:size-4 sm:[&_svg]:size-4.5">{icon}</span>
+              <span className="[&_svg]:size-4">{icon}</span>
             </div>
           ) : null}
           <div className="min-w-0 flex-1 pt-0.5">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-              <h3 className="text-[15px] font-semibold leading-snug tracking-tight text-foreground sm:text-base">
+              <h3 className="text-sm font-semibold leading-snug tracking-tight text-foreground sm:text-[15px]">
                 {title}
               </h3>
               {badge}
@@ -1166,6 +1213,7 @@ function SettingHelp({ text }: { text: string }) {
 function SettingField({
   label,
   description,
+  help,
   warning,
   children,
   className,
@@ -1175,10 +1223,12 @@ function SettingField({
 }: {
   label: string
   description?: string
+  // row 布局下 description 直接外显，help 才进问号 tooltip；其他布局 help 与 description 合并进 tooltip。
+  help?: string
   warning?: string
   children: ReactNode
   className?: string
-  layout?: 'stack' | 'switch'
+  layout?: 'stack' | 'switch' | 'row'
   suffix?: string
   channels?: readonly UpstreamChannel[]
 }) {
@@ -1196,6 +1246,29 @@ function SettingField({
     children
   )
 
+  if (layout === 'row') {
+    return (
+      <div className={cn('flex min-w-0 items-start justify-between gap-4 py-4 first:pt-0 last:pb-0', className)}>
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <label className="text-[13px] font-semibold leading-snug text-foreground sm:text-sm">{label}</label>
+            {help ? <SettingHelp text={help} /> : null}
+            {scope}
+          </div>
+          {description ? (
+            <p className="max-w-3xl text-xs leading-relaxed text-muted-foreground">{description}</p>
+          ) : null}
+          {warning ? (
+            <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400 sm:text-xs">{warning}</p>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 items-center pt-0.5">{control}</div>
+      </div>
+    )
+  }
+
+  const tooltip = [description, help].filter(Boolean).join(' ')
+
   if (layout === 'switch') {
     return (
       <div
@@ -1209,7 +1282,7 @@ function SettingField({
             <label className="block text-[13px] font-semibold leading-snug text-foreground sm:text-sm">
               {label}
             </label>
-            {description ? <SettingHelp text={description} /> : null}
+            {tooltip ? <SettingHelp text={tooltip} /> : null}
             {scope}
           </div>
           {warning ? (
@@ -1229,7 +1302,7 @@ function SettingField({
         <label className="block text-[13px] font-semibold leading-none text-foreground sm:text-sm">
           {label}
         </label>
-        {description ? <SettingHelp text={description} /> : null}
+        {tooltip ? <SettingHelp text={tooltip} /> : null}
         {scope}
       </div>
       <div className="min-w-0">{control}</div>
@@ -1245,11 +1318,11 @@ function SettingField({
 function SettingsSkeleton() {
   return (
     <div className="space-y-6" aria-busy="true" aria-live="polite">
-      <div className="mx-auto h-14 w-full max-w-3xl animate-pulse rounded-full bg-muted" />
       <div className="space-y-2">
         <div className="h-8 w-40 animate-pulse rounded-lg bg-muted" />
         <div className="h-4 w-72 max-w-full animate-pulse rounded-md bg-muted/70" />
       </div>
+      <div className="h-11 w-full animate-pulse rounded-full bg-muted" />
       <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4">
         {[0, 1, 2, 3].map((i) => (
           <div key={i} className="h-[72px] animate-pulse rounded-lg border border-border bg-muted/40" />
@@ -1293,8 +1366,8 @@ function ModelSummaryCard({
       onClick={onOpen}
       className="group flex w-full items-start gap-3.5 rounded-xl border border-border/70 bg-card p-4 text-left shadow-2xs transition-all hover:border-primary/40 hover:bg-muted/10 hover:shadow-xs"
     >
-      <div className="mt-0.5 flex size-9.5 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary ring-1 ring-primary/20 transition-transform group-hover:scale-105">
-        <Layers className="size-4.5" />
+      <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted/70 text-muted-foreground ring-1 ring-border/60 transition-colors group-hover:bg-primary/10 group-hover:text-primary group-hover:ring-primary/20">
+        <Layers className="size-4" />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2">
@@ -1420,23 +1493,240 @@ function SettingsSection({
   children: ReactNode
 }) {
   return (
-    <section id={id} data-settings-section={id} className="scroll-mt-24 space-y-4 sm:scroll-mt-28">
-      <div className="flex items-center gap-3 px-0.5">
-        {icon ? (
-          <div className="flex size-7.5 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
-            <span className="[&_svg]:size-4">{icon}</span>
-          </div>
-        ) : null}
-        <div className="min-w-0">
-          <h2 className="text-base font-bold tracking-tight text-foreground sm:text-lg">{title}</h2>
-          {description ? (
-            <p className="mt-0.5 max-w-3xl text-xs leading-relaxed text-muted-foreground">{description}</p>
+    <section id={id} data-settings-section={id} className="scroll-mt-32 space-y-4">
+      <div className="space-y-1 px-0.5">
+        <div className="flex items-center gap-2.5">
+          {icon ? (
+            <span className="shrink-0 text-muted-foreground [&_svg]:size-4" aria-hidden="true">
+              {icon}
+            </span>
           ) : null}
+          <h2 className="text-[15px] font-semibold tracking-tight text-foreground sm:text-base">{title}</h2>
+          <div className="ml-1 h-px flex-1 bg-border/60" />
         </div>
-        <div className="h-px flex-1 bg-border/60" />
+        {description ? (
+          <p className="max-w-3xl text-xs leading-relaxed text-muted-foreground">{description}</p>
+        ) : null}
       </div>
       <div className="space-y-4">{children}</div>
     </section>
+  )
+}
+
+type SettingsSectionIndexItem = { id: string; label: string; icon: ReactNode }
+
+// 按滚动位置算出当前分区：最后一个顶部越过判定线的分区即当前分区。
+// 点击目录后先锁定所选分区，直到用户手动滚动（滚轮/触摸/键盘）才恢复按位置判定——
+// 页尾几个分区挤在同一屏时，滚动位置分不出用户点的是哪一个。
+// 滚到底的兜底只在末尾分区真正占据视口下半部分时才把高亮给它，否则会抢走倒数第二个分区。
+function useActiveSettingsSection(sectionIds: readonly string[]) {
+  const [activeId, setActiveId] = useState<string | null>(sectionIds[0] ?? null)
+  const pinnedRef = useRef<string | null>(null)
+  const pinSection = useCallback((id: string) => {
+    pinnedRef.current = id
+    setActiveId(id)
+  }, [])
+  useEffect(() => {
+    pinnedRef.current = null
+    setActiveId(sectionIds[0] ?? null)
+    if (sectionIds.length < 2) return
+    let frame = 0
+    const update = () => {
+      frame = 0
+      if (pinnedRef.current) return
+      let current = sectionIds[0]
+      for (const id of sectionIds) {
+        const el = document.getElementById(id)
+        if (el && el.getBoundingClientRect().top <= SETTINGS_SECTION_SPY_OFFSET_PX) current = id
+      }
+      const doc = document.documentElement
+      const atBottom = window.innerHeight + window.scrollY >= doc.scrollHeight - 2
+      if (atBottom) {
+        const lastId = sectionIds[sectionIds.length - 1]
+        const last = document.getElementById(lastId)
+        if (last && last.getBoundingClientRect().top <= window.innerHeight / 2) current = lastId
+      }
+      setActiveId(current)
+    }
+    const schedule = () => {
+      if (!frame) frame = window.requestAnimationFrame(update)
+    }
+    const unpin = () => {
+      if (!pinnedRef.current) return
+      pinnedRef.current = null
+      schedule()
+    }
+    update()
+    window.addEventListener('scroll', schedule, { passive: true })
+    window.addEventListener('resize', schedule)
+    window.addEventListener('wheel', unpin, { passive: true })
+    window.addEventListener('touchstart', unpin, { passive: true })
+    window.addEventListener('keydown', unpin)
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      window.removeEventListener('scroll', schedule)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('wheel', unpin)
+      window.removeEventListener('touchstart', unpin)
+      window.removeEventListener('keydown', unpin)
+    }
+  }, [sectionIds])
+  return { activeId, pinSection }
+}
+
+// Tab 内分区目录：Tab 栏下方居中的磨砂玻璃胶囊条，随 Tab 栏一起粘顶，按滚动位置高亮当前分区。
+function SettingsSectionIndex({
+  items,
+  activeId,
+  label,
+  onSelect,
+}: {
+  items: readonly SettingsSectionIndexItem[]
+  activeId: string | null
+  label: string
+  onSelect: (id: string) => void
+}) {
+  return (
+    <nav aria-label={label} className="flex justify-center">
+      <div
+        className={cn(
+          'flex max-w-full items-center gap-1 overflow-x-auto rounded-full border border-white/50 bg-card/55 p-1 backdrop-blur-xl backdrop-saturate-150 dark:border-white/10 dark:bg-card/45',
+          'shadow-[0_8px_30px_rgb(0_0_0/0.06)] ring-1 ring-black/[0.04] dark:ring-white/[0.05]',
+          '[-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
+        )}
+      >
+        {items.map((item) => {
+          const active = item.id === activeId
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelect(item.id)}
+              aria-current={active ? 'location' : undefined}
+              className={cn(
+                'inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-semibold transition-colors duration-200 [&_svg]:size-3.5',
+                active
+                  ? 'bg-primary/12 text-primary shadow-2xs ring-1 ring-primary/15'
+                  : 'text-muted-foreground hover:bg-background/70 hover:text-foreground',
+              )}
+            >
+              <span className={cn('shrink-0', active ? 'opacity-100' : 'opacity-75')} aria-hidden="true">
+                {item.icon}
+              </span>
+              {item.label}
+            </button>
+          )
+        })}
+      </div>
+    </nav>
+  )
+}
+
+const VISIBLE_CHANNEL_LABELS: Record<UpstreamChannel, string> = {
+  codex: 'Codex',
+  claude: 'Claude',
+  antigravity: 'Antigravity',
+  grok: 'Grok',
+}
+
+// 供应商显示选择器：一排可多选的胶囊，点一下即保存；兜底渠道锁定在选中态。
+function VisibleChannelsPicker() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const { channels, saveChannels } = useVisibleChannels()
+  const [saving, setSaving] = useState(false)
+  const toggle = async (channel: UpstreamChannel) => {
+    if (channel === FALLBACK_VISIBLE_CHANNEL || saving) return
+    setSaving(true)
+    try {
+      await saveChannels(toggleVisibleChannel(channels, channel))
+      showToast(t('settings.autoSaved'), 'success', AUTO_SAVE_TOAST_MS)
+    } catch (error) {
+      showToast(`${t('settings.visibleChannelsSaveFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="space-y-2.5">
+      <div
+        role="group"
+        aria-label={t('settings.visibleChannelsTitle')}
+        className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border/70 bg-muted/35 p-1.5"
+      >
+        {ALL_VISIBLE_CHANNEL_OPTIONS.map((channel) => {
+          const selected = channels.includes(channel)
+          const locked = channel === FALLBACK_VISIBLE_CHANNEL
+          return (
+            <button
+              key={channel}
+              type="button"
+              aria-pressed={selected}
+              aria-disabled={locked || undefined}
+              disabled={saving}
+              title={locked ? t('settings.visibleChannelsFallbackHint') : undefined}
+              onClick={() => void toggle(channel)}
+              className={cn(
+                'inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold transition-colors duration-200',
+                selected
+                  ? 'bg-primary text-primary-foreground shadow-2xs'
+                  : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+                locked && 'cursor-default',
+                saving && 'opacity-70',
+              )}
+            >
+              <span className={cn('inline-flex shrink-0', !selected && 'opacity-75 grayscale')}>
+                <ChannelLogo channel={channel} size={16} />
+              </span>
+              {VISIBLE_CHANNEL_LABELS[channel]}
+            </button>
+          )
+        })}
+      </div>
+      <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.visibleChannelsFallbackHint')}</p>
+    </div>
+  )
+}
+
+// 页头保存状态：自动保存进行中 > 手动字段未保存 > 自动保存失败 > 已保存。
+function SaveStatusPill({
+  autoSaveStatus,
+  dirtyCount,
+}: {
+  autoSaveStatus: AutoSaveStatus
+  dirtyCount: number
+}) {
+  const { t } = useTranslation()
+  let tone = 'text-muted-foreground'
+  let icon: ReactNode = <Check className="size-3.5" />
+  let text = t('settings.saveStatusSaved')
+  let title: string | undefined
+  if (autoSaveStatus === 'saving') {
+    icon = <Loader2 className="size-3.5 animate-spin" />
+    text = t('settings.autoSaving')
+  } else if (dirtyCount > 0) {
+    tone = 'text-amber-700 dark:text-amber-300'
+    icon = <span className="size-1.5 rounded-full bg-amber-500" aria-hidden="true" />
+    text = t('settings.saveStatusUnsaved', { n: dirtyCount })
+    title = t('settings.saveStatusUnsavedHint')
+  } else if (autoSaveStatus === 'error') {
+    tone = 'text-destructive'
+    icon = <CircleAlert className="size-3.5" />
+    text = t('settings.autoSaveFailed')
+  } else if (autoSaveStatus === 'saved') {
+    tone = 'text-emerald-700 dark:text-emerald-300'
+    text = t('settings.autoSaved')
+  }
+  return (
+    <span
+      data-slot="save-status"
+      title={title}
+      aria-live="polite"
+      className={cn('inline-flex h-8 items-center gap-1.5 whitespace-nowrap px-1 text-xs font-medium tabular-nums', tone)}
+    >
+      {icon}
+      {text}
+    </span>
   )
 }
 
@@ -1865,7 +2155,7 @@ export default function Settings() {
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
-    codex_min_cli_version: '0.144.1',
+    codex_min_cli_version: '0.153.3',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -1909,6 +2199,12 @@ export default function Settings() {
   const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
+  // 服务端已确认的设置快照，用来算"手动保存字段还有几项没存"。自动保存路径按 key 局部合并，
+  // 不能整份覆盖，否则一次开关自动保存会把其他还没点保存的文本改动一起标成已保存。
+  const [persistedSettings, setPersistedSettings] = useState<SystemSettings | null>(null)
+  const markPersisted = useCallback((patch: Partial<SystemSettings>) => {
+    setPersistedSettings((current) => (current ? { ...current, ...patch } : current))
+  }, [])
   const [responseCacheValidationError, setResponseCacheValidationError] = useState<ResponseCacheBudgetValidationError | null>(null)
   const responseCacheValidationMessage = responseCacheValidationError
     ? t(`settings.responseCache.validation.${responseCacheValidationError}`)
@@ -1924,6 +2220,8 @@ export default function Settings() {
   // GitHub token 只写不回显：草稿态独立于 settingsForm，提交后清空（issue #522）
   const [githubTokenDraft, setGithubTokenDraft] = useState('')
   const [syncedCliVersion, setSyncedCliVersion] = useState('')
+  // 实际用于出站 UA 的版本(内置与同步取大);「设为同步版本」按钮以它为准,同步值过期/为空时不会把门槛设低
+  const [effectiveCliVersion, setEffectiveCliVersion] = useState('')
   const logoFileInputRef = useRef<HTMLInputElement>(null)
   const backgroundFileInputRef = useRef<HTMLInputElement>(null)
   const persistedBrandingRef = useRef<Partial<SiteBranding> | null>(null)
@@ -2022,6 +2320,7 @@ export default function Settings() {
       ...patch,
     })
     const rollbackPatch = getSettingsPatchValues(previous, patchKeys)
+    markPersisted(getSettingsPatchValues(optimistic, patchKeys))
     const requestedVersions: Record<string, number> = {}
 
     for (const key of patchKeys) {
@@ -2063,6 +2362,7 @@ export default function Settings() {
             ? { response_cache_config_generation: mergedResponseCacheGeneration }
             : {}),
         })
+        markPersisted(getSettingsPatchValues(updated, mergeKeys))
       }
       const autoSaveSuccessMessage = updated.expired_cleaned && updated.expired_cleaned > 0
         ? `${t('settings.autoSaved')} · ${t('settings.expiredCleanedResult', { count: updated.expired_cleaned })}`
@@ -2079,6 +2379,7 @@ export default function Settings() {
           ...settingsFormRef.current,
           ...getSettingsPatchValues({ ...previous, ...rollbackPatch }, rollbackKeys),
         })
+        markPersisted(getSettingsPatchValues({ ...previous, ...rollbackPatch }, rollbackKeys))
       }
       const message = getErrorMessage(error)
       showToast(`${t('settings.autoSaveFailed')}: ${message}`, 'error')
@@ -2141,8 +2442,7 @@ export default function Settings() {
         // 活跃 key 指向的条目被删掉时自动回落「第一个」,避免整次保存被后端校验拒绝。
         antigravity_oauth_client_key: agOAuth.rows.some(row => row.key.trim().toLowerCase() === activeKey) ? activeKey : '',
       })
-      commitSettingsForm({
-        ...settingsFormRef.current,
+      const agOAuthPatch: Partial<SystemSettings> = {
         antigravity_oauth_clients: updated.antigravity_oauth_clients,
         antigravity_oauth_client_key: updated.antigravity_oauth_client_key,
         antigravity_oauth_env_clients: updated.antigravity_oauth_env_clients,
@@ -2150,7 +2450,9 @@ export default function Settings() {
         antigravity_oauth_active_key_effective: updated.antigravity_oauth_active_key_effective,
         antigravity_oauth_using_builtin: updated.antigravity_oauth_using_builtin,
         antigravity_oauth_builtin_client: updated.antigravity_oauth_builtin_client,
-      })
+      }
+      commitSettingsForm({ ...settingsFormRef.current, ...agOAuthPatch })
+      markPersisted(agOAuthPatch)
       setAgOAuthDraft(null)
       showToast(t('settings.antigravityOAuth.saved'), 'success')
     } catch (error) {
@@ -2194,7 +2496,7 @@ export default function Settings() {
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
-    commitSettingsForm(settings)
+    setPersistedSettings(commitSettingsForm(settings))
     const branding = {
       site_name: settings.site_name,
       site_logo: settings.site_logo,
@@ -2208,6 +2510,7 @@ export default function Settings() {
     applyBranding(branding)
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setSyncedCliVersion(settings.codex_synced_cli_version ?? '')
+    setEffectiveCliVersion(settings.codex_effective_cli_version ?? '')
     setModelList(modelsResp.models ?? [])
     setModelItems(modelsResp.items ?? [])
     setModelsLastSyncedAt(modelsResp.last_synced_at)
@@ -2241,7 +2544,7 @@ export default function Settings() {
       // 自定义 Prompt 规则由规则页单独保存，避免普通设置提交覆盖并发发布结果。
       delete payload.prompt_filter_custom_patterns
       const updated = await api.updateSettings(payload)
-      commitSettingsForm(updated)
+      setPersistedSettings(commitSettingsForm(updated))
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -2383,6 +2686,7 @@ export default function Settings() {
     try {
       const result = await api.syncCodexCLIVersion()
       setSyncedCliVersion(result.effective_version)
+      setEffectiveCliVersion(result.effective_version)
       showToast(t('settings.cliVersionSyncSuccess', {
         version: result.effective_version,
         fetched: result.fetched_version || '-',
@@ -2406,6 +2710,7 @@ export default function Settings() {
         added: result.added,
         updated: result.updated,
         skipped: result.skipped?.length ?? 0,
+        removed: result.removed?.length ?? 0,
       }))
     } catch (error) {
       showToast(`${t('settings.modelsSyncFailed')}: ${getErrorMessage(error)}`, 'error')
@@ -2492,8 +2797,32 @@ export default function Settings() {
   const saveCodexUserAgentConfig = useCallback(() => {
     void autoSaveSettingsPatch({ codex_user_agent_config: settingsForm.codex_user_agent_config })
   }, [autoSaveSettingsPatch, settingsForm.codex_user_agent_config])
+  const dirtyKeys = useMemo(() => {
+    if (!persistedSettings) return [] as string[]
+    const current = normalizeLazySettingsForm(settingsForm) as unknown as Record<string, unknown>
+    const base = persistedSettings as unknown as Record<string, unknown>
+    const keys = new Set([...Object.keys(current), ...Object.keys(base)])
+    const changed: string[] = []
+    for (const key of keys) {
+      if (SETTINGS_DIRTY_IGNORED_KEYS.has(key)) continue
+      if (!settingsValueEquals(current[key], base[key])) changed.push(key)
+    }
+    return changed
+  }, [normalizeLazySettingsForm, persistedSettings, settingsForm])
+  const dirtyCount = dirtyKeys.length
+  const discardChanges = useCallback(() => {
+    if (!persistedSettings) return
+    commitSettingsForm(persistedSettings)
+    setResponseCacheValidationError(null)
+  }, [commitSettingsForm, persistedSettings])
+  // 有未保存改动时保存按钮才是主色；没改动也保留可点，脏检查漏判时用户仍能强制保存。
   const renderSaveButton = (className?: string) => (
-    <Button className={className} onClick={() => void handleSaveSettings()} disabled={savingSettings || autoSaveStatus === 'saving'}>
+    <Button
+      className={className}
+      variant={dirtyCount > 0 ? 'default' : 'outline'}
+      onClick={() => void handleSaveSettings()}
+      disabled={savingSettings || autoSaveStatus === 'saving'}
+    >
       <Save className="size-4" />
       {saveButtonLabel}
     </Button>
@@ -2515,7 +2844,6 @@ export default function Settings() {
   const location = useLocation()
   const tabParam = searchParams.get('tab')
   const activeTab: SettingsTabKey = isSettingsTabKey(tabParam) ? tabParam : DEFAULT_SETTINGS_TAB
-  const [endpointsOpen, setEndpointsOpen] = useState(false)
   const [modelPanel, setModelPanel] = useState<ModelPanelKey | null>(null)
   const settingsNavRef = useRef<HTMLElement | null>(null)
 
@@ -2558,6 +2886,18 @@ export default function Settings() {
     btn?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' })
   }, [activeTab])
 
+  const sectionIndexItems = useMemo(
+    () => SETTINGS_TAB_SECTION_INDEX[activeTab].map((item) => ({ id: item.id, label: t(item.labelKey), icon: item.icon })),
+    [activeTab, t],
+  )
+  const sectionIds = useMemo(() => SETTINGS_TAB_SECTION_INDEX[activeTab].map((item) => item.id), [activeTab])
+  const { activeId: activeSectionId, pinSection } = useActiveSettingsSection(sectionIds)
+  const hasSectionIndex = sectionIndexItems.length > 1
+  const jumpToSection = useCallback((sectionId: string) => {
+    pinSection(sectionId)
+    document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [pinSection])
+
   if (showInitialSkeleton) {
     return <SettingsSkeleton />
   }
@@ -2573,23 +2913,25 @@ export default function Settings() {
       errorTitle={t('settings.errorTitle')}
     >
       <>
-        {/* 占位，避免 fixed 导航挡住首屏 */}
-        <div aria-hidden="true" className="mb-5 h-14 sm:h-[4.25rem]" />
+        <PageHeader
+          title={t('settings.title')}
+          description={t('settings.description')}
+          actions={
+            <>
+              <SaveStatusPill autoSaveStatus={autoSaveStatus} dirtyCount={dirtyCount} />
+              {renderSaveButton('shrink-0')}
+            </>
+          }
+        />
 
-        {/* 顶部分段导航 + 自动保存状态：视口顶部居中固定 */}
-        <div
-          className={cn(
-            'fixed left-1/2 top-[max(0.625rem,env(safe-area-inset-top,0px))] z-50 flex w-full -translate-x-1/2 items-center gap-2',
-            'max-w-[min(72rem,calc(100vw-1.25rem))] px-1',
-          )}
-        >
+        {/* Tab 栏 + 分区目录一起跟随页面流、滚动时粘在顶部，不再用 fixed 悬浮盖住内容 */}
+        <div className="sticky top-2 z-30 mb-5 space-y-2.5 lg:top-3">
           <nav
             ref={settingsNavRef}
             role="tablist"
             aria-label={t('settings.navLabel')}
             className={cn(
-              'flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-full border border-border/80 bg-card/95 p-1.5 shadow-[0_10px_40px_hsl(222_30%_12%/0.12)] backdrop-blur-xl',
-              'ring-1 ring-black/[0.03] dark:ring-white/[0.06]',
+              'flex min-w-0 items-center gap-1 overflow-x-auto rounded-full border border-border/70 bg-card/95 p-1 shadow-sm backdrop-blur-xl',
               '[-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
             )}
           >
@@ -2605,9 +2947,9 @@ export default function Settings() {
                   aria-current={active ? 'true' : undefined}
                   onClick={() => selectTab(tab.id)}
                   className={cn(
-                    'inline-flex shrink-0 items-center justify-center gap-2 rounded-full px-3.5 py-1.5 text-[13px] font-semibold tracking-tight transition-all duration-200 sm:flex-1 sm:basis-0 sm:px-4 sm:py-2 sm:text-xs',
+                    'inline-flex shrink-0 items-center justify-center gap-2 rounded-full px-3.5 py-1.5 text-[13px] font-semibold tracking-tight transition-colors duration-200 sm:flex-1 sm:basis-0 sm:px-4 sm:py-1.5 sm:text-xs',
                     active
-                      ? 'bg-primary text-primary-foreground shadow-2xs ring-1 ring-primary/20 scale-[1.02]'
+                      ? 'bg-primary text-primary-foreground shadow-2xs'
                       : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
                   )}
                 >
@@ -2624,19 +2966,22 @@ export default function Settings() {
               )
             })}
           </nav>
+          {hasSectionIndex ? (
+            <SettingsSectionIndex
+              items={sectionIndexItems}
+              activeId={activeSectionId}
+              label={t('settings.sectionIndex')}
+              onSelect={jumpToSection}
+            />
+          ) : null}
         </div>
 
-        <PageHeader
-          title={t('settings.title')}
-          description={t('settings.description')}
-          actions={renderSaveButton('shrink-0')}
-        />
-
-        <div key={activeTab} className="space-y-6 pb-20 sm:pb-0">
+        <div key={activeTab} className="pb-4">
+          <div className="min-w-0 space-y-7">
           {activeTab === 'codex' ? (
             <>
               <SettingsSection id="settings-codex-quota" title={t('settings.nav.codexQuota')} description={t('settings.nav.codexQuotaDesc')} icon={<Gauge className="size-4" />}>
-              <div className="grid gap-4 lg:grid-cols-2">
+              <div className={SETTINGS_CARD_GRID_2}>
                 <SettingsCard title={t('settings.probeScheduling')} icon={<RefreshCw className="size-4" />}>
                   <div className="space-y-4">
                     <div className={SETTINGS_FIELD_GRID}>
@@ -2968,7 +3313,7 @@ export default function Settings() {
               {/* 调度策略跨渠道共用，归在通用设置；这里只做导流，避免用户在 Codex 页找不到。 */}
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3">
                 <div className="flex min-w-0 items-center gap-3">
-                  <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary ring-1 ring-primary/15">
+                  <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/70 text-muted-foreground ring-1 ring-border/60">
                     <Layers className="size-4" />
                   </div>
                   <div className="min-w-0">
@@ -3199,7 +3544,7 @@ export default function Settings() {
 
               <SettingsCard title={t('settings.codexContinueThinking')} description={t('settings.codexContinueThinkingDesc')} icon={<Brain className="size-4" />}>
                 <div className="space-y-4">
-                  <div className={SETTINGS_SWITCH_GRID}>
+                  <div className={SETTINGS_SWITCH_ROW}>
                     <SettingField label={t('settings.codexContinueThinking')} description={t('settings.codexContinueThinkingDesc')} layout="switch">
                       <Switch
                         checked={settingsForm.codex_continue_thinking_enabled}
@@ -3231,42 +3576,51 @@ export default function Settings() {
                 </div>
               </SettingsCard>
 
-              <div className="grid gap-4 lg:grid-cols-3 lg:items-start">
-              <SettingsCard title={t('settings.overflowAutoCompact')} description={t('settings.overflowAutoCompactDesc')} icon={<Layers className="size-4" />}>
-                <div className={SETTINGS_SWITCH_GRID}>
-                  <SettingField label={t('settings.overflowAutoCompactEnabled')} description={t('settings.overflowAutoCompactEnabledDesc')} layout="switch">
+              {/* 三个只有一个开关的兼容项合并成一张卡逐行排列，说明外显；拆成三张窄卡时开关会被挤成半宽折行。 */}
+              <SettingsCard title={t('settings.codexCompatToggles')} description={t('settings.codexCompatTogglesDesc')} icon={<Layers className="size-4" />}>
+                <div className={SETTINGS_ROW_LIST}>
+                  <SettingField
+                    label={t('settings.overflowAutoCompact')}
+                    description={t('settings.overflowAutoCompactDesc')}
+                    help={t('settings.overflowAutoCompactEnabledDesc')}
+                    layout="row"
+                  >
                     <Switch
+                      aria-label={t('settings.overflowAutoCompactEnabled')}
                       checked={settingsForm.overflow_auto_compact_enabled}
                       onCheckedChange={(checked) => autoSaveBooleanField('overflow_auto_compact_enabled', checked)}
                     />
                   </SettingField>
-                </div>
-              </SettingsCard>
-              <SettingsCard title={t('settings.compactViaResponses')} description={t('settings.compactViaResponsesDesc')} icon={<Layers className="size-4" />}>
-                <div className={SETTINGS_SWITCH_GRID}>
-                  <SettingField label={t('settings.compactViaResponsesEnabled')} description={t('settings.compactViaResponsesEnabledDesc')} layout="switch">
+                  <SettingField
+                    label={t('settings.compactViaResponses')}
+                    description={t('settings.compactViaResponsesDesc')}
+                    help={t('settings.compactViaResponsesEnabledDesc')}
+                    layout="row"
+                  >
                     <Switch
+                      aria-label={t('settings.compactViaResponsesEnabled')}
                       checked={settingsForm.compact_via_responses_enabled}
                       onCheckedChange={(checked) => autoSaveBooleanField('compact_via_responses_enabled', checked)}
                     />
                   </SettingField>
-                </div>
-              </SettingsCard>
-              <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
-                <div className={SETTINGS_SWITCH_GRID}>
-                  <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
+                  <SettingField
+                    label={t('settings.codexPreflightSSEPassthrough')}
+                    description={t('settings.codexPreflightSSEPassthroughDesc')}
+                    help={t('settings.codexPreflightSSEPassthroughEnabledDesc')}
+                    layout="row"
+                  >
                     <Switch
+                      aria-label={t('settings.codexPreflightSSEPassthroughEnabled')}
                       checked={settingsForm.codex_preflight_sse_passthrough_enabled}
                       onCheckedChange={(checked) => autoSaveBooleanField('codex_preflight_sse_passthrough_enabled', checked)}
                     />
                   </SettingField>
                 </div>
               </SettingsCard>
-              </div>
 
               <SettingsCard title={t('settings.codexOverloadPause')} description={t('settings.codexOverloadPauseDesc')} icon={<ShieldAlert className="size-4" />}>
                 <div className="space-y-4">
-                  <div className={SETTINGS_SWITCH_GRID}>
+                  <div className={SETTINGS_SWITCH_ROW}>
                     <SettingField label={t('settings.codexOverloadPauseEnabled')} description={t('settings.codexOverloadPauseEnabledDesc')} layout="switch">
                       <Switch
                         checked={settingsForm.codex_overload_pause_enabled}
@@ -3459,10 +3813,24 @@ export default function Settings() {
                       />
                     </SettingField>
                     <SettingField label={t('settings.codexMinCliVersion')} description={t('settings.codexMinCliVersionDesc')}>
-                      <Input
-                        value={settingsForm.codex_min_cli_version}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_min_cli_version: e.target.value }))}
-                      />
+                      <div className="flex items-center gap-2">
+                        <Input
+                          className="min-w-0 flex-1"
+                          value={settingsForm.codex_min_cli_version}
+                          onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_min_cli_version: e.target.value }))}
+                        />
+                        {/* 一键把阈值对齐到当前同步到的 CLI 版本；只改表单值,随「保存设置」落库 */}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="shrink-0"
+                          disabled={!effectiveCliVersion || settingsForm.codex_min_cli_version.trim() === effectiveCliVersion}
+                          title={effectiveCliVersion ? t('settings.codexMinCliVersionUseSyncedDesc', { version: effectiveCliVersion }) : t('settings.codexMinCliVersionNoSynced')}
+                          onClick={() => setSettingsForm(f => ({ ...f, codex_min_cli_version: effectiveCliVersion }))}
+                        >
+                          {t('settings.codexMinCliVersionUseSynced')}
+                        </Button>
+                      </div>
                     </SettingField>
                     <SettingField label={t('settings.codexCliVersionSync')} description={t('settings.codexCliVersionSyncDesc')}>
                       <div className="flex items-center gap-2">
@@ -3557,7 +3925,7 @@ export default function Settings() {
                       <Input
                         className="font-mono text-xs"
                         value={codexUserAgentConfig.raw_user_agent ?? ''}
-                        placeholder="codex-tui/0.144.1 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.144.1)"
+                        placeholder="codex-tui/0.153.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.153.3)"
                         onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ raw_user_agent: e.target.value })}
                         onBlur={saveCodexUserAgentConfig}
                       />
@@ -3995,7 +4363,7 @@ export default function Settings() {
                       />
                     </SettingField>
                   </div>
-                  <div className={SETTINGS_SWITCH_GRID}>
+                  <div className={SETTINGS_SWITCH_ROW}>
                     <SettingField label={t('settings.grokQualityGuardEnabled')} description={t('settings.grokQualityGuardEnabledDesc')} layout="switch">
                       <Switch
                         checked={settingsForm.grok_quality_guard_enabled}
@@ -4190,7 +4558,7 @@ export default function Settings() {
                         </div>
                       </div>
                     </SettingField>
-                    <div className={SETTINGS_SWITCH_GRID}>
+                    <div className={SETTINGS_SWITCH_ROW}>
                       <SettingField label={t('settings.showFullUsageNumbers')} description={t('settings.showFullUsageNumbersDesc')} layout="switch">
                         <Switch
                           checked={settingsForm.show_full_usage_numbers}
@@ -4381,6 +4749,9 @@ export default function Settings() {
                     </Badge>
                   </StatusTile>
                 </div>
+              </SettingsCard>
+              <SettingsCard title={t('settings.visibleChannelsTitle')} description={t('settings.visibleChannelsDesc')} icon={<Eye className="size-4" />}>
+                <VisibleChannelsPicker />
               </SettingsCard>
               </SettingsSection>
 
@@ -4875,7 +5246,7 @@ export default function Settings() {
                       />
                     </SettingField>
                   </div>
-                  <div className={SETTINGS_SWITCH_GRID}>
+                  <div className={SETTINGS_SWITCH_ROW}>
                     <SettingField label={t('settings.firstTokenExcludesWsAcquire')} description={t('settings.firstTokenExcludesWsAcquireDesc')} layout="switch" channels={CHANNELS_CODEX_ONLY}>
                       <Switch
                         checked={settingsForm.first_token_excludes_ws_acquire}
@@ -5202,34 +5573,9 @@ export default function Settings() {
               </SettingsSection>
 
               <SettingsSection id="settings-reference" title={t('settings.nav.reference')} description={t('settings.nav.referenceDesc')} icon={<Link2 className="size-4" />}>
-                <div className="overflow-hidden rounded-xl border border-border bg-card/85 shadow-sm">
-                  <button
-                    type="button"
-                    onClick={() => setEndpointsOpen((open) => !open)}
-                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/30"
-                  >
-                    <div className="flex min-w-0 items-center gap-3">
-                      <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary ring-1 ring-primary/15">
-                        <Link2 className="size-4" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-foreground">
-                          {t('settings.apiEndpoints')}
-                        </div>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {t('settings.nav.endpointsHint')}
-                        </p>
-                      </div>
-                    </div>
-                    <ChevronDown
-                      className={cn(
-                        'size-4 shrink-0 text-muted-foreground transition-transform',
-                        endpointsOpen && 'rotate-180',
-                      )}
-                    />
-                  </button>
-                  {endpointsOpen ? (
-                    <div className="space-y-3 border-t border-border px-4 py-3">
+                {/* 只读参考表常驻展开：折叠起来用户找不到端点列表。 */}
+                <SettingsCard title={t('settings.apiEndpoints')} description={t('settings.nav.endpointsHint')} icon={<Link2 className="size-4" />}>
+                    <div className="space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <p className="text-xs text-muted-foreground">
                           {t('settings.nav.endpointsReadonly')}
@@ -5313,17 +5659,35 @@ export default function Settings() {
                         </Table>
                       </div>
                     </div>
-                  ) : null}
-                </div>
+                </SettingsCard>
               </SettingsSection>
             </>
           ) : null}
-
-          <div className="flex justify-end max-lg:sticky max-lg:bottom-[calc(5.5rem+env(safe-area-inset-bottom,0px))] max-lg:z-20 max-lg:-mx-1 max-lg:rounded-xl max-lg:border max-lg:border-border max-lg:bg-card/95 max-lg:p-2 max-lg:shadow-lg max-lg:backdrop-blur-md">
-            {renderSaveButton('w-full sm:w-auto')}
           </div>
         </div>
 
+        {/* 只有手动保存字段有改动时才出现的底部操作条；开关/下拉类已自动保存，不需要它。 */}
+        {dirtyCount > 0 ? (
+          <div
+            role="status"
+            className="sticky bottom-3 z-30 mt-2 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-card/95 px-4 py-2.5 shadow-lg backdrop-blur-md max-lg:bottom-[calc(5.5rem+env(safe-area-inset-bottom,0px))]"
+          >
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="size-2 shrink-0 rounded-full bg-amber-500" aria-hidden="true" />
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-foreground">{t('settings.saveStatusUnsaved', { n: dirtyCount })}</div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground sm:text-xs">{t('settings.saveStatusUnsavedHint')}</p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2 max-sm:w-full">
+              <Button variant="ghost" size="sm" onClick={discardChanges} disabled={savingSettings} className="max-sm:flex-1">
+                <RotateCcw className="size-3.5" />
+                {t('settings.discardChanges')}
+              </Button>
+              {renderSaveButton('max-sm:flex-1')}
+            </div>
+          </div>
+        ) : null}
       </>
     </StateShell>
   )
