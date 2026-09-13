@@ -6,7 +6,17 @@ import (
 	"io"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 )
+
+// upstreamResponseReadContext 保留普通请求取消后的有界 usage 补读窗口。
+// 持续重试的私有尝试则随下游立即结束，不能因补读而延长重试生命周期。
+func upstreamResponseReadContext(downstreamCtx, upstreamCtx context.Context, policy database.ContinuousRetryPolicy) context.Context {
+	if continuousRetryBuffersAttempts(policy) || upstreamCtx == nil {
+		return downstreamCtx
+	}
+	return upstreamCtx
+}
 
 // readAllLimitedWithContinuousRetryKeepalive 将读取上限与请求级保活组合，
 // 用于非流式成功响应及原生协议 JSON 聚合，避免读体阶段长时间没有下游活动。
@@ -45,11 +55,10 @@ func setContinuousRetryKeepaliveActive(ctx context.Context, active bool) {
 	if keepalive == nil {
 		return
 	}
-	if controller, ok := keepalive.(interface{ SetActive(bool) }); ok {
-		controller.SetActive(active)
-		return
+	if controller, ok := keepalive.(interface{ SetEnabled(bool) }); ok {
+		controller.SetEnabled(active)
 	}
 	if active {
-		keepalive.Activate()
+		activateContinuousRetryKeepalive(ctx)
 	}
 }

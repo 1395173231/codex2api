@@ -148,7 +148,7 @@ func TestForwardGrokNativePrivateAttemptDoesNotPublishFailedHeaders(t *testing.T
 	t.Cleanup(func() { _ = attempt.Close() })
 
 	_, outcome, _, _ := forwardGrokNativeResponseTo(
-		ctx, resp, GrokProtocolResponses, true, time.Now(), nil,
+		ctx.Request.Context(), ctx, resp, GrokProtocolResponses, true, time.Now(), nil,
 		attempt.writerOr(recorder), attempt.flusherOr(recorder),
 	)
 	if outcome.logStatusCode == http.StatusOK {

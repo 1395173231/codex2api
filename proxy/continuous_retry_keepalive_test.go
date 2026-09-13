@@ -82,13 +82,26 @@ func TestRequestContinuousRetryKeepaliveAccumulatesShortWaits(t *testing.T) {
 // TestSetContinuousRetryKeepaliveActive 验证请求级保活可以切换激活状态。
 func TestSetContinuousRetryKeepaliveActive(t *testing.T) {
 	keepalive := &requestContinuousRetryKeepalive{}
-	keepalive.SetActive(true)
+	ctx := contextWithContinuousRetryKeepalive(keepalive)
+	setContinuousRetryKeepaliveActive(ctx, true)
 	if !keepalive.Active() {
 		t.Fatal("keepalive was not activated")
 	}
-	keepalive.SetActive(false)
+	setContinuousRetryKeepaliveActive(ctx, false)
 	if keepalive.Active() {
 		t.Fatal("keepalive was not deactivated")
+	}
+	keepalive.Activate()
+	if keepalive.Active() {
+		t.Fatal("quota admission or retry reactivated disabled keepalive")
+	}
+	keepalive.last = time.Now().Add(-time.Hour)
+	if delay := continuousRetryKeepaliveDelay(keepalive); delay != continuousRetryKeepaliveInterval {
+		t.Fatalf("disabled keepalive must not busy-loop: delay=%s", delay)
+	}
+	setContinuousRetryKeepaliveActive(ctx, true)
+	if !keepalive.Active() {
+		t.Fatal("switching to an enabled provider did not reactivate keepalive")
 	}
 }
 

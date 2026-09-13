@@ -673,6 +673,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
@@ -905,7 +906,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, readErr := readAllLimitedWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, upstreamErrorBodyReadMaxBytes)
+			errBody, readErr := readAllLimitedWithContinuousRetryKeepalive(readCtx, resp.Body, upstreamErrorBodyReadMaxBytes)
 			if readErr != nil {
 				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
 			}
@@ -1076,7 +1077,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if account.IsClaudeOAuth() && (!isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy)) {
 				copyClaudeNativeResponseHeaders(c, resp.Header)
 			}
-			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(readCtx, c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
 			if account.IsClaudeOAuth() {
 				// Anthropic 的 input_tokens 不含缓存命中/写入，转换成计费层的总输入口径。
 				applyAnthropicUsageSemantics(usage)
@@ -1249,7 +1250,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
 			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
 			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				// 保活写失败已判定下游断开:不再翻译/写入,停止读取。
 				if writeErr != nil {
 					return false
@@ -1412,7 +1413,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			accumulator := newAnthropicResponseAccumulator(originalModel)
 
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				if eventType == "error" {

@@ -286,6 +286,8 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 
 上述 HTTP/SSE 保活覆盖 `/v1/responses`（含 relay/native、stream 与 non-stream）、`/v1/chat/completions`、`/v1/messages`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/images/generations` 和 `/v1/images/edits`；视频、image jobs 与 `POST /v1/live` 不启用这套保活。Claude 原生 Messages 的首字前及已提交流保活继续由 `stream_keepalive_enabled` 共同控制，缺省为开启。
 
+配置 API Key 模型请求次数预算时，额度准入完成前不会因保活提交 SSE 200；准入或重试也不会重新开启已关闭的 Claude 保活。普通 Responses、Chat Completions 和 Messages 请求在下游取消后停止发送心跳，并沿用最多 5 秒的上游 usage 补读窗口；持续重试的响应读取仍随下游取消立即结束。
+
 单次流式尝试的暂存上限为 64 MiB，前 8 MiB 使用内存，之后写入立即 unlink 的 mode-0600 临时文件；暂存超限或存储失败会作为本地错误立即停止。当前没有跨请求的进程级暂存总预算，高并发环境需要另行限制并发并监控内存与临时磁盘。Responses HTTP 等待期间若 SSE 心跳已提交响应头，最终成功账号的 `X-Codex-Turn-State` 无法再补发，因此实现会省略该头而不会转发失败账号的状态；无法安全展开为自包含请求的账号绑定 continuation 也不会强行换号。
 
 客户端取消、下游写失败、WebSocket 断开、入口校验、账号池/并发调度、本地提示词或输出策略拒绝、暂存资源失败和成功回放失败都立即结束，绝不作为上游错误继续轮换。普通图片请求仍以 5 次为上限，普通 Grok 图片/视频创建仍以 3 次为上限；一旦错误被持续策略选中（含 `catch_all`），就会越过普通上限，直到成功或客户端取消。图片/视频创建可能重复生成和重复扣费，因为上游未必支持可靠幂等键。超级模式还可能持续消耗 token、请求次数、余额、账号配额、暂存内存与磁盘，并长期占用 API Key 与 scope 并发槽位、阻塞较新的请求，必须显式承担风险后开启。

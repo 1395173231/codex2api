@@ -27,11 +27,13 @@ type continuousRetryKeepalive interface {
 type continuousRetryKeepaliveContextKey struct{}
 
 type requestContinuousRetryKeepalive struct {
-	mu     sync.Mutex
-	active bool
-	last   time.Time
-	write  func() error
-	cancel context.CancelCauseFunc
+	mu       sync.Mutex
+	active   bool
+	disabled bool
+	ctx      context.Context
+	last     time.Time
+	write    func() error
+	cancel   context.CancelCauseFunc
 }
 
 // Activate 开始请求级保活时间窗；重复激活不会重置已有时间窗。
@@ -41,6 +43,9 @@ func (k *requestContinuousRetryKeepalive) Activate() {
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.disabled || (k.ctx != nil && k.ctx.Err() != nil) {
+		return
+	}
 	if !k.active {
 		k.active = true
 		// 从请求具备下游保活资格时开始计时；后续短等待共用同一时间窗，
@@ -49,22 +54,23 @@ func (k *requestContinuousRetryKeepalive) Activate() {
 	}
 }
 
-// Deactivate 停止请求级保活，但保留请求上下文供调用方收尾。
-func (k *requestContinuousRetryKeepalive) Deactivate() {
-	if k != nil {
-		k.mu.Lock()
-		defer k.mu.Unlock()
+// SetEnabled 保存端点的保活开关；准入和重试不能重新开启明确关闭的保活。
+// 重新允许保活后仍须单独通过额度准入检查并 Activate。
+func (k *requestContinuousRetryKeepalive) SetEnabled(enabled bool) {
+	if k == nil {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.disabled = !enabled
+	if !enabled {
 		k.active = false
 	}
 }
 
-// SetActive 根据端点协议开关启用或停用请求级保活。
-func (k *requestContinuousRetryKeepalive) SetActive(active bool) {
-	if active {
-		k.Activate()
-		return
-	}
-	k.Deactivate()
+// activeLocked 同时检查准入状态与下游生命周期，调用方须持有 mu。
+func (k *requestContinuousRetryKeepalive) activeLocked() bool {
+	return k.active && !k.disabled && (k.ctx == nil || k.ctx.Err() == nil)
 }
 
 // Active 报告请求级保活当前是否处于激活状态。
@@ -74,7 +80,7 @@ func (k *requestContinuousRetryKeepalive) Active() bool {
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return k.active
+	return k.activeLocked()
 }
 
 // Keepalive 在心跳到期时写入一次协议保活，并在写失败时取消请求。
@@ -84,7 +90,7 @@ func (k *requestContinuousRetryKeepalive) Keepalive() error {
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if !k.active || k.write == nil {
+	if !k.activeLocked() || k.write == nil {
 		return nil
 	}
 	if continuousRetryKeepaliveInterval <= 0 {
@@ -147,7 +153,7 @@ func installContinuousRetrySSEKeepaliveWithOptions(c *gin.Context, stream bool, 
 	}
 	original := c.Request
 	requestCtx, cancel := context.WithCancelCause(original.Context())
-	keepalive := &requestContinuousRetryKeepalive{write: func() error {
+	keepalive := &requestContinuousRetryKeepalive{ctx: requestCtx, write: func() error {
 		setSSEStreamHeaders(c, options.contentType)
 		if !c.Writer.Written() {
 			// Cloudflare 对 102 之后的最终响应仍有 125s 限制；长期保活
@@ -209,6 +215,7 @@ func installContinuousRetryHTTPInformationalKeepalive(c *gin.Context) func() {
 	original := c.Request
 	requestCtx, cancel := context.WithCancelCause(original.Context())
 	keepalive := &requestContinuousRetryKeepalive{
+		ctx: requestCtx,
 		write: func() error {
 			// net/http flushes informational headers immediately. Do not call
 			// Flush: it would implicitly send the final 200 status.
@@ -279,7 +286,7 @@ func continuousRetryKeepaliveDelay(keepalive continuousRetryKeepalive) time.Dura
 	}
 	requestKeepalive.mu.Lock()
 	defer requestKeepalive.mu.Unlock()
-	if requestKeepalive.last.IsZero() {
+	if !requestKeepalive.activeLocked() || requestKeepalive.last.IsZero() {
 		return continuousRetryKeepaliveInterval
 	}
 	delay := continuousRetryKeepaliveInterval - time.Since(requestKeepalive.last)
@@ -408,6 +415,19 @@ type continuousRetryReadResult struct {
 	err  error
 }
 
+// keepaliveWhileReading 停止向断开的下游写入，但保留独立上游 context 的
+// 有界补读。持续重试使用下游 context，写失败仍会立即终止当前尝试。
+func keepaliveWhileReading(ctx context.Context, keepalive continuousRetryKeepalive) error {
+	err := keepalive.Keepalive()
+	if err != nil && ctx.Err() == nil {
+		if requestKeepalive, ok := keepalive.(*requestContinuousRetryKeepalive); ok &&
+			requestKeepalive.ctx != nil && requestKeepalive.ctx.Err() != nil {
+			return nil
+		}
+	}
+	return err
+}
+
 // readAllWithContinuousRetryKeepalive keeps an active JSON retry alive while
 // the upstream response body is still being read. The worker owns the read;
 // the caller goroutine remains the sole downstream writer. 上游 JSON body
@@ -425,7 +445,7 @@ func readAllWithContinuousRetryKeepalive(ctx context.Context, reader io.Reader) 
 	for {
 		delay := continuousRetryKeepaliveDelay(keepalive)
 		if delay <= 0 {
-			if err := keepalive.Keepalive(); err != nil {
+			if err := keepaliveWhileReading(ctx, keepalive); err != nil {
 				return nil, err
 			}
 			delay = continuousRetryKeepaliveDelay(keepalive)
@@ -439,7 +459,7 @@ func readAllWithContinuousRetryKeepalive(ctx context.Context, reader io.Reader) 
 			stopContinuousRetryTimer(timer)
 			return callResult.data, callResult.err
 		case <-timer.C:
-			if err := keepalive.Keepalive(); err != nil {
+			if err := keepaliveWhileReading(ctx, keepalive); err != nil {
 				return nil, err
 			}
 		case <-ctx.Done():
@@ -502,7 +522,7 @@ func readStreamWithContinuousRetryKeepalive[T any](ctx context.Context, read fun
 			stopContinuousRetryTimer(timer)
 			return err
 		case <-timer.C:
-			if err := keepalive.Keepalive(); err != nil {
+			if err := keepaliveWhileReading(ctx, keepalive); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -545,7 +565,7 @@ func waitWithContinuousRetryKeepalive(ctx context.Context, interval time.Duratio
 	if keepalive == nil || continuousRetryKeepaliveInterval <= 0 {
 		return waitForRetryInterval(ctx, interval)
 	}
-	keepalive.Activate()
+	activateContinuousRetryKeepalive(ctx)
 	remaining := interval
 	for remaining > 0 {
 		step := continuousRetryKeepaliveDelay(keepalive)

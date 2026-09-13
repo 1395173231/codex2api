@@ -1015,20 +1015,20 @@ func continuousRetryProtocolForGrok(protocol GrokProtocol) continuousRetryHTTPPr
 // projection is inspected only for terminal state, usage, and the pre-output
 // retry boundary. firstTokenMs is measured from startedAt.
 func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func()) (*UsageInfo, streamOutcome, bool, int) {
-	return forwardGrokNativeResponseTo(c, resp, protocol, streaming, startedAt, firstVisible, nil, nil)
+	return forwardGrokNativeResponseTo(c.Request.Context(), c, resp, protocol, streaming, startedAt, firstVisible, nil, nil)
 }
 
-func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher) (*UsageInfo, streamOutcome, bool, int) {
-	return forwardGrokNativeResponseObserved(c, resp, protocol, streaming, startedAt, firstVisible, output, outputFlusher, nil)
+func forwardGrokNativeResponseTo(readCtx context.Context, c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher) (*UsageInfo, streamOutcome, bool, int) {
+	return forwardGrokNativeResponseObserved(readCtx, c, resp, protocol, streaming, startedAt, firstVisible, output, outputFlusher, nil)
 }
 
 // observe stages metadata without changing the provider's wire bytes. The
 // handler commits that metadata only after this attempt and its replay succeed.
-func forwardGrokNativeResponseObserved(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher, observe func([]byte)) (*UsageInfo, streamOutcome, bool, int) {
+func forwardGrokNativeResponseObserved(readCtx context.Context, c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher, observe func([]byte)) (*UsageInfo, streamOutcome, bool, int) {
 	privateAttempt := output != nil && output != c.Writer
 	resp.Header.Del(grokNativeRouteHeader)
 	if !streaming {
-		body, err := readAllLimitedWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, grokMaxDecodedBody)
+		body, err := readAllLimitedWithContinuousRetryKeepalive(readCtx, resp.Body, grokMaxDecodedBody)
 		if err != nil {
 			return nil, classifyStreamOutcome(nil, err, nil, false), false, 0
 		}
@@ -1087,7 +1087,7 @@ func forwardGrokNativeResponseObserved(c *gin.Context, resp *http.Response, prot
 	var pending bytes.Buffer
 	writeErr := error(nil)
 	frameErr := error(nil)
-	readErr := readRawGrokSSEFramesWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(frame rawGrokSSEFrame) bool {
+	readErr := readRawGrokSSEFramesWithContinuousRetryKeepalive(readCtx, resp.Body, func(frame rawGrokSSEFrame) bool {
 		if frame.HasData && !frame.Done {
 			if observe != nil {
 				observe(frame.Data)
@@ -4108,6 +4108,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				lastUpstreamCancel()
 			}
 			upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+			readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 			lastUpstreamCancel = upstreamCancel
 			ttftGuard := (*firstTokenTimeoutGuard)(nil)
 			if isStream {
@@ -4243,7 +4244,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 				}
 				retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
-				errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), resp.Body)
+				errBody, _ := readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
 				rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 				resp.Body.Close()
 				if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -4378,7 +4379,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				downstreamFlusher, _ := c.Writer.(http.Flusher)
 				streamAttempt := h.newContinuousRetryStreamAttempt(isStream && continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
 				var compactionDigests compactionProvenanceDigests
-				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseObserved(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher), compactionDigests.addPayload)
+				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseObserved(readCtx, c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher), compactionDigests.addPayload)
 				totalDuration := int(time.Since(start).Milliseconds())
 				stopTTFTGuard()
 				resp.Body.Close()
@@ -4523,7 +4524,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				emptyIncomplete := &emptyIncompleteTracker{}
-				readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+				readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 					streamDiag.markUpstreamFrame()
 					if account.IsGrokAPI() || continuousRetryBuffersAttempts(continuousRetryPolicy) {
 						compactionDigests.addPayload(data)
@@ -4634,7 +4635,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			} else {
 				var respBody []byte
-				respBody, readErr = readAllWithContinuousRetryKeepalive(c.Request.Context(), resp.Body)
+				respBody, readErr = readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
 				if readErr == nil {
 					if isEmptyIncompleteResponseBody(respBody) {
 						respBody = synthesizeEmptyIncompleteFailureBody(respBody)
@@ -4883,6 +4884,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
@@ -4993,7 +4995,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
 			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
-			errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), resp.Body)
+			errBody, _ := readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -5419,7 +5421,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					resp = foldRes.FinalResponse
 				}
 			} else {
-				readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, forwardWithEvent)
+				readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, forwardWithEvent)
 			}
 			// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 			// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
@@ -5441,7 +5443,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			emptyIncomplete := &emptyIncompleteTracker{}
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
 				} else {
@@ -6860,6 +6862,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
@@ -6984,7 +6987,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), resp.Body)
+			errBody, _ := readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolChat) {
@@ -7088,7 +7091,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if isGrokNativeRouteResponse(resp) {
 			downstreamFlusher, _ := c.Writer.(http.Flusher)
 			streamAttempt := h.newContinuousRetryStreamAttempt(isStream && continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
-			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolChatCompletions, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(readCtx, c, resp, GrokProtocolChatCompletions, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
 			totalDuration := int(time.Since(start).Milliseconds())
 			ttftGuard.Stop()
 			resp.Body.Close()
@@ -7227,7 +7230,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
 			var pendingFirstTokenChunks bytes.Buffer
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				if eventType == "response.failed" {
@@ -7393,7 +7396,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			outputCollector := newResponseOutputCollector()
 			var finishReasonOverride string
 
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				outputCollector.Add(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
