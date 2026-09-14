@@ -1719,10 +1719,13 @@ type accountResponse struct {
 	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
+	CreditsValid                  bool                        `json:"credits_valid"`
 	CreditsBalance                *string                     `json:"credits_balance"`
 	CreditsHasCredits             *bool                       `json:"credits_has_credits"`
 	CreditsUnlimited              *bool                       `json:"credits_unlimited"`
 	CreditsOverageLimitReached    *bool                       `json:"credits_overage_limit_reached"`
+	CreditsSpendControlReached    *bool                       `json:"credits_spend_control_reached,omitempty"`
+	CreditsRateLimitReachedType   string                      `json:"credits_rate_limit_reached_type,omitempty"`
 	AutoPause5hThreshold          *float64                    `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold          *float64                    `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled           bool                        `json:"auto_pause_5h_disabled"`
@@ -3878,6 +3881,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			allowDuplicate: req.AllowDuplicate,
 			customHeaders:  customHeaders,
 		})
+		seed = hydrateSeedWithWhoAmI(ctx, seed, req.ProxyURL)
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
 			if err != nil {
@@ -4007,6 +4011,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
+		seed = hydrateSeedWithWhoAmI(ctx, seed, req.ProxyURL)
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
 			if err != nil {

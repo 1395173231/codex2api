@@ -105,6 +105,7 @@ import {
   needsUsageReload,
   officialUsdValue,
   supportsOfficialUsage,
+  isWorkspaceCreditHardStop,
 } from "../lib/usageFormat";
 import {
   applyOptionalWorkspaceRouteHeader,
@@ -530,12 +531,18 @@ function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
 
-// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测、已达硬限制）返回 null。
 function getCreditBalanceDisplay(account: AccountRow): string | null {
-  if (!account.credits_has_credits) return null;
+  if (account.credits_valid === false) return null;
+  if (isWorkspaceCreditHardStop(account) || account.credits_overage_limit_reached) return null;
   if (account.credits_unlimited) return "∞";
+  if (!account.credits_has_credits) return null;
   const balance = (account.credits_balance ?? "").trim();
-  return balance ? balance : null;
+  const parsed = Number.parseFloat(balance);
+  if (balance && Number.isFinite(parsed) && parsed > 0) {
+    return balance;
+  }
+  return "✓";
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -1338,7 +1345,9 @@ const AccountTableRow = memo(function AccountTableRow({
                                               ? t(
                                                   "accounts.creditsBalanceUnlimited",
                                                 )
-                                              : t(
+                                              : getCreditBalanceDisplay(account) === "✓"
+                                                ? t("accounts.creditsBalanceAvailable")
+                                                : t(
                                                   "accounts.creditsBalanceBadge",
                                                   {
                                                     balance:
@@ -13623,7 +13632,9 @@ function AccountMobileCard({
                   title={
                     account.credits_unlimited
                       ? t("accounts.creditsBalanceUnlimited")
-                      : t("accounts.creditsBalanceBadge", { balance: creditBalance })
+                      : creditBalance === "✓"
+                        ? t("accounts.creditsBalanceAvailable")
+                        : t("accounts.creditsBalanceBadge", { balance: creditBalance })
                   }
                 >
                   <Coins className="size-3" />

@@ -278,13 +278,17 @@ type Account struct {
 	ApplicableResetCreditsValid bool
 	// Credits* 是 wham/usage 返回的 credits 积分余额快照（零额度成本）。
 	// Balance 原样保留上游字符串（单位未知，不做换算）；Valid 表示已探测过。
-	CreditsBalance             string
-	CreditsHasCredits          bool
-	CreditsUnlimited           bool
-	CreditsOverageLimitReached bool
-	CreditsValid               bool
+	CreditsBalance              string
+	CreditsBalanceKnown         bool
+	CreditsHasCredits           bool
+	CreditsUnlimited            bool
+	CreditsOverageLimitReached  bool
+	CreditsSpendControlReached  bool
+	CreditsSpendControlValid    bool
+	CreditsRateLimitReachedType string
+	CreditsValid                bool
 	// creditsPersistedKey 是最近一次成功落库的积分快照指纹，用于跳过无变化的写库。
-	// 只比对四个业务字段，不含时间戳——否则每次探针都会写一次库。
+	// 只比对业务字段，不含时间戳——否则每次探针都会写一次库。
 	creditsPersistedKey string
 	// resetCreditsProbedAt 记录最近一次成功 wham 用量探针的时间。
 	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
@@ -1714,19 +1718,49 @@ func creditsBalanceValue(raw string) float64 {
 	return v
 }
 
+// isWorkspaceCreditHardStop 判断 rate_limit_reached_type 是否为 workspace 级别的强制停止信号。
+// 官方 Codex 客户端中：
+// - workspace_owner_credits_depleted
+// - workspace_member_credits_depleted
+// - workspace_owner_usage_limit_reached
+// - workspace_member_usage_limit_reached
+// 这些均属于工作区级配额耗尽或达到上限的权威 hard-stop，不能用积分顶替。
+func isWorkspaceCreditHardStop(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "workspace_owner_credits_depleted",
+		"workspace_member_credits_depleted",
+		"workspace_owner_usage_limit_reached",
+		"workspace_member_usage_limit_reached":
+		return true
+	default:
+		return false
+	}
+}
+
 // creditsAvailableLocked 判断账号当前是否还有可花的积分（需持有 mu 读锁）。
 //
 // CreditsValid=false 表示 wham 探针还没跑过、余额未知，这里按「没有积分」处理：
 // 宁可白等一个用量窗口，也不要把请求送进注定 429 的账号。
-// OverageLimitReached 是上游给的权威「超额额度已用尽」信号，优先于余额数字。
+//
+// 判定顺序：
+// 1. 未探测或标记无效 -> false
+// 2. workspace hard-stop (spend_control.reached=true 或 rate_limit_reached_type 耗尽/超限) -> false
+// 3. 上游 overage_limit_reached (兼容旧上游) -> false
+// 4. unlimited=true 或 has_credits=true -> true (官方 Codex 明确允许 has_credits=true 且 balance 隐藏)
 func (a *Account) creditsAvailableLocked() bool {
-	if !a.CreditsValid || a.CreditsOverageLimitReached {
+	if !a.CreditsValid {
 		return false
 	}
-	if a.CreditsUnlimited {
-		return true
+	if a.CreditsSpendControlValid && a.CreditsSpendControlReached {
+		return false
 	}
-	return a.CreditsHasCredits && creditsBalanceValue(a.CreditsBalance) > 0
+	if isWorkspaceCreditHardStop(a.CreditsRateLimitReachedType) {
+		return false
+	}
+	if a.CreditsOverageLimitReached {
+		return false
+	}
+	return a.CreditsUnlimited || a.CreditsHasCredits
 }
 
 // creditSkipsUsageWindowLocked 判断是否用积分顶替用量窗口限流。
@@ -2391,22 +2425,80 @@ func (a *Account) GetApplicableResetCredits() (int, bool) {
 	return a.ApplicableResetCredits, a.ApplicableResetCreditsValid
 }
 
-// SetCreditBalance 记录 wham/usage 返回的 credits 积分余额快照。
-func (a *Account) SetCreditBalance(balance string, hasCredits, unlimited, overageReached bool) {
+// SetCreditBalanceDetails 记录 wham/usage 或响应头返回的完整 credits 积分与配额状态。
+func (a *Account) SetCreditBalanceDetails(balance *string, hasCredits, unlimited, overageReached bool,
+	spendControlReached *bool, rateLimitReachedType string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.CreditsBalance = balance
+	if balance != nil {
+		a.CreditsBalance = strings.TrimSpace(*balance)
+		a.CreditsBalanceKnown = true
+	} else {
+		a.CreditsBalance = ""
+		a.CreditsBalanceKnown = false
+	}
 	a.CreditsHasCredits = hasCredits
 	a.CreditsUnlimited = unlimited
 	a.CreditsOverageLimitReached = overageReached
+	if spendControlReached != nil {
+		a.CreditsSpendControlReached = *spendControlReached
+		a.CreditsSpendControlValid = true
+	}
+	a.CreditsRateLimitReachedType = strings.TrimSpace(rateLimitReachedType)
 	a.CreditsValid = true
 }
 
+// SetCreditBalance 记录 wham/usage 返回的 credits 积分余额快照（向后兼容接口）。
+func (a *Account) SetCreditBalance(balance string, hasCredits, unlimited, overageReached bool) {
+	trimmed := strings.TrimSpace(balance)
+	var balPtr *string
+	if trimmed != "" {
+		balPtr = &trimmed
+	}
+	a.SetCreditBalanceDetails(balPtr, hasCredits, unlimited, overageReached, nil, "")
+}
+
+// SetRateLimitReachedType 更新账号的 rate_limit_reached_type。
+func (a *Account) SetRateLimitReachedType(kind string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.CreditsRateLimitReachedType = strings.TrimSpace(kind)
+}
+
+// ApplySparseCreditsHeaders 应用普通 Codex 响应头携带的 sparse credits 观测信息。
+func (a *Account) ApplySparseCreditsHeaders(hasCredits, unlimited bool, balance *string, overageReached *bool, rateLimitReachedType string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.CreditsValid = true
+	a.CreditsHasCredits = hasCredits
+	a.CreditsUnlimited = unlimited
+	if balance != nil {
+		a.CreditsBalance = strings.TrimSpace(*balance)
+		a.CreditsBalanceKnown = true
+	}
+	if overageReached != nil {
+		a.CreditsOverageLimitReached = *overageReached
+	}
+	if rateLimitReachedType != "" {
+		a.CreditsRateLimitReachedType = strings.TrimSpace(rateLimitReachedType)
+	}
+}
+
 // GetCreditBalance 返回 credits 积分余额快照及其是否已探测过。
-func (a *Account) GetCreditBalance() (balance string, hasCredits, unlimited, overageReached, ok bool) {
+func (a *Account) GetCreditBalance() (balance string, balanceKnown, hasCredits, unlimited, overageReached bool,
+	spendControlReached *bool, rateLimitReachedType string, ok bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.CreditsBalance, a.CreditsHasCredits, a.CreditsUnlimited, a.CreditsOverageLimitReached, a.CreditsValid
+	var sc *bool
+	if a.CreditsSpendControlValid {
+		v := a.CreditsSpendControlReached
+		sc = &v
+	}
+	return a.CreditsBalance, a.CreditsBalanceKnown, a.CreditsHasCredits, a.CreditsUnlimited,
+		a.CreditsOverageLimitReached, sc, a.CreditsRateLimitReachedType, a.CreditsValid
 }
 
 // CreditBalanceSnapshot 是落库到 credentials["codex_credits"] 的积分快照。
@@ -2414,29 +2506,39 @@ func (a *Account) GetCreditBalance() (balance string, hasCredits, unlimited, ove
 // CreditsValid 归零 → 账号被当成「没积分」→ 积分顶替限流失效、且会被「清理限流账号」
 // 误删，直到下一轮 wham 探针落地才恢复。
 type CreditBalanceSnapshot struct {
-	Balance             string    `json:"balance"`
-	HasCredits          bool      `json:"has_credits"`
-	Unlimited           bool      `json:"unlimited"`
-	OverageLimitReached bool      `json:"overage_limit_reached"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	Balance              *string   `json:"balance"`
+	HasCredits           bool      `json:"has_credits"`
+	Unlimited            bool      `json:"unlimited"`
+	OverageLimitReached  bool      `json:"overage_limit_reached"`
+	SpendControlReached  *bool     `json:"spend_control_reached,omitempty"`
+	RateLimitReachedType string    `json:"rate_limit_reached_type,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // creditBalanceKey 是快照的比对指纹（不含时间戳）。
-func creditBalanceKey(balance string, hasCredits, unlimited, overageReached bool) string {
-	return fmt.Sprintf("%s|%t|%t|%t", balance, hasCredits, unlimited, overageReached)
+func creditBalanceKey(balance *string, hasCredits, unlimited, overageReached bool, spendControlReached *bool, rateLimitReachedType string) string {
+	balStr := "<nil>"
+	if balance != nil {
+		balStr = *balance
+	}
+	scStr := "<nil>"
+	if spendControlReached != nil {
+		scStr = fmt.Sprintf("%t", *spendControlReached)
+	}
+	return fmt.Sprintf("%s|%t|%t|%t|%s|%s", balStr, hasCredits, unlimited, overageReached, scStr, rateLimitReachedType)
 }
 
 // MarshalCreditBalanceSnapshot 序列化积分快照，供落库使用。
 func MarshalCreditBalanceSnapshot(snap CreditBalanceSnapshot) (string, error) {
-	raw, err := json.Marshal(snap)
+	bytes, err := json.Marshal(snap)
 	if err != nil {
 		return "", err
 	}
-	return string(raw), nil
+	return string(bytes), nil
 }
 
 // RestoreCreditBalanceFromJSON 用库里的积分快照回填账号（重启后恢复）。
-// 空串/解析失败/未探测过（三个布尔全 false 且余额为空）都视为无快照，返回 false，
+// 空串/解析失败/未探测过（全空且无任何有效标记）都视为无快照，返回 false，
 // 保持 CreditsValid=false 的「未知」语义，不会凭空造出一个可用余额。
 func (a *Account) RestoreCreditBalanceFromJSON(raw string) bool {
 	if a == nil {
@@ -2450,34 +2552,45 @@ func (a *Account) RestoreCreditBalanceFromJSON(raw string) bool {
 	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
 		return false
 	}
-	balance := strings.TrimSpace(snap.Balance)
-	if balance == "" && !snap.HasCredits && !snap.Unlimited && !snap.OverageLimitReached {
+	balanceKnown := snap.Balance != nil
+	balanceStr := ""
+	if balanceKnown {
+		balanceStr = strings.TrimSpace(*snap.Balance)
+	}
+	if balanceStr == "" && !balanceKnown && !snap.HasCredits && !snap.Unlimited && !snap.OverageLimitReached && snap.SpendControlReached == nil && snap.RateLimitReachedType == "" {
 		return false
 	}
 	a.mu.Lock()
-	a.CreditsBalance = snap.Balance
+	a.CreditsBalance = balanceStr
+	a.CreditsBalanceKnown = balanceKnown
 	a.CreditsHasCredits = snap.HasCredits
 	a.CreditsUnlimited = snap.Unlimited
 	a.CreditsOverageLimitReached = snap.OverageLimitReached
+	if snap.SpendControlReached != nil {
+		a.CreditsSpendControlReached = *snap.SpendControlReached
+		a.CreditsSpendControlValid = true
+	}
+	a.CreditsRateLimitReachedType = strings.TrimSpace(snap.RateLimitReachedType)
 	a.CreditsValid = true
 	// 恢复值本来自库里，指纹一并对齐，避免启动后第一次探针又写一遍同样的内容。
-	a.creditsPersistedKey = creditBalanceKey(snap.Balance, snap.HasCredits, snap.Unlimited, snap.OverageLimitReached)
+	a.creditsPersistedKey = creditBalanceKey(snap.Balance, snap.HasCredits, snap.Unlimited, snap.OverageLimitReached, snap.SpendControlReached, snap.RateLimitReachedType)
 	a.mu.Unlock()
 	return true
 }
 
 // PersistCreditBalance 写入积分快照并落库（值无变化时跳过写库）。
-// store 为 nil（单测/无库场景）时只更新内存，行为与 SetCreditBalance 一致。
-func (s *Store) PersistCreditBalance(acc *Account, balance string, hasCredits, unlimited, overageReached bool) {
+// store 为 nil（单测/无库场景）时只更新内存，行为与 SetCreditBalanceDetails 一致。
+func (s *Store) PersistCreditBalance(acc *Account, balance *string, hasCredits, unlimited, overageReached bool,
+	spendControlReached *bool, rateLimitReachedType string) {
 	if acc == nil {
 		return
 	}
-	acc.SetCreditBalance(balance, hasCredits, unlimited, overageReached)
+	acc.SetCreditBalanceDetails(balance, hasCredits, unlimited, overageReached, spendControlReached, rateLimitReachedType)
 	if s == nil || s.db == nil {
 		return
 	}
 
-	key := creditBalanceKey(balance, hasCredits, unlimited, overageReached)
+	key := creditBalanceKey(balance, hasCredits, unlimited, overageReached, spendControlReached, rateLimitReachedType)
 	acc.mu.Lock()
 	if acc.creditsPersistedKey == key {
 		acc.mu.Unlock()
@@ -2487,23 +2600,75 @@ func (s *Store) PersistCreditBalance(acc *Account, balance string, hasCredits, u
 	acc.mu.Unlock()
 
 	raw, err := MarshalCreditBalanceSnapshot(CreditBalanceSnapshot{
-		Balance:             balance,
-		HasCredits:          hasCredits,
-		Unlimited:           unlimited,
-		OverageLimitReached: overageReached,
-		UpdatedAt:           time.Now(),
+		Balance:              balance,
+		HasCredits:           hasCredits,
+		Unlimited:            unlimited,
+		OverageLimitReached:  overageReached,
+		SpendControlReached:  spendControlReached,
+		RateLimitReachedType: rateLimitReachedType,
+		UpdatedAt:            time.Now(),
 	})
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		err = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
-	}
-	if err != nil {
-		// 落库失败就清掉指纹，让下一次探针重试，而不是把"已持久化"错记下来。
+		_ = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
+	} else {
 		acc.mu.Lock()
 		acc.creditsPersistedKey = ""
 		acc.mu.Unlock()
 		log.Printf("[账号 %d] 持久化积分快照失败: %v", acc.DBID, err)
+	}
+}
+
+// PersistSparseCreditObservation 写入来自响应头的 sparse credits 观测并适时落库。
+func (s *Store) PersistSparseCreditObservation(acc *Account, hasCredits, unlimited bool, balance *string, overageReached *bool, rateLimitReachedType string) {
+	if acc == nil {
+		return
+	}
+	acc.ApplySparseCreditsHeaders(hasCredits, unlimited, balance, overageReached, rateLimitReachedType)
+	if s == nil || s.db == nil {
+		return
+	}
+
+	acc.mu.RLock()
+	var balPtr *string
+	if acc.CreditsBalanceKnown {
+		b := acc.CreditsBalance
+		balPtr = &b
+	}
+	hasCred := acc.CreditsHasCredits
+	unlim := acc.CreditsUnlimited
+	overage := acc.CreditsOverageLimitReached
+	var sc *bool
+	if acc.CreditsSpendControlValid {
+		v := acc.CreditsSpendControlReached
+		sc = &v
+	}
+	rlrt := acc.CreditsRateLimitReachedType
+	acc.mu.RUnlock()
+
+	key := creditBalanceKey(balPtr, hasCred, unlim, overage, sc, rlrt)
+	acc.mu.Lock()
+	if acc.creditsPersistedKey == key {
+		acc.mu.Unlock()
+		return
+	}
+	acc.creditsPersistedKey = key
+	acc.mu.Unlock()
+
+	raw, err := MarshalCreditBalanceSnapshot(CreditBalanceSnapshot{
+		Balance:              balPtr,
+		HasCredits:           hasCred,
+		Unlimited:            unlim,
+		OverageLimitReached:  overage,
+		SpendControlReached:  sc,
+		RateLimitReachedType: rlrt,
+		UpdatedAt:            time.Now(),
+	})
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
 	}
 }
 

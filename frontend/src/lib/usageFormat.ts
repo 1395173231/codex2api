@@ -142,6 +142,8 @@ export function isOfficialCostTooNew(
 
 export function supportsOfficialUsage(account: {
   access_token_type?: string | null
+  account_id?: string | null
+  chatgpt_account_id?: string | null
   openai_responses_api?: boolean
   grok_api?: boolean
   claude_api?: boolean
@@ -149,7 +151,11 @@ export function supportsOfficialUsage(account: {
 }): boolean {
   // wham 只属于 ChatGPT 渠道：中转 / Grok / Claude / Antigravity（Google）账号没有官方统计。
   if (account.openai_responses_api || account.grok_api || account.claude_api || account.antigravity_api) return false
-  return (account.access_token_type || '').trim().toLowerCase() !== 'codex_at'
+  const isAT = (account.access_token_type || '').trim().toLowerCase() === 'codex_at'
+  if (!isAT) return true
+  // codex_at 账号如果具备工作区 ID（通过 whoami 或自定义头补充），则支持官方用量统计
+  const workspaceID = (account.chatgpt_account_id || account.account_id || '').trim()
+  return workspaceID !== ''
 }
 
 export function officialUsdValue(account: {
@@ -215,3 +221,22 @@ export function officialUsdFromDailyItems(
   }
   return any ? usd : null
 }
+
+const WORKSPACE_CREDIT_HARD_STOPS = new Set([
+  'workspace_owner_credits_depleted',
+  'workspace_member_credits_depleted',
+  'workspace_owner_usage_limit_reached',
+  'workspace_member_usage_limit_reached',
+])
+
+export function isWorkspaceCreditHardStop(account: {
+  credits_spend_control_reached?: boolean | null
+  credits_rate_limit_reached_type?: string | null
+}): boolean {
+  if (account.credits_spend_control_reached === true) {
+    return true
+  }
+  const kind = (account.credits_rate_limit_reached_type ?? '').trim().toLowerCase()
+  return WORKSPACE_CREDIT_HARD_STOPS.has(kind)
+}
+

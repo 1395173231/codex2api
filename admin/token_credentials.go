@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"context"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +122,41 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 func effectiveWorkspaceIDFromSeed(seed tokenCredentialSeed) string {
 	seed = normalizeTokenCredentialSeed(seed)
 	return openaiidentity.EffectiveWorkspaceID(seed.workspaceID, seed.customHeaders)
+}
+
+func hydrateSeedWithWhoAmI(ctx context.Context, seed tokenCredentialSeed, proxyURL string) tokenCredentialSeed {
+	if seed.accessTokenType != accessTokenTypeCodexAT || strings.TrimSpace(seed.accessToken) == "" {
+		return seed
+	}
+	if seed.workspaceID != "" && seed.email != "" && seed.planType != "" {
+		return seed
+	}
+	whoamiCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	meta, err := QueryPersonalAccessTokenMetadata(whoamiCtx, seed.accessToken, proxyURL)
+	if err != nil {
+		log.Printf("PAT whoami 身份获取失败（忽略）: %v", err)
+		return seed
+	}
+	if meta == nil {
+		return seed
+	}
+	if seed.workspaceID == "" && meta.ChatGPTAccountID != "" {
+		seed.workspaceID = meta.ChatGPTAccountID
+	}
+	if seed.accountID == "" && meta.ChatGPTAccountID != "" {
+		seed.accountID = meta.ChatGPTAccountID
+	}
+	if seed.userID == "" && meta.ChatGPTUserID != "" {
+		seed.userID = meta.ChatGPTUserID
+	}
+	if seed.email == "" && meta.Email != nil {
+		seed.email = strings.TrimSpace(*meta.Email)
+	}
+	if seed.planType == "" && meta.ChatGPTPlanType != "" {
+		seed.planType = meta.ChatGPTPlanType
+	}
+	return seed
 }
 
 const accessTokenTypeCodexAT = "codex_at"

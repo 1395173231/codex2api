@@ -190,6 +190,10 @@ type CodexUsageSyncResult struct {
 	UsageWindowLimitsIgnored bool
 	// Cleared5h 表示本次同步因上游未返回 5h 窗口而清除了本地陈旧 5h 快照（issue #382）。
 	Cleared5h bool
+	// CreditsObserved 表示本次同步观察到了上游 credits 相关响应头。
+	CreditsObserved bool
+	// RateLimitReachedType 记录上游返回的 rate_limit_reached_type。
+	RateLimitReachedType string
 }
 
 type codexRateLimitWindow string
@@ -8450,6 +8454,36 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 			store.ClearStaleSubscriptionExpiresAt(account)
 		}
 	}
+
+	rateLimitReachedType := strings.TrimSpace(resp.Header.Get("x-codex-rate-limit-reached-type"))
+	result.RateLimitReachedType = rateLimitReachedType
+	creditsHasCreditsHeader := resp.Header.Get("x-codex-credits-has-credits")
+	creditsUnlimitedHeader := resp.Header.Get("x-codex-credits-unlimited")
+	creditsBalanceHeader := resp.Header.Get("x-codex-credits-balance")
+	creditsOverageHeader := resp.Header.Get("x-codex-credits-overage-reached")
+
+	if creditsHasCreditsHeader != "" || creditsUnlimitedHeader != "" || creditsBalanceHeader != "" || creditsOverageHeader != "" {
+		result.CreditsObserved = true
+		hasCredits, _ := strconv.ParseBool(creditsHasCreditsHeader)
+		unlimited, _ := strconv.ParseBool(creditsUnlimitedHeader)
+		var balPtr *string
+		if trimmed := strings.TrimSpace(creditsBalanceHeader); trimmed != "" {
+			balPtr = &trimmed
+		}
+		var overagePtr *bool
+		if creditsOverageHeader != "" {
+			ov, _ := strconv.ParseBool(creditsOverageHeader)
+			overagePtr = &ov
+		}
+		if store != nil {
+			store.PersistSparseCreditObservation(account, hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		} else {
+			account.ApplySparseCreditsHeaders(hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		}
+	} else if rateLimitReachedType != "" {
+		account.SetRateLimitReachedType(rateLimitReachedType)
+	}
+
 	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	observation := parseCodexUsageHeaderObservation(resp)
