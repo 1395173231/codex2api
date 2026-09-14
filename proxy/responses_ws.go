@@ -1072,7 +1072,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	var usage *UsageInfo
 	var actualServiceTier string
 	ttftRecorded := false
-	// contentTokenSeen 用严格判定（与 first_token_mode 无关）。loose 模式下
+	// contentTokenSeen 用严格判定（与宽松首字统计无关）。宽松口径下
 	// codex.rate_limits / metadata 会置位 ttftRecorded；本机 2004 还开了
 	// preflight passthrough，这两帧会先写出并置位 wroteAnyBody。若用它们做
 	// 「首包前」判断，previous_response_not_found 降级在真实上游上永远进不去（#541）。
@@ -1153,7 +1153,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		// terminalFailurePayload 取改写前的原始 data，不受影响。
 		clientData = sanitizeCapacityShedEventForClient(eventType, clientData)
 		ttftGuard.MarkProgress(eventType)
-		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+		isFirstToken := isLooseFirstTokenResult(parsed)
 		if !ttftRecorded && isFirstToken {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 			ttftRecorded = true
