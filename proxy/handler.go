@@ -190,6 +190,10 @@ type CodexUsageSyncResult struct {
 	UsageWindowLimitsIgnored bool
 	// Cleared5h 表示本次同步因上游未返回 5h 窗口而清除了本地陈旧 5h 快照（issue #382）。
 	Cleared5h bool
+	// CreditsObserved 表示本次同步观察到了上游 credits 相关响应头。
+	CreditsObserved bool
+	// RateLimitReachedType 记录上游返回的 rate_limit_reached_type。
+	RateLimitReachedType string
 }
 
 type codexRateLimitWindow string
@@ -8450,9 +8454,39 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 			store.ClearStaleSubscriptionExpiresAt(account)
 		}
 	}
-	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	observation := parseCodexUsageHeaderObservation(resp)
+	rateLimitReachedType := strings.TrimSpace(resp.Header.Get("x-codex-rate-limit-reached-type"))
+	result.RateLimitReachedType = rateLimitReachedType
+	if hasCredits, unlimited, ok := parseCodexCreditsFlagHeaders(resp); ok {
+		result.CreditsObserved = true
+		var balPtr *string
+		if trimmed := strings.TrimSpace(resp.Header.Get("x-codex-credits-balance")); trimmed != "" {
+			balPtr = &trimmed
+		}
+		var overagePtr *bool
+		if raw := strings.TrimSpace(resp.Header.Get("x-codex-credits-overage-reached")); raw != "" {
+			if ov, err := strconv.ParseBool(raw); err == nil {
+				overagePtr = &ov
+			}
+		}
+		if store != nil {
+			store.PersistSparseCreditObservation(account, hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		} else {
+			account.ApplySparseCreditsHeaders(hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		}
+	} else if rateLimitReachedType != "" || observation.authoritative {
+		// reached-type 是逐响应字段：带用量头的响应没有它就是「未触达」，要把旧的
+		// workspace hard-stop 清掉，否则工作区充值后积分顶替永远回不来。
+		if store != nil {
+			store.PersistRateLimitReachedType(account, rateLimitReachedType)
+		} else {
+			account.SetRateLimitReachedType(rateLimitReachedType)
+		}
+	}
+
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
+
 	result.Used5hHeaders = observation.w5h.valid
 	usageApplied := false
 	if observation.authoritative {
@@ -8524,6 +8558,26 @@ func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64
 // parseCodexUsageHeaderObservation classifies only windows with a positive,
 // recognizable duration. Used-percent-only partial headers are not authoritative
 // evidence that the optional 5h window disappeared.
+// parseCodexCreditsFlagHeaders 解析 sparse credits 头里的两个布尔。对齐官方客户端：
+// has-credits 与 unlimited 都在且可解析才采纳，否则整组丢弃——缺席头强转成 false
+// 会把 wham 探到的正确快照盖成「没积分」并落库。
+func parseCodexCreditsFlagHeaders(resp *http.Response) (hasCredits, unlimited, ok bool) {
+	rawHas := strings.TrimSpace(resp.Header.Get("x-codex-credits-has-credits"))
+	rawUnlimited := strings.TrimSpace(resp.Header.Get("x-codex-credits-unlimited"))
+	if rawHas == "" || rawUnlimited == "" {
+		return false, false, false
+	}
+	hasCredits, err := strconv.ParseBool(rawHas)
+	if err != nil {
+		return false, false, false
+	}
+	unlimited, err = strconv.ParseBool(rawUnlimited)
+	if err != nil {
+		return false, false, false
+	}
+	return hasCredits, unlimited, true
+}
+
 func parseCodexUsageHeaderObservation(resp *http.Response) codexUsageHeaderObservation {
 	out := codexUsageHeaderObservation{}
 	if resp == nil {
