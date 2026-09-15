@@ -9194,6 +9194,9 @@ type settingsResponse struct {
 	ReasoningEffortModels              string                           `json:"reasoning_effort_models"`
 	ResinURL                           string                           `json:"resin_url"`
 	ResinPlatformName                  string                           `json:"resin_platform_name"`
+	// CodexEgress 是后端权威的"Codex 渠道当前由谁承担出站"摘要:Resin 启用时代理池与
+	// proxy_url 对 Codex 不生效,界面据此标注,避免三套配置并存看不出谁在生效(issue #679)。
+	CodexEgress                        proxy.CodexEgressSummary         `json:"codex_egress"`
 	PromptFilterEnabled                bool                             `json:"prompt_filter_enabled"`
 	PromptFilterMode                   string                           `json:"prompt_filter_mode"`
 	PromptFilterThreshold              int                              `json:"prompt_filter_threshold"`
@@ -10200,6 +10203,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
 		ResinURL:                            resinURL,
 		ResinPlatformName:                   resinPlatformName,
+		CodexEgress:                         proxy.CurrentCodexEgressSummary(),
 		PromptFilterEnabled:                 promptFilterCfg.Enabled,
 		PromptFilterMode:                    promptFilterCfg.Mode,
 		PromptFilterThreshold:               promptFilterCfg.Threshold,
@@ -12042,6 +12046,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
 		ResinURL:                            resinURL,
 		ResinPlatformName:                   resinPlatformName,
+		CodexEgress:                         proxy.CurrentCodexEgressSummary(),
 		PromptFilterEnabled:                 promptFilterCfg.Enabled,
 		PromptFilterMode:                    promptFilterCfg.Mode,
 		PromptFilterThreshold:               promptFilterCfg.Threshold,

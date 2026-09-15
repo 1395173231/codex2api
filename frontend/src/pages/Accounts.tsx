@@ -2094,6 +2094,8 @@ export default function Accounts() {
   // 开启时成立,所以开关与全局代理都得跟着代理池一起进来。
   const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
   const [globalProxyURL, setGlobalProxyURL] = useState("");
+  // Resin 启用时 Codex 账号出站整层改经 Resin,徽章要报 resin 而不是下面任何一层。
+  const [resinEnabled, setResinEnabled] = useState(false);
   // 单个对象且引用稳定:memo 行组件的 props 里不能出现每轮新建的数组/对象,
   // 否则整表 memo 失效(账号页性能优化的既有教训)。
   // 分组用全量而非 codexGroups:后端解析组代理时不看渠道,迁移前挂在别的渠道组里
@@ -2105,8 +2107,9 @@ export default function Accounts() {
         groups: allGroups,
         poolEnabled: proxyPoolEnabled,
         globalProxy: globalProxyURL,
+        resinEnabled,
       }),
-    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL],
+    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL, resinEnabled],
   );
   const [lazyMode, setLazyMode] = useState(false);
   const [accountPortalEnabled, setAccountPortalEnabled] = useState(false);
@@ -2694,6 +2697,7 @@ export default function Accounts() {
         setAccountPortalEnabled(Boolean(settings.public_account_portal_page_enabled));
         setProxyPoolEnabled(Boolean(settings.proxy_pool_enabled));
         setGlobalProxyURL((settings.proxy_url ?? "").trim());
+        setResinEnabled(Boolean(settings.codex_egress?.resin_enabled));
       })
       .catch(() => undefined);
     return () => { cancelled = true; };

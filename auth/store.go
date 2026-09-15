@@ -4805,11 +4805,17 @@ func (s *Store) resolveProxyForAccountSnapshot(acc *Account) (string, bool) {
 	var accountID int64
 	var accountProxy string
 	var groupIDs []int64
+	// Resin 承担 Codex 出站时,代理池 fail-closed 对 Codex 账号不再成立:出口 IP 由
+	// Resin 提供,池空或绑定的托管代理已禁用都不会让它脏 IP 直连。选出的代理照常返回
+	// (Resin 模式下执行器只拿它做审计),只有 usable 判定放行。中继型账号不经 Resin,
+	// 仍按原规则(issue #679)。
+	resinCarriesEgress := false
 	if acc != nil {
 		acc.mu.RLock()
 		accountID = acc.DBID
 		accountProxy = strings.TrimSpace(acc.ProxyURL)
 		groupIDs = cloneInt64Slice(acc.GroupIDs)
+		resinCarriesEgress = ResinEgressEnabled() && !acc.isRelayStyleLocked()
 		acc.mu.RUnlock()
 	}
 
@@ -4828,7 +4834,7 @@ func (s *Store) resolveProxyForAccountSnapshot(acc *Account) (string, bool) {
 	}
 	if accountProxy != "" {
 		if managedProxyUnavailable(accountProxy) {
-			return "", false
+			return "", resinCarriesEgress
 		}
 		return accountProxy, true
 	}
@@ -4858,7 +4864,7 @@ func (s *Store) resolveProxyForAccountSnapshot(acc *Account) (string, bool) {
 	}
 
 	proxyURL := strings.TrimSpace(s.globalProxy)
-	return proxyURL, proxyURL != "" || !s.proxyPoolEnabled
+	return proxyURL, proxyURL != "" || !s.proxyPoolEnabled || resinCarriesEgress
 }
 
 // resolveGroupProxyForAccount 返回账号按组继承的代理(issue #479):按 GroupIDs
