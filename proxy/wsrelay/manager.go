@@ -268,6 +268,12 @@ type Manager struct {
 	capacityMu     sync.Mutex
 	pendingCreates map[int64]int
 
+	// 账号级等待唤醒：busy/容量等待者在同账号连接释放、销毁、新建或在途请求结束时
+	// 立即被唤醒重新选连，不再空等整个退避间隔（最多 AcquireMaxBackoff）。
+	// 每次 notify 关闭并替换当前 channel；只有等待者存在时才有条目。
+	waitNotifyMu sync.Mutex
+	waitNotify   map[int64]chan struct{}
+
 	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
 	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
 	// 的请求必须回到原连接，落到别的槽位会得到 "previous response not found"。
@@ -361,6 +367,9 @@ func (m *Manager) evictExpired() {
 		if wc.IsExpired() || !wc.IsConnected() || isRotatableOverAge(wc) {
 			m.connections.Delete(key)
 			wc.Close()
+			if wc.session != nil {
+				m.notifyAccountWaiters(wc.session.AccountID)
+			}
 		}
 		return true
 	})
@@ -620,6 +629,54 @@ func (m *Manager) releaseAccountConnectionCapacity(accountID int64) {
 		m.pendingCreates[accountID] = pending - 1
 	}
 	m.capacityMu.Unlock()
+	m.notifyAccountWaiters(accountID)
+}
+
+// accountWaitSignal 返回账号当前的等待唤醒 channel：下一次 notifyAccountWaiters 会关闭它。
+// 等待者必须在检查池状态之前取到 channel，才不会漏掉检查与等待之间发生的变化。
+func (m *Manager) accountWaitSignal(accountID int64) <-chan struct{} {
+	m.waitNotifyMu.Lock()
+	defer m.waitNotifyMu.Unlock()
+	if m.waitNotify == nil {
+		m.waitNotify = make(map[int64]chan struct{})
+	}
+	ch, ok := m.waitNotify[accountID]
+	if !ok {
+		ch = make(chan struct{})
+		m.waitNotify[accountID] = ch
+	}
+	return ch
+}
+
+// notifyAccountWaiters 唤醒该账号所有等待中的 acquire：连接释放/销毁/新建、在途请求结束、
+// 拨号占位归还时调用。没有等待者时是一次 map 查找。
+func (m *Manager) notifyAccountWaiters(accountID int64) {
+	if m == nil {
+		return
+	}
+	m.waitNotifyMu.Lock()
+	ch, ok := m.waitNotify[accountID]
+	if ok {
+		delete(m.waitNotify, accountID)
+	}
+	m.waitNotifyMu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+// waitForAccountChange 等待账号池变化、退避到期或上下文取消，返回实际等待时长。
+func waitForAccountChange(ctx context.Context, wake <-chan struct{}, backoff time.Duration) (time.Duration, error) {
+	start := time.Now()
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return time.Since(start), ctx.Err()
+	case <-wake:
+	case <-timer.C:
+	}
+	return time.Since(start), nil
 }
 
 // AcquireConnection 获取或创建连接
@@ -641,6 +698,8 @@ func (m *Manager) AcquireConnection(
 	var busyOverflowAttempted bool
 
 	for {
+		// 先取唤醒信号再检查池状态：检查之后发生的释放/销毁一定会关闭这个 channel。
+		wake := m.accountWaitSignal(account.ID())
 		lock.Lock()
 		if v, ok := m.connections.Load(key); ok {
 			wc := v.(*WsConnection)
@@ -694,12 +753,12 @@ func (m *Manager) AcquireConnection(
 				if maxWait := busyAcquireMaxWait(); waited >= maxWait {
 					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", maxWait)
 				}
-				select {
-				case <-ctx.Done():
-					return nil, nil, ctx.Err()
-				case <-time.After(wait):
+				// 在途请求结束（RemovePendingRequest）或连接被销毁时立即唤醒，退避只是兜底。
+				slept, waitErr := waitForAccountChange(ctx, wake, wait)
+				if waitErr != nil {
+					return nil, nil, waitErr
 				}
-				waited += wait
+				waited += slept
 				if wait < AcquireMaxBackoff {
 					wait *= 2
 					if wait > AcquireMaxBackoff {
@@ -717,12 +776,12 @@ func (m *Manager) AcquireConnection(
 			if maxWait := busyAcquireMaxWait(); waited >= maxWait {
 				return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", maxWait)
 			}
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(wait):
+			// 同账号连接销毁/拨号占位归还时立即唤醒重试容量预留，退避只是兜底。
+			slept, waitErr := waitForAccountChange(ctx, wake, wait)
+			if waitErr != nil {
+				return nil, nil, waitErr
 			}
-			waited += wait
+			waited += slept
 			if wait < AcquireMaxBackoff {
 				wait *= 2
 				if wait > AcquireMaxBackoff {
@@ -1188,6 +1247,7 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 		wc.Close()
 	}
 	m.sessions.Delete(key)
+	m.notifyAccountWaiters(accountID)
 }
 
 // DiscardConnection 关闭并从连接池移除一条坏连接。
@@ -1210,6 +1270,9 @@ func (m *Manager) DiscardConnection(wc *WsConnection) {
 		wc.session.SetConnected(false)
 	}
 	_ = wc.Close()
+	if wc.session != nil {
+		m.notifyAccountWaiters(wc.session.AccountID)
+	}
 }
 
 // BindResponseConn 记录 response_id 由哪条连接产出（续链亲和）。
