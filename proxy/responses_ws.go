@@ -445,7 +445,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// Only a request that passed payload, prompt-policy and API-key admission may
 	// replace the active owner. Claim before concurrency/account acquisition so
 	// the old request can release those leases for the new one.
-	if preemptCtx, cleanupPreempt, armed := h.beginResponsesWSSessionPreemption(c.Request.Context(), c, rawBody, sessionIdentity); armed {
+	// 被更新的连接取代时先给本连接发 1013 关闭帧再取消：Codex 客户端据此立即重试，
+	// 而不是在裸 1006 断开后静默等到自己的空闲超时。
+	notifyPreempted := func() {
+		closeResponsesWS(conn, websocket.CloseTryAgainLater, responsesWSSessionPreemptedCloseReason)
+	}
+	if preemptCtx, cleanupPreempt, armed := h.beginResponsesWSSessionPreemptionWithNotify(c.Request.Context(), c, rawBody, sessionIdentity, notifyPreempted); armed {
 		originalRequest := c.Request
 		c.Request = originalRequest.WithContext(preemptCtx)
 		defer func() {
