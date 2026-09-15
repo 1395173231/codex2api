@@ -2611,8 +2611,10 @@ func (s *Store) PersistCreditBalance(acc *Account, balance *string, hasCredits, 
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
-	} else {
+		err = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
+	}
+	if err != nil {
+		// 落库失败就清掉指纹，让下一次探针重试，而不是把"已持久化"错记下来。
 		acc.mu.Lock()
 		acc.creditsPersistedKey = ""
 		acc.mu.Unlock()
@@ -2668,7 +2670,14 @@ func (s *Store) PersistSparseCreditObservation(acc *Account, hasCredits, unlimit
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
+		err = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
+	}
+	if err != nil {
+		// 落库失败就清掉指纹，让下一次探针重试，而不是把"已持久化"错记下来。
+		acc.mu.Lock()
+		acc.creditsPersistedKey = ""
+		acc.mu.Unlock()
+		log.Printf("[账号 %d] 持久化稀疏积分快照失败: %v", acc.DBID, err)
 	}
 }
 

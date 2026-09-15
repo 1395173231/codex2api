@@ -2,8 +2,11 @@ package auth
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/codex2api/database"
 )
 
 // plus5hExhausted 构造一个 5h 窗口已打满的 plus 账号：没有积分时它就是 rate_limited。
@@ -545,3 +548,121 @@ func TestRestoreCreditBalanceKeepsDrainedBalance(t *testing.T) {
 		t.Error("IsAvailable() = true for a drained credit account, want false")
 	}
 }
+
+func TestPersistCreditBalance_SuccessAndRollbackOnDBError(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "persist-credit-test.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "test-account", map[string]interface{}{
+		"plan_type": "team",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &Account{
+		DBID:        id,
+		AccessToken: "at",
+		PlanType:    "team",
+	}
+
+	bal := "50.00"
+	sc := false
+	store.PersistCreditBalance(account, &bal, true, false, false, &sc, "")
+
+	account.mu.RLock()
+	persistedKey := account.creditsPersistedKey
+	account.mu.RUnlock()
+	if persistedKey == "" {
+		t.Fatal("expected creditsPersistedKey to be set after successful PersistCreditBalance")
+	}
+
+	accRow, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	codexCreditsRaw := accRow.GetCredential("codex_credits")
+	if codexCreditsRaw == "" {
+		t.Fatal("expected codex_credits credential to be written in DB, got empty")
+	}
+
+	// Close DB to force a database error on subsequent update with different balance
+	_ = db.Close()
+	closed = true
+
+	bal2 := "40.00"
+	store.PersistCreditBalance(account, &bal2, true, false, false, &sc, "")
+
+	account.mu.RLock()
+	rolledBackKey := account.creditsPersistedKey
+	account.mu.RUnlock()
+	if rolledBackKey != "" {
+		t.Fatalf("expected creditsPersistedKey to be cleared after DB write failure, got %q", rolledBackKey)
+	}
+}
+
+func TestPersistSparseCreditObservation_SuccessAndRollbackOnDBError(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "sparse-credit-test.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "test-sparse-account", map[string]interface{}{
+		"plan_type": "team",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &Account{
+		DBID:        id,
+		AccessToken: "at",
+		PlanType:    "team",
+	}
+
+	bal := "25.00"
+	ov := false
+	store.PersistSparseCreditObservation(account, true, false, &bal, &ov, "")
+
+	account.mu.RLock()
+	persistedKey := account.creditsPersistedKey
+	account.mu.RUnlock()
+	if persistedKey == "" {
+		t.Fatal("expected creditsPersistedKey to be set after successful PersistSparseCreditObservation")
+	}
+
+	// Close DB to force an error
+	_ = db.Close()
+	closed = true
+
+	bal2 := "10.00"
+	store.PersistSparseCreditObservation(account, true, false, &bal2, &ov, "")
+
+	account.mu.RLock()
+	rolledBackKey := account.creditsPersistedKey
+	account.mu.RUnlock()
+	if rolledBackKey != "" {
+		t.Fatalf("expected creditsPersistedKey to be cleared after DB write failure, got %q", rolledBackKey)
+	}
+}
+
