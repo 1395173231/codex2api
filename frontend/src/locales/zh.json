@@ -613,6 +613,7 @@
     "themeStyle": "主题风格",
     "theme": {
       "default": "经典蓝",
+      "glass": "霜玻璃",
       "claude": "Claude 暖杏",
       "chatgpt": "ChatGPT 极简",
       "deepseek": "DeepSeek 科技",
@@ -4005,6 +4006,10 @@
       "slack": {
         "surface": "茄紫侧栏",
         "controls": "清晰分区"
+      },
+      "glass": {
+        "surface": "霜化玻璃",
+        "controls": "胶囊高光"
       }
     },
     "title": "主题设置",
@@ -4044,6 +4049,7 @@
     },
     "themeDesc": {
       "default": "稳重的蓝色主色，适合通用后台和默认部署。",
+      "glass": "取自明暗开关的乳白玻璃与内凹高光：半透明卡片、胶囊控件，浅色用琥珀点缀，深色转成夜空银辉。",
       "claude": "暖色纸张质感，弱化冷色并保留清晰层级。",
       "chatgpt": "干净中性的极简风格，适合高频操作页面。",
       "deepseek": "冷色科技感更强，适合深色控制台和监控场景。",

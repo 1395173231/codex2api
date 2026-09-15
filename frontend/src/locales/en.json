@@ -613,6 +613,7 @@
     "themeStyle": "Theme Style",
     "theme": {
       "default": "Classic Blue",
+      "glass": "Frosted Glass",
       "claude": "Claude Warm",
       "chatgpt": "ChatGPT Minimal",
       "deepseek": "DeepSeek Tech",
@@ -4005,6 +4006,10 @@
       "slack": {
         "surface": "Aubergine sidebar",
         "controls": "Distinct regions"
+      },
+      "glass": {
+        "surface": "Frosted glass",
+        "controls": "Lit pills"
       }
     },
     "title": "Theme Settings",
@@ -4044,6 +4049,7 @@
     },
     "themeDesc": {
       "default": "A stable blue accent for general admin use and default deployments.",
+      "glass": "Taken from the theme switcher's milky glass and inset highlights: frosted cards, pill controls, amber by day and moonlight silver at night.",
       "claude": "A warm paper-like palette with softer cool tones and clear hierarchy.",
       "chatgpt": "A clean neutral minimal style for high-frequency operation pages.",
       "deepseek": "A cooler technical style for dark consoles and monitoring workflows.",
