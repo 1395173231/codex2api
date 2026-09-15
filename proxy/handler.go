@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1713,7 +1714,7 @@ func setIngressRequestBodyIfAbsent(c *gin.Context, body []byte) {
 	if c == nil {
 		return
 	}
-	if _, exists := c.Get(ingressRequestBodyContextKey); exists {
+	if value, exists := c.Get(ingressRequestBodyContextKey); exists && value != nil {
 		return
 	}
 	// The request-size middleware already owns this immutable buffer for the
@@ -2759,9 +2760,16 @@ func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{})
 
 func responseOutputItemDoneKey(item gjson.Result) string {
 	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
-		return key
+		// gjson strings borrow the parsed item's storage. Keep only the short
+		// identity, not a second full output JSON through this map key.
+		if len(key) <= 256 {
+			return "id:" + key
+		}
+		sum := sha256.Sum256([]byte(key))
+		return fmt.Sprintf("id-sha256:%x", sum)
 	}
-	return strings.TrimSpace(item.Get("type").String()) + "|" + strings.TrimSpace(item.Raw)
+	sum := sha256.Sum256([]byte(strings.TrimSpace(item.Raw)))
+	return fmt.Sprintf("raw-sha256:%x", sum)
 }
 
 func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
@@ -2836,6 +2844,12 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 	if !ok {
 		return false
 	}
+	// Count only newly accepted item identities, not delta/terminal events or
+	// duplicate done frames after a collector has reached exactly its limit.
+	if len(c.seen) > responseOutputCollectorMaxItems {
+		c.clearOverflow()
+		return false
+	}
 	record := responseOutputItemRecord{sequence: c.sequence, raw: raw}
 	c.sequence++
 	if outputIndex := gjson.GetBytes(data, "output_index"); outputIndex.Exists() && outputIndex.Int() >= 0 {
@@ -2850,10 +2864,7 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 		}
 	}
 	if nextBytes > c.limit {
-		c.overflow = true
-		c.indexed = nil
-		c.unindexed = nil
-		c.bytes = 0
+		c.clearOverflow()
 		log.Printf("跳过 Responses 终态 output 重建: output_item.done 累计超过 %d 字节", c.limit)
 		return false
 	}
@@ -2864,6 +2875,16 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 		c.unindexed = append(c.unindexed, record)
 	}
 	return true
+}
+
+const responseOutputCollectorMaxItems = 4096
+
+func (c *responseOutputCollector) clearOverflow() {
+	c.overflow = true
+	c.indexed = nil
+	c.unindexed = nil
+	c.seen = nil
+	c.bytes = 0
 }
 
 func (c *responseOutputCollector) Items() []json.RawMessage {

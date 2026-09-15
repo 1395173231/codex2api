@@ -397,6 +397,7 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	security.ConfigureRequestMemoryBudget(cfg.RequestMemoryBudgetBytes)
 	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
 	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
 	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {

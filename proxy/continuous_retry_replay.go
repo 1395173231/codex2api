@@ -99,7 +99,7 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 				_ = r.Close()
 				return 0, errContinuousRetryReplayStorage
 			}
-			r.memory.Reset()
+			r.memory = bytes.Buffer{}
 		}
 	}
 	n, err := r.file.Write(data)
@@ -157,7 +157,7 @@ func (r *continuousRetryReplay) Close() error {
 		return nil
 	}
 	r.closed = true
-	r.memory.Reset()
+	r.memory = bytes.Buffer{}
 	var closeErr error
 	if r.file != nil {
 		if err := r.file.Close(); err != nil {

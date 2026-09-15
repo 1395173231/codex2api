@@ -56,6 +56,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
 | `BIND_HOST` | 否 | `127.0.0.1`（SQLite）/ `0.0.0.0`（PostgreSQL） | Docker 端口发布绑定地址（非进程监听地址，由 `CODEX_BIND` 控制）。SQLite compose 默认 `127.0.0.1` 仅本机访问；标准 compose 默认 `0.0.0.0` 所有网络接口 |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
+| `CODEX_REQUEST_MEMORY_BUDGET_MB` | 否 | 至少 128 | 单进程 HTTP/WS 逻辑正文总预算（MiB），包括读入/解压、排队和处理中正文及 Realtime 会话正文；默认取 128 与单请求上限的较大值，显式配置不能小于单请求上限，重启生效。预算不足时 HTTP 返回 503 和 `Retry-After: 1`，WS 关闭码为 1013。不是 RSS 硬上限，账号导入的流式 multipart 路径仍按独立导入上限处理 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
 | `CODEX_SCHEDULER_ENGINE` | 否 | 空 | 调度引擎强制值：`legacy` / `shadow` / `indexed`。设置后优先于数据库配置，适合容器级灰度或紧急回退 |
@@ -219,7 +220,11 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 
 只有预算实际变化时才会分配并递增 generation；同值更新或空更新不会递增。当前实例在数据库提交后立即应用，其他实例每 5 秒轮询一次，只应用更新的 generation；单次读取最多等待 3 秒。同步失败时保留最后一次有效配置，并在运维页显示错误，后续轮询成功后自动恢复。
 
-这些预算只控制本地重建的 HTTP Responses/Compact 上下文。客户端原生 Responses WebSocket 入口不查询本地 response cache，会保留 `previous_response_id` 交给上游处理。
+这些预算覆盖 HTTP Responses/Compact 和原生 Responses WebSocket 的本地回放上下文。健康的原生 WS 续链仍保留 `previous_response_id` 交给上游；需要降级时可使用完整本地快照。原生 WS 显式 `store:false` 的请求不写回放缓存。
+
+共享后端写入的异步与同步路径统一限制为最多 16 个在途写、64 MiB 在途逻辑正文、64 个等待者；在复制/编码之前获取额度，最多等待 5 秒。超过 64 MiB 的既有合法单条上下文可独占写入器，因此其逻辑上限为普通预算与最大在途单条的较大值，不会静默丢弃大快照。普通写入 I/O deadline 为 2 秒，关停同步写为 500 毫秒。饱和时响应收尾及同 WS 后续轮次可能等待写入额度；写失败后 L1 仍可服务，必须依赖该快照但 L1/共享后端均缺失时返回 503。
+
+运维 API `/api/admin/ops/overview` 的 `request_memory` 提供正文预算、当前值、高水位与拒绝数，`response_cache_writer` 提供在途/等待写数、逻辑字节、超时和拒绝数；`response_cache.backend_write_failures` 统计后端写入失败。L1 `current_bytes` 是各快照逻辑大小之和，`shared_payload_bytes` 是去重后的正文大小；两者均不包含 JSON 编码副本、Go 分配器和容器开销。
 
 这里的“字节”是保留 `json.RawMessage` 长度之和，不包含 map、切片、LRU、Go 堆或容器开销，因此不是 RSS 或进程内存硬上限。滚动升级时，新前端对旧后端缺失的设置使用 64/8/64 MiB 展示默认值、generation `0`；旧后端缺少 response-cache 运维对象时，前端显示兼容等待状态而不会崩溃。
 
