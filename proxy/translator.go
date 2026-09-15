@@ -1280,6 +1280,32 @@ func normalizeResponsesInputItemIDs(body map[string]any) bool {
 	return modified
 }
 
+// responsesInputInternalMetadataField 是 Codex CLI 在自定义 provider 名为 "OpenAI"
+// 时附在 input 项顶层的内部元数据，ChatGPT 后端不接受该字段直接 400。
+const responsesInputInternalMetadataField = "internal_chat_message_metadata_passthrough"
+
+// stripResponsesInputInternalMetadata 只删 input[] 顶层项上的内部元数据字段，
+// 不碰 content/arguments 里恰好同名的用户内容。
+func stripResponsesInputInternalMetadata(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap[responsesInputInternalMetadataField]; exists {
+			delete(itemMap, responsesInputInternalMetadataField)
+			modified = true
+		}
+	}
+	return modified
+}
+
 func normalizeResponsesContentPartTypes(body map[string]any) bool {
 	inputItems, ok := body["input"].([]any)
 	if !ok {
@@ -1835,6 +1861,7 @@ func buildChatResponsesRequest(req openAIRequest) map[string]any {
 	normalizeResponsesContentPartTypes(out)
 	normalizeResponsesInputMessageContent(out)
 	normalizeResponsesInputItemIDs(out)
+	stripResponsesInputInternalMetadata(out)
 
 	// 2. reasoning effort + summary
 	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
@@ -2451,6 +2478,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesToolCallArgumentTypes(body)
 	sanitizeMalformedResponsesFunctionCalls(body)
 	normalizeResponsesInputItemIDs(body)
+	stripResponsesInputInternalMetadata(body)
 	dropBareReasoningInputItems(body)
 	// 6c. 修复工具调用/输出的 call_id 配对（issue #414）。
 	// previous_response_id 保留给上游的原生续链场景跳过：历史存于上游服务端，
