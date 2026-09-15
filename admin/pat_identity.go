@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -23,6 +22,9 @@ const (
 // patWhoAmIURLForTest 允许测试替换 whoami 端点 URL。生产代码不要赋值。
 var patWhoAmIURLForTest = ""
 
+// errPATWhoAmINoWorkspace 表示 whoami 成功但没给出工作区 ID。
+var errPATWhoAmINoWorkspace = errors.New("whoami response has no chatgpt_account_id")
+
 // PersonalAccessTokenMetadata 是 /v1/user-auth-credential/whoami 返回的身份元数据结构。
 type PersonalAccessTokenMetadata struct {
 	Email                   *string `json:"email"`
@@ -32,21 +34,27 @@ type PersonalAccessTokenMetadata struct {
 	ChatGPTAccountIsFedramp bool    `json:"chatgpt_account_is_fedramp"`
 }
 
+// patWhoAmIStatusError 表示 whoami 端点返回了非 2xx：这是这枚 token 自己的问题
+// （无权限 / 已吊销），不代表网络不通，批量导入时不应因此熔断后续 token。
+type patWhoAmIStatusError struct {
+	StatusCode int
+}
+
+func (e *patWhoAmIStatusError) Error() string {
+	return fmt.Sprintf("whoami returned status %d", e.StatusCode)
+}
+
+// newPATWhoAmIClient 复用按代理池化的严格客户端（连接复用、代理配置失败不静默绕过），
+// 只覆盖超时与重定向策略：带 Bearer PAT 的请求绝不自动跟随重定向发往别的 host。
 func newPATWhoAmIClient(proxyURL string) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	dialer := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-	transport.DialContext = dialer.DialContext
-	if err := auth.ConfigureTransportProxy(transport, proxyURL, dialer); err != nil {
+	base, err := auth.BuildHTTPClientChecked(proxyURL)
+	if err != nil {
 		return nil, fmt.Errorf("invalid proxy URL for whoami: %w", err)
 	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   patWhoAmITimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 安全原则：绝不将带 Bearer PAT 的请求自动跟随重定向发送到其他 host
-			return http.ErrUseLastResponse
-		},
-	}, nil
+	client := *base
+	client.Timeout = patWhoAmITimeout
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &client, nil
 }
 
 // QueryPersonalAccessTokenMetadata 调用 OpenAI Auth API 的 /v1/user-auth-credential/whoami
@@ -83,7 +91,7 @@ func QueryPersonalAccessTokenMetadata(ctx context.Context, accessToken string, p
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("whoami returned status %d", resp.StatusCode)
+		return nil, &patWhoAmIStatusError{StatusCode: resp.StatusCode}
 	}
 
 	var meta PersonalAccessTokenMetadata

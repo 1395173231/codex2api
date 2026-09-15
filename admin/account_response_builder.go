@@ -370,16 +370,14 @@ func (h *Handler) buildAccountResponse(
 		if applicable, ok := runtimeAccount.GetApplicableResetCredits(); ok {
 			resp.ApplicableResetCredits = &applicable
 		}
-		if balance, balanceKnown, hasCredits, unlimited, overage, spendControlReached, rateLimitReachedType, ok := runtimeAccount.GetCreditBalance(); ok {
+		if credits, ok := runtimeAccount.GetCreditBalance(); ok {
 			resp.CreditsValid = true
-			if balanceKnown {
-				resp.CreditsBalance = &balance
-			}
-			resp.CreditsHasCredits = &hasCredits
-			resp.CreditsUnlimited = &unlimited
-			resp.CreditsOverageLimitReached = &overage
-			resp.CreditsSpendControlReached = spendControlReached
-			resp.CreditsRateLimitReachedType = rateLimitReachedType
+			resp.CreditsBalance = credits.Balance
+			resp.CreditsHasCredits = &credits.HasCredits
+			resp.CreditsUnlimited = &credits.Unlimited
+			resp.CreditsOverageLimitReached = &credits.OverageLimitReached
+			resp.CreditsSpendControlReached = credits.SpendControlReached
+			resp.CreditsRateLimitReachedType = credits.RateLimitReachedType
 		}
 		if includeDetails {
 			if snapshot := runtimeAccount.GetDispatchCountSnapshot(); snapshot.Limit > 0 {

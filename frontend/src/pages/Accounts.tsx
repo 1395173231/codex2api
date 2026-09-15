@@ -538,11 +538,13 @@ function getCreditBalanceDisplay(account: AccountRow): string | null {
   if (account.credits_unlimited) return "∞";
   if (!account.credits_has_credits) return null;
   const balance = (account.credits_balance ?? "").trim();
+  if (!balance) return "✓"; // 上游隐藏了余额（Team 成员）：有积分但看不到数字
   const parsed = Number.parseFloat(balance);
-  if (balance && Number.isFinite(parsed) && parsed > 0) {
+  if (Number.isFinite(parsed) && parsed > 0) {
     return balance;
   }
-  return "✓";
+  // 余额已知且为 0：与后端 creditsAvailableLocked 一致，不算可用积分
+  return null;
 }
 
 function getInitialAnalysisVisibility(): boolean {

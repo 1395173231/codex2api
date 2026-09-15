@@ -68,9 +68,9 @@ type WhamUsage struct {
 	AdditionalRateLimits    []WhamAdditionalRateLimit `json:"additional_rate_limits,omitempty"`
 	AdditionalRateLimitsAlt []WhamAdditionalRateLimit `json:"additionalRateLimits,omitempty"`
 
-	Credits                 *WhamCredits              `json:"credits,omitempty"`
-	SpendControl            *WhamSpendControl         `json:"spend_control,omitempty"`
-	RateLimitReachedType    *WhamRateLimitReachedType `json:"rate_limit_reached_type,omitempty"`
+	Credits              *WhamCredits              `json:"credits,omitempty"`
+	SpendControl         *WhamSpendControl         `json:"spend_control,omitempty"`
+	RateLimitReachedType *WhamRateLimitReachedType `json:"rate_limit_reached_type,omitempty"`
 
 	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
 	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。

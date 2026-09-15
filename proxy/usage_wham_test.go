@@ -1472,10 +1472,10 @@ func TestQueryWhamUsage_ParsesTeamMemberNullBalanceCredits(t *testing.T) {
 
 	ApplyWhamUsage(store, account, &usage)
 
-	bal, balKnown, hasCredits, unlimited, overage, sc, rlType, ok := account.GetCreditBalance()
-	if !ok || !hasCredits || balKnown || bal != "" || unlimited || overage || (sc != nil && *sc) || rlType != "" {
-		t.Fatalf("unexpected credit state: bal=%q, balKnown=%t, hasCredits=%t, unlim=%t, ov=%t, sc=%v, rlType=%q, ok=%t",
-			bal, balKnown, hasCredits, unlimited, overage, sc, rlType, ok)
+	credits, ok := account.GetCreditBalance()
+	if !ok || !credits.HasCredits || credits.Balance != nil || credits.Unlimited || credits.OverageLimitReached ||
+		(credits.SpendControlReached != nil && *credits.SpendControlReached) || credits.RateLimitReachedType != "" {
+		t.Fatalf("unexpected credit state: %+v, ok=%t", credits, ok)
 	}
 
 	// Should bypass 7d / 5h limits because has_credits is true and no hard stop
@@ -1560,4 +1560,3 @@ func TestApplyWhamUsage_WorkspaceHardStopPreventsCreditBypass(t *testing.T) {
 		t.Fatal("SkipsUsageWindowLimits() = true, want false due to spend_control.reached=true")
 	}
 }
-

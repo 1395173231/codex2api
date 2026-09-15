@@ -473,10 +473,9 @@ func TestCreditBalanceSnapshotRoundTrip(t *testing.T) {
 	if !acc.RestoreCreditBalanceFromJSON(raw) {
 		t.Fatal("RestoreCreditBalanceFromJSON() = false, want true")
 	}
-	balance, balanceKnown, hasCredits, unlimited, overage, _, _, ok := acc.GetCreditBalance()
-	if !ok || !balanceKnown || balance != "981.7471800000" || !hasCredits || unlimited || overage {
-		t.Fatalf("GetCreditBalance() = %q/%t/%t/%t/%t/%t, want 981.7471800000/true/true/false/false/true",
-			balance, balanceKnown, hasCredits, unlimited, overage, ok)
+	credits, ok := acc.GetCreditBalance()
+	if !ok || credits.Balance == nil || *credits.Balance != "981.7471800000" || !credits.HasCredits || credits.Unlimited || credits.OverageLimitReached {
+		t.Fatalf("GetCreditBalance() = %+v/%t, want balance 981.7471800000, has_credits, probed", credits, ok)
 	}
 	if !acc.UsingCredits() {
 		t.Error("UsingCredits() = false after restore, want true — the restored balance must keep the override alive")
@@ -496,10 +495,9 @@ func TestRestoreCreditBalanceFromOldJSONFormat(t *testing.T) {
 	if !acc.RestoreCreditBalanceFromJSON(oldJSON) {
 		t.Fatal("RestoreCreditBalanceFromJSON(oldJSON) = false, want true")
 	}
-	balance, balanceKnown, hasCredits, unlimited, overage, _, _, ok := acc.GetCreditBalance()
-	if !ok || !balanceKnown || balance != "1234.5000000000" || !hasCredits || unlimited || overage {
-		t.Fatalf("GetCreditBalance() from old JSON = %q/%t/%t/%t/%t/%t, want 1234.5000000000/true/true/false/false/true",
-			balance, balanceKnown, hasCredits, unlimited, overage, ok)
+	credits, ok := acc.GetCreditBalance()
+	if !ok || credits.Balance == nil || *credits.Balance != "1234.5000000000" || !credits.HasCredits || credits.Unlimited || credits.OverageLimitReached {
+		t.Fatalf("GetCreditBalance() from old JSON = %+v/%t, want balance 1234.5000000000, has_credits, probed", credits, ok)
 	}
 	if !acc.UsingCredits() {
 		t.Error("UsingCredits() = false after restoring old JSON, want true")
@@ -519,7 +517,7 @@ func TestRestoreCreditBalanceRejectsEmptyOrInvalid(t *testing.T) {
 		if acc.RestoreCreditBalanceFromJSON(raw) {
 			t.Errorf("RestoreCreditBalanceFromJSON(%q) = true, want false", raw)
 		}
-		if _, _, _, _, _, _, _, ok := acc.GetCreditBalance(); ok {
+		if _, ok := acc.GetCreditBalance(); ok {
 			t.Errorf("RestoreCreditBalanceFromJSON(%q) marked the balance as probed", raw)
 		}
 		if acc.UsingCredits() {
@@ -651,12 +649,22 @@ func TestPersistSparseCreditObservation_SuccessAndRollbackOnDBError(t *testing.T
 		t.Fatal("expected creditsPersistedKey to be set after successful PersistSparseCreditObservation")
 	}
 
-	// Close DB to force an error
+	// 只有余额变化不落库（余额逐请求递减，留给 wham 探针刷新）。
+	bal2 := "10.00"
+	store.PersistSparseCreditObservation(account, true, false, &bal2, &ov, "")
+	account.mu.RLock()
+	keyAfterBalanceOnly := account.creditsPersistedKey
+	account.mu.RUnlock()
+	if keyAfterBalanceOnly != persistedKey {
+		t.Fatalf("balance-only sparse observation rewrote the snapshot: %q -> %q", persistedKey, keyAfterBalanceOnly)
+	}
+
+	// Close DB to force an error on the next flag change
 	_ = db.Close()
 	closed = true
 
-	bal2 := "10.00"
-	store.PersistSparseCreditObservation(account, true, false, &bal2, &ov, "")
+	ovReached := true
+	store.PersistSparseCreditObservation(account, true, false, &bal2, &ovReached, "")
 
 	account.mu.RLock()
 	rolledBackKey := account.creditsPersistedKey
@@ -666,3 +674,70 @@ func TestPersistSparseCreditObservation_SuccessAndRollbackOnDBError(t *testing.T
 	}
 }
 
+// 余额已知且为 0 时即使 has_credits=true 也不放行：刚花掉最后一分积分的那次响应。
+func TestUsingCreditsBlockedWhenKnownBalanceZero(t *testing.T) {
+	for _, balance := range []string{"0", "0.00", "0.0000000000"} {
+		acc := withCredits(plus5hExhausted(), balance, true, false, false)
+		acc.CreditsBalanceKnown = true
+		if acc.UsingCredits() {
+			t.Fatalf("UsingCredits() = true for known balance %q, want false", balance)
+		}
+		if acc.IsAvailable() {
+			t.Fatalf("IsAvailable() = true for known balance %q, want false", balance)
+		}
+	}
+	// unlimited 不看余额。
+	acc := withCredits(plus5hExhausted(), "0", true, true, false)
+	acc.CreditsBalanceKnown = true
+	if !acc.UsingCredits() {
+		t.Fatal("UsingCredits() = false for unlimited credits, want true")
+	}
+}
+
+// 旧版快照把隐藏余额写成 ""：恢复后必须当「未知」而不是「0」，否则 Team 账号升级后先被判无积分。
+func TestRestoreCreditBalanceLegacyEmptyBalanceMeansUnknown(t *testing.T) {
+	acc := plus5hExhausted()
+	acc.CreditEnabled = true
+	acc.CreditSkipUsageWindow = true
+	if !acc.RestoreCreditBalanceFromJSON(`{"balance":"","has_credits":true,"unlimited":false,"overage_limit_reached":false,"updated_at":"2026-08-01T12:00:00Z"}`) {
+		t.Fatal("RestoreCreditBalanceFromJSON() = false, want true")
+	}
+	credits, ok := acc.GetCreditBalance()
+	if !ok || credits.Balance != nil {
+		t.Fatalf("restored credits = %+v/%t, want hidden balance (nil) and probed", credits, ok)
+	}
+	if !acc.UsingCredits() {
+		t.Fatal("UsingCredits() = false after restoring legacy hidden balance, want true")
+	}
+}
+
+// wham 全量快照缺 spend_control / rate_limit_reached_type 时要把旧的 hard-stop 清掉。
+func TestSetCreditBalanceDetailsClearsStaleWorkspaceHardStop(t *testing.T) {
+	acc := withCredits(plus5hExhausted(), "", true, false, false)
+	reached := true
+	acc.SetCreditBalanceDetails(nil, true, false, false, &reached, "workspace_member_credits_depleted")
+	if acc.UsingCredits() {
+		t.Fatal("UsingCredits() = true under hard stop, want false")
+	}
+	acc.SetCreditBalanceDetails(nil, true, false, false, nil, "")
+	if !acc.UsingCredits() {
+		t.Fatal("UsingCredits() = false after wham snapshot without hard stop, want true")
+	}
+	credits, _ := acc.GetCreditBalance()
+	if credits.SpendControlReached != nil || credits.RateLimitReachedType != "" {
+		t.Fatalf("stale hard stop survived wham snapshot: %+v", credits)
+	}
+}
+
+// 响应头缺 rate_limit_reached_type 即「未触达」：sparse 观测必须把旧标记清掉。
+func TestApplySparseCreditsHeadersClearsReachedType(t *testing.T) {
+	acc := withCredits(plus5hExhausted(), "", true, false, false)
+	acc.SetRateLimitReachedType("workspace_owner_credits_depleted")
+	if acc.UsingCredits() {
+		t.Fatal("UsingCredits() = true under hard stop, want false")
+	}
+	acc.ApplySparseCreditsHeaders(true, false, nil, nil, "")
+	if !acc.UsingCredits() {
+		t.Fatal("UsingCredits() = false after response without reached-type, want true")
+	}
+}

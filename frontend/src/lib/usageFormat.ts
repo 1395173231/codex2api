@@ -142,8 +142,8 @@ export function isOfficialCostTooNew(
 
 export function supportsOfficialUsage(account: {
   access_token_type?: string | null
-  account_id?: string | null
   chatgpt_account_id?: string | null
+  effective_workspace_id?: string | null
   openai_responses_api?: boolean
   grok_api?: boolean
   claude_api?: boolean
@@ -153,8 +153,9 @@ export function supportsOfficialUsage(account: {
   if (account.openai_responses_api || account.grok_api || account.claude_api || account.antigravity_api) return false
   const isAT = (account.access_token_type || '').trim().toLowerCase() === 'codex_at'
   if (!isAT) return true
-  // codex_at 账号如果具备工作区 ID（通过 whoami 或自定义头补充），则支持官方用量统计
-  const workspaceID = (account.chatgpt_account_id || account.account_id || '').trim()
+  // codex_at 账号如果具备工作区 ID（whoami 补全或自定义头覆盖），则支持官方用量统计。
+  // 与后端 isCodexATAccount 一致：先看生效工作区（含请求头覆盖），再看凭证里的。
+  const workspaceID = (account.effective_workspace_id || account.chatgpt_account_id || '').trim()
   return workspaceID !== ''
 }
 

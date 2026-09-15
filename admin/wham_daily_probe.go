@@ -137,6 +137,8 @@ func whamDailyUsageDueTargets(all []*auth.Account, lastAttempt map[int64]time.Ti
 }
 
 func (h *Handler) runWhamDailyUsageProbe(ctx context.Context, lastAttempt map[int64]time.Time) {
+	// 先把缺工作区的 PAT 补全，补上的账号本轮就能进候选。(issue #662)
+	h.hydratePATWorkspaces(ctx)
 	all := h.whamDailyUsageProbeTargets()
 	if len(all) == 0 {
 		return

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -100,7 +101,10 @@ func TestHydrateSeedWithWhoAmI(t *testing.T) {
 		t.Fatalf("workspaceID before hydrate = %q, want empty", seed.workspaceID)
 	}
 
-	hydrated := hydrateSeedWithWhoAmI(context.Background(), seed, "")
+	hydrated, err := hydrateSeedWithWhoAmI(context.Background(), seed, "")
+	if err != nil {
+		t.Fatalf("hydrateSeedWithWhoAmI: %v", err)
+	}
 	if hydrated.workspaceID != "acc-team-workspace" {
 		t.Errorf("hydrated.workspaceID = %q, want acc-team-workspace", hydrated.workspaceID)
 	}
@@ -115,5 +119,46 @@ func TestHydrateSeedWithWhoAmI(t *testing.T) {
 	}
 	if hydrated.planType != "team" {
 		t.Errorf("hydrated.planType = %q, want team", hydrated.planType)
+	}
+}
+
+// 批量导入内：网络层失败熔断本批剩余 token，端点 4xx 只影响那一枚。
+func TestPATWhoAmIHydratorBreaker(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	oldURL := patWhoAmIURLForTest
+	patWhoAmIURLForTest = server.URL
+	defer func() { patWhoAmIURLForTest = oldURL }()
+
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: "at-forbidden"})
+	statusHydrator := &patWhoAmIHydrator{}
+	statusHydrator.hydrate(context.Background(), seed)
+	statusHydrator.hydrate(context.Background(), seed)
+	if statusHydrator.tripped {
+		t.Fatal("hydrator tripped on a per-token 403, want it to keep trying other tokens")
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("whoami calls = %d, want 2 (one per token)", got)
+	}
+
+	// 把端点指向一个已关闭的服务器模拟网络不通。
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	patWhoAmIURLForTest = deadURL
+	netHydrator := &patWhoAmIHydrator{}
+	netHydrator.hydrate(context.Background(), seed)
+	if !netHydrator.tripped {
+		t.Fatal("hydrator did not trip on a transport failure")
+	}
+	patWhoAmIURLForTest = server.URL
+	before := atomic.LoadInt32(&calls)
+	netHydrator.hydrate(context.Background(), seed)
+	if got := atomic.LoadInt32(&calls); got != before {
+		t.Fatalf("tripped hydrator still called whoami (%d -> %d)", before, got)
 	}
 }

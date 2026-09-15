@@ -12,11 +12,9 @@ services:
       - .env
     volumes:
       - sqlite-data-local:/data
-      - logs-data-local:/app/logs
+      - ./logs:/app/logs
     restart: unless-stopped
 
 volumes:
   sqlite-data-local:
     name: codex2api-sqlite-local_sqlite-data-local
-  logs-data-local:
-    name: codex2api-sqlite-local_logs-data-local
