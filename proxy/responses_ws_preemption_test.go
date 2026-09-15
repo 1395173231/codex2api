@@ -166,6 +166,49 @@ func TestResponsesWSSessionPreemptKeySeparatesSubagentThreads(t *testing.T) {
 	}
 }
 
+func TestResponsesWSSessionPreemptKeySeparatesMemoryRequestKind(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	row := &database.APIKeyRow{ID: 11, AllowedGroupIDs: []int64{7}}
+	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+	newKindContext := func(kind string) *gin.Context {
+		c := newResponsesWSPreemptTestContext(11, row)
+		c.Request.Header.Set("Session-Id", "shared-session")
+		c.Request.Header.Set("Thread-Id", "shared-session")
+		if kind != "" {
+			c.Request.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"shared-session","request_kind":"`+kind+`"}`)
+		}
+		return c
+	}
+	keyFor := func(c *gin.Context, raw []byte) responsesWSSessionPreemptKey {
+		t.Helper()
+		key, ok := newResponsesWSSessionPreemptKey(c, raw, resolveRequestSessionIdentity(c.Request.Header, raw))
+		if !ok {
+			t.Fatal("session did not arm preemption")
+		}
+		return key
+	}
+
+	legacy := keyFor(newKindContext(""), body)
+	turn := keyFor(newKindContext("turn"), body)
+	compaction := keyFor(newKindContext("compaction"), body)
+	if turn.sessionHash != legacy.sessionHash || compaction.sessionHash != legacy.sessionHash {
+		t.Fatal("turn/compaction request kinds must keep the legacy shared-session preemption key")
+	}
+	memory := keyFor(newKindContext("memory"), body)
+	if memory.sessionHash == legacy.sessionHash {
+		t.Fatal("request_kind=memory shares the user turn preemption key; a background memory turn would cancel the active user turn")
+	}
+	if repeat := keyFor(newKindContext("memory"), body); repeat.sessionHash != memory.sessionHash {
+		t.Fatal("memory request kind did not keep a stable preemption key")
+	}
+
+	// 头里没有 turn 元数据时按请求体 client_metadata 内嵌的 request_kind 分道。
+	bodyMemory := []byte(`{"model":"gpt-5.5","input":"hello","client_metadata":{"x-codex-turn-metadata":"{\"thread_id\":\"shared-session\",\"request_kind\":\"memory\"}"}}`)
+	if keyFor(newKindContext(""), bodyMemory).sessionHash == legacy.sessionHash {
+		t.Fatal("body-embedded request_kind=memory shares the user turn preemption key")
+	}
+}
+
 func TestWatchResponsesWSSessionPreemptOwnerDetectsRemoteReplacement(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	ownerStore := tokenCache.(cache.RuntimeOwnerStore)

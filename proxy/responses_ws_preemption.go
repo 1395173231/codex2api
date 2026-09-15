@@ -88,7 +88,7 @@ func newResponsesWSSessionPreemptKey(c *gin.Context, rawBody []byte, identity re
 		return responsesWSSessionPreemptKey{}, false
 	}
 	scopeHash := responsesWSSessionPreemptScopeHash(c, identity)
-	sessionHash := responsesWSSessionPreemptIdentityHash(rawBody, identity, responsesWSTransportLane(c, identity))
+	sessionHash := responsesWSSessionPreemptIdentityHash(rawBody, identity, responsesWSTransportLane(c, rawBody, identity))
 	if scopeHash == "" || sessionHash == "" {
 		return responsesWSSessionPreemptKey{}, false
 	}
@@ -150,7 +150,7 @@ func normalizedResponsesWSPreemptGroupIDs(ids []int64) []int64 {
 	return result
 }
 
-func responsesWSTransportLane(c *gin.Context, identity requestSessionIdentity) string {
+func responsesWSTransportLane(c *gin.Context, rawBody []byte, identity requestSessionIdentity) string {
 	if c == nil || c.Request == nil {
 		return ""
 	}
@@ -161,7 +161,7 @@ func responsesWSTransportLane(c *gin.Context, identity requestSessionIdentity) s
 	if base == "" {
 		return ""
 	}
-	lane := ResolveCodexWebsocketTransportSessionKey(base, c.Request.Header)
+	lane := ResolveCodexWebsocketTransportSessionKeyWithBody(base, c.Request.Header, rawBody)
 	if lane == base {
 		return ""
 	}
