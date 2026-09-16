@@ -422,21 +422,6 @@ export default function AccountQuickConfigSheet({
               />
             </div>
 
-            <div className="flex items-center justify-between gap-3 pt-1 border-t border-border/40">
-              <div>
-                <div className="text-xs font-semibold text-foreground">
-                  Prism 模式 (GPT-6/Astra)
-                </div>
-                <div className="text-[11px] text-muted-foreground">
-                  使用独立 Prism 额度，不消耗 Codex 配额
-                </div>
-              </div>
-              <Switch
-                checked={form.usePrismMode}
-                onCheckedChange={(checked) => patchForm({ usePrismMode: checked })}
-              />
-            </div>
-
             <div className="space-y-1.5 pt-1 border-t border-border/40">
               <label className="block text-xs font-semibold text-foreground">
                 代理服务器 (Proxy URL)

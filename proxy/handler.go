@@ -4129,14 +4129,6 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		if account.IsRelayStyle() {
 			relayContinuationAttempted = true
-
-			// Prism 模式检查：如果账户启用了 Prism 且模型适合，则通过 Prism 处理
-			if HandlePrismResponsesIfEnabled(c.Request.Context(), c, account, attemptEffectiveModel, rawBody) {
-				log.Printf("[Prism] 请求已通过 Prism 模式完成 account=%d model=%s", account.ID(), attemptEffectiveModel)
-				h.store.Release(account)
-				return
-			}
-
 			if lastUpstreamCancel != nil {
 				lastUpstreamCancel()
 			}

@@ -50,7 +50,6 @@ type AccountRow struct {
 	BaseConcurrencyOverride sql.NullInt64
 	Tags                    []string
 	Note                    string
-	UsePrismMode            bool
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 	DeletedAt               sql.NullTime
@@ -95,7 +94,6 @@ type BatchAccountMetadataUpdate struct {
 	ScoreBiasOverride       OptionalNullInt64
 	BaseConcurrencyOverride OptionalNullInt64
 	SkipWarmTier            OptionalBool
-	UsePrismMode            OptionalBool
 	AllowedAPIKeyIDs        OptionalInt64Slice
 	Tags                    OptionalStringSlice
 	GroupIDs                OptionalInt64Slice
@@ -1131,7 +1129,6 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 1;
-	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS use_prism_mode BOOLEAN NOT NULL DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id                        SERIAL PRIMARY KEY,
@@ -7105,7 +7102,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 
 // UpdateAccountSchedulerMetadata applies scheduler overrides and UI metadata in
 // one transaction. Runtime store updates should happen only after this returns.
-func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, usePrismMode OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString, credentialUpdates map[string]interface{}) error {
+func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString, credentialUpdates map[string]interface{}) error {
 	return db.withSQLiteWriteLock(ctx, func() error {
 		tx, err := db.conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -7145,9 +7142,6 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 		}
 		if skipWarmTier.Set {
 			add("skip_warm_tier", skipWarmTier.Value)
-		}
-		if usePrismMode.Set {
-			add("use_prism_mode", usePrismMode.Value)
 		}
 		if tags.Set {
 			if db.isSQLite() {
@@ -7348,9 +7342,6 @@ func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []i
 	}
 	if update.SkipWarmTier.Set {
 		add("skip_warm_tier", update.SkipWarmTier.Value, true)
-	}
-	if update.UsePrismMode.Set {
-		add("use_prism_mode", update.UsePrismMode.Value, true)
 	}
 	if update.Tags.Set {
 		if db.isSQLite() {
