@@ -390,6 +390,7 @@ type Account struct {
 	IgnoreUsageLimitStatusOverride *bool
 	ignoreUsageLimitStatus         bool
 	SkipWarmTier                   bool // 跳过 warm 层级降级
+	UsePrismMode                   bool // 使用 Prism 模式（GPT-6/Astra 独立额度）
 	AllowedAPIKeyIDs               []int64
 	allowedAPIKeySet               map[int64]struct{}
 	Tags                           []string
@@ -5614,6 +5615,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	account.ModelCooldownBackoffOverride = row.GetCredentialOptionalBool("model_cooldown_backoff_override")
 	account.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	account.SkipWarmTier = row.SkipWarmTier
+	account.UsePrismMode = row.UsePrismMode
 	if row.Status == "error" {
 		account.Status = StatusError
 		account.ErrorMsg = row.ErrorMessage
