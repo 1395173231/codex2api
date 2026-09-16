@@ -188,6 +188,11 @@ type Handler struct {
 	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
 	// 防止并发请求在“检查不存在”后同时建号。
 	agentIdentityImportMu sync.Mutex
+
+	// Reset Radar hook 状态（reset_radar.go 使用）
+	resetRadarHookMu     sync.Mutex
+	resetRadarHookState  resetRadarHookState
+	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
 }
 
 type responseCacheSettingsStore interface {
@@ -1650,6 +1655,7 @@ type accountResponse struct {
 	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
 	UsingCredits                  bool                        `json:"using_credits,omitempty"`
 	SkipWarmTier                  bool                        `json:"skip_warm_tier"`
+	UsePrismMode                  bool                        `json:"use_prism_mode"`
 	AccountType                   string                      `json:"account_type,omitempty"`
 	AccessTokenType               string                      `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
@@ -2127,6 +2133,7 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
+	UsePrismMode            json.RawMessage `json:"use_prism_mode"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -2151,6 +2158,7 @@ type accountSchedulerUpdate struct {
 	ScoreBiasOverride       database.OptionalNullInt64
 	BaseConcurrencyOverride database.OptionalNullInt64
 	SkipWarmTier            database.OptionalBool
+	UsePrismMode            database.OptionalBool
 	AllowedAPIKeyIDs        database.OptionalInt64Slice
 	Tags                    optionalStringSlice
 	GroupIDs                database.OptionalInt64Slice
@@ -2183,6 +2191,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	usePrismMode, err := parseOptionalBoolField(req.UsePrismMode, "use_prism_mode")
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -2348,6 +2360,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ScoreBiasOverride:       scoreBiasOverride,
 		BaseConcurrencyOverride: baseConcurrencyOverride,
 		SkipWarmTier:            skipWarmTier,
+		UsePrismMode:            usePrismMode,
 		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
 		Tags:                    tags,
 		GroupIDs:                groupIDs,
@@ -2661,7 +2674,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 	}
 
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.UsePrismMode, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
