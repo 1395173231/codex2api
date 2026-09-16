@@ -1164,7 +1164,11 @@ func antigravityCustomToolCallText(raw any) string {
 func antigravityCustomToolNames(raw []byte) map[string]bool {
 	names := make(map[string]bool)
 	gjson.GetBytes(raw, "tools").ForEach(func(_, tool gjson.Result) bool {
-		if tool.Get("type").String() != "custom" {
+		// Normalize exactly like antigravityGeminiFunctionDeclarations does via
+		// lowerStringField. A case/whitespace difference here would declare the
+		// tool to the model but fail to mark it custom on the way back, so the
+		// response would carry a function_call for a tool Codex declared custom.
+		if !strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "custom") {
 			return true
 		}
 		// The Chat bridge tolerates a nested `custom` object; prefer its name so

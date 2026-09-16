@@ -1785,6 +1785,26 @@ func TestAntigravityCustomToolNamesReadsOnlyFreeformDeclarations(t *testing.T) {
 	}
 }
 
+// The declaration path normalizes the tool type via lowerStringField; the
+// collection path must normalize identically or a `"CUSTOM"` declaration is
+// forwarded to the model while the response comes back as function_call.
+func TestAntigravityCustomToolNamesNormalizesToolTypeLikeDeclaration(t *testing.T) {
+	for _, body := range []string{
+		`{"tools":[{"type":"CUSTOM","name":"apply_patch"}]}`,
+		`{"tools":[{"type":" custom ","name":"apply_patch"}]}`,
+		`{"tools":[{"type":"Custom","custom":{"name":"apply_patch"}}]}`,
+	} {
+		names := antigravityCustomToolNames([]byte(body))
+		if !names["apply_patch"] {
+			t.Fatalf("body %s must register apply_patch as custom, got %#v", body, names)
+		}
+	}
+	// A non-custom type must still not be picked up by loose matching.
+	if names := antigravityCustomToolNames([]byte(`{"tools":[{"type":"customs","name":"apply_patch"}]}`)); names != nil {
+		t.Fatalf("type \"customs\" must not match custom: %#v", names)
+	}
+}
+
 func TestAntigravitySSERebuildsCustomToolCallLifecycle(t *testing.T) {
 	input := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"apply_patch\",\"args\":{\"input\":\"*** Begin Patch\\n*** End Patch\\n\"},\"id\":\"call_patch_1\"}}]},\"finishReason\":\"STOP\"}]}\n\n"
 	body := newAntigravitySSEResponseBodyWithCustomTools(
