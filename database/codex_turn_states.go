@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,13 +43,84 @@ func (db *DB) ensureCodexTurnStateSchema(ctx context.Context) error {
 			token_hash TEXT NOT NULL DEFAULT '',
 			lease_id TEXT NOT NULL DEFAULT '', lease_until BIGINT NOT NULL DEFAULT 0,
 			PRIMARY KEY(account_id, model))`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_turn_state_unique_ticket ON codex_turn_states(account_id,token_hash) WHERE token_hash <> ''`,
 	} {
 		if _, err := db.conn.ExecContext(ctx, query); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Early development builds created this table before token_hash was added.
+	// Add/backfill the column before creating the index so those databases can
+	// start normally. PostgreSQL supports IF NOT EXISTS; SQLite uses PRAGMA.
+	if db.isSQLite() {
+		if err := db.ensureSQLiteColumn(ctx, "codex_turn_states", "token_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	} else if _, err := db.conn.ExecContext(ctx, `ALTER TABLE codex_turn_states ADD COLUMN IF NOT EXISTS token_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := db.backfillCodexTurnStateTokenHashes(ctx); err != nil {
+		return err
+	}
+	_, err := db.conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_turn_state_unique_ticket ON codex_turn_states(account_id,token_hash) WHERE token_hash <> ''`)
+	return err
+}
+
+func (db *DB) backfillCodexTurnStateTokenHashes(ctx context.Context) error {
+	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT account_id,model,payload FROM codex_turn_states ORDER BY account_id,model`)
+		if err != nil {
+			return err
+		}
+		type row struct {
+			accountID int64
+			model     string
+			payload   string
+		}
+		var records []row
+		for rows.Next() {
+			var item row
+			if err := rows.Scan(&item.accountID, &item.model, &item.payload); err != nil {
+				rows.Close()
+				return err
+			}
+			records = append(records, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		seen := make(map[string]struct{}, len(records))
+		for _, item := range records {
+			var rec CodexTurnStateRecord
+			if err := decodeTurnStateRecord(item.payload, &rec); err != nil {
+				return fmt.Errorf("decode Codex turn-state account=%d model=%s: %w", item.accountID, item.model, err)
+			}
+			hash := turnStateTokenHash(rec.Token)
+			key := fmt.Sprintf("%d\x00%s", item.accountID, hash)
+			if hash != "" {
+				if _, duplicate := seen[key]; duplicate {
+					rec.Token = ""
+					rec.IssuedAt = time.Time{}
+					rec.CapturedAt = time.Time{}
+					rec.ExpiresAt = time.Time{}
+					rec.NextAttemptAt = time.Time{}
+					rec.RefreshRequested = true
+					rec.LastError = "duplicate legacy turn-state removed; refresh requested"
+					hash = ""
+				} else {
+					seen[key] = struct{}{}
+				}
+			}
+			payload, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE codex_turn_states SET payload=$3,token_hash=$4 WHERE account_id=$1 AND model=$2`,
+				item.accountID, item.model, encryptCredentialValue("codex_turn_state_ticket", string(payload)), hash); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func turnStateTokenHash(token string) string {

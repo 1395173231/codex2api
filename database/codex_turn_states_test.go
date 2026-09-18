@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -111,6 +112,61 @@ func TestCodexTurnStateSQLiteMigrationAndRestart(t *testing.T) {
 	got := requireCodexTurnStateRecord(t, db, id, want.Model)
 	if got.Token != want.Token || got.Identity != want.Identity || got.Revision != saved.Revision || got.Attempts != want.Attempts || !got.IssuedAt.Equal(want.IssuedAt) || !got.ExpiresAt.Equal(want.ExpiresAt) || !got.NextAttemptAt.Equal(want.NextAttemptAt) {
 		t.Fatalf("reopened ticket=%+v, want %+v", got, saved)
+	}
+}
+
+func TestCodexTurnStateMigratesLegacyTableWithoutTokenHash(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := New("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertCodexTurnStateTestAccount(t, db, "legacy")
+	if _, err := db.conn.ExecContext(ctx, `DROP TABLE codex_turn_states`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `CREATE TABLE codex_turn_states (
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		model TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', revision BIGINT NOT NULL DEFAULT 0,
+		lease_id TEXT NOT NULL DEFAULT '', lease_until BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY(account_id, model))`); err != nil {
+		t.Fatal(err)
+	}
+	first := codexTurnStateTestRecord(id, "gpt-5.5", "legacy-shared-token")
+	second := codexTurnStateTestRecord(id, "gpt-5.4", "legacy-shared-token")
+	for _, rec := range []CodexTurnStateRecord{first, second} {
+		payload, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO codex_turn_states(account_id,model,payload) VALUES($1,$2,$3)`, rec.AccountID, rec.Model, string(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = New("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen legacy database: %v", err)
+	}
+	defer db.Close()
+	columns, err := db.sqliteTableColumns(ctx, "codex_turn_states")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := columns["token_hash"]; !ok {
+		t.Fatal("legacy table was not upgraded with token_hash")
+	}
+	kept := requireCodexTurnStateRecord(t, db, id, "gpt-5.4")
+	removed := requireCodexTurnStateRecord(t, db, id, "gpt-5.5")
+	if kept.Token != "legacy-shared-token" || removed.Token != "" || !removed.RefreshRequested {
+		t.Fatalf("legacy duplicate migration kept=%+v removed=%+v", kept, removed)
+	}
+	if _, err := db.ReplaceCodexTurnState(ctx, codexTurnStateTestRecord(id, "gpt-5.5", kept.Token)); err == nil {
+		t.Fatal("unique ticket index was not created after legacy migration")
 	}
 }
 
