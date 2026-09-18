@@ -489,6 +489,13 @@ func (h *Handler) buildAccountResponse(
 	if !includeDetails {
 		stripAccountDetailFields(&resp)
 	}
+	if h.codexTurnStates != nil && (upstreamType == "" || strings.EqualFold(upstreamType, "codex")) {
+		if runtimeAccount == nil {
+			runtimeAccount = &auth.Account{DBID: row.ID, PlanType: row.GetCredential("plan_type"), DispatchPaused: 1}
+		}
+		resp.CodexTurnStates = h.codexTurnStates.Statuses(row.ID, runtimeAccount)
+		resp.CodexTurnState = ""
+	}
 	return resp
 }
 

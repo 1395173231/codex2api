@@ -138,13 +138,34 @@ func (a *Account) CodexTurnStateInjection(models ...string) string {
 		return ""
 	}
 	a.mu.RLock()
+	manager := a.codexTurnStateManager
 	value, scope := a.CodexTurnState, a.CodexTurnStateModels
 	a.mu.RUnlock()
+	if manager != nil {
+		// The last model is the final outbound name. Never use a client alias's ticket.
+		model := ""
+		if len(models) > 0 {
+			model = models[len(models)-1]
+		}
+		return manager.Injection(a, model)
+	}
 	value = strings.TrimSpace(value)
 	if value == "" || !CodexTurnStateModelsMatch(scope, models...) {
 		return ""
 	}
 	return value
+}
+
+func (a *Account) ObserveManagedCodexTurnState(model, used, observed string) {
+	if a == nil {
+		return
+	}
+	a.mu.RLock()
+	manager := a.codexTurnStateManager
+	a.mu.RUnlock()
+	if manager != nil {
+		manager.Observe(a, model, used, observed)
+	}
 }
 
 // CodexTurnStateConfig 返回配置快照（值、模型名单、设置时刻）。

@@ -759,8 +759,8 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 | base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，`≥1` 无上限，`null` 表示恢复全局默认                                                      |
 | skip_warm_tier            | boolean/null   | 否   | 是否跳过 warm 层级；`null` 等同 `false`，字段省略时保持原值                                                |
 | allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
-| codex_turn_state          | string/null    | 否   | 凭据级强制注入的 `X-Codex-Turn-State`：非空时该账号每个出站 Codex 请求（HTTP 头与 WebSocket 帧体 `client_metadata` 都覆盖）都强制携带该值，优先于客户端回带值与自定义请求头；只接受单行 ASCII 可见字符，最长 4096 字节；`null` 或空串表示关闭。换成新值时会重置 `codex_turn_state_set_at`（时效起点，实测约 1 小时失效），原样重提同一个值不重置，存量值没有起点时补一次 |
-| codex_turn_state_models   | string/null    | 否   | 把上述注入限定在指定模型：逗号分隔，大小写不敏感，结尾 `*` 做前缀匹配，客户端模型与上游模型任一命中即注入；空表示不限模型；识别不出模型名的请求照常注入 |
+| codex_turn_state          | string/null    | 否   | 旧版全账号共享票据字段，保留读写兼容；新按模型票据服务不使用此值。请使用 `PUT /api/admin/accounts/:id/turn-states` |
+| codex_turn_state_models   | string/null    | 否   | 旧版共享票据范围字段；新服务要求精确出站模型和独立票据，不使用此字段 |
 
 **响应:**
 
@@ -1707,7 +1707,22 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
 
 `injected_turn_state` / `upstream_turn_state` 是本次尝试实际注入到出站请求上的、以及上游响应
 回带的 `X-Codex-Turn-State`（HTTP 取响应头，WebSocket 取流内 metadata 帧），空串表示没有；
-注入配置见 `PATCH /api/admin/accounts/:id/scheduler` 的 `codex_turn_state`。
+按模型注入配置使用 `/api/admin/accounts/:id/turn-states`，采集设置使用 `/api/admin/settings/codex-turn-state`。管理端状态摘要不返回票据原文；既有请求追踪日志的票据字段仍遵循现有日志权限。
+
+#### Codex Turn-State 管理接口
+
+以下接口全部要求管理端鉴权。
+
+| 方法 | 路径 | 请求/响应 |
+| --- | --- | --- |
+| GET | `/api/admin/settings/codex-turn-state` | 返回 CONFIGURATION.md 中列出的全部配置，另含 `proxy_configured`；代理认证信息脱敏 |
+| PUT | `/api/admin/settings/codex-turn-state` | 支持部分字段更新，校验后热生效；`clear_proxy:true` 显式清除代理 |
+| GET | `/api/admin/accounts/:id/turn-states` | 返回 `{enabled, items:[{model,token_length,target_length,issued_at,expires_at,captured_at,remaining_seconds,ready,status,last_attempt_at,next_attempt_at,attempts,last_error}]}` |
+| PUT | `/api/admin/accounts/:id/turn-states` | `{model,token}`，保存通过长度/Fernet 封装/本地时效校验的票据 |
+| DELETE | `/api/admin/accounts/:id/turn-states` | `{model}`，清除该模型票据并使旧在途写入失效；开启自动采集时后续会补采 |
+| POST | `/api/admin/accounts/:id/turn-states/refresh` | `{model}`，对已启用采集的有效账号/模型排队，返回 202 |
+
+`status` 为 `missing / ready / refreshing / expired / error / disabled`。账号列表另含不带原文的 `codex_turn_states` 摘要。预计有效期依据票据签发时间计算，不依据保存时间；长度和时间戳未构成上游验签。
 
 #### GET /api/admin/usage/chart-data
 

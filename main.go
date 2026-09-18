@@ -369,6 +369,9 @@ func main() {
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	if err := adminHandler.StartCodexTurnStates(backgroundCtx); err != nil {
+		log.Fatalf("启动 Codex turn-state 服务失败: %v", err)
+	}
 	adminHandler.StartQualityTests(backgroundCtx)
 	defer cancelBackground()
 	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {

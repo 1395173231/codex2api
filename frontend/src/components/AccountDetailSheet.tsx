@@ -25,6 +25,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountHealthBar from "./AccountHealthBar";
+import CodexTurnStatePanel from "./CodexTurnStatePanel";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
@@ -719,6 +720,10 @@ export default function AccountDetailSheet({
                 </MetricCard>
               </div>
             </Section>
+
+            {!account.openai_responses_api && !account.grok_api && !account.claude_api && !account.antigravity_api ? (
+              <CodexTurnStatePanel key={account.id} accountId={account.id} />
+            ) : null}
 
             {account.codex_refresh_error ? (
               <Section title={t("accounts.tokenRefreshNotice")}>

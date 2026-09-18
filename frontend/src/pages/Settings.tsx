@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
+import CodexTurnStateSettings from '../components/CodexTurnStateSettings'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
@@ -4120,6 +4121,7 @@ export default function Settings() {
               </SettingsSection>
 
               <SettingsSection id="settings-codex-client" title={t('settings.nav.codexClient')} description={t('settings.nav.codexClientDesc')} icon={<Terminal className="size-4" />}>
+              <CodexTurnStateSettings />
               <SettingsCard title={t('settings.codexClientTitle')} description={t('settings.codexClientDesc')} icon={<Terminal className="size-4" />}>
                 <div className="space-y-4">
                   <div className={SETTINGS_FIELD_GRID_3}>

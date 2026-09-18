@@ -341,6 +341,7 @@ export interface AccountRow {
   codex_turn_state_models?: string
   /** RFC3339 timestamp of the last time the injected value changed; absent = unknown. */
   codex_turn_state_set_at?: string
+  codex_turn_states?: CodexTurnStateStatus[]
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -2011,6 +2012,37 @@ export interface CodexEgressSummary {
   /** 打码后的 Resin 地址(不含 token),仅用于展示。 */
   resin_endpoint?: string
   resin_platform_name?: string
+}
+
+export interface CodexTurnStateSettings {
+  enabled: boolean
+  models: string[]
+  harvest_proxy_url: string
+  proxy_configured: boolean
+  target_length: number
+  team_target_length: number
+  ttl_seconds: number
+  refresh_before_seconds: number
+  retry_interval_seconds: number
+  attempt_timeout_seconds: number
+  max_attempts: number
+  concurrency: number
+}
+
+export interface CodexTurnStateStatus {
+  model: string
+  token_length: number
+  target_length: number
+  issued_at?: string
+  expires_at?: string
+  captured_at?: string
+  remaining_seconds: number
+  ready: boolean
+  status: 'missing' | 'ready' | 'refreshing' | 'expired' | 'error' | 'disabled'
+  last_attempt_at?: string
+  next_attempt_at?: string
+  attempts: number
+  last_error?: string
 }
 
 export interface SystemSettings {

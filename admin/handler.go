@@ -182,6 +182,9 @@ type Handler struct {
 	resetCreditPostCancel     context.CancelFunc
 	resetCreditPostClosed     bool
 	settingsUpdateMu          sync.Mutex
+	codexTurnStates           *auth.CodexTurnStateManager
+	codexTurnStatesStartOnce  sync.Once
+	codexTurnStatesStartErr   error
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -1169,6 +1172,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.GET("/accounts/:id/turn-states", h.GetAccountTurnStates)
+	api.PUT("/accounts/:id/turn-states", h.UpdateAccountTurnState)
+	api.DELETE("/accounts/:id/turn-states", h.DeleteAccountTurnState)
+	api.POST("/accounts/:id/turn-states/refresh", h.RefreshAccountTurnState)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -1273,6 +1280,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/settings/channel-tests", h.GetChannelTestSettings)
 	api.PUT("/settings/channel-tests", h.UpdateChannelTestSettings)
 	api.GET("/settings/antigravity", h.GetAntigravitySettings)
+	api.GET("/settings/codex-turn-state", h.GetCodexTurnStateSettings)
+	api.PUT("/settings/codex-turn-state", h.UpdateCodexTurnStateSettings)
 	api.PUT("/settings/antigravity", h.UpdateAntigravitySettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
@@ -1692,6 +1701,7 @@ type accountResponse struct {
 	CodexTurnState                string                      `json:"codex_turn_state,omitempty"`
 	CodexTurnStateModels          string                      `json:"codex_turn_state_models,omitempty"`
 	CodexTurnStateSetAt           string                      `json:"codex_turn_state_set_at,omitempty"`
+	CodexTurnStates               []auth.CodexTurnStateStatus `json:"codex_turn_states,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`

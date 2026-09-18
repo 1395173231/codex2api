@@ -28,6 +28,11 @@ const codexTurnStateMetadataKey = "x-codex-turn-state"
 
 type codexTurnStateInjectionKey struct{}
 type codexClientModelKey struct{}
+type codexManagedTurnStateKey struct{}
+type codexManagedTurnStateAttempt struct {
+	account     *auth.Account
+	model, used string
+}
 
 // WithCodexClientModel 记录下游请求的原始模型名，供模型名单与上游模型名一并匹配：
 // 映射改写之后两者常常不是同一个名字，而操作者填的通常是自己请求时用的那个。
@@ -72,12 +77,24 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	if account == nil {
 		return ctx, requestBody, headers
 	}
+	if previous := CodexTurnStateInjectionFromContext(ctx); previous != "" {
+		ctx = withCodexTurnStateInjection(ctx, "")
+		ctx = context.WithValue(ctx, codexManagedTurnStateKey{}, codexManagedTurnStateAttempt{})
+		if headers.Get(codexTurnStateHeader) == previous {
+			headers = headers.Clone()
+			headers.Del(codexTurnStateHeader)
+		}
+		if gjson.GetBytes(requestBody, "client_metadata."+codexTurnStateMetadataKey).String() == previous {
+			requestBody, _ = sjson.DeleteBytes(requestBody, "client_metadata."+codexTurnStateMetadataKey)
+		}
+	}
 	upstreamModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
 	injected := account.CodexTurnStateInjection(codexClientModelFromContext(ctx), upstreamModel)
 	if injected == "" {
 		return ctx, requestBody, headers
 	}
 	ctx = withCodexTurnStateInjection(ctx, injected)
+	ctx = context.WithValue(ctx, codexManagedTurnStateKey{}, codexManagedTurnStateAttempt{account, upstreamModel, injected})
 	if headers == nil {
 		headers = make(http.Header)
 	} else {
@@ -129,7 +146,7 @@ func observedCodexTurnState(value string) string {
 	return value
 }
 
-var codexTurnStateFrameNeedles = [][]byte{[]byte("turn-state"), []byte("Turn-State")}
+var codexTurnStateFrameNeedles = [][]byte{[]byte("turn-state"), []byte("Turn-State"), []byte("turn_state")}
 
 // codexTurnStateFromFrame 从 WS 事件帧里找上游回带的 turn state。官方契约里 WS 路径
 // 的值来自握手响应头或 response.metadata 事件；这里按键名等值（大小写不敏感）在几个
@@ -162,7 +179,7 @@ func codexTurnStateFromFrame(payload []byte) string {
 		}
 		state := ""
 		object.ForEach(func(key, value gjson.Result) bool {
-			if strings.EqualFold(key.String(), codexTurnStateHeader) && value.Type == gjson.String {
+			if (strings.EqualFold(key.String(), codexTurnStateHeader) || key.String() == "current_turn_state") && value.Type == gjson.String {
 				state = value.String()
 				return false
 			}
@@ -180,5 +197,15 @@ func codexTurnStateFromFrame(payload []byte) string {
 func ObserveCodexTurnStateFrame(ctx context.Context, payload []byte) {
 	if state := codexTurnStateFromFrame(payload); state != "" {
 		noteUpstreamTurnState(ctx, state)
+		observeManagedCodexTurnState(ctx, state)
+	}
+}
+
+func observeManagedCodexTurnState(ctx context.Context, state string) {
+	if ctx == nil {
+		return
+	}
+	if attempt, ok := ctx.Value(codexManagedTurnStateKey{}).(codexManagedTurnStateAttempt); ok {
+		attempt.account.ObserveManagedCodexTurnState(attempt.model, attempt.used, state)
 	}
 }

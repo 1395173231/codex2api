@@ -1,5 +1,7 @@
 import { qualityTestFilterQuery, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
+  CodexTurnStateSettings,
+  CodexTurnStateStatus,
   AccountEventTrendPoint,
   AccountPortalAuthURLResponse,
   AccountPortalSubmitResponse,
@@ -1273,6 +1275,17 @@ export const api = {
   clearUsageLogs: () =>
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
+  getCodexTurnStateSettings: () => request<CodexTurnStateSettings>('/settings/codex-turn-state'),
+  updateCodexTurnStateSettings: (data: CodexTurnStateSettings & { clear_proxy?: boolean }) =>
+    request<CodexTurnStateSettings>('/settings/codex-turn-state', { method: 'PUT', body: JSON.stringify(data) }),
+  getAccountTurnStates: (id: number, signal?: AbortSignal) =>
+    request<{ enabled: boolean; items: CodexTurnStateStatus[] }>(`/accounts/${id}/turn-states`, { signal }),
+  saveAccountTurnState: (id: number, model: string, token: string) =>
+    request<unknown>(`/accounts/${id}/turn-states`, { method: 'PUT', body: JSON.stringify({ model, token }) }),
+  deleteAccountTurnState: (id: number, model: string) =>
+    request<unknown>(`/accounts/${id}/turn-states`, { method: 'DELETE', body: JSON.stringify({ model }) }),
+  refreshAccountTurnState: (id: number, model: string) =>
+    request<unknown>(`/accounts/${id}/turn-states/refresh`, { method: 'POST', body: JSON.stringify({ model }) }),
   getSettings: () => request<SystemSettings>('/settings'),
   getClaudeConfig: () =>
     request<ClaudeGlobalConfig>('/settings/claude-config'),
