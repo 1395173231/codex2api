@@ -31,12 +31,21 @@ var resinCfg atomic.Pointer[ResinConfig]
 // SetResinConfig 设置全局 Resin 配置；cfg 为 nil 或两项均为空时禁用 Resin。
 // 调用方应先通过 ValidateResinConfig 校验配置，以便向操作者返回可处理的错误。
 func SetResinConfig(cfg *ResinConfig) {
+	// 启用/禁用会同步到 auth 包的出口标记,让调度器的代理池 fail-closed 过滤知道
+	// Codex 账号此时由 Resin 承担出站。日志里的地址只保留 scheme://host,路径段
+	// 就是 Resin token,不能整段落盘(issue #679)。
+	wasEnabled := IsResinEnabled()
 	if cfg == nil {
 		resinCfg.Store(nil)
+		auth.SetResinEgressEnabled(false)
+		if wasEnabled {
+			log.Printf("[Resin] 已禁用;Codex 渠道出站恢复按 账号 > 分组 > 代理池 > 全局 > 直连 解析")
+		}
 		return
 	}
 	if err := ValidateResinConfig(cfg); err != nil {
 		resinCfg.Store(nil)
+		auth.SetResinEgressEnabled(false)
 		log.Printf("[Resin] 配置无效，已禁用: %v", err)
 		return
 	}
@@ -44,13 +53,18 @@ func SetResinConfig(cfg *ResinConfig) {
 	platformName := strings.TrimSpace(cfg.PlatformName)
 	if baseURL == "" && platformName == "" {
 		resinCfg.Store(nil)
+		auth.SetResinEgressEnabled(false)
+		if wasEnabled {
+			log.Printf("[Resin] 已禁用;Codex 渠道出站恢复按 账号 > 分组 > 代理池 > 全局 > 直连 解析")
+		}
 		return
 	}
 	resinCfg.Store(&ResinConfig{BaseURL: baseURL, PlatformName: platformName})
+	auth.SetResinEgressEnabled(true)
 	// BaseURL contains the Resin access token in its path. Never write that
 	// credential to logs; operators only need the proxy origin to verify the
 	// active endpoint.
-	log.Printf("[Resin] 已启用: platform=%s proxy=%s", platformName, redactResinURL(baseURL))
+	log.Printf("[Resin] 已启用: platform=%s proxy=%s;Codex 渠道出站全部经 Resin", platformName, redactResinURL(baseURL))
 }
 
 func redactResinURL(raw string) string {
@@ -76,11 +90,11 @@ func IsResinEnabled() bool {
 // transport 建立，从而保留 uTLS/浏览器指纹。返回 viaResin=true 仅表示调用方
 // 应使用返回的池化客户端；生产请求不需要也不应注入 X-Resin-Account。
 func resinMaintenanceTarget(account *auth.Account, targetURL string) (finalURL string, client *http.Client, viaResin bool) {
-	if !IsResinEnabled() || account == nil {
+	egress := ResolveCodexEgress(account, targetURL, "")
+	if !egress.ViaResin() {
 		return targetURL, nil, false
 	}
-	effectiveProxyURL := EffectiveProxyURLForAccount(account, "")
-	return targetURL, getCodexMaintenanceClient(account, effectiveProxyURL), true
+	return egress.URL, egress.Client(), true
 }
 
 // ValidateResinConfig 校验 Resin forward-proxy 配置。

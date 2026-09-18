@@ -1,16 +1,18 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X, CircleDollarSign, Braces } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X, CircleDollarSign, Braces, FlaskConical } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
 import { useVersionCheck } from '../hooks/useVersionCheck'
+import { buildVersionLabel } from '../lib/buildVersion'
 import { useTheme } from '../hooks/useTheme'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
 import SecurityBanner from './SecurityBanner'
 import { cn } from '@/lib/utils'
+import { CinematicThemeSwitcher } from '@/components/ui/cinematic-theme-switcher'
 
 type NavDef = {
   to: string
@@ -26,6 +28,7 @@ const navDefs: NavDef[] = [
   { to: '/api-keys', labelKey: 'nav.apiKeys', icon: <KeyRound className="size-[18px]" /> },
   { to: '/proxies', labelKey: 'nav.proxies', icon: <Globe className="size-[18px]" /> },
   { to: '/images/studio', labelKey: 'nav.images', icon: <ImageIcon className="size-[18px]" />, activePrefix: '/images' },
+  { to: '/quality-test', labelKey: 'nav.qualityTest', icon: <FlaskConical className="size-[18px]" /> },
   { to: '/prompt-filter/overview', labelKey: 'nav.promptFilter', icon: <ShieldAlert className="size-[18px]" />, activePrefix: '/prompt-filter' },
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
@@ -380,7 +383,7 @@ export default function Layout({ children }: PropsWithChildren) {
                         tabIndex={sidebarCollapsed ? -1 : 0}
                         onClick={() => setShowVersionPopover((current) => !current)}
                       >
-                        {__APP_VERSION__}
+                        {buildVersionLabel(__APP_VERSION__)}
                         {hasUpdate && (
                           <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
                         )}
@@ -551,6 +554,7 @@ export default function Layout({ children }: PropsWithChildren) {
                 {t('common.online')}
               </span>
               <div className={`flex items-center gap-0.5 ${sidebarCollapsed ? 'flex-col' : ''}`}>
+                {!sidebarCollapsed && <CinematicThemeSwitcher size="mini" />}
                 <button
                   onClick={toggleLang}
                   className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150 text-[12px] font-bold"
@@ -567,16 +571,18 @@ export default function Layout({ children }: PropsWithChildren) {
                 >
                   <svg className="size-[18px]" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
                 </a>
-                <button
-                  onClick={handleThemeToggle}
-                  className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150"
-                  title={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
-                  aria-label={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
-                >
-                  <span className={`inline-flex transition-transform duration-500 ease-out ${spinning ? 'rotate-[360deg] scale-110' : 'rotate-0 scale-100'}`}>
-                    {theme === 'dark' ? <Sun className="size-[18px]" /> : <Moon className="size-[18px]" />}
-                  </span>
-                </button>
+                {sidebarCollapsed && (
+                  <button
+                    onClick={handleThemeToggle}
+                    className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150"
+                    title={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
+                    aria-label={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
+                  >
+                    <span className={`inline-flex transition-transform duration-500 ease-out ${spinning ? 'rotate-[360deg] scale-110' : 'rotate-0 scale-100'}`}>
+                      {theme === 'dark' ? <Sun className="size-[18px]" /> : <Moon className="size-[18px]" />}
+                    </span>
+                  </button>
+                )}
                 <button
                   onClick={resetAdminAuthState}
                   className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150"
@@ -619,7 +625,7 @@ export default function Layout({ children }: PropsWithChildren) {
                 title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
                 onClick={() => setShowVersionPopover((current) => !current)}
               >
-                {__APP_VERSION__}
+                {buildVersionLabel(__APP_VERSION__)}
                 {hasUpdate && (
                   <span className="absolute -top-1 -right-1 size-2 rounded-full bg-red-500 shadow-sm ring-2 ring-card animate-pulse" />
                 )}
@@ -764,7 +770,7 @@ export default function Layout({ children }: PropsWithChildren) {
                     {t('common.online')}
                   </span>
                   <span className="font-mono text-[11px] font-semibold">
-                    v{__APP_VERSION__}
+                    {buildVersionLabel(__APP_VERSION__)}
                   </span>
                 </div>
               </div>

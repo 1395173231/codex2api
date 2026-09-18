@@ -132,8 +132,13 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
 	}
 
+	// 出口链路统一由 ResolveCodexWebsocketEgress 决定。
+	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyURL(account, proxyOverride))
+	wsURL = egress.URL
+
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
+	proxy.ApplyCodexTurnStateInjectionHeader(ctx, headers)
 	// 握手身份与每个 response.create 帧必须使用同一组 session/thread/window。
 	// 账号自定义头已经生效，因此这里以最终握手头为准同步帧内副本。
 	wsBody = synchronizeWebsocketRequestIdentity(wsBody, headers)
@@ -143,6 +148,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// was actually sent when that connection was established.
 	proxy.RecordUpstreamUserAgent(ctx, headers.Get("User-Agent"))
 
+	egress.ApplyHeaders(headers)
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
 	//
@@ -161,7 +167,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// handshake compatibility profile in the local pool key.  The former avoids
 	// serializing independent child threads; the latter prevents reusing a
 	// socket whose frozen handshake identity differs from this request.
-	transportSessionID := proxy.ResolveCodexWebsocketTransportSessionKey(sessionID, ginHeaders)
+	transportSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
 	poolSessionID := websocketPoolSessionKey(transportSessionID, compatibilityKey)
 	var wc *WsConnection
 	var pr *PendingRequest
@@ -343,8 +349,11 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		headers.Set("X-Codex-Beta-Features", "remote_compaction_v2")
 	}
 
-	// Originator
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); !usedGeneratedHeaders && originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
+	// Originator：与 HTTP 路径同规则——生成 UA 时跟随生成的客户端前缀，
+	// 透传官方客户端时沿用下游值。
+	if usedGeneratedHeaders {
+		headers.Set("Originator", proxy.CodexOriginatorForGeneratedUserAgent(headers.Get("User-Agent")))
+	} else if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
 		headers.Set("Originator", originator)
 	} else {
 		headers.Set("Originator", proxy.Originator)
@@ -1029,6 +1038,8 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 		defer wsResp.Close()
 
 		err := wsResp.ReadStream(func(data []byte) bool {
+			// 上游回带的 turn state 只在帧里（握手头是建连时的旧快照），逐帧观测记进追踪。
+			proxy.ObserveCodexTurnStateFrame(ctx, data)
 			// SSE 的 data: 负载以换行为界，含换行的帧（如 pretty-printed JSON）
 			// 必须先压缩成单行，否则下游解析器只能读到第一行。
 			if bytes.IndexByte(data, '\n') >= 0 {

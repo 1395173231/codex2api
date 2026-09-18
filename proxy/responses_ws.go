@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 const (
 	responsesWSFirstMessageTimeout        = 30 * time.Second
 	responsesWSWriteTimeout               = 30 * time.Second
+	responsesWSOverloadWriteTimeout       = time.Second
 	responsesWSFriendlyUpstreamErr        = "上游服务临时繁忙，请稍后重试"
 	newAPIPolicyWebSocketEventField       = "__newapi_policy_event_id"
 	newAPIPolicyWebSocketCapabilityHeader = "X-Codex2API-Policy-Event-ID"
@@ -87,15 +89,6 @@ func isPreviousResponseNotFoundBody(payload []byte) bool {
 	return false
 }
 
-// degradeResponsesWSContinuationBody 把续链请求降级为自包含请求：先用本地响应缓存
-// 把历史 items 补回 input，再剥离 previous_response_id。剥离后请求不再依赖上游会话
-// 状态，可以落到任意账号继续，而不是整轮失败。
-func degradeResponsesWSContinuationBody(codexBody []byte, cacheOwner string) []byte {
-	expanded, _ := expandPreviousResponse(codexBody, cacheOwner)
-	expanded, _ = sjson.DeleteBytes(expanded, "previous_response_id")
-	return expanded
-}
-
 type responsesWSCloseError struct {
 	code   int
 	reason string
@@ -113,21 +106,35 @@ type responsesWSForwardOptions struct {
 // turn is backing off, so a client disconnect can cancel an unlimited retry
 // loop without introducing a second concurrent WebSocket reader.
 type responsesWSInboundMessage struct {
-	messageType int
-	payload     []byte
-	turn        int
-	err         error
-	queuedBytes *atomic.Int64
+	messageType   int
+	payload       []byte
+	turn          int
+	err           error
+	queuedBytes   *atomic.Int64
+	requestMemory *security.RequestMemoryReservation
 }
 
 type responsesWSInboundObserver func(responsesWSInboundMessage)
 
 func (m *responsesWSInboundMessage) releaseQueueBudget() {
-	if m == nil || m.queuedBytes == nil {
+	if m == nil {
 		return
 	}
-	m.queuedBytes.Add(-int64(len(m.payload)))
-	m.queuedBytes = nil
+	if m.queuedBytes != nil {
+		m.queuedBytes.Add(-int64(len(m.payload)))
+		m.queuedBytes = nil
+	}
+	if m.requestMemory != nil {
+		m.requestMemory.Release()
+		m.requestMemory = nil
+	}
+}
+
+// The read pump must have stopped before draining the connection's leftovers.
+func drainResponsesWSInboundMessages(messages <-chan responsesWSInboundMessage) {
+	for message := range messages {
+		message.releaseQueueBudget()
+	}
 }
 
 func startResponsesWSReadPump(ctx context.Context, conn *websocket.Conn, observers ...responsesWSInboundObserver) (context.Context, <-chan responsesWSInboundMessage, <-chan struct{}, context.CancelFunc) {
@@ -151,8 +158,16 @@ func startResponsesWSReadPump(ctx context.Context, conn *websocket.Conn, observe
 			} else {
 				_ = conn.SetReadDeadline(time.Time{})
 			}
-			messageType, payload, err := conn.ReadMessage()
+			messageType, reader, err := conn.NextReader()
+			var payload []byte
+			var reservation *security.RequestMemoryReservation
+			if err == nil {
+				payload, reservation, err = security.ReadRequestMemory(reader, queueByteLimit)
+			}
 			if err != nil {
+				if errors.Is(err, security.ErrRequestMemoryBudget) {
+					closeResponsesWSWithin(conn, websocket.CloseTryAgainLater, "request memory capacity exhausted", responsesWSOverloadWriteTimeout)
+				}
 				// Cancel before notifying the consumer. If the bounded handoff
 				// buffer is already full, the active upstream turn still
 				// observes cancellation and will stop without waiting for it.
@@ -167,14 +182,16 @@ func startResponsesWSReadPump(ctx context.Context, conn *websocket.Conn, observe
 			payloadBytes := int64(len(payload))
 			if queuedBytes.Add(payloadBytes) > queueByteLimit {
 				queuedBytes.Add(-payloadBytes)
+				reservation.Release()
 				cancel()
 				return
 			}
 			message := responsesWSInboundMessage{
-				messageType: messageType,
-				payload:     payload,
-				turn:        turn,
-				queuedBytes: &queuedBytes,
+				messageType:   messageType,
+				payload:       payload,
+				turn:          turn,
+				queuedBytes:   &queuedBytes,
+				requestMemory: reservation,
 			}
 			// Observers must stay non-blocking. Realtime uses this hook to signal a
 			// response.cancel while the serial consumer is waiting on an upstream
@@ -187,10 +204,10 @@ func startResponsesWSReadPump(ctx context.Context, conn *websocket.Conn, observe
 			select {
 			case messages <- message:
 			case <-readCtx.Done():
-				queuedBytes.Add(-payloadBytes)
+				message.releaseQueueBudget()
 				return
 			default:
-				queuedBytes.Add(-payloadBytes)
+				message.releaseQueueBudget()
 				// A turn is processed serially. The bounded count and byte budgets
 				// absorb normal Realtime event bursts without allowing a stalled
 				// upstream turn to retain unbounded client input.
@@ -248,10 +265,13 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 	conn.SetReadLimit(int64(security.MaxRequestBodySize))
 	requestCtx, messages, readPumpDone, cancel := startResponsesWSReadPump(c.Request.Context(), conn)
 	c.Request = c.Request.WithContext(requestCtx)
+	stopDownstreamKeepalive := startDownstreamWSKeepalive(requestCtx, conn, cancel)
 	defer func() {
 		cancel()
 		_ = conn.Close()
+		stopDownstreamKeepalive()
 		<-readPumpDone
+		drainResponsesWSInboundMessages(messages)
 	}()
 
 	for {
@@ -324,6 +344,14 @@ func stripNewAPIPolicyWebSocketEventID(payload []byte) ([]byte, string) {
 }
 
 func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte, policyEventID string, options *responsesWSForwardOptions) (returnErr error) {
+	defer releasePromptRequestFrameBody(c)
+	reservation, admitted := security.TryAcquireRequestMemory(int64(len(rawPayload)))
+	if !admitted {
+		apiErr := api.NewAPIError(api.ErrCodeServiceUnavailable, "Request memory capacity exhausted, please retry later", api.ErrorTypeServer)
+		_ = writeResponsesWSErrorWithin(conn, apiErr, responsesWSOverloadWriteTimeout)
+		return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
+	}
+	defer reservation.Release()
 	if apiErr := h.refreshNewAPIWebSocketBinding(c, time.Now()); apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
@@ -351,6 +379,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// prior frame's compaction badges.
 	compactionMeta := requestBodyCompactionMeta(rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
+	cacheRequestUltraMode(c, resolveRequestUltraMode(nil, rawBody))
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -414,6 +443,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	turnContinuation := codexWSTurnContinuationToken(rawBody) != ""
 	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	respCacheOwner := responseCacheOwner(apiKeyID)
+	markResponsesWSContinuationCapable(respCacheOwner, rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	// 上下文压缩轮豁免首字超时看门狗（issue #381）：压缩首帧天然慢，超时换号无益。
 	bodySignalCompact := compactionMeta.ProtocolTriggered
@@ -423,7 +453,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
-	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
+	codexBody, naturalImageIntent := prepareResponsesWebSocketTurnBody(rawBody)
+	// Pin an available L1 ancestor before upstream generation; defer backend
+	// lookup, merging and serialization until a snapshot is actually needed.
 	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
 	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
@@ -449,7 +481,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// Only a request that passed payload, prompt-policy and API-key admission may
 	// replace the active owner. Claim before concurrency/account acquisition so
 	// the old request can release those leases for the new one.
-	if preemptCtx, cleanupPreempt, armed := h.beginResponsesWSSessionPreemption(c.Request.Context(), c, rawBody, sessionIdentity); armed {
+	// 被更新的连接取代时先给本连接发 1013 关闭帧再取消：Codex 客户端据此立即重试，
+	// 而不是在裸 1006 断开后静默等到自己的空闲超时。
+	notifyPreempted := func() {
+		closeResponsesWS(conn, websocket.CloseTryAgainLater, responsesWSSessionPreemptedCloseReason)
+	}
+	if preemptCtx, cleanupPreempt, armed := h.beginResponsesWSSessionPreemptionWithNotify(c.Request.Context(), c, rawBody, sessionIdentity, notifyPreempted); armed {
 		originalRequest := c.Request
 		c.Request = originalRequest.WithContext(preemptCtx)
 		defer func() {
@@ -516,11 +553,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		stopRetryDeadline()
 	}()
-	stopRetryKeepalive := installContinuousRetryWSKeepalive(c, conn)
-	defer stopRetryKeepalive()
-	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-		activateContinuousRetryKeepalive(c.Request.Context())
-	}
 	// The continuous selector is independent from the legacy finite WebSocket
 	// silent-retry switch. Selected failures use its unlimited budget even when
 	// the legacy switch is disabled; unselected failures retain old semantics.
@@ -542,12 +574,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// 忽略本地 WHAM 100% 快照；previous_response_id 本身不足以证明这是活跃 turn。
 	continuationPinned := turnContinuation && turnHasBinding
 	continuationDegraded := false
-	degradeContinuation := func(reason string, attempt int) {
+	turnReplay := newResponsesWSReplaySource(codexBody, respCacheOwner)
+	degradeContinuation := func(reason string, attempt int) *api.APIError {
+		expanded, lost, contextErr := degradeResponsesWSContinuationWithSource(codexBody, respCacheOwner, turnReplay)
+		if contextErr != nil {
+			return contextErr
+		}
 		continuationDegraded = true
 		continuationPinned = false
-		codexBody = degradeResponsesWSContinuationBody(codexBody, respCacheOwner)
-		expandedInputRaw = responsesInputRaw(codexBody)
+		codexBody = expanded
+		turnReplay = newResponsesWSReplaySourceFromInput(responsesInputRaw(expanded))
+		if lost {
+			turnReplay = newResponsesWSReplaySourceFromInput("")
+		}
 		log.Printf("Responses WebSocket continuation degraded: %s, stripped previous_response_id and retried once (attempt %d)", reason, attempt)
+		return nil
 	}
 	preserveContinuationBinding := func() bool {
 		return continuationPinned || (hasPreviousResponse && !continuationDegraded)
@@ -568,6 +609,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	for attempt := 0; ; attempt++ {
 		resetAnalyticsResponseObservation(c)
 		if c.Request.Context().Err() != nil {
@@ -583,7 +625,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				// id 也不能被带到一个明确不同的账号上反复失败。
 				if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
 					if exclude := retryExclusions.ForSelection(); exclude[boundID] {
-						degradeContinuation(fmt.Sprintf("bound account %d excluded by this request", boundID), attempt+1)
+						if contextErr := degradeContinuation(fmt.Sprintf("bound account %d excluded by this request", boundID), attempt+1); contextErr != nil {
+							_ = writeResponsesWSError(conn, contextErr)
+							return newResponsesWSCloseError(responsesWSContextCloseCode(contextErr), contextErr.Message, contextErr)
+						}
 					}
 				}
 			}
@@ -593,16 +638,18 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationPinned {
-				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithMessageHashesAndDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
 			if c.Request.Context().Err() != nil {
 				return errResponsesWSClientGone
 			}
-			if compactionAffinity.Known {
+			if errors.Is(selectionErr, auth.ErrSchedulerQueueFull) {
+				apiErr = schedulerQueueFullAPIError()
+			} else if compactionAffinity.Known {
 				apiErr = compactionUpstreamUnavailableAPIError()
 			} else if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
@@ -611,8 +658,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				// 候选被 scope 预算剔空（issue #439）：按限流语义回帧，而不是「无可用账号」。
 				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, msg, api.ErrorTypeRateLimit)
-			} else if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
-				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, "Codex 账号用量窗口已达上限", api.ErrorTypeRateLimit)
+			} else if limited := h.store.UsageLimitedCandidateSummary(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy); limited.Found {
+				// WS 帧没有 Retry-After 头，瞬时 throttle 的等待秒数写进文案。
+				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, usageLimitedPoolMessages(limited).Chinese, api.ErrorTypeRateLimit)
 			} else {
 				apiErr = api.NewAPIError(api.ErrCodeServiceUnavailable, noAvailableAccountMessage(effectiveModel), api.ErrorTypeServer)
 			}
@@ -658,7 +706,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		useWebsocket := !wsHTTPFallback.ForceHTTP()
 		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
 		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
-		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
+		if useWebsocket && (responsesBodyRequestsImageGeneration(rawBody) || naturalImageIntent) {
 			useWebsocket = false
 		}
 		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
@@ -670,27 +718,35 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
 		upstreamBody := codexBody
-		attemptExpandedInputRaw := expandedInputRaw
+		attemptReplay := turnReplay
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		} else if prevID := strings.TrimSpace(gjson.GetBytes(codexBody, "previous_response_id").String()); prevID != "" {
-			// HTTP 上游不支持续链（executor 出站前会剥掉 previous_response_id）：
-			// 命中本地响应缓存时先把历史展开进 input[] 再剥离，避免降级后静默失忆；
-			// 未命中只能按原样继续，明确记日志便于诊断（issue #548）。只改本次
-			// attempt 的出站体，后续换回 WS 的重试仍用原始续链请求。
-			if cached := getResponseCache(respCacheOwner, prevID); cached != nil {
-				upstreamBody = degradeResponsesWSContinuationBody(codexBody, respCacheOwner)
-				attemptExpandedInputRaw = responsesInputRaw(upstreamBody)
-				log.Printf("Responses WebSocket HTTP 降级：previous_response_id=%s 已用本地缓存展开为自包含请求 (account=%d)", prevID, account.ID())
-			} else {
-				log.Printf("Responses WebSocket HTTP 降级：previous_response_id=%s 本地缓存未命中，上游侧会话历史将不可用 (account=%d)", prevID, account.ID())
+			var contextErr *api.APIError
+			var lost bool
+			upstreamBody, lost, contextErr = degradeResponsesWSContinuationWithSource(codexBody, respCacheOwner, turnReplay)
+			if contextErr != nil {
+				ttftGuard.Stop()
+				upstreamCancel()
+				h.store.Release(account)
+				_ = writeResponsesWSError(conn, contextErr)
+				return newResponsesWSCloseError(responsesWSContextCloseCode(contextErr), contextErr.Message, contextErr)
 			}
+			// 降级时快照已经算过一次，直接复用展开后的 input，不再二次过滤。
+			attemptReplay = newResponsesWSReplaySourceFromInput(responsesInputRaw(upstreamBody))
+			if lost {
+				attemptReplay = nil
+			}
+		}
+		if gjson.GetBytes(rawBody, "store").Type == gjson.False {
+			attemptReplay = nil
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, effectiveModel, downstreamHeaders, attemptIdentity)
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
+		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		rememberAnalyticsUpstreamSession(c, upstreamSessionID)
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
@@ -810,7 +866,15 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					}
 					if codexChanged {
 						codexBody = strippedCodexBody
-						expandedInputRaw = responsesInputRaw(codexBody)
+						// Keep the admitted ancestor while dropping rejected opaque items from
+						// this attempt. A previously lossy fallback must remain unwritable.
+						if turnReplay != nil && !(turnReplay.precomputed && turnReplay.input == "") {
+							updated := newResponsesWSReplaySource(codexBody, respCacheOwner)
+							if turnReplay.previous != nil {
+								updated.previous = turnReplay.previous
+							}
+							turnReplay = updated
+						}
 					}
 					log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
 					h.store.Release(account)
@@ -824,7 +888,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			// 上游认不出续链 id：账号本身是好的，别记失败也别排除它，
 			// 降级成自包含请求后原地重试一次（issue #400）。
 			if canDegradeContinuation() && isPreviousResponseNotFoundBody(errBody) {
-				degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1)
+				if contextErr := degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1); contextErr != nil {
+					h.store.Release(account)
+					_ = writeResponsesWSError(conn, contextErr)
+					return newResponsesWSCloseError(responsesWSContextCloseCode(contextErr), contextErr.Message, contextErr)
+				}
 				SyncCodexUsageState(h.store, account, resp)
 				h.store.Release(account)
 				continue
@@ -906,7 +974,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		preserveAffinity := preserveContinuationBinding()
 		allowContinuationDegrade := canDegradeContinuation()
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, apiKeyID, sessionIdentity.messageHashes, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, attemptExpandedInputRaw, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, apiKeyID, sessionIdentity.messageHashes, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, attemptReplay, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
 			if continuousRetryDeadlineExceeded(c.Request.Context()) {
 				return errResponsesWSClientGone
 			}
@@ -914,7 +982,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if canDegradeContinuation() && errors.As(err, &continuationErr) {
 				// 账号已在流内释放，未记失败也未解绑：剥离续链 id 后原地再试一次。
 				// turn-state 钉号同样走这条路：上游已经说找不到 id，换号无益，剥 id 才能继续。
-				degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1)
+				if contextErr := degradeContinuation(fmt.Sprintf("upstream rejected previous_response_id on account %d", account.ID()), attempt+1); contextErr != nil {
+					_ = writeResponsesWSError(conn, contextErr)
+					return newResponsesWSCloseError(responsesWSContextCloseCode(contextErr), contextErr.Message, contextErr)
+				}
 				continue
 			}
 			var retryErr *responsesWSRetryableStreamError
@@ -1023,7 +1094,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	reasoningEffort string,
 	serviceTier string,
 	respCacheOwner string,
-	expandedInputRaw string,
+	replayInput *responsesWSReplaySource,
 	start time.Time,
 	ttftGuard *firstTokenTimeoutGuard,
 	retryEnabled bool,
@@ -1064,6 +1135,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	var terminalFailureClientPayload []byte
 	var preContentErrorCandidate []byte
 	var completedResponsePayload []byte
+	outputCollector := newResponseOutputCollector()
+	emptyIncomplete := &emptyIncompleteTracker{}
 	terminalFailureEventType := ""
 	wroteAnyBody := false
 	var wsReplay *continuousRetryWSReplay
@@ -1110,9 +1183,11 @@ func (h *Handler) streamResponsesWSUpstream(
 		if wsReplay == nil {
 			h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 		}
+		outputCollector.Add(data)
 		parsed := gjson.ParseBytes(data)
 		eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 		observeAnalyticsResponsePayload(c, data)
+		eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 		clientData := data
 		if options != nil && options.transformClientEvent != nil {
 			if transformed := options.transformClientEvent(data); len(transformed) > 0 {
@@ -1124,7 +1199,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		// terminalFailurePayload 取改写前的原始 data，不受影响。
 		clientData = sanitizeCapacityShedEventForClient(eventType, clientData)
 		ttftGuard.MarkProgress(eventType)
-		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+		isFirstToken := isLooseFirstTokenResult(parsed)
 		if !ttftRecorded && isFirstToken {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 			ttftRecorded = true
@@ -1146,7 +1221,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			if eventType == "response.completed" {
+			if eventType == "response.completed" || eventType == "response.incomplete" {
 				completedResponsePayload = append([]byte(nil), data...)
 			}
 			gotTerminal = true
@@ -1406,12 +1481,14 @@ func (h *Handler) streamResponsesWSUpstream(
 			})
 		}
 		if len(completedResponsePayload) > 0 {
-			if options != nil && options.onResponseCompleted != nil {
+			if options != nil && options.onResponseCompleted != nil && gjson.GetBytes(completedResponsePayload, "type").String() == "response.completed" {
 				options.onResponseCompleted(append([]byte(nil), completedResponsePayload...))
 			}
-			// Only committed response.completed events become continuation history.
+			// Committed completed/incomplete responses can be continuation history.
 			// Failed attempts and locally blocked/unwritable replays leave no cache.
-			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), completedResponsePayload)
+			if !outputCollector.overflow {
+				cacheResponsesWSCompletedResponse(respCacheOwner, replayInput.Input(), completedResponsePayload, outputCollector.Items())
+			}
 		}
 	}
 	_ = wsReplay.Close()
@@ -1467,6 +1544,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		logInput.OutputTokens = usage.OutputTokens
 		logInput.ReasoningTokens = usage.ReasoningTokens
 		logInput.CachedTokens = usage.CachedTokens
+		logInput.ImageInputTokens, logInput.ImageOutputTokens, logInput.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 	}
 	applyImageUsageLogInfo(logInput, imageLogInfo)
 	h.logUsageForRequest(c, logInput)
@@ -1570,7 +1648,7 @@ func (h *Handler) streamResponsesWSUpstream(
 }
 
 func normalizeResponsesWebSocketClientPayload(raw []byte) ([]byte, string, *api.APIError) {
-	trimmed := []byte(strings.TrimSpace(string(raw)))
+	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return nil, "", api.NewAPIError(api.ErrCodeInvalidRequest, "empty websocket request payload", api.ErrorTypeInvalidRequest)
 	}
@@ -1673,6 +1751,10 @@ func isResponsesWebSocketUpgradeRequest(r *http.Request) bool {
 }
 
 func writeResponsesWSError(conn *websocket.Conn, apiErr *api.APIError) error {
+	return writeResponsesWSErrorWithin(conn, apiErr, responsesWSWriteTimeout)
+}
+
+func writeResponsesWSErrorWithin(conn *websocket.Conn, apiErr *api.APIError, timeout time.Duration) error {
 	if apiErr == nil {
 		apiErr = api.NewAPIError(api.ErrCodeServerError, "Internal server error", api.ErrorTypeServer)
 	}
@@ -1686,7 +1768,11 @@ func writeResponsesWSError(conn *websocket.Conn, apiErr *api.APIError) error {
 	if err != nil {
 		return err
 	}
-	return writeResponsesWSMessage(conn, payload)
+	if conn == nil {
+		return errResponsesWSClientGone
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	return conn.WriteMessage(websocket.TextMessage, payload)
 }
 
 func responsesWSClientUpstreamAPIError(apiErr *api.APIError, hideUpstreamErrors bool) *api.APIError {
@@ -1705,12 +1791,16 @@ func writeResponsesWSMessage(conn *websocket.Conn, payload []byte) error {
 }
 
 func closeResponsesWS(conn *websocket.Conn, code int, reason string) {
+	closeResponsesWSWithin(conn, code, reason, responsesWSWriteTimeout)
+}
+
+func closeResponsesWSWithin(conn *websocket.Conn, code int, reason string, timeout time.Duration) {
 	if conn == nil {
 		return
 	}
 	reason = truncateWebSocketCloseReason(reason)
 	msg := websocket.FormatCloseMessage(code, reason)
-	_ = conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(responsesWSWriteTimeout))
+	_ = conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(timeout))
 }
 
 func truncateWebSocketCloseReason(reason string) string {

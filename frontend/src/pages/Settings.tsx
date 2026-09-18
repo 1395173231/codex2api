@@ -7,7 +7,8 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { AntigravityOAuthClientSetting, HealthResponse, ModelInfo, SiteBranding, SystemSettings, UpstreamChannel } from '../types'
+import type { AntigravityOAuthClientSetting, AntigravitySettingsResponse, ChannelTestSettings, CodexUserAgentCatalog, CodexUserAgentPreview, HealthResponse, ModelInfo, SiteBranding, SystemSettings, UpstreamChannel } from '../types'
+import { ANTIGRAVITY_DEFAULT_MODELS } from '../lib/antigravityModels'
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
@@ -99,6 +100,7 @@ import {
   Timer,
   Upload,
   Users,
+  Shuffle,
   Wifi,
   Wrench,
   X,
@@ -126,6 +128,25 @@ type CodexUserAgentConfig = {
   os_version?: string
   arch?: string
   terminal?: string
+  client_kind?: string
+  app_name?: string
+  app_version?: string
+  mode?: string
+  pool_mix?: Record<string, number>
+}
+type CodexUAKind = 'codex-tui' | 'codex-desktop' | 'codex-vscode' | 'codex-exec' | 'custom'
+const CODEX_UA_KINDS: CodexUAKind[] = ['codex-tui', 'codex-desktop', 'codex-vscode', 'codex-exec', 'custom']
+const CODEX_UA_POOL_KINDS: CodexUAKind[] = ['codex-desktop', 'codex-vscode', 'codex-tui', 'codex-exec']
+const CODEX_UA_FALLBACK_POOL_MIX: Record<string, number> = { 'codex-desktop': 50, 'codex-vscode': 30, 'codex-tui': 20 }
+const CODEX_UA_STRING_KEYS = ['raw_user_agent', 'client_name', 'client_version', 'os_name', 'os_version', 'arch', 'terminal', 'client_kind', 'app_name', 'app_version', 'mode'] as const
+// 与后端 inferCodexClientKind 同规则:未指定形态的旧配置按客户端名推断。
+const inferCodexUAKind = (clientName?: string): CodexUAKind => {
+  const name = (clientName ?? '').trim().toLowerCase()
+  if (!name || name === 'codex-tui') return 'codex-tui'
+  if (name === 'codex desktop') return 'codex-desktop'
+  if (name === 'codex_vscode') return 'codex-vscode'
+  if (name === 'codex_exec') return 'codex-exec'
+  return 'custom'
 }
 
 const EMPTY_REASONING_EFFORT_MODEL_ENTRIES: ReasoningEffortModelEntry[] = []
@@ -153,6 +174,11 @@ const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   os_version: '15.5.0',
   arch: 'arm64',
   terminal: 'xterm-256color',
+  client_kind: '',
+  app_name: '',
+  app_version: '',
+  mode: '',
+  pool_mix: {},
 }
 
 type SettingsTabKey = 'codex' | 'claude' | 'antigravity' | 'grok' | 'appearance' | 'general'
@@ -167,6 +193,7 @@ const CHANNELS_STREAMING: readonly UpstreamChannel[] = ['codex', 'grok', 'antigr
 const CHANNELS_RELAY: readonly UpstreamChannel[] = ['codex', 'antigravity']
 const SETTINGS_TAB_KEYS: readonly SettingsTabKey[] = ['codex', 'claude', 'antigravity', 'grok', 'appearance', 'general']
 const DEFAULT_SETTINGS_TAB: SettingsTabKey = 'codex'
+const HIDDEN_IMAGE_DRIVER_MODELS = new Set(['gpt-5.3-codex-spark', 'codex-auto-review', 'gpt-reserve'])
 const isSettingsTabKey = (value: string | null): value is SettingsTabKey =>
   value !== null && (SETTINGS_TAB_KEYS as readonly string[]).includes(value)
 // 旧版单页锚点 → Tab 映射，保证外部深链不失效。
@@ -181,6 +208,7 @@ const LEGACY_SECTION_TABS: Record<string, SettingsTabKey> = {
   'settings-codex-quota': 'codex',
   'settings-codex-transport': 'codex',
   'settings-codex-client': 'codex',
+  'settings-codex-images': 'codex',
   'settings-grok': 'grok',
   'settings-claude': 'claude',
   'settings-antigravity': 'antigravity',
@@ -193,6 +221,7 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
     { id: 'settings-codex-quota', labelKey: 'settings.nav.codexQuota', icon: <Gauge /> },
     { id: 'settings-codex-transport', labelKey: 'settings.nav.codexTransport', icon: <Wifi /> },
     { id: 'settings-codex-client', labelKey: 'settings.nav.codexClient', icon: <Terminal /> },
+    { id: 'settings-codex-images', labelKey: 'settings.nav.codexImages', icon: <ImageIcon /> },
     { id: 'settings-models', labelKey: 'settings.nav.models', icon: <Layers /> },
   ],
   claude: [{ id: 'settings-claude', labelKey: 'settings.nav.claude', icon: <ChannelLogo channel="claude" size={16} /> }],
@@ -211,7 +240,7 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
 // 分区滚动高亮的判定线：分区顶部越过视口该高度即视为当前分区（要盖过粘性 Tab 栏）。
 const SETTINGS_SECTION_SPY_OFFSET_PX = 140
 // 手动保存字段的脏检查里跳过的键：生成号是服务端只读，自定义 Prompt 规则由规则页单独保存。
-const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns'])
+const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns', 'codex_images_default_main_model', 'codex_egress'])
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -253,9 +282,6 @@ const normalizeReasoningEffortValue = (effort: string) => {
 
 const normalizeBillingTierPolicyValue = (value?: string | null): 'actual' | 'requested' =>
   value === 'requested' ? 'requested' : 'actual'
-
-const normalizeFirstTokenModeValue = (value?: string | null): 'strict' | 'loose' =>
-  value === 'loose' ? 'loose' : 'strict'
 
 const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof SystemSettings>): Partial<SystemSettings> => {
   const patch: Record<string, unknown> = {}
@@ -353,6 +379,12 @@ const parseCodexUserAgentConfig = (value?: string): CodexUserAgentConfig => {
   try {
     const parsed = JSON.parse(value || '{}')
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const poolMix: Record<string, number> = {}
+    if (parsed.pool_mix && typeof parsed.pool_mix === 'object' && !Array.isArray(parsed.pool_mix)) {
+      for (const [kind, weight] of Object.entries(parsed.pool_mix as Record<string, unknown>)) {
+        if (typeof weight === 'number' && Number.isFinite(weight)) poolMix[kind] = weight
+      }
+    }
     return {
       raw_user_agent: typeof parsed.raw_user_agent === 'string' ? parsed.raw_user_agent : '',
       client_name: typeof parsed.client_name === 'string' ? parsed.client_name : '',
@@ -361,6 +393,11 @@ const parseCodexUserAgentConfig = (value?: string): CodexUserAgentConfig => {
       os_version: typeof parsed.os_version === 'string' ? parsed.os_version : '',
       arch: typeof parsed.arch === 'string' ? parsed.arch : '',
       terminal: typeof parsed.terminal === 'string' ? parsed.terminal : '',
+      client_kind: typeof parsed.client_kind === 'string' ? parsed.client_kind : '',
+      app_name: typeof parsed.app_name === 'string' ? parsed.app_name : '',
+      app_version: typeof parsed.app_version === 'string' ? parsed.app_version : '',
+      mode: typeof parsed.mode === 'string' ? parsed.mode : '',
+      pool_mix: poolMix,
     }
   } catch {
     return {}
@@ -369,99 +406,19 @@ const parseCodexUserAgentConfig = (value?: string): CodexUserAgentConfig => {
 
 const serializeCodexUserAgentConfig = (config: CodexUserAgentConfig) => {
   const normalized: CodexUserAgentConfig = {}
-  for (const key of ['raw_user_agent', 'client_name', 'client_version', 'os_name', 'os_version', 'arch', 'terminal'] as const) {
+  for (const key of CODEX_UA_STRING_KEYS) {
     const value = (config[key] ?? '').trim()
     if (value) normalized[key] = key === 'client_version' ? normalizeVersionText(value) : value
   }
+  const poolMix: Record<string, number> = {}
+  for (const [kind, weight] of Object.entries(config.pool_mix ?? {})) {
+    if (Number.isFinite(weight) && weight >= 0) poolMix[kind] = Math.floor(weight)
+  }
+  if (Object.keys(poolMix).length > 0) normalized.pool_mix = poolMix
   return JSON.stringify(normalized)
 }
 
-type ParsedVersion = {
-  core: [number, number, number]
-  prerelease: string
-}
-
 const normalizeVersionText = (version?: string) => (version ?? '').trim().replace(/^v/i, '')
-
-const parseVersion = (version?: string): ParsedVersion | null => {
-  const match = normalizeVersionText(version).match(/^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9][A-Za-z0-9.-]*))?$/)
-  if (!match) return null
-  return {
-    core: [Number(match[1]), Number(match[2]), Number(match[3])],
-    prerelease: match[4] ?? '',
-  }
-}
-
-const isNumericVersionIdentifier = (value: string) => /^\d+$/.test(value)
-
-const compareNumericVersionIdentifier = (a: string, b: string) => {
-  const av = a.replace(/^0+/, '') || '0'
-  const bv = b.replace(/^0+/, '') || '0'
-  if (av.length !== bv.length) return av.length > bv.length ? 1 : -1
-  if (av !== bv) return av > bv ? 1 : -1
-  return 0
-}
-
-const comparePrerelease = (a: string, b: string) => {
-  if (!a && !b) return 0
-  if (!a) return 1
-  if (!b) return -1
-  const av = a.split('.')
-  const bv = b.split('.')
-  for (let i = 0; i < av.length && i < bv.length; i += 1) {
-    const ai = av[i]
-    const bi = bv[i]
-    const an = isNumericVersionIdentifier(ai)
-    const bn = isNumericVersionIdentifier(bi)
-    if (an && bn) {
-      const cmp = compareNumericVersionIdentifier(ai, bi)
-      if (cmp !== 0) return cmp
-    } else if (an) {
-      return -1
-    } else if (bn) {
-      return 1
-    } else if (ai !== bi) {
-      return ai > bi ? 1 : -1
-    }
-  }
-  if (av.length !== bv.length) return av.length > bv.length ? 1 : -1
-  return 0
-}
-
-const compareVersions = (a?: string, b?: string) => {
-  const av = parseVersion(a)
-  const bv = parseVersion(b)
-  if (!av || !bv) return 0
-  for (let i = 0; i < 3; i += 1) {
-    if (av.core[i] !== bv.core[i]) return av.core[i] > bv.core[i] ? 1 : -1
-  }
-  return comparePrerelease(av.prerelease, bv.prerelease)
-}
-
-const effectiveGeneratedCodexClientVersion = (version: string, minVersion: string, compatMode: string) => {
-  const cleanVersion = normalizeVersionText(version) || DEFAULT_CODEX_UA_CONFIG.client_version
-  const cleanMinVersion = normalizeVersionText(minVersion)
-  if (compatMode === 'auto' && cleanMinVersion && compareVersions(cleanVersion, cleanMinVersion) < 0) {
-    return cleanMinVersion
-  }
-  return cleanVersion
-}
-
-const buildCodexUserAgentPreview = (config: CodexUserAgentConfig, minVersion: string, compatMode: string) => {
-  const raw = (config.raw_user_agent ?? '').trim()
-  if (raw) return raw
-  const clientName = (config.client_name ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.client_name
-  const clientVersion = effectiveGeneratedCodexClientVersion(
-    (config.client_version ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.client_version,
-    minVersion,
-    compatMode,
-  )
-  const osName = (config.os_name ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.os_name
-  const osVersion = (config.os_version ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.os_version
-  const arch = (config.arch ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.arch
-  const terminal = (config.terminal ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.terminal
-  return `${clientName}/${clientVersion} (${osName} ${osVersion}; ${arch}) ${terminal} (${clientName}; ${clientVersion})`
-}
 
 // 模型映射编辑器组件
 function ModelMappingEditor({
@@ -777,10 +734,207 @@ const SETTINGS_SWITCH_ROW = 'grid grid-cols-1 gap-3'
 // 一组只含开关的相关设置合并成一张卡，用 SettingField layout="row" 逐行排列，说明文字直接外显。
 const SETTINGS_ROW_LIST = 'divide-y divide-border/60'
 // 卡片级双列栅格：卡片高度不一，必须顶对齐，否则矮卡被拉高留下大片空白。
-const SETTINGS_CARD_GRID_2 = 'grid gap-4 lg:grid-cols-2 lg:items-start'
+const SETTINGS_CARD_GRID_2 = 'grid gap-4 lg:grid-cols-2 lg:items-stretch'
 
 // ClaudeCodeSettingsCard 是 ClaudeCode 全局配置卡片(独立读写 /settings/claude-config)。
 // 全体 Claude 账号默认遵守;个体账号可在「账号管理 → 编辑账号」里覆盖。
+// Claude / Antigravity 渠道的连通性测试卡片:独立于全局 test_model/test_content(那是
+// Codex 语义),按渠道保存默认探测模型与测活内容;留空模型 = 按账号目录自动选。
+const CLAUDE_TEST_MODEL_CHOICES = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-5', 'claude-sonnet-4-5']
+
+function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'claude' }) {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [settings, setSettings] = useState<ChannelTestSettings | null>(null)
+  const [defaultContent, setDefaultContent] = useState('')
+  const [defaultConcurrency, setDefaultConcurrency] = useState(0)
+  const [contentDraft, setContentDraft] = useState('')
+  const [catalogChoices, setCatalogChoices] = useState<string[]>([])
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.getChannelTestSettings().then((response) => {
+      if (!active) return
+      setSettings(response[channel])
+      setContentDraft(response[channel].test_content)
+      setDefaultContent(response.default_test_content)
+      setDefaultConcurrency(response.default_test_concurrency)
+      setCatalogChoices(response.model_choices?.[channel] ?? [])
+    }).catch((error) => {
+      if (!active) return
+      showToast(getErrorMessage(error), 'error')
+    })
+    return () => {
+      active = false
+    }
+  }, [channel, showToast])
+
+  const save = useCallback(async (patch: Partial<ChannelTestSettings>) => {
+    setSaving(true)
+    try {
+      const response = await api.updateChannelTestSettings({ [channel]: patch })
+      setSettings(response[channel])
+      setContentDraft(response[channel].test_content)
+      setDefaultContent(response.default_test_content)
+      setDefaultConcurrency(response.default_test_concurrency)
+      setCatalogChoices(response.model_choices?.[channel] ?? [])
+      showToast(t('settings.channelTest.saved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [channel, showToast, t])
+
+  // 候选优先取后端汇总的号池目录并集(Claude 多为带日期的具体 ID),读不到再回落常量。
+  const modelChoices = useMemo(() => {
+    const base = catalogChoices.length > 0
+      ? catalogChoices
+      : channel === 'antigravity' ? [...ANTIGRAVITY_DEFAULT_MODELS] : CLAUDE_TEST_MODEL_CHOICES
+    const current = settings?.test_model?.trim() ?? ''
+    const list = current && !base.includes(current) ? [current, ...base] : base
+    return [
+      { value: '', label: t('settings.channelTest.autoModel') },
+      ...list.map((model) => ({ value: model, label: model })),
+    ]
+  }, [catalogChoices, channel, settings?.test_model, t])
+
+  return (
+    <SettingsCard
+      title={t('settings.connectivityTest')}
+      description={t(channel === 'antigravity' ? 'settings.channelTest.antigravityDesc' : 'settings.channelTest.claudeDesc')}
+      icon={<Wifi className="size-4" />}
+    >
+      <div className="space-y-4">
+        <div className={SETTINGS_FIELD_GRID}>
+          <SettingField label={t('settings.testModelLabel')} description={t('settings.channelTest.modelHint')}>
+            <Select
+              value={settings?.test_model ?? ''}
+              onValueChange={(value) => void save({ test_model: value })}
+              options={modelChoices}
+              disabled={settings === null || saving}
+            />
+          </SettingField>
+          <SettingField
+            label={t('settings.testConcurrency')}
+            description={t('settings.channelTest.concurrencyHint', { value: defaultConcurrency || 1 })}
+          >
+            <DraftNumberInput
+              min={0}
+              max={200}
+              value={settings?.test_concurrency ?? 0}
+              placeholder={String(defaultConcurrency || 1)}
+              disabled={settings === null || saving}
+              onValueChange={(value) => {
+                if (value !== (settings?.test_concurrency ?? 0)) void save({ test_concurrency: value })
+              }}
+            />
+          </SettingField>
+        </div>
+        <SettingField label={t('settings.testContent')} description={t('settings.channelTest.contentHint')}>
+          <textarea
+            rows={3}
+            value={contentDraft}
+            placeholder={defaultContent || t('settings.testContentPlaceholder')}
+            disabled={settings === null || saving}
+            onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setContentDraft(e.target.value)}
+            onBlur={(e) => {
+              const next = e.currentTarget.value.trim()
+              if (next !== (settings?.test_content ?? '')) void save({ test_content: next })
+            }}
+            className={cn(
+              'flex min-h-[88px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
+            )}
+          />
+        </SettingField>
+      </div>
+    </SettingsCard>
+  )
+}
+
+// Antigravity 模型重定向:下游请求不带思考强度后缀的逻辑模型(gemini-3.8-flash)时,
+// 自动落到配置的固定档位(gemini-3.8-flash-high)。候选档位由后端按模型目录给出。
+function AntigravityModelRedirectCard() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [settings, setSettings] = useState<AntigravitySettingsResponse | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.getAntigravitySettings().then((response) => {
+      if (active) setSettings(response)
+    }).catch((error) => {
+      if (active) showToast(getErrorMessage(error), 'error')
+    })
+    return () => {
+      active = false
+    }
+  }, [showToast])
+
+  const save = useCallback(async (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean }) => {
+    setSaving(true)
+    try {
+      setSettings(await api.updateAntigravitySettings(patch))
+      showToast(t('settings.antigravityRedirect.saved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [showToast, t])
+
+  const setRedirect = (model: string, target: string) => {
+    if (!settings) return
+    const next = { ...settings.model_redirects }
+    if (target) next[model] = target
+    else delete next[model]
+    void save({ model_redirects: next })
+  }
+
+  return (
+    <SettingsCard
+      title={t('settings.antigravityRedirect.title')}
+      description={t('settings.antigravityRedirect.description')}
+      icon={<Shuffle className="size-4" />}
+    >
+      <div className="space-y-4">
+        <div className={SETTINGS_FIELD_GRID}>
+          {(settings?.choices ?? []).map((choice) => (
+            <SettingField
+              key={choice.model}
+              label={choice.model}
+              description={t('settings.antigravityRedirect.rowHint', { level: choice.default_level })}
+            >
+              <Select
+                value={settings?.model_redirects[choice.model] ?? ''}
+                onValueChange={(value) => setRedirect(choice.model, value)}
+                disabled={settings === null || saving}
+                options={[
+                  { value: '', label: t('settings.antigravityRedirect.noRedirect', { level: choice.default_level }) },
+                  ...choice.tiers.map((tier) => ({ value: tier, label: tier })),
+                ]}
+              />
+            </SettingField>
+          ))}
+        </div>
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="text-sm font-medium">{t('settings.antigravityRedirect.overrideLabel')}</div>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t('settings.antigravityRedirect.overrideHint')}</p>
+          </div>
+          <Switch
+            checked={settings?.redirect_overrides_effort ?? false}
+            disabled={settings === null || saving}
+            onCheckedChange={(checked) => void save({ redirect_overrides_effort: checked })}
+          />
+        </div>
+      </div>
+    </SettingsCard>
+  )
+}
+
 function ClaudeCodeSettingsCard() {
   const { t } = useTranslation()
   const { showToast } = useToast()
@@ -1220,12 +1374,15 @@ function SettingField({
   layout = 'stack',
   suffix,
   channels,
+  stretch = false,
 }: {
   label: string
   description?: string
   // row 布局下 description 直接外显，help 才进问号 tooltip；其他布局 help 与 description 合并进 tooltip。
   help?: string
   warning?: string
+  // stretch:stack 布局下让控件撑满剩余高度(等高卡片里的 textarea)。
+  stretch?: boolean
   children: ReactNode
   className?: string
   layout?: 'stack' | 'switch' | 'row'
@@ -1297,7 +1454,7 @@ function SettingField({
   }
 
   return (
-    <div className={cn('flex min-w-0 flex-col gap-1.5', className)}>
+    <div className={cn('flex min-w-0 flex-col gap-1.5', stretch && 'flex-1', className)}>
       <div className="flex min-h-5 items-center gap-1.5">
         <label className="block text-[13px] font-semibold leading-none text-foreground sm:text-sm">
           {label}
@@ -1305,7 +1462,7 @@ function SettingField({
         {tooltip ? <SettingHelp text={tooltip} /> : null}
         {scope}
       </div>
-      <div className="min-w-0">{control}</div>
+      <div className={cn('min-w-0', stretch && 'flex flex-1 flex-col [&>*]:flex-1')}>{control}</div>
       {warning ? (
         <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400 sm:text-xs">
           {warning}
@@ -1979,10 +2136,6 @@ export default function Settings() {
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
   ]
-  const firstTokenModeOptions = [
-    { label: t('settings.firstTokenModeStrict'), value: 'strict' },
-    { label: t('settings.firstTokenModeLoose'), value: 'loose' },
-  ]
   const imageStorageBackendOptions = [
     { label: t('settings.imageStorageLocal'), value: 'local' },
     { label: t('settings.imageStorageS3'), value: 's3' },
@@ -1991,8 +2144,11 @@ export default function Settings() {
     const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
       ...cacheNormalized,
+      codex_images_main_model: cacheNormalized.codex_images_main_model ?? '',
+      codex_telemetry_enabled: cacheNormalized.codex_telemetry_enabled ?? false,
+      codex_telemetry_timing_debug: cacheNormalized.codex_telemetry_timing_debug ?? false,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
-      first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
+      first_token_mode: 'loose',
       models_list_read_max_bytes:
         Number.isFinite(cacheNormalized.models_list_read_max_bytes) && cacheNormalized.models_list_read_max_bytes >= MIB
           ? cacheNormalized.models_list_read_max_bytes
@@ -2040,6 +2196,7 @@ export default function Settings() {
 	    usage_probe_responses_fallback_enabled: true,
 	    recovery_probe_interval_minutes: 30,
     lazy_mode: false,
+    codex_oauth_keepalive_enabled: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -2058,6 +2215,8 @@ export default function Settings() {
     auto_reset_credits_before_expiry_min: 60,
     auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
+    codex_telemetry_enabled: false,
+    codex_telemetry_timing_debug: false,
     codex_request_compression: true,
     codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
@@ -2157,6 +2316,7 @@ export default function Settings() {
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.153.3',
+    codex_images_main_model: '',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -2165,7 +2325,7 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
-    first_token_mode: 'strict',
+    first_token_mode: 'loose',
     first_token_timeout_seconds: 0,
     first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
@@ -2724,6 +2884,9 @@ export default function Settings() {
   const isExternalDatabase = settingsForm.database_driver === 'postgres'
   const isExternalCache = settingsForm.cache_driver === 'redis'
   const showConnectionPool = isExternalDatabase || isExternalCache
+  // Resin 生效与否以后端摘要为准(保存后随响应刷新),不按表单里未保存的草稿猜。
+  const codexEgress = persistedSettings?.codex_egress
+  const resinActive = Boolean(codexEgress?.resin_enabled)
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
@@ -2759,6 +2922,14 @@ export default function Settings() {
     )
     .map((model) => ({ label: model.id, value: model.id }))
   const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
+  const imagesDefaultMainModel = settingsForm.codex_images_default_main_model || 'gpt-5.6-luna'
+  const imagesMainModelOptions = [
+    { value: '', label: t('settings.codexImagesDefault', { model: imagesDefaultMainModel }) },
+    ...textModelOptions,
+  ]
+  if (settingsForm.codex_images_main_model && !imagesMainModelOptions.some((option) => option.value === settingsForm.codex_images_main_model)) {
+    imagesMainModelOptions.push({ value: settingsForm.codex_images_main_model, label: settingsForm.codex_images_main_model })
+  }
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
   const modelsSourceLabel = modelsSourceURL || 'https://developers.openai.com/codex/models'
   const anthropicMappingCount = useMemo(
@@ -2782,10 +2953,6 @@ export default function Settings() {
     () => parseCodexUserAgentConfig(settingsForm.codex_user_agent_config),
     [settingsForm.codex_user_agent_config],
   )
-  const codexUserAgentPreview = useMemo(
-    () => buildCodexUserAgentPreview(codexUserAgentConfig, settingsForm.codex_min_cli_version, settingsForm.client_compat_mode),
-    [codexUserAgentConfig, settingsForm.client_compat_mode, settingsForm.codex_min_cli_version],
-  )
   const updateCodexUserAgentConfig = useCallback((patch: Partial<CodexUserAgentConfig>) => {
     setSettingsForm((form) => {
       const current = parseCodexUserAgentConfig(form.codex_user_agent_config)
@@ -2798,6 +2965,132 @@ export default function Settings() {
   const saveCodexUserAgentConfig = useCallback(() => {
     void autoSaveSettingsPatch({ codex_user_agent_config: settingsForm.codex_user_agent_config })
   }, [autoSaveSettingsPatch, settingsForm.codex_user_agent_config])
+  // 下拉/分段控件没有 blur,改完直接落库;从 ref 取最新表单避免闭包里的旧值。
+  const patchAndSaveCodexUserAgentConfig = useCallback((patch: Partial<CodexUserAgentConfig>) => {
+    const current = parseCodexUserAgentConfig(settingsFormRef.current.codex_user_agent_config)
+    void autoSaveSettingsPatch({ codex_user_agent_config: serializeCodexUserAgentConfig({ ...current, ...patch }) })
+  }, [autoSaveSettingsPatch])
+  // 形态目录与出站身份预览都由后端算,前端不复制 UA 拼装/版本配对规则。
+  const [codexUACatalog, setCodexUACatalog] = useState<CodexUserAgentCatalog | null>(null)
+  const [codexUAPreview, setCodexUAPreview] = useState<CodexUserAgentPreview | null>(null)
+  const [codexUAPreviewError, setCodexUAPreviewError] = useState('')
+  useEffect(() => {
+    let cancelled = false
+    api.getCodexUserAgentCatalog()
+      .then((catalog) => { if (!cancelled) setCodexUACatalog(catalog) })
+      .catch(() => { /* 目录拉不到只影响预设候选,表单仍可自由填写 */ })
+    return () => { cancelled = true }
+  }, [])
+  useEffect(() => {
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      api.previewCodexUserAgent({
+        config: settingsForm.codex_user_agent_config,
+        client_compat_mode: settingsForm.client_compat_mode,
+        codex_min_cli_version: settingsForm.codex_min_cli_version,
+      })
+        .then((preview) => {
+          if (cancelled) return
+          setCodexUAPreview(preview)
+          setCodexUAPreviewError('')
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return
+          setCodexUAPreviewError(err instanceof Error ? err.message : String(err))
+        })
+    }, 250)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [settingsForm.codex_user_agent_config, settingsForm.client_compat_mode, settingsForm.codex_min_cli_version])
+  const codexUAMode: 'single' | 'pool' = codexUserAgentConfig.mode === 'pool' ? 'pool' : 'single'
+  const codexUAKind: CodexUAKind = CODEX_UA_KINDS.includes(codexUserAgentConfig.client_kind as CodexUAKind)
+    ? (codexUserAgentConfig.client_kind as CodexUAKind)
+    : inferCodexUAKind(codexUserAgentConfig.client_name)
+  const codexUAKindSpec = codexUACatalog?.kinds.find((kind) => kind.kind === codexUAKind) ?? null
+  const codexUAAppFollowsCLI = codexUAKindSpec ? codexUAKindSpec.app_follows_cli : codexUAKind === 'codex-tui' || codexUAKind === 'codex-exec'
+  const codexUADefaultPoolMix = codexUACatalog?.default_pool_mix ?? CODEX_UA_FALLBACK_POOL_MIX
+  const codexUAKindLabel = useCallback((kind: CodexUAKind) => {
+    switch (kind) {
+      case 'codex-desktop': return t('settings.codexUAKindDesktop')
+      case 'codex-vscode': return t('settings.codexUAKindVscode')
+      case 'codex-exec': return t('settings.codexUAKindExec')
+      case 'custom': return t('settings.codexUAKindCustom')
+      default: return t('settings.codexUAKindTui')
+    }
+  }, [t])
+  const codexUAKindOptions = useMemo(() => CODEX_UA_KINDS.map((kind) => ({ label: codexUAKindLabel(kind), value: kind })), [codexUAKindLabel])
+  const codexUAModeOptions = useMemo(() => [
+    { label: t('settings.codexUAModeSingle'), value: 'single' as const },
+    { label: t('settings.codexUAModePool'), value: 'pool' as const },
+  ], [t])
+  const selectCodexUAKind = useCallback((kind: CodexUAKind) => {
+    patchAndSaveCodexUserAgentConfig({
+      client_kind: kind,
+      client_name: '',
+      client_version: '',
+      app_name: '',
+      app_version: '',
+      os_name: '',
+      os_version: '',
+      arch: '',
+      terminal: '',
+    })
+  }, [patchAndSaveCodexUserAgentConfig])
+  const codexUAPlatformKey = (osName: string, osVersion: string, arch: string) => `${osName}|${osVersion}|${arch}`
+  const codexUAPlatformOptions = useMemo(() => {
+    const options = (codexUAKindSpec?.platforms ?? []).map((platform) => ({
+      label: `${platform.os_name} ${platform.os_version} · ${platform.arch}`,
+      value: codexUAPlatformKey(platform.os_name, platform.os_version, platform.arch),
+    }))
+    return [...options, { label: t('settings.codexUACustomOption'), value: 'custom' }]
+  }, [codexUAKindSpec, t])
+  const codexUAEffectivePlatform = {
+    os_name: (codexUserAgentConfig.os_name ?? '').trim() || codexUAKindSpec?.default_platform.os_name || DEFAULT_CODEX_UA_CONFIG.os_name,
+    os_version: (codexUserAgentConfig.os_version ?? '').trim() || codexUAKindSpec?.default_platform.os_version || DEFAULT_CODEX_UA_CONFIG.os_version,
+    arch: (codexUserAgentConfig.arch ?? '').trim() || codexUAKindSpec?.default_platform.arch || DEFAULT_CODEX_UA_CONFIG.arch,
+  }
+  const codexUAPlatformPresetValue = (() => {
+    const key = codexUAPlatformKey(codexUAEffectivePlatform.os_name, codexUAEffectivePlatform.os_version, codexUAEffectivePlatform.arch)
+    return codexUAPlatformOptions.some((option) => option.value === key) ? key : 'custom'
+  })()
+  const applyCodexUAPlatformPreset = useCallback((value: string) => {
+    if (value === 'custom') return
+    const [os_name, os_version, arch] = value.split('|')
+    patchAndSaveCodexUserAgentConfig({ os_name, os_version, arch })
+  }, [patchAndSaveCodexUserAgentConfig])
+  const codexUATerminalOptions = useMemo(() => [
+    ...(codexUAKindSpec?.terminals ?? []).map((terminal) => ({ label: terminal.value, value: terminal.value })),
+    { label: t('settings.codexUACustomOption'), value: 'custom' },
+  ], [codexUAKindSpec, t])
+  const codexUAEffectiveTerminal = (codexUserAgentConfig.terminal ?? '').trim() || codexUAKindSpec?.default_terminal || DEFAULT_CODEX_UA_CONFIG.terminal
+  const codexUATerminalPresetValue = codexUATerminalOptions.some((option) => option.value === codexUAEffectiveTerminal && option.value !== 'custom') ? codexUAEffectiveTerminal : 'custom'
+  const codexUAAppNameOptions = useMemo(() => [
+    ...(codexUAKindSpec?.app_names ?? []).map((name) => ({ label: name.value, value: name.value })),
+    { label: t('settings.codexUACustomOption'), value: 'custom' },
+  ], [codexUAKindSpec, t])
+  const codexUAEffectiveAppName = (codexUserAgentConfig.app_name ?? '').trim() || codexUAKindSpec?.default_app_name || (codexUserAgentConfig.client_name ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.client_name
+  const codexUAAppNamePresetValue = codexUAAppNameOptions.some((option) => option.value === codexUAEffectiveAppName && option.value !== 'custom') ? codexUAEffectiveAppName : 'custom'
+  const codexUAShowAppNamePreset = codexUAKind !== 'custom' && !codexUAAppFollowsCLI && (codexUAKindSpec?.app_names?.length ?? 0) > 1
+  const codexUAClientVersionPlaceholder = (() => {
+    const pairs = codexUAKindSpec?.version_pairs ?? []
+    if (pairs.length > 0) {
+      return pairs.reduce((best, pair) => (pair.weight > best.weight ? pair : best), pairs[0]).cli_version
+    }
+    return settingsForm.codex_synced_cli_version || DEFAULT_CODEX_UA_CONFIG.client_version
+  })()
+  const codexUAPoolMixValue = (kind: CodexUAKind) => {
+    const weight = codexUserAgentConfig.pool_mix?.[kind]
+    return weight === undefined ? '' : String(weight)
+  }
+  const updateCodexUAPoolMix = useCallback((kind: CodexUAKind, text: string) => {
+    const current = parseCodexUserAgentConfig(settingsFormRef.current.codex_user_agent_config)
+    const parsed = Number(text)
+    const weight = text.trim() === '' || !Number.isFinite(parsed) ? 0 : Math.max(0, Math.floor(parsed))
+    // 首次编辑时把其余形态从默认配比补齐,避免只填一项就把别的形态全部清零。
+    updateCodexUserAgentConfig({ pool_mix: { ...codexUADefaultPoolMix, ...(current.pool_mix ?? {}), [kind]: weight } })
+  }, [codexUADefaultPoolMix, updateCodexUserAgentConfig])
   const dirtyKeys = useMemo(() => {
     if (!persistedSettings) return [] as string[]
     const current = normalizeLazySettingsForm(settingsForm) as unknown as Record<string, unknown>
@@ -3041,6 +3334,13 @@ export default function Settings() {
                           }}
                         />
                       </SettingField>
+                      <SettingField label={t('settings.codexOAuthKeepalive')} description={t('settings.codexOAuthKeepaliveDesc')} layout="switch">
+                        <Switch
+                          aria-label={t('settings.codexOAuthKeepalive')}
+                          checked={settingsForm.codex_oauth_keepalive_enabled}
+                          onCheckedChange={(checked) => autoSaveBooleanField('codex_oauth_keepalive_enabled', checked)}
+                        />
+                      </SettingField>
                       {inviteGuideEnabled !== null && (
                         <SettingField
                           label={t('settings.inviteGuide')}
@@ -3057,8 +3357,14 @@ export default function Settings() {
                     </div>
                   </div>
                 </SettingsCard>
-              <SettingsCard title={t('settings.connectivityTest')} description={t('settings.connectivityTestDesc')} icon={<Wifi className="size-4" />}>
-                <div className="space-y-4">
+              <SettingsCard
+                title={t('settings.connectivityTest')}
+                description={t('settings.connectivityTestDesc')}
+                icon={<Wifi className="size-4" />}
+                className="h-full"
+                contentClassName="flex h-full flex-col"
+              >
+                <div className="flex flex-1 flex-col gap-4">
                   <div className={SETTINGS_FIELD_GRID}>
                     <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
                       <Select
@@ -3076,7 +3382,7 @@ export default function Settings() {
                       />
                     </SettingField>
                   </div>
-                  <SettingField label={t('settings.testContent')} description={t('settings.testContentDesc')}>
+                  <SettingField label={t('settings.testContent')} description={t('settings.testContentDesc')} stretch>
                     <textarea
                       rows={3}
                       value={settingsForm.test_content}
@@ -3855,6 +4161,24 @@ export default function Settings() {
                         )}
                       </div>
                     </SettingField>
+                    <SettingField
+                      label={t('settings.codexTelemetry')}
+                      description={t('settings.codexTelemetryDesc')}
+                    >
+                      <Switch
+                        checked={settingsForm.codex_telemetry_enabled}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_telemetry_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.codexTelemetryTiming')}
+                      description={t('settings.codexTelemetryTimingDesc')}
+                    >
+                      <Switch
+                        checked={settingsForm.codex_telemetry_timing_debug}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_telemetry_timing_debug', checked)}
+                      />
+                    </SettingField>
                     {/* CLI 版本自动同步：开关 + 间隔成对横排，行高一致 */}
                     <div className="sm:col-span-2 grid gap-0 overflow-hidden rounded-lg border border-border/60 bg-muted/15 sm:grid-cols-2 sm:divide-x sm:divide-border/60">
                       <div className="flex min-h-[48px] items-center justify-between gap-3 px-3 py-2.5">
@@ -3933,70 +4257,197 @@ export default function Settings() {
                         options={codexFingerprintDefaultModeOptions}
                       />
                     </SettingField>
-                    <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
-                      <Input
-                        className="font-mono text-xs"
-                        value={codexUserAgentConfig.raw_user_agent ?? ''}
-                        placeholder="codex-tui/0.153.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.153.3)"
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ raw_user_agent: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
+                    <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUAMode')} description={t('settings.codexUAModeDesc')}>
+                      <SegmentedPillGroup
+                        className="max-w-sm"
+                        value={codexUAMode}
+                        onChange={(value) => patchAndSaveCodexUserAgentConfig({ mode: value === 'pool' ? 'pool' : '' })}
+                        options={codexUAModeOptions}
                       />
                     </SettingField>
-                    <SettingField label={t('settings.codexUAClientName')} description={t('settings.codexUAClientNameDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.client_name ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.client_name}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_name: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexUAClientVersion')} description={t('settings.codexUAClientVersionDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.client_version ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.client_version}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_version: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexUAOSName')} description={t('settings.codexUAOSNameDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.os_name ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.os_name}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_name: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexUAOSVersion')} description={t('settings.codexUAOSVersionDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.os_version ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.os_version}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_version: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexUAArch')} description={t('settings.codexUAArchDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.arch ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.arch}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ arch: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexUATerminal')} description={t('settings.codexUATerminalDesc')}>
-                      <Input
-                        value={codexUserAgentConfig.terminal ?? ''}
-                        placeholder={DEFAULT_CODEX_UA_CONFIG.terminal}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ terminal: e.target.value })}
-                        onBlur={saveCodexUserAgentConfig}
-                      />
-                    </SettingField>
+                    {codexUAMode === 'pool' ? (
+                      CODEX_UA_POOL_KINDS.map((kind) => (
+                        <SettingField key={kind} label={`${t('settings.codexUAPoolMix')} · ${codexUAKindLabel(kind)}`} description={t('settings.codexUAPoolMixDesc')}>
+                          <Input
+                            type="number"
+                            min={0}
+                            step={1}
+                            inputMode="numeric"
+                            value={codexUAPoolMixValue(kind)}
+                            placeholder={String(codexUADefaultPoolMix[kind] ?? 0)}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUAPoolMix(kind, e.target.value)}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                      ))
+                    ) : (
+                      <>
+                        <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUAKind')} description={t('settings.codexUAKindDesc')}>
+                          <SegmentedPillGroup
+                            className="max-w-3xl"
+                            value={codexUAKind}
+                            onChange={selectCodexUAKind}
+                            options={codexUAKindOptions}
+                          />
+                        </SettingField>
+                        <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
+                          <Input
+                            className="font-mono text-xs"
+                            value={codexUserAgentConfig.raw_user_agent ?? ''}
+                            placeholder="codex-tui/0.153.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.153.3)"
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ raw_user_agent: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAClientName')} description={t('settings.codexUAClientNameDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.client_name ?? ''}
+                            placeholder={codexUAKindSpec?.client_name ?? DEFAULT_CODEX_UA_CONFIG.client_name}
+                            disabled={codexUAKind !== 'custom'}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_name: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAClientVersion')} description={t('settings.codexUAClientVersionDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.client_version ?? ''}
+                            placeholder={codexUAClientVersionPlaceholder}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_version: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAPlatformPreset')} description={t('settings.codexUAPlatformPresetDesc')}>
+                          <Select
+                            value={codexUAPlatformPresetValue}
+                            onValueChange={applyCodexUAPlatformPreset}
+                            options={codexUAPlatformOptions}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAOSName')} description={t('settings.codexUAOSNameDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.os_name ?? ''}
+                            placeholder={codexUAKindSpec?.default_platform.os_name ?? DEFAULT_CODEX_UA_CONFIG.os_name}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_name: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAOSVersion')} description={t('settings.codexUAOSVersionDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.os_version ?? ''}
+                            placeholder={codexUAKindSpec?.default_platform.os_version ?? DEFAULT_CODEX_UA_CONFIG.os_version}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_version: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAArch')} description={t('settings.codexUAArchDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.arch ?? ''}
+                            placeholder={codexUAKindSpec?.default_platform.arch ?? DEFAULT_CODEX_UA_CONFIG.arch}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ arch: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUATerminalPreset')} description={t('settings.codexUATerminalPresetDesc')}>
+                          <Select
+                            value={codexUATerminalPresetValue}
+                            onValueChange={(value) => { if (value !== 'custom') patchAndSaveCodexUserAgentConfig({ terminal: value }) }}
+                            options={codexUATerminalOptions}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUATerminal')} description={t('settings.codexUATerminalDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.terminal ?? ''}
+                            placeholder={codexUAKindSpec?.default_terminal ?? DEFAULT_CODEX_UA_CONFIG.terminal}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ terminal: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAAppName')} description={t('settings.codexUAAppNameDesc')}>
+                          <div className="space-y-2">
+                            {codexUAShowAppNamePreset ? (
+                              <Select
+                                value={codexUAAppNamePresetValue}
+                                onValueChange={(value) => { if (value !== 'custom') patchAndSaveCodexUserAgentConfig({ app_name: value }) }}
+                                options={codexUAAppNameOptions}
+                              />
+                            ) : null}
+                            <Input
+                              value={codexUserAgentConfig.app_name ?? ''}
+                              placeholder={codexUAAppFollowsCLI ? t('settings.codexUAFollowsClient') : codexUAEffectiveAppName}
+                              disabled={codexUAAppFollowsCLI || (codexUAKind === 'codex-desktop')}
+                              onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ app_name: e.target.value })}
+                              onBlur={saveCodexUserAgentConfig}
+                            />
+                          </div>
+                        </SettingField>
+                        <SettingField label={t('settings.codexUAAppVersion')} description={t('settings.codexUAAppVersionDesc')}>
+                          <Input
+                            value={codexUserAgentConfig.app_version ?? ''}
+                            placeholder={codexUAAppFollowsCLI ? t('settings.codexUAFollowsClient') : t('settings.codexUAAutoPaired')}
+                            disabled={codexUAAppFollowsCLI}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ app_version: e.target.value })}
+                            onBlur={saveCodexUserAgentConfig}
+                          />
+                        </SettingField>
+                      </>
+                    )}
                     <div className="min-w-0 rounded-lg border border-border/70 bg-muted/25 p-3 sm:col-span-2 xl:col-span-3">
-                      <div className="mb-1.5 text-[13px] font-medium text-foreground">{t('settings.codexUAPreview')}</div>
-                      <div className="break-all font-mono text-[11px] leading-5 text-muted-foreground">{codexUserAgentPreview}</div>
+                      <div className="mb-1.5 text-[13px] font-medium text-foreground">
+                        {codexUAMode === 'pool' ? t('settings.codexUAPoolPreview') : t('settings.codexUAPreview')}
+                      </div>
+                      {codexUAPreviewError ? (
+                        <div className="break-all text-[11px] leading-5 text-destructive">{codexUAPreviewError}</div>
+                      ) : !codexUAPreview ? (
+                        <div className="text-[11px] leading-5 text-muted-foreground">{t('settings.codexUAPreviewLoading')}</div>
+                      ) : codexUAPreview.persona ? (
+                        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 font-mono text-[11px] leading-5 text-muted-foreground">
+                          <dt className="text-foreground/70">User-Agent</dt>
+                          <dd className="break-all">{codexUAPreview.persona.user_agent}</dd>
+                          <dt className="text-foreground/70">Originator</dt>
+                          <dd className="break-all">{codexUAPreview.persona.originator}</dd>
+                          <dt className="text-foreground/70">Version</dt>
+                          <dd className="break-all">{codexUAPreview.persona.version}</dd>
+                        </dl>
+                      ) : (
+                        <ul className="space-y-0.5 font-mono text-[11px] leading-5 text-muted-foreground">
+                          {(codexUAPreview.samples ?? []).map((sample) => (
+                            <li key={`${sample.label}-${sample.account_id ?? 0}`} className="break-all">
+                              <span className="text-foreground/70">{sample.label}{sample.account_id ? ` · ${sample.account_id}` : ''}</span>
+                              {' '}{sample.user_agent}
+                              <span className="text-foreground/50">{' · '}{sample.originator}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {codexUAPreview?.warnings?.length ? (
+                        <div className="mt-1.5 text-[11px] leading-5 text-amber-600 dark:text-amber-400">
+                          {t('settings.codexUAWarnUnseen', { fields: codexUAPreview.warnings.map((field) => t(`settings.codexUAWarn_${field}`)).join(' / ') })}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 </div>
               </SettingsCard>
+              </SettingsSection>
+
+              <SettingsSection id="settings-codex-images" title={t('settings.nav.codexImages')} description={t('settings.nav.codexImagesDesc')} icon={<ImageIcon className="size-4" />}>
+                <SettingsCard title={t('settings.codexImagesDriver')} description={t('settings.codexImagesDriverDesc')} icon={<ImageIcon className="size-4" />}>
+                  <div className="space-y-4">
+                    <div className={SETTINGS_FIELD_GRID}>
+                      <SettingField label={t('settings.codexImagesMainModel')} description={t('settings.codexImagesMainModelDesc')}>
+                        <Select
+                          value={settingsForm.codex_images_main_model}
+                          options={imagesMainModelOptions.filter(({ value }) => !HIDDEN_IMAGE_DRIVER_MODELS.has(value.toLowerCase()))}
+                          onValueChange={(value) => autoSaveStringField('codex_images_main_model', value)}
+                        />
+                      </SettingField>
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-muted/20 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+                      <p>{t('settings.codexImagesScope')}</p>
+                      <p className="mt-1.5">{t('settings.codexImagesFallback')}</p>
+                    </div>
+                  </div>
+                </SettingsCard>
               </SettingsSection>
 
               <SettingsSection id="settings-models" title={t('settings.nav.models')} description={t('settings.nav.modelsDesc')} icon={<Layers className="size-4" />}>
@@ -4166,6 +4617,7 @@ export default function Settings() {
           {activeTab === 'claude' ? (
             <>
               <SettingsSection id="settings-claude" title={t('settings.nav.claude')} description={t('settings.nav.claudeDesc')} icon={<ChannelLogo channel="claude" size={16} />}>
+                <ChannelConnectivityTestCard channel="claude" />
                 <ClaudeCodeSettingsCard />
               </SettingsSection>
             </>
@@ -4174,6 +4626,8 @@ export default function Settings() {
           {activeTab === 'antigravity' ? (
             <>
               <SettingsSection id="settings-antigravity" title={t('settings.nav.antigravity')} description={t('settings.nav.antigravityDesc')} icon={<ChannelLogo channel="antigravity" size={16} />}>
+              <ChannelConnectivityTestCard channel="antigravity" />
+              <AntigravityModelRedirectCard />
               <SettingsCard
                 title={t('settings.antigravityOAuth.title')}
                 description={t('settings.antigravityOAuth.description')}
@@ -5241,13 +5695,6 @@ export default function Settings() {
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: value }))}
                       />
                     </SettingField>
-                    <SettingField label={t('settings.firstTokenMode')} description={t('settings.firstTokenModeDesc')}>
-                      <SegmentedPillGroup
-                        value={settingsForm.first_token_mode}
-                        onChange={(value) => autoSaveStringField('first_token_mode', value)}
-                        options={firstTokenModeOptions}
-                      />
-                    </SettingField>
                     <SettingField label={t('settings.firstTokenTimeout')} description={t('settings.firstTokenTimeoutDesc')}>
                       <DraftNumberInput
                         min={0}
@@ -5319,7 +5766,11 @@ export default function Settings() {
                     <Badge variant="outline" className="text-[11px]">
                       {t('settings.nav.restartRequired')}
                     </Badge>
-                  ) : null
+                  ) : (
+                    <Badge variant={resinActive ? 'default' : 'outline'} className="text-[11px]">
+                      {resinActive ? t('settings.resinActiveBadge') : t('settings.resinInactiveBadge')}
+                    </Badge>
+                  )
                 }
               >
                 <div className="space-y-4">
@@ -5349,10 +5800,28 @@ export default function Settings() {
                   ) : null}
                   {showConnectionPool ? (
                     <div className="border-t border-border/80 pt-4">
-                      <h4 className="text-[13px] font-semibold text-foreground sm:text-sm">{t('settings.resinTitle')}</h4>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="text-[13px] font-semibold text-foreground sm:text-sm">{t('settings.resinTitle')}</h4>
+                        <Badge variant={resinActive ? 'default' : 'outline'} className="text-[11px]">
+                          {resinActive ? t('settings.resinActiveBadge') : t('settings.resinInactiveBadge')}
+                        </Badge>
+                      </div>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.resinDesc')}</p>
                     </div>
                   ) : null}
+                  {/* 三套出口并存时必须明说谁在生效(issue #679):Resin 是整层覆盖,不是叠加。 */}
+                  <div
+                    className={cn(
+                      'rounded-lg border px-3 py-2 text-xs leading-relaxed',
+                      resinActive
+                        ? 'border-amber-500/30 bg-amber-500/5 text-amber-800 dark:text-amber-200'
+                        : 'border-border/60 bg-muted/20 text-muted-foreground',
+                    )}
+                  >
+                    {resinActive
+                      ? t('settings.resinActiveNote', { endpoint: codexEgress?.resin_endpoint || '', platform: codexEgress?.resin_platform_name || '' })
+                      : t('settings.resinInactiveNote')}
+                  </div>
                   <div className={SETTINGS_FIELD_GRID}>
                     <SettingField label={t('settings.resinUrl')} description={t('settings.resinUrlDesc')}>
                       <Input

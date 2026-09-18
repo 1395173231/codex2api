@@ -360,6 +360,14 @@ func (h *Handler) UpdateModelPricing(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	if !req.Reset && req.Pricing != nil {
+		if err := database.ValidateModelUserBilling(key, *req.Pricing); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		normalized := database.NormalizeModelPricingOverride(key, *req.Pricing)
+		req.Pricing = &normalized
+	}
 	if !req.Reset && (req.Pricing == nil || req.Pricing.IsEmpty()) {
 		writeError(c, http.StatusBadRequest, "pricing 不能为空（或用 reset 清除）")
 		return

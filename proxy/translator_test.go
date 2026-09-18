@@ -2641,6 +2641,30 @@ func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_StripsInputItemInternalMetadata(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"keep internal_chat_message_metadata_passthrough in text"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"}},
+			{"type":"function_call","call_id":"call_1","name":"run","arguments":"{\"internal_chat_message_metadata_passthrough\":1}","internal_chat_message_metadata_passthrough":{"turn_id":"t1"}}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for i := 0; i < 2; i++ {
+		if meta := gjson.GetBytes(got, fmt.Sprintf("input.%d.internal_chat_message_metadata_passthrough", i)); meta.Exists() {
+			t.Fatalf("input[%d].internal_chat_message_metadata_passthrough should be stripped, got %s; body=%s", i, meta.Raw, got)
+		}
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(text, "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("same-named user content must survive, got %q", text)
+	}
+	if args := gjson.GetBytes(got, "input.1.arguments").String(); !strings.Contains(args, "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("function_call arguments must not be touched, got %q", args)
+	}
+}
+
 func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -3214,7 +3238,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.id").String(); got != "call_custom" {
 		t.Fatalf("tool call id = %q, want call_custom; chunk=%s", got, chunk)
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.name").String(); got != "run_custom" {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.name").String(); got != "run_custom" {
 		t.Fatalf("tool call name = %q, want run_custom; chunk=%s", got, chunk)
 	}
 
@@ -3230,7 +3254,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if chunk == nil {
 		t.Fatal("should emit chunk for custom_tool_call_input delta")
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"cmd":` {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.input").String(); got != `{"cmd":` {
 		t.Fatalf("custom tool input delta = %q, want arguments delta; chunk=%s", got, chunk)
 	}
 
@@ -3246,7 +3270,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if chunk == nil {
 		t.Fatal("should emit chunk for custom_tool_call_input call_id delta")
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `"pwd"}` {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.input").String(); got != `"pwd"}` {
 		t.Fatalf("custom tool input call_id delta = %q, want arguments delta; chunk=%s", got, chunk)
 	}
 

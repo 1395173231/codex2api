@@ -69,6 +69,51 @@ Account groups are channel-isolated: an Antigravity account can only join an Ant
 
 Antigravity inference is admitted through `/v1/responses`, `/v1/chat/completions`, and `/v1/messages`; its models are exposed through `/v1/models` and the Codex model manifest. Chat and Messages translate their inbound body into a Responses payload before dispatch, which is exactly what the `v1internal` adapter consumes, so all three transports share one admission gate and one adapter. `/v1/responses/compact` still excludes Antigravity accounts because no compaction adapter exists, and the official Codex executors reject Antigravity credentials before any network request as a provider-boundary safeguard.
 
+## Native Gemini API (`/v1beta`)
+
+Antigravity OAuth accounts also support the native Gemini REST shape for clients that speak `generativelanguage.googleapis.com/v1beta` directly (for example ADK, LangChain Gemini adapters, or MCP stacks that post raw Gemini JSON).
+
+| Endpoint | Method | Notes |
+| --- | --- | --- |
+| `/v1beta/models` | GET | Lists scoped Antigravity model IDs in Gemini `models[]` shape (`name`, `displayName`, `supportedGenerationMethods`). |
+| `/v1beta/models/{model}` | GET | Returns one model record; accepts IDs with or without the `models/` prefix. |
+| `/v1beta/models/{model}:generateContent` | POST | Non-streaming generate; unwraps the Cloud Code envelope back to Gemini JSON. |
+| `/v1beta/models/{model}:streamGenerateContent` | POST | SSE stream; supports `?alt=sse`. |
+| `/v1beta/models/{model}:countTokens` | POST | Local token estimate (no upstream round trip). |
+
+Requirements and behavior:
+
+- **OAuth only.** API Key / Interactions accounts are rejected; bind a downstream key to the `antigravity` upstream channel (or use an `auto` key whose scoped catalog includes Antigravity models).
+- **Authentication.** Send the Codex2API downstream key as `Authorization: Bearer <key>`, `x-api-key: <key>`, or `x-goog-api-key: <key>`. The last form is what the `google-genai` SDK, ADK, and the Gemini channel of aggregator gateways send by default, so pointing their base URL at Codex2API works without a custom header. The `?key=` query-string form is not accepted (the key would land in URLs and access logs).
+- **Model IDs** match the published Antigravity catalog (`gemini-3.7-flash-high`, `gemini-3.8-flash-low`, Claude tiers exposed by the channel, and so on), not raw Google wire IDs.
+- **Tool schemas** are normalized before upstream dispatch: orphan `required` entries are dropped, `anyOf` / `oneOf` / `allOf` unions are flattened, invalid function names are sanitized with response-name restore, and schemas are sent as `parametersJsonSchema` (Cloud Code expectation).
+- **Multi-turn tools:** `functionResponse` turns are regrouped for the adapter; leading `inlineData` parts in the same user turn are attached under the matching `functionResponse.parts`.
+- **Thinking:** client-supplied `generationConfig.thinkingConfig` is preserved; when absent, the gateway applies the tier default for the requested public model.
+- **Thought signatures:** missing stubs are injected on outbound `functionCall` parts; stale signatures on inbound `functionResponse` parts are stripped to avoid replay failures.
+- **countTokens:** OAuth accounts call upstream `/v1internal:countTokens` with the same request normalization as generateContent (minus `project`, `model`, `sessionId`, `toolConfig`, and safety settings). When no account is available or upstream returns 404, the gateway falls back to a local token estimate.
+- **Tool schema cleanup:** MCP-style bare property maps, boolean `required` flags, local `$ref` / `$defs` JSON Pointer inline (including nested pointers, `anyOf` `$ref` branches, sibling overrides, and cycle fallback), orphan `required` entries, union flattening, missing array `items`, and unsupported enums are normalized before upstream dispatch.
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:2004/v1beta/models/gemini-3.7-flash-high:generateContent \
+  -H "Authorization: Bearer $CODEX2API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Say hello"}]}]}'
+```
+
+Gemini-native clients authenticate with the same key through `x-goog-api-key`; for example with the `google-genai` Python SDK:
+
+```python
+import os
+from google import genai
+
+client = genai.Client(api_key=os.environ["CODEX2API_KEY"], http_options={"base_url": "http://127.0.0.1:2004"})
+client.models.generate_content(model="gemini-3.7-flash-high", contents="Say hello")
+```
+
+Not yet implemented on this surface: batch/embed APIs, Imagen `predict`, and full parity with every `generativelanguage` metadata field on model list responses.
+
 ## Function tools
 
 Responses function tools are bridged into Gemini `functionDeclarations`. Dropping them is not a safe degradation: the upstream still receives the system instruction describing those tools, answers with a call it was never allowed to declare, and terminates the turn as `MALFORMED_FUNCTION_CALL`. Built-in Codex tools (web search, image generation, computer use) have no `v1internal` equivalent and are still ignored. Operators can pin the bridge off for diagnostics, which makes a `tool_choice` that forces a function fail closed with a 400 instead:
@@ -149,6 +194,9 @@ OAuth documents include the access/refresh/ID tokens, project, OAuth client sele
 - `GET /api/admin/accounts/:id/antigravity/state` is read-only and never calls Google. It returns credential kind, catalog source/verification, identity/project status, sanitized permissions/quota, generation-fenced capability observations, timestamps, and warnings.
 - `POST /api/admin/accounts/:id/antigravity/sync` refreshes the Google identity/control plane for OAuth accounts. For API-key accounts it only persists the declared/default local catalog with `verified: false`; it does not fabricate remote catalog, quota, permission, project, or Interactions verification.
 - `POST /api/admin/accounts/:id/antigravity/capabilities/probe` performs one bounded non-stream request against the first configured/default model with a one-token output limit. This explicit action consumes a small amount of generation quota. Only a successful HTTP/JSON response persists `verified: true`; transport, status, content-type, or envelope failures remain unverified. State reads and sync never silently run it.
+- `GET /api/admin/accounts/:id/test?model=<published-id>` is the shared connection test, now wired for Antigravity. It sends the configured test prompt through the same Cloud Code executor as live dispatch (endpoint fallback, 429/503 quota mapping, one refresh-and-retry on 401 for OAuth accounts) and streams `test_start` / `content` / `test_complete` or `error` SSE events, so the account page's "Test connection" button shows the model's actual reply. The model must be one of the account's published IDs; without `model` it prefers the global test model, then the cheapest `*-flash-*-low` tier. A success clears cooldown/error state; 429/503 record a per-model cooldown instead of marking the account failed. Batch and recycle-bin tests use the same path.
+- `GET/PUT /api/admin/settings/channel-tests` stores per-channel connection-test defaults for Antigravity and Claude (`{"antigravity":{"test_model","test_content","test_concurrency"},"claude":{...}}`, persisted in `system_settings.channel_test_config`). `test_concurrency` (0~200, 0 = global) is applied to batch tests whose accounts all belong to that channel; mixed batches keep the global concurrency. The model must be in the tested account's catalog or automatic selection is used; empty content falls back to the global test content. The response also carries `model_choices` (union of the pool's catalogs) and `default_test_content` for the settings page. Grok and Codex keep using the global `test_model` / `test_content`.
+- `GET/PUT /api/admin/settings/antigravity` stores channel settings in `system_settings.antigravity_config`. `model_redirects` maps a bare logical model to one of its own fixed tiers (`{"gemini-3.8-flash":"gemini-3.8-flash-high"}`); a request that names the bare model without `reasoning.effort` then runs as that tier on every entry point (Responses fold, Chat Completions, Messages, API-key Interactions). `redirect_overrides_effort` makes the redirect win even when the request carries an explicit effort. Suffixed tier IDs are never redirected, and the response lists `choices` (each logical model with its default level and tier IDs) for the settings page.
 
 ## Relevant admin endpoints
 

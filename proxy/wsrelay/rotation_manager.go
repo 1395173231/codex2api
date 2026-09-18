@@ -99,7 +99,8 @@ func (m *Manager) trimIdleRotationGroup(wc *WsConnection) {
 		return
 	}
 	limit := wsMaxSiblingConnections()
-	lock := m.keyLock(rotationGroupLockKey(wc.session.AccountID, wc.URL, groupKey))
+	lock, releaseLock := m.keyLock(rotationGroupLockKey(wc.session.AccountID, wc.URL, groupKey))
+	defer releaseLock()
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -191,10 +192,11 @@ func (m *Manager) tryAcquireRotatingIdle(
 		if !rotationRouteAllowed(wc.proxyURL, routes) || !canReuseConnection(wc) {
 			continue
 		}
-		lock := m.keyLock(wc.PoolKey)
+		lock, releaseLock := m.keyLock(wc.PoolKey)
 		lock.Lock()
 		if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc || wc.IsDraining() || !canReuseConnection(wc) {
 			lock.Unlock()
+			releaseLock()
 			continue
 		}
 		if !m.probe(wc) {
@@ -202,7 +204,7 @@ func (m *Manager) tryAcquireRotatingIdle(
 			lock.Unlock()
 			continue
 		}
-		accountLock := m.accountLock(account.ID())
+		accountLock, releaseAccountLock := m.accountLock(account.ID())
 		accountLock.Lock()
 		current, exists := m.connections.Load(wc.PoolKey)
 		if !exists || current != wc || wc.IsDraining() || !canReuseConnection(wc) {
@@ -221,6 +223,8 @@ func (m *Manager) tryAcquireRotatingIdle(
 		}
 		m.DiscardConnection(wc)
 		accountLock.Unlock()
+		releaseAccountLock()
+		releaseLock()
 		lock.Unlock()
 	}
 	return nil, nil, false
@@ -400,7 +404,8 @@ func (m *Manager) createRotationLease(
 		ctx = context.Background()
 	}
 	key := m.poolKey(account.ID(), wsURL, poolSessionKey, proxyURL)
-	accountLock := m.accountLock(account.ID())
+	accountLock, releaseAccountLock := m.accountLock(account.ID())
+	defer releaseAccountLock()
 	accountLock.Lock()
 	if _, exists := m.connections.Load(key); exists {
 		accountLock.Unlock()
@@ -469,7 +474,8 @@ func (m *Manager) acquireConnectionWithRotation(
 	if len(routes) == 0 {
 		return nil, nil, fmt.Errorf("%w: account websocket proxy route limit reached", errRotationRouteLimit)
 	}
-	lock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, groupKey))
+	lock, releaseLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, groupKey))
+	defer releaseLock()
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -536,10 +542,11 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 	// has an idle sibling available.
 	for i := 0; i < slots; i++ {
 		slotKey := fmt.Sprintf("%s#%d", baseKey, i)
-		groupLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, slotKey))
+		groupLock, releaseGroupLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, slotKey))
 		groupLock.Lock()
 		wc, pr, ok := m.tryAcquireRotatingIdle(ctx, account, wsURL, slotKey, slotKey, routes)
 		groupLock.Unlock()
+		releaseGroupLock()
 		if ok {
 			return wc, pr, slotKey, nil
 		}
@@ -552,7 +559,7 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 	var schedulerPressureErr error
 	for i := 0; i < slots; i++ {
 		slotKey := fmt.Sprintf("%s#%d", baseKey, i)
-		groupLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, slotKey))
+		groupLock, releaseGroupLock := m.keyLock(rotationGroupLockKey(account.ID(), wsURL, slotKey))
 		groupLock.Lock()
 		connections := m.rotationGroupConnections(account.ID(), wsURL, slotKey)
 		for _, wc := range connections {
@@ -569,6 +576,7 @@ func (m *Manager) acquireReusableConnectionWithRotation(
 		}
 		wc, pr, err := m.createRotationLease(ctx, account, wsURL, slotKey, slotKey, poolSessionKey, headers, route)
 		groupLock.Unlock()
+		releaseGroupLock()
 		if err != nil {
 			// Capacity or route reservations can be consumed by a sibling slot
 			// between the two passes; keep scanning before returning an error.

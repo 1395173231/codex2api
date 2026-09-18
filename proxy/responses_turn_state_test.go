@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,7 +29,7 @@ func readResponsesWSTerminalEvent(t *testing.T, conn *websocket.Conn) []byte {
 			t.Fatalf("read websocket event: %v", err)
 		}
 		switch gjson.GetBytes(event, "type").String() {
-		case "response.completed", "response.failed", "error":
+		case "response.completed", "response.incomplete", "response.failed", "error":
 			return event
 		}
 	}
@@ -48,7 +49,7 @@ func newUsageLimitedRelayStore(upstreamURL string) (*auth.Store, *auth.Account) 
 		UpstreamType:        auth.UpstreamOpenAIResponses,
 		BaseURL:             upstreamURL,
 		APIKey:              "relay-token",
-		Models:              []string{"gpt-5.4"},
+		Models:              []string{"gpt-5.5"},
 		PlanType:            "plus",
 		UsagePercent5h:      100,
 		UsagePercent5hValid: true,
@@ -64,7 +65,7 @@ func TestResponsesTurnStateAllowsOnlyBoundTurnPastWHAMLimit(t *testing.T) {
 	upstream := newContinuationRelayUpstream(t, false, &seenBody)
 	store, account := newUsageLimitedRelayStore(upstream.URL)
 	handler := NewHandler(store, nil, nil, nil)
-	body := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"continue"}],"stream":true}`)
+	body := []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"continue"}],"stream":true}`)
 
 	fresh := invokeResponsesHandlerWithContext(t, func(c *gin.Context) {
 		c.Request.Header.Set("Session-Id", "turn-session")
@@ -118,11 +119,11 @@ func TestResponsesTurnStateExpiredBindingUsesBaselineSchedulerWhenContinuousRetr
 	t.Cleanup(store.Stop)
 	bound := &auth.Account{
 		DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: boundUpstream.URL,
-		APIKey: "bound-token", Models: []string{"gpt-5.4"}, PlanType: "api",
+		APIKey: "bound-token", Models: []string{"gpt-5.5"}, PlanType: "api",
 	}
 	fallback := &auth.Account{
 		DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: fallbackUpstream.URL,
-		APIKey: "fallback-token", Models: []string{"gpt-5.4"}, PlanType: "api",
+		APIKey: "fallback-token", Models: []string{"gpt-5.5"}, PlanType: "api",
 	}
 	fallback.SetSchedulerPriority(20)
 	store.AddAccount(bound)
@@ -134,7 +135,7 @@ func TestResponsesTurnStateExpiredBindingUsesBaselineSchedulerWhenContinuousRetr
 	recorder := invokeResponsesHandlerWithContext(t, func(c *gin.Context) {
 		c.Request.Header.Set("Session-Id", "expired-http-turn")
 		c.Request.Header.Set(codexTurnStateHeader, "turn-state")
-	}, handler.Responses, []byte(`{"model":"gpt-5.4","input":"continue","stream":true}`))
+	}, handler.Responses, []byte(`{"model":"gpt-5.5","input":"continue","stream":true}`))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
@@ -163,7 +164,7 @@ func TestResponsesTurnStateDoesNotRerouteAfterAuthoritativeLimit(t *testing.T) {
 		UpstreamType: auth.UpstreamOpenAIResponses,
 		BaseURL:      upstream.URL,
 		APIKey:       "healthy-token",
-		Models:       []string{"gpt-5.4"},
+		Models:       []string{"gpt-5.5"},
 		PlanType:     "api",
 	})
 	store.BindSessionAffinity("limited-turn", limited, "")
@@ -173,7 +174,7 @@ func TestResponsesTurnStateDoesNotRerouteAfterAuthoritativeLimit(t *testing.T) {
 	recorder := invokeResponsesHandlerWithContext(t, func(c *gin.Context) {
 		c.Request.Header.Set("Session-Id", "limited-turn")
 		c.Request.Header.Set(codexTurnStateHeader, "turn-state-hard-limited")
-	}, handler.Responses, []byte(`{"model":"gpt-5.4","input":"continue","stream":true}`))
+	}, handler.Responses, []byte(`{"model":"gpt-5.5","input":"continue","stream":true}`))
 
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429; body=%s", recorder.Code, recorder.Body.String())
@@ -208,7 +209,7 @@ func TestResponsesReconcilesEndpointEnabledDirectlyInDatabase(t *testing.T) {
 			"upstream_type": auth.UpstreamOpenAIResponses,
 			"base_url":      baseURL,
 			"api_key":       "sk-test",
-			"models":        []string{"gpt-5.4"},
+			"models":        []string{"gpt-5.5"},
 		}, "")
 		if err != nil {
 			t.Fatalf("InsertOpenAIResponsesAccount(%s): %v", name, err)
@@ -235,7 +236,7 @@ func TestResponsesReconcilesEndpointEnabledDirectlyInDatabase(t *testing.T) {
 	}
 
 	handler := NewHandler(store, db, nil, nil)
-	recorder := invokeResponsesHandler(t, handler.Responses, []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`))
+	recorder := invokeResponsesHandler(t, handler.Responses, []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after DB reconciliation; body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -257,7 +258,7 @@ func TestResponsesCopiesCodexTurnStateResponseHeader(t *testing.T) {
 
 	store := newContinuationRelayStore(upstream.URL)
 	handler := NewHandler(store, nil, nil, nil)
-	recorder := invokeResponsesHandler(t, handler.Responses, []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`))
+	recorder := invokeResponsesHandler(t, handler.Responses, []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -335,8 +336,8 @@ func TestResponsesWebSocketTurnStateRetainsLimitedAccountOnlyWithinTurn(t *testi
 		}
 	}
 
-	run(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-turn","input":"tool output","client_metadata":{"x-codex-turn-state":"turn-1"}}`)
-	run(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-turn","input":"new turn"}`)
+	run(`{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"ws-turn","input":"tool output","client_metadata":{"x-codex-turn-state":"turn-1"}}`)
+	run(`{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"ws-turn","input":"new turn"}`)
 
 	if first := <-served; first != limited.ID() {
 		t.Fatalf("same-turn account = %d, want limited bound account %d", first, limited.ID())
@@ -395,7 +396,7 @@ func TestResponsesWebSocketTurnStateExpiredBindingUsesBaselineSchedulerWhenConti
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"expired-ws-turn","input":"continue","client_metadata":{"x-codex-turn-state":"turn-state"}}`
+	request := `{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"expired-ws-turn","input":"continue","client_metadata":{"x-codex-turn-state":"turn-state"}}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}
@@ -451,7 +452,7 @@ func TestResponsesWebSocketFreshTurnReportsUsageLimitAs429(t *testing.T) {
 		t.Fatalf("dial websocket failed: %v", err)
 	}
 	defer conn.Close()
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"new turn"}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"new turn"}`)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -518,7 +519,7 @@ func TestResponsesWebSocketTurnStateDoesNotRerouteAfterAuthoritativeLimit(t *tes
 		t.Fatalf("dial websocket failed: %v", err)
 	}
 	defer conn.Close()
-	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-limited-turn","input":"continue","client_metadata":{"x-codex-turn-state":"turn-hard-limited"}}`
+	request := `{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"ws-limited-turn","input":"continue","client_metadata":{"x-codex-turn-state":"turn-hard-limited"}}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}
@@ -586,7 +587,7 @@ func TestResponsesWebSocketUpgradeTurnStateDoesNotAuthorizeFreshFrame(t *testing
 		t.Fatalf("dial websocket failed: %v", err)
 	}
 	defer conn.Close()
-	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-upgrade-turn","input":"fresh turn"}`
+	request := `{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"ws-upgrade-turn","input":"fresh turn"}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}
@@ -602,6 +603,10 @@ func TestResponsesWebSocketUpgradeTurnStateDoesNotAuthorizeFreshFrame(t *testing
 }
 
 func TestResponsesWebSocketPinnedTurnDegradesPreviousResponseFailure(t *testing.T) {
+	resetResponseCacheForTest()
+	t.Cleanup(resetResponseCacheForTest)
+	setResponseCache("anon", "resp_missing", []json.RawMessage{json.RawMessage(`{"type":"message","role":"user","content":"earlier context"}`)})
+
 	gin.SetMode(gin.TestMode)
 	previousExec := WebsocketExecuteFunc
 	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
@@ -646,7 +651,7 @@ func TestResponsesWebSocketPinnedTurnDegradesPreviousResponseFailure(t *testing.
 		t.Fatalf("dial websocket failed: %v", err)
 	}
 	defer conn.Close()
-	request := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"ws-pinned-failure","previous_response_id":"resp_missing","input":"continue","client_metadata":{"x-codex-turn-state":"turn-state"}}`
+	request := `{"type":"response.create","model":"gpt-5.5","prompt_cache_key":"ws-pinned-failure","previous_response_id":"resp_missing","input":"continue","client_metadata":{"x-codex-turn-state":"turn-state"}}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write websocket request: %v", err)
 	}

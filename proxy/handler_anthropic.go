@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -366,7 +365,8 @@ func (h *Handler) resolveMessagesRoutingBodyForRequest(c *gin.Context, rawBody [
 	mapped := resolveAnthropicModel(requestedModel, mappingJSON, supportedModels)
 	// 原生 Claude 路由:若存在能服务该模型的 Claude Code OAuth 账号,则保持原生
 	// 模型 ID,交由 claude 账号原生透传;否则维持既有 Codex 翻译兜底(claude-* →
-	// gpt-5.4),不影响没有 claude 账号、靠 Codex 服务 /v1/messages 的用户。
+	// gpt-5.5 / haiku → gpt-5.6-luna),不影响没有 claude 账号、靠 Codex 服务
+	// /v1/messages 的用户。
 	if nativeClaudeRoute {
 		mapped = nativeClaudeModel
 	}
@@ -495,6 +495,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 
+	reviewedClaudeBody := canonicalBody
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
@@ -531,11 +532,9 @@ func (h *Handler) Messages(c *gin.Context) {
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolAnthropic)
 	defer stopRetryDeadline()
-	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, isStream, "text/event-stream; charset=utf-8")
+	stopRetryKeepalive := installContinuousRetryMessagesKeepalive(c, isStream)
 	defer stopRetryKeepalive()
-	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-		activateContinuousRetryKeepalive(c.Request.Context())
-	}
+	h.activateAnthropicMessagesKeepalive(c.Request.Context(), nil, isStream)
 
 	reasoningEffort := extractReasoningEffort(routingBody)
 	serviceTier := extractServiceTier(routingBody)
@@ -575,15 +574,19 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	grokQualityAttempts := 0
 	var lastClaudePolicyErr *Error
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithMessageHashesAndGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithMessageHashesAndGuard(c.Request.Context(), affinityKey, apiKeyID, sessionIdentity.messageHashes, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolAnthropic) {
+				return
+			}
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
 				return
 			}
@@ -670,6 +673,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
+		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
@@ -684,9 +689,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		ttftGuard := newFirstTokenTimeoutGuard(attemptFirstTokenTimeout, upstreamCancel)
 		var resp *http.Response
 		var reqErr error
+		h.activateAnthropicMessagesKeepalive(c.Request.Context(), account, isStream)
 		if account.IsClaudeOAuth() {
 			// 首字前保活：长推理期间让下游能区分"上游在思考"与"连接已死"。
-			activateClaudeStreamKeepalive(c.Request.Context(), h.store, account, isStream)
 			// Claude Code OAuth 账号本身说 Anthropic Messages API：不翻译成 Codex，
 			// 直接把原始入站 body 透传到 api.anthropic.com/v1/messages；返回的响应
 			// 已是原生 Anthropic SSE，打上原生路由标记复用既有透传链路。
@@ -698,15 +703,23 @@ func (h *Handler) Messages(c *gin.Context) {
 				if normalizeErr != nil {
 					ttftGuard.Stop()
 					h.store.Release(account)
+					if isStream && writeCommittedAnthropicRetryError(c, "invalid_request_error", normalizeErr.Error()) {
+						return
+					}
 					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", normalizeErr.Error())
 					return
 				}
 				claudeRequestBody = normalized
 			}
-			if !bytes.Equal(claudeRequestBody, canonicalBody) && h.inspectPromptFilterAnthropic(c, claudeRequestBody, "/v1/messages", model) {
-				ttftGuard.Stop()
-				h.store.Release(account)
-				return
+			if !account.IsClaudeAPIKey() && !bytes.Equal(claudeRequestBody, reviewedClaudeBody) {
+				// Recheck changed prompt content once; transport-only normalization and
+				// retries of an already reviewed payload do not repeat external review.
+				if !sameAnthropicPromptContent(claudeRequestBody, reviewedClaudeBody) && h.inspectPromptFilterAnthropic(c, claudeRequestBody, "/v1/messages", model) {
+					ttftGuard.Stop()
+					h.store.Release(account)
+					return
+				}
+				reviewedClaudeBody = claudeRequestBody
 			}
 			if nativeModel := h.resolveNativeClaudeRequestModel(c, model); nativeModel != "" && !strings.EqualFold(nativeModel, model) {
 				if rewritten, rewriteErr := sjson.SetBytes(claudeRequestBody, "model", nativeModel); rewriteErr == nil {
@@ -893,7 +906,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, readErr := readAllLimited(resp.Body, upstreamErrorBodyReadMaxBytes)
+			errBody, readErr := readAllLimitedWithContinuousRetryKeepalive(readCtx, resp.Body, upstreamErrorBodyReadMaxBytes)
 			if readErr != nil {
 				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
 			}
@@ -1064,7 +1077,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if account.IsClaudeOAuth() && (!isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy)) {
 				copyClaudeNativeResponseHeaders(c, resp.Header)
 			}
-			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(readCtx, c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
 			if account.IsClaudeOAuth() {
 				// Anthropic 的 input_tokens 不含缓存命中/写入，转换成计费层的总输入口径。
 				applyAnthropicUsageSemantics(usage)
@@ -1110,6 +1123,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					retryLog.PromptTokens, retryLog.CompletionTokens, retryLog.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
 					retryLog.InputTokens, retryLog.OutputTokens = usage.InputTokens, usage.OutputTokens
 					retryLog.ReasoningTokens, retryLog.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+					retryLog.ImageInputTokens, retryLog.ImageOutputTokens, retryLog.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 					applyUsageCacheWritesToLog(&retryLog, usage)
 				}
 				h.logUsageForRequest(c, &retryLog)
@@ -1164,6 +1178,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
 				logInput.InputTokens, logInput.OutputTokens = usage.InputTokens, usage.OutputTokens
 				logInput.ReasoningTokens, logInput.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+				logInput.ImageInputTokens, logInput.ImageOutputTokens, logInput.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 				applyUsageCacheWritesToLog(logInput, usage)
 			}
 			if outcome.logStatusCode != http.StatusOK {
@@ -1229,45 +1244,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
 			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
-			// downstreamMu 串行化翻译写路径与其共享状态(writeErr/wroteAnyBody/
-			// streamWriter):下面的下游保活 goroutine 与翻译回调并发写同一个
-			// ResponseWriter,必须互斥,否则注释可能插进半个 SSE 事件里。
-			var downstreamMu sync.Mutex
-			// 首个内容帧之后上游长推理/等工具边界期间可能数十秒无可转发帧,与
-			// /v1/responses 一样定期写标准 SSE 注释,避免反代/CDN/隧道把健康长流
-			// 当空闲连接掐断(issue #623)。缓冲式持续重试下 streamWriter 写的是
-			// 私有缓冲,真实下游心跳由 request 级 keepalive 负责,不再起第二个。
-			stopDownstreamKeepalive := func() {}
-			if !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-				stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
-					downstreamMu.Lock()
-					defer downstreamMu.Unlock()
-					if writeErr != nil || c.Request.Context().Err() != nil {
-						return false
-					}
-					// 首个真实字节前不能写注释,否则会提前提交 HTTP 200,
-					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
-					if !wroteAnyBody {
-						return true
-					}
-					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
-						// 下游已断:翻译回调只会在下一帧到达时才发现,上游静默期间
-						// 会一直阻塞在读上,这里主动取消上游读让本 attempt 尽快收尾。
-						writeErr = err
-						upstreamCancel()
-						return false
-					}
-					return true
-				})
-			}
+			// 请求级 Messages keepalive 从首个模型事件前开始发送
+			// Anthropic 原生 ping；翻译写入与保活不会再由独立 ticker 并发。
 			// contentStarted 用严格口径（isFirstTokenResult）跟踪"首个真实内容帧"，
 			// 专供流提交决策（缓冲/重试窗口/failed 抑制）使用；ttftRecorded 按
-			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
+			// 宽松首字口径记录，只用于首字统计。宽松口径会把
 			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
 			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
-				downstreamMu.Lock()
-				defer downstreamMu.Unlock()
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				// 保活写失败已判定下游断开:不再翻译/写入,停止读取。
 				if writeErr != nil {
 					return false
@@ -1277,7 +1261,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// TTFT 跟踪
 				ttftGuard.MarkProgress(eventType)
-				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+				isFirstToken := isLooseFirstTokenResult(parsed)
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -1371,6 +1355,14 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// 翻译并写入
 				events := translator.translateEvent(data)
+				if translator.toolInputError != nil {
+					terminalFailurePayload = malformedToolArgumentsFailurePayload(translator.toolInputError)
+					gotTerminal = true
+					if visibleBody {
+						writeErr = writeAnthropicStreamErrorEvent(streamWriter, "api_error", translator.toolInputError.Error(), nil)
+					}
+					return false
+				}
 				if len(events) > 0 {
 					var payload bytes.Buffer
 					for _, evt := range events {
@@ -1403,8 +1395,6 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return !isResponsesTerminalEvent(eventType)
 			})
-			// stop 会等保活 goroutine 完整退出,之后的收尾写入不再有并发方。
-			stopDownstreamKeepalive()
 			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
 			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
 			if writeErr == nil && wroteAnyBody {
@@ -1430,7 +1420,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			accumulator := newAnthropicResponseAccumulator(originalModel)
 
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				if eventType == "error" {
@@ -1440,9 +1430,14 @@ func (h *Handler) Messages(c *gin.Context) {
 					return false
 				}
 				accumulator.apply(translator.translateEvent(data))
+				if translator.toolInputError != nil {
+					terminalFailurePayload = malformedToolArgumentsFailurePayload(translator.toolInputError)
+					gotTerminal = true
+					return false
+				}
 
 				ttftGuard.MarkProgress(eventType)
-				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
+				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1652,6 +1647,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.OutputTokens = usage.OutputTokens
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
+			logInput.ImageInputTokens, logInput.ImageOutputTokens, logInput.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 			applyUsageCacheWritesToLog(logInput, usage)
 		}
 		h.logUsageForRequest(c, logInput)
@@ -1677,4 +1673,13 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		return
 	}
+}
+
+func sameAnthropicPromptContent(a, b []byte) bool {
+	for _, field := range []string{"messages", "system", "tools"} {
+		if gjson.GetBytes(a, field).Raw != gjson.GetBytes(b, field).Raw {
+			return false
+		}
+	}
+	return true
 }

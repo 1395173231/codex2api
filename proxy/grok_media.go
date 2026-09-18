@@ -526,6 +526,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 	defer stopRetryDeadline()
 	stopRetryKeepalive := installContinuousRetryHTTPInformationalKeepalive(c)
 	defer stopRetryKeepalive()
+	activateContinuousRetryKeepalive(c.Request.Context())
 	maxRetries := h.getMaxRetries()
 	generalRetries := 0
 	rateLimitRetries := 0

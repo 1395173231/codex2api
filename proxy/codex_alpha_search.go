@@ -65,6 +65,13 @@ func (h *Handler) CodexAlphaSearchHandler(c *gin.Context) {
 	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/alpha/search", model) {
 		return
 	}
+	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
+	defer stopRetryDeadline()
+	stopRetryKeepalive := installContinuousRetryHTTPInformationalKeepalive(c)
+	defer stopRetryKeepalive()
+	activateContinuousRetryKeepalive(c.Request.Context())
 
 	apiKeyID := requestAPIKeyID(c)
 	// 搜索端点只存在于 ChatGPT 后端，relay/Grok 账号无从代答。
@@ -161,13 +168,15 @@ func ForwardCodexAlphaSearch(ctx context.Context, account *auth.Account, proxyUR
 	// 搜索请求携带账号 Bearer token，必须与实际流量使用同一个 Resin 粘性出口。
 	effectiveProxyURL := EffectiveProxyURLForAccount(account, proxyURL)
 	client := getCodexMaintenanceClient(account, effectiveProxyURL)
-	resp, err := client.Do(req)
+	resp, err := executeHTTPWithContinuousRetryKeepalive(reqCtx, func() (*http.Response, error) {
+		return client.Do(req)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("codex search request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, codexAlphaSearchBodyLimit))
+	body, err := readAllLimitedWithContinuousRetryKeepalive(reqCtx, resp.Body, codexAlphaSearchBodyLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read codex search response: %w", err)
 	}

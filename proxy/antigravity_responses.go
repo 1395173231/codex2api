@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/auth"
+	"github.com/tidwall/gjson"
 )
 
 const antigravityInteractionsAgent = "antigravity-preview-05-2026"
@@ -111,11 +113,63 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 	if err != nil {
 		return nil, err
 	}
-	method := "generateContent"
-	query := ""
-	if stream {
-		method, query = "streamGenerateContent", "?alt=sse"
+	payload, err := json.Marshal(gemini)
+	if err != nil {
+		return nil, err
 	}
+	wireModel, _ := gemini["model"].(string)
+	publicModel := model
+	// Freeform tool names have to survive the round trip: Codex dispatches a
+	// custom_tool_call by name and will not accept a function_call for a tool it
+	// declared as custom.
+	customTools := antigravityCustomToolNames(body)
+	return executeAntigravityOAuthRequest(ctx, account, payload, antigravityOAuthGenerateCall(stream), proxyURL, wireModel, func(resp *http.Response, stream bool, _ string) (*http.Response, error) {
+		if stream {
+			resp.Body = newAntigravitySSEResponseBodyWithCustomTools(resp.Body, customTools, publicModel)
+			resp.Header.Set("Content-Type", "text/event-stream")
+			return resp, nil
+		}
+		converted, convertErr := newAntigravityJSONResponseBodyWithCustomTools(resp.Body, publicModel, customTools)
+		if convertErr != nil {
+			return nil, convertErr
+		}
+		resp.Body = converted
+		return resp, nil
+	})
+}
+
+type antigravityOAuthUpstreamCall struct {
+	Method string
+	Query  string
+}
+
+func antigravityOAuthGenerateCall(stream bool) antigravityOAuthUpstreamCall {
+	if stream {
+		return antigravityOAuthUpstreamCall{Method: "streamGenerateContent", Query: "?alt=sse"}
+	}
+	return antigravityOAuthUpstreamCall{Method: "generateContent", Query: ""}
+}
+
+func antigravityOAuthCountTokensCall() antigravityOAuthUpstreamCall {
+	return antigravityOAuthUpstreamCall{Method: "countTokens", Query: ""}
+}
+
+type antigravityOAuthSuccessTransform func(resp *http.Response, stream bool, publicModel string) (*http.Response, error)
+
+func executeAntigravityOAuthRequest(ctx context.Context, account *auth.Account, payload []byte, call antigravityOAuthUpstreamCall, proxyURL string, wireModel string, transform antigravityOAuthSuccessTransform) (*http.Response, error) {
+	if account == nil {
+		return nil, fmt.Errorf("antigravity account is nil")
+	}
+	project, bearer := account.AntigravityCredentials()
+	if project == "" || bearer == "" {
+		return nil, fmt.Errorf("antigravity account %d has no project_id or access token", account.ID())
+	}
+	method := strings.TrimSpace(call.Method)
+	if method == "" {
+		method = "generateContent"
+	}
+	query := call.Query
+	stream := method == "streamGenerateContent"
 	client, err := antigravityHTTPClient(account.ID(), proxyURL)
 	if err != nil {
 		return nil, err
@@ -130,8 +184,9 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 		lastRetryableResponse = nil
 	}
 	useUserProject := antigravityUserProjectHeaderEnabled()
-	payload, _ := json.Marshal(gemini)
 	sameEndpointBudget := &antigravitySameEndpointRetryBudget{}
+	payload = sanitizeAntigravityEnvelopeToolSchemas(payload)
+	publicModel := strings.TrimSpace(wireModel)
 	for headerAttempt := 0; headerAttempt < 2; headerAttempt++ {
 		retryWithoutUserProject := false
 		for _, base := range antigravityOAuthEndpointList() {
@@ -149,7 +204,7 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 					req.Header.Set("x-goog-user-project", project)
 				}
 				var doErr error
-				if err := ConsumeAPIKeyModelRequestQuota(ctx, fmt.Sprint(gemini["model"])); err != nil {
+				if err := ConsumeAPIKeyModelRequestQuota(ctx, wireModel); err != nil {
 					discardLastRetryable()
 					return nil, err
 				}
@@ -172,8 +227,6 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
-				// A sub-second RATE_LIMIT_EXCEEDED or a shared MODEL_CAPACITY_EXHAUSTED
-				// is cheaper to wait out right here than to switch endpoint or account.
 				if wait, retry := sameEndpointBudget.retryDelay(resp.StatusCode, body); retry {
 					if sleepErr := antigravitySleep(ctx, wait); sleepErr == nil {
 						continue
@@ -198,10 +251,6 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
-				// Antigravity Manager retries every 403 once without the quota
-				// consumer header. Some managed projects can call Cloud Code with
-				// their bearer but are not allowed to use themselves as the billing
-				// project, which otherwise looks exactly like SERVICE_DISABLED.
 				if useUserProject {
 					_ = resp.Body.Close()
 					retryWithoutUserProject = true
@@ -232,9 +281,6 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 				if readErr == nil && antigravityEndpointLocationUnsupported(body) {
-					// Location eligibility is authoritative for the official daily
-					// route. Return the real 400 instead of hiding it behind a later
-					// production 429/5xx response.
 					discardLastRetryable()
 					return resp, nil
 				}
@@ -245,16 +291,13 @@ func ExecuteAntigravityResponsesRequest(ctx context.Context, account *auth.Accou
 				discardLastRetryable()
 				return resp, nil
 			}
-			if stream {
-				resp.Body = newAntigravitySSEResponseBody(resp.Body, model)
-				resp.Header.Set("Content-Type", "text/event-stream")
-			} else {
-				converted, convertErr := newAntigravityJSONResponseBody(resp.Body, model)
-				if convertErr != nil {
-					last = convertErr
+			if transform != nil {
+				transformed, transformErr := transform(resp, stream, publicModel)
+				if transformErr != nil {
+					last = transformErr
 					continue
 				}
-				resp.Body = converted
+				resp = transformed
 			}
 			discardLastRetryable()
 			return resp, nil
@@ -478,32 +521,49 @@ func responsesToGeminiInternal(raw []byte, project, model string) (map[string]an
 				if role == "" {
 					role = "user"
 				}
-				text, textErr := responseItemText(m["content"])
-				if textErr != nil {
-					return nil, textErr
+				parts, partsErr := responseItemParts(m["content"], role == "user")
+				if partsErr != nil {
+					return nil, partsErr
 				}
 				switch role {
 				case "assistant":
-					add("model", text)
+					addParts("model", parts)
 				case "system", "developer":
-					if strings.TrimSpace(text) != "" {
-						systemParts = append(systemParts, text)
+					for _, p := range parts {
+						if pm, ok := p.(map[string]any); ok {
+							if t, ok := pm["text"].(string); ok && strings.TrimSpace(t) != "" {
+								systemParts = append(systemParts, t)
+							}
+						}
 					}
 				case "user":
-					add("user", text)
+					addParts("user", parts)
 				default:
 					return nil, antigravityOAuthUnsupported("message role " + role)
 				}
-			case "function_call":
-				name, _ := m["name"].(string)
-				name = strings.TrimSpace(name)
+			case "function_call", "custom_tool_call":
+				// A custom_tool_call is the freeform sibling of function_call:
+				// the payload is opaque text (an apply_patch body, a shell
+				// script) rather than a JSON argument object. Gemini's
+				// functionCall only carries structured args, so the text travels
+				// inside the single `input` property that the matching
+				// declaration advertises, and the response side unwraps it back
+				// into a custom_tool_call.
+				custom := itemType == "custom_tool_call"
+				name := firstAntigravityString(m, "name")
 				callID := firstAntigravityString(m, "call_id", "id")
 				if name == "" || callID == "" {
-					return nil, antigravityOAuthUnsupported("function_call without name or call_id")
+					return nil, antigravityOAuthUnsupported(itemType + " without name or call_id")
 				}
-				arguments, argumentErr := antigravityGeminiFunctionArguments(m["arguments"])
-				if argumentErr != nil {
-					return nil, argumentErr
+				var arguments any
+				if custom {
+					arguments = map[string]any{"input": antigravityCustomToolCallText(m["input"])}
+				} else {
+					resolved, argumentErr := antigravityGeminiFunctionArguments(m["arguments"])
+					if argumentErr != nil {
+						return nil, argumentErr
+					}
+					arguments = resolved
 				}
 				functionPart := map[string]any{"functionCall": map[string]any{"name": name, "args": arguments, "id": callID}}
 				if antigravityGeminiNeedsToolSignature(wireModel) {
@@ -512,19 +572,25 @@ func responsesToGeminiInternal(raw []byte, project, model string) (map[string]an
 				}
 				callNames[callID] = name
 				addParts("model", []any{functionPart})
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output":
 				callID := firstAntigravityString(m, "call_id", "id")
 				name := callNames[callID]
 				if callID == "" || name == "" {
-					return nil, antigravityOAuthUnsupported("orphan function_call_output")
+					return nil, antigravityOAuthUnsupported("orphan " + itemType)
 				}
-				output, outputErr := antigravityFunctionOutputText(m["output"])
+				output, images, outputErr := antigravityFunctionOutput(m["output"])
 				if outputErr != nil {
 					return nil, outputErr
 				}
-				addParts("user", []any{map[string]any{"functionResponse": map[string]any{
-					"name": name, "response": map[string]any{"result": output}, "id": callID,
-				}}})
+				functionResponse := map[string]any{
+					"name":     name,
+					"response": map[string]any{"result": output},
+					"id":       callID,
+				}
+				if len(images) > 0 {
+					functionResponse["parts"] = images
+				}
+				addParts("user", []any{map[string]any{"functionResponse": functionResponse}})
 			case "reasoning":
 				// Codex and the Anthropic bridge echo previous reasoning items
 				// back as conversation history. Their payload is an opaque
@@ -588,7 +654,9 @@ func responsesToGeminiInternal(raw []byte, project, model string) (map[string]an
 	if t, ok := in["temperature"].(float64); ok {
 		generationConfig["temperature"] = t
 	}
-	if thinkingBudget, enabled := antigravityGeminiThinkingBudget(model, wireModel, reasoning); enabled {
+	if level, enabled := antigravityGeminiThinkingLevel(model, wireModel, reasoning); enabled {
+		generationConfig["thinkingConfig"] = map[string]any{"thinkingLevel": level}
+	} else if thinkingBudget, enabled := antigravityGeminiThinkingBudget(model, wireModel, reasoning); enabled {
 		generationConfig["thinkingConfig"] = map[string]any{
 			"includeThoughts": true,
 			"thinkingBudget":  thinkingBudget,
@@ -732,35 +800,46 @@ func antigravityGeminiFunctionArguments(raw any) (any, error) {
 	return raw, nil
 }
 
-func antigravityFunctionOutputText(raw any) (string, error) {
+func antigravityFunctionOutput(raw any) (string, []any, error) {
 	if raw == nil {
-		return "", nil
+		return "", nil, nil
 	}
 	if text, ok := raw.(string); ok {
-		return text, nil
+		return text, nil, nil
 	}
 	if parts, ok := raw.([]any); ok {
 		texts := make([]string, 0, len(parts))
+		images := make([]any, 0)
 		for _, part := range parts {
 			partValue, ok := part.(map[string]any)
 			if !ok {
-				return "", antigravityOAuthUnsupported("non-text function_call_output parts")
+				return "", nil, antigravityOAuthUnsupported("non-map function_call_output parts")
 			}
 			partType := lowerStringField(partValue, "type")
-			if partType != "" && partType != "input_text" && partType != "output_text" && partType != "text" {
-				return "", antigravityOAuthUnsupported("function_call_output part type " + partType)
-			}
-			if text, ok := partValue["text"].(string); ok {
-				texts = append(texts, text)
+			switch partType {
+			case "", "input_text", "output_text", "text":
+				if text, ok := partValue["text"].(string); ok {
+					texts = append(texts, text)
+				} else if text, ok := partValue["content"].(string); ok {
+					texts = append(texts, text)
+				}
+			case "input_image", "image_url":
+				inlinePart, err := antigravityExtractInlineImagePart(partValue)
+				if err != nil {
+					return "", nil, err
+				}
+				images = append(images, inlinePart)
+			default:
+				return "", nil, antigravityOAuthUnsupported("function_call_output part type " + partType)
 			}
 		}
-		return strings.Join(texts, "\n"), nil
+		return strings.Join(texts, "\n"), images, nil
 	}
 	encoded, err := json.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("encode function_call_output: %w", err)
+		return "", nil, fmt.Errorf("encode function_call_output: %w", err)
 	}
-	return string(encoded), nil
+	return string(encoded), nil, nil
 }
 
 func antigravityGeminiNeedsToolSignature(model string) bool {
@@ -826,6 +905,21 @@ func antigravityGeminiResolvedModel(model string, reasoning map[string]any) stri
 		return wireModel
 	}
 	return strings.TrimSpace(model)
+}
+
+// New tiered Flash uses a named level, not the older numeric budget ladder.
+// Fixed suffixes win over conflicting effort; bare models default to low.
+func antigravityGeminiThinkingLevel(requestedModel, wireModel string, reasoning map[string]any) (string, bool) {
+	if wireModel != "gemini-3.8-flash-tiered" {
+		return "", false
+	}
+	if variant, ok := antigravityResolvedVariant(requestedModel, reasoning); ok {
+		return strings.ToUpper(variant.level), true
+	}
+	if len(reasoning) == 0 {
+		return "LOW", true
+	}
+	return strings.ToUpper(antigravityGeminiReasoningTier(reasoning)), true
 }
 
 func antigravityGeminiThinkingBudget(requestedModel, wireModel string, reasoning map[string]any) (int, bool) {
@@ -917,6 +1011,8 @@ func antigravityGeminiThinkingBudgetCap(model string) int {
 func antigravityGeminiMaxOutputTokens(model string) int {
 	name := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case name == "gemini-3.8-flash-tiered":
+		return 65536
 	case strings.Contains(name, "claude"):
 		return 64000
 	case strings.Contains(name, "gpt-oss"):
@@ -955,7 +1051,23 @@ func antigravityGeminiFunctionDeclarations(tools []any) []any {
 	declarations := make([]any, 0, len(tools))
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
-		if !ok || lowerStringField(tool, "type") != "function" {
+		if !ok {
+			continue
+		}
+		toolType := lowerStringField(tool, "type")
+		if toolType == "custom" {
+			// Codex declares freeform tools (apply_patch and friends) as
+			// `{"type":"custom","format":...}` with no JSON schema. The
+			// v1internal bridge has no freeform tool form, so the tool is
+			// declared as a function whose single `input` argument carries the
+			// raw payload. Dropping it instead would silently strip the tool
+			// from the model's repertoire.
+			if declaration := antigravityGeminiCustomToolDeclaration(tool); declaration != nil {
+				declarations = append(declarations, declaration)
+			}
+			continue
+		}
+		if toolType != "function" {
 			// Codex commonly sends built-in tools next to function tools. The
 			// v1internal bridge cannot faithfully express them, so ignore them.
 			continue
@@ -973,7 +1085,11 @@ func antigravityGeminiFunctionDeclarations(tools []any) []any {
 		if description, ok := function["description"].(string); ok && strings.TrimSpace(description) != "" {
 			declaration["description"] = description
 		}
-		declaration["parameters"] = antigravityGeminiParameters(function["parameters"])
+		rawParams := function["parameters"]
+		if rawParams == nil {
+			rawParams = function["parametersJsonSchema"]
+		}
+		declaration["parametersJsonSchema"] = antigravityGeminiParameters(rawParams)
 		declarations = append(declarations, declaration)
 	}
 	sort.SliceStable(declarations, func(i, j int) bool {
@@ -984,10 +1100,127 @@ func antigravityGeminiFunctionDeclarations(tools []any) []any {
 	return declarations
 }
 
+// antigravityGeminiCustomToolDeclaration lowers a Responses freeform tool into
+// the Gemini function declaration that stands in for it. The freeform payload
+// is carried in a single `input` string, the shape both directions agree on:
+// the request side sends {"input": <text>} and the response side reads the same
+// field back out. `name`/`description` are accepted both at the top level and
+// inside the nested `custom` object that the Chat bridge also tolerates.
+func antigravityGeminiCustomToolDeclaration(tool map[string]any) map[string]any {
+	body := tool
+	if nested, ok := tool["custom"].(map[string]any); ok {
+		body = nested
+	}
+	name := firstAntigravityString(body, "name")
+	if name == "" {
+		name = firstAntigravityString(tool, "name")
+	}
+	if name == "" {
+		return nil
+	}
+	declaration := map[string]any{"name": name}
+	if description, ok := body["description"].(string); ok && strings.TrimSpace(description) != "" {
+		declaration["description"] = description
+	}
+	declaration["parametersJsonSchema"] = antigravityGeminiParameters(map[string]any{
+		"type": "OBJECT",
+		"properties": map[string]any{
+			"input": map[string]any{
+				"type":        "STRING",
+				"description": "The complete raw payload for " + name + ", exactly as its own format expects.",
+			},
+		},
+		"required": []any{"input"},
+	})
+	return declaration
+}
+
+// antigravityCustomToolCallText renders a custom_tool_call input as the string
+// the Gemini functionCall carries. Custom tool input is opaque text, so a
+// non-string payload (a client bug) is passed through as JSON rather than
+// silently dropped.
+func antigravityCustomToolCallText(raw any) string {
+	switch typed := raw.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
+}
+
+// antigravityCustomToolNames collects the tool names the request declared as
+// freeform, so the response side can rebuild their calls as custom_tool_call
+// items instead of function_call. Codex matches tool calls by name and rejects a
+// function_call for a tool it declared as custom, so the distinction has to
+// survive the round trip. Traversal is lazy (issue #417: a full Unmarshal of a
+// 16MB body is not free, and responsesToGeminiInternal already parses it once).
+// A body that does not parse yields no names, keeping function_call behaviour.
+func antigravityCustomToolNames(raw []byte) map[string]bool {
+	names := make(map[string]bool)
+	gjson.GetBytes(raw, "tools").ForEach(func(_, tool gjson.Result) bool {
+		// Normalize exactly like antigravityGeminiFunctionDeclarations does via
+		// lowerStringField. A case/whitespace difference here would declare the
+		// tool to the model but fail to mark it custom on the way back, so the
+		// response would carry a function_call for a tool Codex declared custom.
+		if !strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "custom") {
+			return true
+		}
+		// The Chat bridge tolerates a nested `custom` object; prefer its name so
+		// both declaration paths resolve to the same tool.
+		name := strings.TrimSpace(tool.Get("custom.name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("name").String())
+		}
+		if name != "" {
+			names[name] = true
+		}
+		return true
+	})
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// antigravityCustomToolCallInput unwraps the `input` string the custom tool
+// declaration asked for. Gemini can return arguments that do not match the
+// declared schema, so anything unexpected falls back to the raw arguments text
+// rather than losing the model's output.
+func antigravityCustomToolCallInput(arguments string) string {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" || trimmed == "{}" {
+		return ""
+	}
+	var decoded any
+	if json.Unmarshal([]byte(trimmed), &decoded) != nil {
+		return arguments
+	}
+	switch typed := decoded.(type) {
+	case string:
+		return typed
+	case map[string]any:
+		if text, ok := typed["input"].(string); ok {
+			return text
+		}
+	}
+	return arguments
+}
+
 func antigravityGeminiParameters(raw any) map[string]any {
 	root, ok := raw.(map[string]any)
 	if !ok {
-		return map[string]any{"type": "OBJECT", "properties": map[string]any{}}
+		return antigravityFinalizeToolSchema(map[string]any{"type": "OBJECT", "properties": map[string]any{}})
+	}
+	root = antigravityNormalizeMalformedToolSchema(root)
+	root = antigravityInlineLocalSchemaRefs(root)
+	if flattened, ok := antigravityFlattenSchemaUnions(root).(map[string]any); ok && flattened != nil {
+		root = flattened
 	}
 	definitions := map[string]any{}
 	for _, key := range []string{"$defs", "definitions"} {
@@ -1007,7 +1240,90 @@ func antigravityGeminiParameters(raw any) map[string]any {
 	if _, ok := cleaned["properties"]; !ok {
 		cleaned["properties"] = map[string]any{}
 	}
-	return cleaned
+	antigravityCleanupGeminiRequiredFields(cleaned)
+	return antigravityFinalizeToolSchema(cleaned)
+}
+
+// antigravityCleanupGeminiRequiredFields drops required entries that are not
+// declared in the sibling properties map. Gemini rejects such schemas with
+// "property is not defined" before inference starts (issue #655).
+func antigravityCleanupGeminiRequiredFields(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		antigravityFilterRequiredAgainstProperties(typed)
+		for key, item := range typed {
+			if key == "required" {
+				continue
+			}
+			antigravityCleanupGeminiRequiredFields(item)
+		}
+	case []any:
+		for _, item := range typed {
+			antigravityCleanupGeminiRequiredFields(item)
+		}
+	}
+}
+
+func antigravityFilterRequiredAgainstProperties(schema map[string]any) {
+	rawRequired, hasRequired := schema["required"]
+	if !hasRequired {
+		return
+	}
+	props, hasProps := schema["properties"].(map[string]any)
+	if !hasProps {
+		delete(schema, "required")
+		return
+	}
+	requiredNames := antigravityRequiredFieldNames(rawRequired)
+	if len(requiredNames) == 0 {
+		delete(schema, "required")
+		return
+	}
+	valid := make([]any, 0, len(requiredNames))
+	for _, name := range requiredNames {
+		if _, exists := props[name]; exists {
+			valid = append(valid, name)
+		}
+	}
+	if len(valid) == 0 {
+		delete(schema, "required")
+	} else {
+		schema["required"] = valid
+	}
+}
+
+func antigravityRequiredFieldNames(raw any) []string {
+	switch typed := raw.(type) {
+	case []any:
+		names := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if name, ok := item.(string); ok && strings.TrimSpace(name) != "" {
+				names = append(names, name)
+			}
+		}
+		return names
+	case []string:
+		names := make([]string, 0, len(typed))
+		for _, name := range typed {
+			if strings.TrimSpace(name) != "" {
+				names = append(names, name)
+			}
+		}
+		return names
+	default:
+		return nil
+	}
+}
+
+// decodeJSONPointerToken 把 $ref 里的 JSON Pointer 引用 token 还原成定义键:
+// 片段里先做百分号解码,再按 RFC 6901 把 ~1 还原成 /、~0 还原成 ~(顺序不能反)。
+// 不解码时 "#/$defs/A~1B" 会按字面量找不到 "A/B",引用被清成 {} 丢掉约束。
+func decodeJSONPointerToken(token string) string {
+	if unescaped, err := url.PathUnescape(token); err == nil {
+		token = unescaped
+	}
+	token = strings.ReplaceAll(token, "~1", "/")
+	return strings.ReplaceAll(token, "~0", "~")
 }
 
 func antigravityCleanGeminiSchema(value any, definitions map[string]any, resolving map[string]bool, depth int) any {
@@ -1027,6 +1343,7 @@ func antigravityCleanGeminiSchema(value any, definitions map[string]any, resolvi
 			case strings.HasPrefix(ref, definitionsPrefix):
 				name = strings.TrimPrefix(ref, definitionsPrefix)
 			}
+			name = decodeJSONPointerToken(name)
 			if definition, ok := definitions[name]; ok && name != "" && !resolving[name] {
 				resolving[name] = true
 				if expanded, ok := antigravityCleanGeminiSchema(definition, definitions, resolving, depth+1).(map[string]any); ok {
@@ -1108,6 +1425,85 @@ func antigravityOAuthUnsupported(feature string) error {
 		Type:       ErrorTypeInvalidRequest,
 		HTTPStatus: http.StatusBadRequest,
 	}
+}
+
+func responseItemParts(v any, allowImages bool) ([]any, error) {
+	if s, ok := v.(string); ok {
+		if strings.TrimSpace(s) == "" {
+			return nil, nil
+		}
+		return []any{map[string]any{"text": s}}, nil
+	}
+	arr, _ := v.([]any)
+	var parts []any
+	for _, x := range arr {
+		m, ok := x.(map[string]any)
+		if !ok {
+			return nil, antigravityOAuthUnsupported("non-map content parts")
+		}
+		partType := lowerStringField(m, "type")
+		switch partType {
+		case "", "input_text", "output_text", "text":
+			text := ""
+			if s, ok := m["text"].(string); ok {
+				text = s
+			} else if s, ok := m["content"].(string); ok {
+				text = s
+			}
+			if strings.TrimSpace(text) != "" {
+				parts = append(parts, map[string]any{"text": text})
+			}
+		case "input_image", "image_url":
+			if !allowImages {
+				return nil, antigravityOAuthUnsupported("images in non-user messages")
+			}
+			inlinePart, err := antigravityExtractInlineImagePart(m)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, inlinePart)
+		default:
+			return nil, antigravityOAuthUnsupported("content part type " + partType)
+		}
+	}
+	return parts, nil
+}
+
+func antigravityExtractInlineImagePart(m map[string]any) (map[string]any, error) {
+	var rawURL string
+	if u, ok := m["image_url"].(string); ok {
+		rawURL = strings.TrimSpace(u)
+	} else if obj, ok := m["image_url"].(map[string]any); ok {
+		if u, ok := obj["url"].(string); ok {
+			rawURL = strings.TrimSpace(u)
+		}
+	}
+	if rawURL == "" {
+		if u, ok := m["url"].(string); ok {
+			rawURL = strings.TrimSpace(u)
+		}
+	}
+	if rawURL == "" {
+		return nil, antigravityOAuthUnsupported("image part without image_url")
+	}
+	if strings.HasPrefix(rawURL, "data:") {
+		rest := strings.TrimPrefix(rawURL, "data:")
+		mediaType, data, ok := strings.Cut(rest, ";base64,")
+		if !ok || strings.TrimSpace(data) == "" {
+			return nil, antigravityOAuthUnsupported("invalid base64 image data URI")
+		}
+		mimeType := strings.TrimSpace(mediaType)
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		return map[string]any{
+			"inlineData": map[string]any{
+				"mimeType": mimeType,
+				"data":     data,
+			},
+		}, nil
+	}
+	return nil, antigravityOAuthUnsupported("remote image URLs in Antigravity OAuth adapter; use data URI")
 }
 
 func responseItemText(v any) (string, error) {
@@ -1225,13 +1621,24 @@ func readBoundedAntigravityBody(r io.ReadCloser, limit int64) ([]byte, error) {
 }
 
 func newAntigravityJSONResponseBody(r io.ReadCloser, model string) (io.ReadCloser, error) {
+	return newAntigravityJSONResponseBodyWithCustomTools(r, model, nil)
+}
+
+// newAntigravityJSONResponseBodyWithCustomTools additionally carries the set of
+// freeform tool names declared by the request, so their calls are rebuilt as
+// custom_tool_call instead of function_call.
+func newAntigravityJSONResponseBodyWithCustomTools(r io.ReadCloser, model string, customTools map[string]bool) (io.ReadCloser, error) {
 	// Reading the complete upstream body may block until generation finishes.
 	// Freeze the synthetic Responses creation time before that work starts.
 	createdAt := time.Now().Unix()
-	return newAntigravityJSONResponseBodyAt(r, model, createdAt)
+	return newAntigravityJSONResponseBodyAtWithCustomTools(r, model, createdAt, customTools)
 }
 
 func newAntigravityJSONResponseBodyAt(r io.ReadCloser, model string, createdAt int64) (io.ReadCloser, error) {
+	return newAntigravityJSONResponseBodyAtWithCustomTools(r, model, createdAt, nil)
+}
+
+func newAntigravityJSONResponseBodyAtWithCustomTools(r io.ReadCloser, model string, createdAt int64, customTools map[string]bool) (io.ReadCloser, error) {
 	body, err := readBoundedAntigravityBody(r, antigravityResponseBodyLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read Antigravity JSON response: %w", err)
@@ -1244,7 +1651,7 @@ func newAntigravityJSONResponseBodyAt(r io.ReadCloser, model string, createdAt i
 		env = v
 	}
 	text := extractGeminiText(env)
-	functionCalls := extractGeminiFunctionCalls(env)
+	functionCalls := extractGeminiFunctionCalls(env, customTools)
 	finishReason := geminiFinishReason(env)
 	blocked := geminiBlocked(env)
 	status := geminiFinishStatus(finishReason)
@@ -1296,9 +1703,13 @@ type antigravityFunctionCall struct {
 	CallID    string
 	Name      string
 	Arguments string
+	// Custom marks a call to a tool the request declared as freeform. It decides
+	// whether the call is rebuilt downstream as custom_tool_call or
+	// function_call, which Codex distinguishes by type rather than by name.
+	Custom bool
 }
 
-func extractGeminiFunctionCalls(value map[string]any) []antigravityFunctionCall {
+func extractGeminiFunctionCalls(value map[string]any, customTools map[string]bool) []antigravityFunctionCall {
 	candidates, _ := value["candidates"].([]any)
 	if len(candidates) == 0 {
 		return nil
@@ -1338,11 +1749,17 @@ func extractGeminiFunctionCalls(value map[string]any) []antigravityFunctionCall 
 		if callID == "" {
 			callID = "call_ag_" + antigravityRandomHex(12)
 		}
+		custom := customTools[name]
+		itemPrefix := "fc_ag_"
+		if custom {
+			itemPrefix = "ctc_ag_"
+		}
 		calls = append(calls, antigravityFunctionCall{
-			ItemID:    "fc_ag_" + antigravityRandomHex(12),
+			ItemID:    itemPrefix + antigravityRandomHex(12),
 			CallID:    callID,
 			Name:      name,
 			Arguments: arguments,
+			Custom:    custom,
 		})
 	}
 	return calls
@@ -1358,6 +1775,16 @@ func firstAntigravityString(value map[string]any, keys ...string) string {
 }
 
 func antigravityFunctionCallItem(functionCall antigravityFunctionCall, status, arguments string) map[string]any {
+	if functionCall.Custom {
+		return map[string]any{
+			"id":      functionCall.ItemID,
+			"type":    "custom_tool_call",
+			"status":  status,
+			"call_id": functionCall.CallID,
+			"name":    functionCall.Name,
+			"input":   antigravityCustomToolCallInput(arguments),
+		}
+	}
 	return map[string]any{
 		"id":        functionCall.ItemID,
 		"type":      "function_call",
@@ -1384,9 +1811,18 @@ type antigravitySSEBody struct {
 	// textStarted records that the assistant message item and its text part
 	// have been opened downstream, so later fragments go out as deltas.
 	textStarted bool
+	// customTools holds the tool names the request declared as freeform, so a
+	// Gemini functionCall for one of them is rebuilt as custom_tool_call.
+	customTools map[string]bool
 }
 
 func newAntigravitySSEResponseBody(r io.ReadCloser, model ...string) io.ReadCloser {
+	return newAntigravitySSEResponseBodyWithCustomTools(r, nil, model...)
+}
+
+// newAntigravitySSEResponseBodyWithCustomTools additionally carries the set of
+// freeform tool names declared by the request.
+func newAntigravitySSEResponseBodyWithCustomTools(r io.ReadCloser, customTools map[string]bool, model ...string) io.ReadCloser {
 	modelID := ""
 	if len(model) > 0 {
 		modelID = strings.TrimSpace(model[0])
@@ -1396,6 +1832,7 @@ func newAntigravitySSEResponseBody(r io.ReadCloser, model ...string) io.ReadClos
 		responseID: "resp_ag_" + antigravityRandomHex(12),
 		messageID:  "msg_ag_" + antigravityRandomHex(12),
 		model:      modelID, createdAt: time.Now().Unix(),
+		customTools: customTools,
 	}
 }
 func (b *antigravitySSEBody) Close() error {
@@ -1528,20 +1965,33 @@ func (b *antigravitySSEBody) enqueueSuccess(status string, usage map[string]any)
 			"output_index": outputIndex,
 			"item":         added,
 		})
-		if functionCall.Arguments != "" {
-			b.enqueue("response.function_call_arguments.delta", map[string]any{
+		// A custom tool streams its freeform payload through its own event family
+		// and reports it as `input`; a function tool reports JSON `arguments`.
+		deltaEvent, doneEvent := "response.function_call_arguments.delta", "response.function_call_arguments.done"
+		payload := functionCall.Arguments
+		if functionCall.Custom {
+			deltaEvent, doneEvent = "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done"
+			payload = antigravityCustomToolCallInput(functionCall.Arguments)
+		}
+		if payload != "" {
+			b.enqueue(deltaEvent, map[string]any{
 				"output_index": outputIndex,
 				"item_id":      functionCall.ItemID,
 				"call_id":      functionCall.CallID,
-				"delta":        functionCall.Arguments,
+				"delta":        payload,
 			})
 		}
-		b.enqueue("response.function_call_arguments.done", map[string]any{
+		doneFields := map[string]any{
 			"output_index": outputIndex,
 			"item_id":      functionCall.ItemID,
 			"call_id":      functionCall.CallID,
-			"arguments":    functionCall.Arguments,
-		})
+		}
+		if functionCall.Custom {
+			doneFields["input"] = payload
+		} else {
+			doneFields["arguments"] = payload
+		}
+		b.enqueue(doneEvent, doneFields)
 		completed := antigravityFunctionCallItem(functionCall, "completed", functionCall.Arguments)
 		b.enqueue("response.output_item.done", map[string]any{"output_index": outputIndex, "item": completed})
 		output = append(output, completed)
@@ -1616,7 +2066,7 @@ func (b *antigravitySSEBody) Read(p []byte) (int, error) {
 		// that frame's text is forwarded; a rejection that arrives in a later
 		// frame terminates the stream with response.failed instead.
 		fragment := extractGeminiText(env)
-		calls := extractGeminiFunctionCalls(env)
+		calls := extractGeminiFunctionCalls(env, b.customTools)
 		if b.text.Len()+len(fragment)+antigravityFunctionCallsSize(b.functions)+antigravityFunctionCallsSize(calls) > antigravityResponseBodyLimit {
 			b.enqueueFailure(ErrorCodeUpstreamError, "antigravity streamed response exceeded the safe size limit")
 			continue

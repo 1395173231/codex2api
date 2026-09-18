@@ -123,6 +123,10 @@ func (h *Handler) buildAccountResponse(
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	}
+	codexPassthroughMode := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	}
 	balanceQueryURL := ""
 	if isOpenAIResponsesAccount && includeDetails {
 		balanceQueryURL = row.GetCredential(openAIResponsesBalanceQueryURLCredential)
@@ -132,9 +136,10 @@ func (h *Handler) buildAccountResponse(
 	if !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isClaudeAccount {
 		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
 	}
-	// Claude Code 指纹收敛模式 + 绑定时区,仅 Claude OAuth 账号暴露。
+	// Claude Code 指纹收敛模式仅 Claude OAuth 账号暴露；绑定时区对所有账号暴露：
+	// Claude 用它做身份标签，Codex 官方账号用它改写出站 environment_context。
 	claudeFingerprintMode := ""
-	accountTimezone := ""
+	accountTimezone := strings.TrimSpace(row.GetCredential(auth.AccountTimezoneCredentialKey))
 	claudeClientPlatformOverride := ""
 	claudeVersionPolicyOverride := ""
 	claudeClientVersionOverride := ""
@@ -142,7 +147,6 @@ func (h *Handler) buildAccountResponse(
 	if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamClaude) {
 		claudeClientPolicy = auth.ClaudeClientPolicy{Platform: auth.ClaudeClientPlatformAny, VersionPolicy: auth.ClaudeVersionPolicyPassthrough}
 		claudeFingerprintMode = auth.NormalizeClaudeFingerprintMode(row.GetCredential(auth.ClaudeFingerprintModeCredentialKey))
-		accountTimezone = strings.TrimSpace(row.GetCredential("timezone"))
 		claudeClientPlatformOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(auth.ClaudeClientPlatformCredentialKey)))
 		claudeVersionPolicyOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(auth.ClaudeVersionPolicyCredentialKey)))
 		claudeClientVersionOverride = strings.TrimSpace(row.GetCredential(auth.ClaudeClientVersionCredentialKey))
@@ -180,7 +184,14 @@ func (h *Handler) buildAccountResponse(
 	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, headers)
 	if includeDetails {
 		modelMapping = row.GetCredential("model_mapping")
-		if isClaudeAccount {
+		if isClaudeAccount && claudeAuthKindForRow(row, true) == auth.ClaudeAuthKindAPIKey {
+			// API Key custom_headers are operator configuration (never a generated
+			// fingerprint) and can't contain gateway-owned secrets (reserved names
+			// are rejected on write), so they are shown in full like Codex relay
+			// accounts. The UA preview reflects custom header > identity emulation.
+			customHeaders = headers
+			claudeUserAgent = auth.ClaudeAPIKeyUpstreamUserAgent(headers, claudeFingerprintMode)
+		} else if isClaudeAccount {
 			// Claude detail responses may be consumed by admin tooling, but must
 			// never expose arbitrary historical custom headers such as
 			// Authorization/Cookie/x-api-key. Keep only the provider identity
@@ -209,6 +220,9 @@ func (h *Handler) buildAccountResponse(
 		EffectiveWorkspaceID:         effectiveWorkspaceID,
 		PlanType:                     planType,
 		SubscriptionExpiresAt:        row.GetCredential("subscription_expires_at"),
+		Subscription:                 subscriptionStatusViewForRow(row, planType),
+		CodexLastRefreshAt:           row.GetCredential("codex_last_refresh_at"),
+		CodexRefreshError:            row.GetCredential("codex_refresh_error"),
 		Status:                       row.Status,
 		ErrorMessage:                 row.ErrorMessage,
 		ATOnly:                       !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
@@ -239,6 +253,7 @@ func (h *Handler) buildAccountResponse(
 		Models:                       row.GetCredentialStringSlice("models"),
 		ModelMapping:                 modelMapping,
 		CodexClientMetadataMode:      codexClientMetadataMode,
+		CodexPassthroughMode:         codexPassthroughMode,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
 		ClaudeUserAgent:              claudeUserAgent,
@@ -249,6 +264,9 @@ func (h *Handler) buildAccountResponse(
 		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
 		Timezone:                     accountTimezone,
+		CodexTurnState:               strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey)),
+		CodexTurnStateModels:         auth.NormalizeCodexTurnStateModels(row.GetCredential(auth.CodexTurnStateModelsCredentialKey)),
+		CodexTurnStateSetAt:          strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey)),
 		CustomHeaders:                customHeaders,
 		UpstreamRequestIDHeader:      row.GetCredential(auth.UpstreamRequestIDHeaderCredentialKey),
 		ProxyURL:                     row.ProxyURL,
@@ -355,11 +373,14 @@ func (h *Handler) buildAccountResponse(
 		if applicable, ok := runtimeAccount.GetApplicableResetCredits(); ok {
 			resp.ApplicableResetCredits = &applicable
 		}
-		if balance, hasCredits, unlimited, overage, ok := runtimeAccount.GetCreditBalance(); ok {
-			resp.CreditsBalance = &balance
-			resp.CreditsHasCredits = &hasCredits
-			resp.CreditsUnlimited = &unlimited
-			resp.CreditsOverageLimitReached = &overage
+		if credits, ok := runtimeAccount.GetCreditBalance(); ok {
+			resp.CreditsValid = true
+			resp.CreditsBalance = credits.Balance
+			resp.CreditsHasCredits = &credits.HasCredits
+			resp.CreditsUnlimited = &credits.Unlimited
+			resp.CreditsOverageLimitReached = &credits.OverageLimitReached
+			resp.CreditsSpendControlReached = credits.SpendControlReached
+			resp.CreditsRateLimitReachedType = credits.RateLimitReachedType
 		}
 		if includeDetails {
 			if snapshot := runtimeAccount.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
@@ -489,6 +510,7 @@ func stripAccountDetailFields(resp *accountResponse) {
 	}
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
+	resp.CodexPassthroughMode = ""
 	resp.CustomHeaders = nil
 	resp.AllowedAPIKeyIDs = nil
 	resp.Usage5hDetail = nil
