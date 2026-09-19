@@ -14,7 +14,7 @@ export function CodexTurnStateSummary({ items }: { items?: CodexTurnStateStatus[
   const { t } = useTranslation()
   if (!items?.length) return null
   return <div className="flex flex-wrap gap-x-2 gap-y-1 text-[10px] text-muted-foreground">
-    {items.map(item => <span key={item.model} className="break-all" title={item.last_error || undefined}>
+    {items.map(item => <span key={item.model} className="break-all" title={item.pause_reason ? t('turnState.pauseReason.' + item.pause_reason) : item.last_error || undefined}>
       {item.model}: {t('turnState.status.' + turnStateDisplayStatus(item))}
     </span>)}
   </div>
@@ -92,7 +92,8 @@ export default function CodexTurnStatePanel({ accountId }: { accountId: number }
               <div className="mt-1 whitespace-nowrap font-sans text-muted-foreground">{item.token_length} / {item.target_lengths.join(', ')}</div>
             </td>
             <td className="max-w-48 py-2 pr-2">
-              <span className={item.ready && turnStateRemainingMs(item, now) > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}>{t('turnState.status.' + turnStateDisplayStatus(item, now))}</span>
+              <span className={item.status === 'ready' && turnStateRemainingMs(item, now) > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}>{t('turnState.status.' + turnStateDisplayStatus(item, now))}</span>
+              {item.pause_reason && <div className="mt-1 text-amber-700 dark:text-amber-400">{t('turnState.pauseReason.' + item.pause_reason)}</div>}
               <div className="mt-1 text-muted-foreground">{t('turnState.attempts', { count: item.attempts })}</div>
               {item.last_attempt_at && <div title={t('turnState.lastAttempt')} className="mt-1 text-muted-foreground">{formatBeijingTime(item.last_attempt_at)}</div>}
               {item.next_attempt_at && <div className="mt-1 text-muted-foreground">{t('turnState.nextAttempt')}: {formatBeijingTime(item.next_attempt_at)}</div>}
@@ -103,7 +104,7 @@ export default function CodexTurnStatePanel({ accountId }: { accountId: number }
               {item.issued_at && <div className="mt-1 text-muted-foreground" title={t('turnState.issuedAt')}>{formatBeijingTime(item.issued_at)}</div>}
             </td>
             <td className="py-2"><div className="flex gap-1">
-              <Button type="button" size="icon-sm" variant="ghost" title={t('turnState.collect')} aria-label={t('turnState.collect')} disabled={busy || !data.enabled || item.status === 'refreshing'} onClick={() => void run(() => api.refreshAccountTurnState(accountId, item.model), false, true)}><RefreshCw className="size-4" /></Button>
+              <Button type="button" size="icon-sm" variant="ghost" title={t('turnState.collect')} aria-label={t('turnState.collect')} disabled={busy || !data.enabled || item.status === 'refreshing' || item.status === 'paused'} onClick={() => void run(() => api.refreshAccountTurnState(accountId, item.model), false, true)}><RefreshCw className="size-4" /></Button>
               <Button type="button" size="icon-sm" variant="ghost" title={t('turnState.remove')} aria-label={t('turnState.remove')} disabled={busy || !item.token_length} onClick={() => void run(() => api.deleteAccountTurnState(accountId, item.model))}><Trash2 className="size-4" /></Button>
             </div></td>
           </tr>)}</tbody>

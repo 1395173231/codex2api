@@ -3,7 +3,8 @@
     "invalidModels": "需要 1–32 个精确模型名（ASCII、每项不超过 128 字符、不含通配符）。",
     "title": "模型 Turn State",
     "settingsTitle": "Turn State 后台采集",
-    "caveat": "Fernet 时间戳仅解码、未验签；有效期为本地估计。292 / 332 是本地长度筛选条件，不能证明上游授权、模型能力或回答质量。",
+    "caveat": "Fernet 时间戳仅解码、未验签；有效期为本地估计。292 / 332 是本地长度筛选条件，不能证明上游授权、模型能力或回答质量。采集会发送真实上游请求并消耗账号额度，进入积分计费后会消耗积分。",
+    "collectionCostHint": "采集会发送真实上游请求并消耗账号额度，进入积分计费后会消耗积分。账号限流或缺少可用积分时暂停采集，恢复后自动继续。",
     "model": "模型",
     "state": "状态 / 尝试",
     "validity": "剩余 / 签发时间",
@@ -34,9 +35,14 @@
       "missing": "未获取",
       "ready": "可用",
       "refreshing": "采集中",
+      "paused": "暂停采集",
       "expired": "已过期",
       "error": "采集失败",
       "disabled": "已关闭"
+    },
+    "pauseReason": {
+      "rate_limited": "账号限流，暂停采集",
+      "credits_unavailable": "账号积分不可用，暂停采集"
     },
     "config": {
       "target_lengths": "有效票据长度（逗号分隔）",

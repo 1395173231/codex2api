@@ -90,6 +90,99 @@ func TestCodexTurnStateSettingsMigratesLegacyLengths(t *testing.T) {
 	}
 }
 
+func TestCodexTurnStateHarvestPausesForRateLimitsAndMissingCredits(t *testing.T) {
+	m, a := turnStateManagerFixture(t, nil)
+	now := time.Now()
+	ticket := fakeFernetTicket(now.Add(-time.Minute), 160, 1)
+	if err := m.Replace(context.Background(), a, "model-a", ticket); err != nil {
+		t.Fatal(err)
+	}
+
+	a.mu.Lock()
+	a.Status = StatusCooldown
+	a.CooldownReason = "rate_limited"
+	a.CooldownUtil = now.Add(time.Minute)
+	a.mu.Unlock()
+	status := m.Statuses(a.ID(), a)[0]
+	if status.Status != "paused" || status.PauseReason != codexTurnStatePauseRateLimited || !status.Ready || m.Injection(a, "model-a") != ticket {
+		t.Fatalf("active cooldown status = %+v", status)
+	}
+	if err := m.RequestRefresh(context.Background(), a, "model-a"); err == nil {
+		t.Fatal("manual refresh bypassed active cooldown")
+	}
+
+	a.mu.Lock()
+	a.Status = StatusReady
+	a.CooldownReason = ""
+	a.CooldownUtil = time.Time{}
+	a.PlanType = "free"
+	a.UsagePercent7dValid = true
+	a.UsagePercent7d = 100
+	a.Reset7dAt = now.Add(time.Hour)
+	a.CreditEnabled = false
+	a.CreditSkipUsageWindow = false
+	a.CreditsValid = false
+	a.mu.Unlock()
+	status = m.Statuses(a.ID(), a)[0]
+	if status.Status != "paused" || status.PauseReason != codexTurnStatePauseCreditsUnavailable || !status.Ready {
+		t.Fatalf("exhausted usage status = %+v", status)
+	}
+
+	// Explicitly authorized, available credits make a fresh probe eligible.
+	a.mu.Lock()
+	a.CreditEnabled = true
+	a.CreditSkipUsageWindow = true
+	a.CreditsValid = true
+	a.CreditsHasCredits = true
+	a.CreditsBalanceKnown = true
+	a.CreditsBalance = "5"
+	a.mu.Unlock()
+	status = m.Statuses(a.ID(), a)[0]
+	reason := codexTicketHarvestPauseReason(a, "model-a", now)
+	if status.Status == "paused" || reason != "" {
+		t.Fatalf("available authorized credits did not resume collection: status=%+v reason=%q", status, reason)
+	}
+
+	a.SetModelCooldownUntil("model-a", "rate_limited", now.Add(time.Minute))
+	status = m.Statuses(a.ID(), a)[0]
+	if status.Status != "paused" || status.PauseReason != codexTurnStatePauseRateLimited {
+		t.Fatalf("model cooldown status = %+v", status)
+	}
+}
+
+func TestCodexTurnStateSchedulerDoesNotProbeUntilRateLimitRecovers(t *testing.T) {
+	var calls atomic.Int32
+	ticket := fakeFernetTicket(time.Now(), 160, 7)
+	m, a := turnStateManagerFixture(t, func(context.Context, *Account, string, string) (string, error) {
+		calls.Add(1)
+		return ticket, nil
+	})
+	cfg := m.Config()
+	cfg.Models = []string{"model-a"}
+	if err := m.SaveConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	a.SetCooldownUntil(time.Now().Add(time.Minute), "rate_limited")
+
+	var wg sync.WaitGroup
+	m.schedule(context.Background(), &wg)
+	wg.Wait()
+	if calls.Load() != 0 {
+		t.Fatal("rate-limited account sent a collection request")
+	}
+
+	a.mu.Lock()
+	a.Status = StatusReady
+	a.CooldownReason = ""
+	a.CooldownUtil = time.Time{}
+	a.mu.Unlock()
+	m.schedule(context.Background(), &wg)
+	wg.Wait()
+	if calls.Load() != 1 || m.Injection(a, "model-a") != ticket {
+		t.Fatal("collection did not resume after rate-limit recovery")
+	}
+}
+
 func TestCodexTurnStateIsolationRestartAndExpiry(t *testing.T) {
 	m, a := turnStateManagerFixture(t, nil)
 	ctx := context.Background()

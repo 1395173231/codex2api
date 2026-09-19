@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"slices"
 	"sort"
@@ -198,6 +199,10 @@ func (m *CodexTurnStateManager) Statuses(id int64, a *Account) []CodexTurnStateS
 		if busy[model] || rec.LeaseUntil > now.Unix() {
 			status.Status = "refreshing"
 		}
+		if reason := codexTicketHarvestPauseReason(a, model, now); reason != "" {
+			status.Status = "paused"
+			status.PauseReason = reason
+		}
 		if !cfg.Enabled || !slices.Contains(cfg.Models, model) || !codexTicketAccount(a) {
 			status.Status = "disabled"
 			status.Ready = false
@@ -261,6 +266,9 @@ func (m *CodexTurnStateManager) RequestRefresh(ctx context.Context, a *Account, 
 	cfg := m.Config()
 	if !cfg.Enabled || !codexTicketAccount(a) || !slices.Contains(cfg.Models, model) {
 		return errors.New("enable collection and select an active Codex account/model first")
+	}
+	if reason := codexTicketHarvestPauseReason(a, model, time.Now()); reason != "" {
+		return fmt.Errorf("turn-state collection paused: %s", reason)
 	}
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
@@ -350,6 +358,14 @@ func (m *CodexTurnStateManager) schedule(ctx context.Context, wg *sync.WaitGroup
 		}
 		for _, model := range cfg.Models {
 			key := turnStateKey{a.ID(), model}
+			if codexTicketHarvestPauseReason(a, model, now) != "" {
+				m.mu.Lock()
+				if cancel := m.inflight[key]; cancel != nil {
+					cancel()
+				}
+				m.mu.Unlock()
+				continue
+			}
 			m.mu.RLock()
 			rec := m.records[key]
 			_, busy := m.inflight[key]
@@ -396,7 +412,7 @@ func (m *CodexTurnStateManager) probeOnce(ctx context.Context, a *Account, model
 	}
 	claimedRecord := rec
 	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		_ = m.db.ReleaseCodexTurnState(releaseCtx, claimedRecord)
 		m.mu.Lock()
@@ -458,7 +474,7 @@ func (m *CodexTurnStateManager) probeOnce(ctx context.Context, a *Account, model
 	m.mu.RLock()
 	currentGeneration := m.generation
 	m.mu.RUnlock()
-	if currentGeneration != generation || codexTicketIdentity(a) != identity || !codexTicketAccount(a) {
+	if currentGeneration != generation || codexTicketIdentity(a) != identity || !codexTicketAccount(a) || codexTicketHarvestPauseReason(a, model, time.Now()) != "" {
 		return nil
 	}
 	changed, err := m.db.CommitCodexTurnState(ctx, rec)

@@ -2037,7 +2037,8 @@ export interface CodexTurnStateStatus {
   captured_at?: string
   remaining_seconds: number
   ready: boolean
-  status: 'missing' | 'ready' | 'refreshing' | 'expired' | 'error' | 'disabled'
+  status: 'missing' | 'ready' | 'refreshing' | 'paused' | 'expired' | 'error' | 'disabled'
+  pause_reason?: 'rate_limited' | 'credits_unavailable'
   last_attempt_at?: string
   next_attempt_at?: string
   attempts: number

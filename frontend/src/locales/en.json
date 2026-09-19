@@ -3,7 +3,8 @@
     "invalidModels": "Specify 1–32 exact ASCII model names, up to 128 characters each, without wildcards.",
     "title": "Model Turn State",
     "settingsTitle": "Turn State background collection",
-    "caveat": "Fernet timestamps are decoded, not signature-verified; expiry is a local estimate. Lengths 292 / 332 are local filters, not proof of upstream authorization, model capability, or answer quality.",
+    "caveat": "Fernet timestamps are decoded, not signature-verified; expiry is a local estimate. Lengths 292 / 332 are local filters, not proof of upstream authorization, model capability, or answer quality. Collection sends real upstream requests, consumes account quota, and consumes credits when credit billing applies.",
+    "collectionCostHint": "Collection sends real upstream requests, consumes account quota, and consumes credits when credit billing applies. It pauses while the account is rate-limited or has no usable credits, then resumes automatically after recovery.",
     "model": "Model",
     "state": "Status / attempts",
     "validity": "Remaining / issued",
@@ -34,9 +35,14 @@
       "missing": "Missing",
       "ready": "Ready",
       "refreshing": "Collecting",
+      "paused": "Collection paused",
       "expired": "Expired",
       "error": "Failed",
       "disabled": "Disabled"
+    },
+    "pauseReason": {
+      "rate_limited": "Account rate-limited; collection paused",
+      "credits_unavailable": "Account credits unavailable; collection paused"
     },
     "config": {
       "target_lengths": "Accepted token lengths (comma-separated)",

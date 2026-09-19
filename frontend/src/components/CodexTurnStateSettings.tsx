@@ -58,6 +58,7 @@ export default function CodexTurnStateSettings() {
     {!config && !error && <p className="text-xs text-muted-foreground">{t('common.loading')}</p>}
     {config && <>
       <div className="flex items-center justify-between gap-3"><label htmlFor="turn-state-enabled" className="text-sm">{t('turnState.enabled')}</label><Switch id="turn-state-enabled" disabled={busy} checked={config.enabled} onCheckedChange={enabled => change({ enabled })} /></div>
+      <p className="text-xs text-muted-foreground">{t('turnState.collectionCostHint')}</p>
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="space-y-1.5 text-xs sm:col-span-2"><span>{t('turnState.models')}</span><Input disabled={busy} value={models} onChange={event => { setModels(event.target.value); setSaved(false) }} placeholder="gpt-5.5, gpt-5.4" autoComplete="off" spellCheck={false} /></label>
         <label className="space-y-1.5 text-xs sm:col-span-2"><span>{t('turnState.config.target_lengths')}</span><Input disabled={busy} value={targetLengths} onChange={event => { setTargetLengths(event.target.value); setSaved(false) }} placeholder="292, 332" inputMode="numeric" autoComplete="off" spellCheck={false} /></label>

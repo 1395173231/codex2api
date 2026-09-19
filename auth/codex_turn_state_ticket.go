@@ -227,9 +227,41 @@ func codexTicketAccount(a *Account) bool {
 	if a == nil || a.IsRelayStyle() || a.IsCodexAgentIdentity() {
 		return false
 	}
+	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return false
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.DBID > 0 && a.AccessToken != "" && a.Status != StatusError && atomic.LoadInt32(&a.DispatchPaused) == 0
+	return a.DBID > 0 && a.AccessToken != "" && a.Status != StatusError && a.healthTierLocked() != HealthTierBanned
+}
+
+const (
+	codexTurnStatePauseRateLimited        = "rate_limited"
+	codexTurnStatePauseCreditsUnavailable = "credits_unavailable"
+)
+
+// codexTicketHarvestPauseReason applies fresh-request gates to synthetic
+// collection probes. Existing valid tickets remain injectable while collection
+// is paused; the gate only prevents spending quota/credits on another probe.
+func codexTicketHarvestPauseReason(a *Account, model string, now time.Time) string {
+	if !codexTicketAccount(a) {
+		return ""
+	}
+	if a.IsModelRateLimited(model) {
+		return codexTurnStatePauseRateLimited
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.usageWindowBlocksFreshDispatchLocked(now) {
+		return codexTurnStatePauseCreditsUnavailable
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return codexTurnStatePauseRateLimited
+	}
+	if a.quotaAutoPausedLocked(now) {
+		return codexTurnStatePauseRateLimited
+	}
+	return ""
 }
 
 func codexTicketReady(rec database.CodexTurnStateRecord, a *Account, cfg CodexTurnStateSettings, now time.Time) bool {
@@ -254,6 +286,7 @@ type CodexTurnStateStatus struct {
 	NextAttemptAt    string `json:"next_attempt_at,omitempty"`
 	Attempts         int    `json:"attempts"`
 	LastError        string `json:"last_error,omitempty"`
+	PauseReason      string `json:"pause_reason,omitempty"`
 }
 
 func turnStateTime(t time.Time) string {

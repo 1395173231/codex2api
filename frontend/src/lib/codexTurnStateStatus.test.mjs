@@ -18,6 +18,7 @@ test('a ready row becomes expired locally and collection failures remain visible
   assert.equal(turnStateDisplayStatus(item, now), 'ready')
   assert.equal(turnStateDisplayStatus(item, now + 300000), 'expired')
   assert.equal(turnStateDisplayStatus({ ...item, status: 'refreshing' }, now + 300000), 'refreshing')
+  assert.equal(turnStateDisplayStatus({ ...item, status: 'paused', pause_reason: 'rate_limited' }, now + 300000), 'paused')
   assert.equal(turnStateDisplayStatus({ ...item, status: 'error' }, now), 'error')
   assert.equal(turnStateDisplayStatus({ ...item, status: 'disabled' }, now), 'disabled')
 })
@@ -52,5 +53,8 @@ test('three locales cover all turn-state statuses and configuration fields', () 
   const flatten = (value, prefix = '') => Object.entries(value).flatMap(([key, val]) => typeof val === 'string' ? [prefix + key] : flatten(val, prefix + key + '.')).sort()
   assert.deepEqual(flatten(locales[0]), flatten(locales[1]))
   assert.deepEqual(flatten(locales[0]), flatten(locales[2]))
-  for (const locale of locales) for (const status of ['missing', 'ready', 'refreshing', 'expired', 'error', 'disabled']) assert.equal(typeof locale.status[status], 'string')
+  for (const locale of locales) {
+    for (const status of ['missing', 'ready', 'refreshing', 'paused', 'expired', 'error', 'disabled']) assert.equal(typeof locale.status[status], 'string')
+    for (const reason of ['rate_limited', 'credits_unavailable']) assert.equal(typeof locale.pauseReason[reason], 'string')
+  }
 })

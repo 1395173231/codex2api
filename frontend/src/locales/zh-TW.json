@@ -3,7 +3,8 @@
     "invalidModels": "需要 1–32 個精確模型名稱（ASCII、每項不超過 128 字元、不含萬用字元）。",
     "title": "模型 Turn State",
     "settingsTitle": "Turn State 背景擷取",
-    "caveat": "Fernet 時間戳僅解碼、未驗簽；有效期為本機估計。292 / 332 是本機長度篩選條件，不能證明上游授權、模型能力或回答品質。",
+    "caveat": "Fernet 時間戳僅解碼、未驗簽；有效期為本機估計。292 / 332 是本機長度篩選條件，不能證明上游授權、模型能力或回答品質。擷取會傳送真實上游請求並消耗帳號額度，進入點數計費後會消耗點數。",
+    "collectionCostHint": "擷取會傳送真實上游請求並消耗帳號額度，進入點數計費後會消耗點數。帳號受到限流或沒有可用點數時會暫停擷取，恢復後自動繼續。",
     "model": "模型",
     "state": "狀態 / 嘗試",
     "validity": "剩餘 / 簽發時間",
@@ -34,9 +35,14 @@
       "missing": "未取得",
       "ready": "可用",
       "refreshing": "擷取中",
+      "paused": "暫停擷取",
       "expired": "已過期",
       "error": "擷取失敗",
       "disabled": "已關閉"
+    },
+    "pauseReason": {
+      "rate_limited": "帳號受到限流，暫停擷取",
+      "credits_unavailable": "帳號點數不可用，暫停擷取"
     },
     "config": {
       "target_lengths": "有效票據長度（逗號分隔）",
