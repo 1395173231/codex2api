@@ -5,6 +5,8 @@
     "settingsTitle": "Turn State background collection",
     "caveat": "Fernet timestamps are decoded, not signature-verified; expiry is a local estimate. Lengths 292 / 332 are local filters, not proof of upstream authorization, model capability, or answer quality. Collection sends real upstream requests, consumes account quota, and consumes credits when credit billing applies.",
     "collectionCostHint": "Collection sends real upstream requests, consumes account quota, and consumes credits when credit billing applies. It pauses while the account is rate-limited or has no usable credits, then resumes automatically after recovery.",
+    "schedulingEnabled": "Use Turn State for scheduling",
+    "schedulingHint": "When enabled, this applies only to configured models. Codex accounts without a valid token for the requested model are skipped. The overall feature must be enabled first. If a request returns a Turn State with an unexpected length, the token for that account and model is invalidated immediately and collection restarts.",
     "model": "Model",
     "state": "Status / attempts",
     "validity": "Remaining / issued",

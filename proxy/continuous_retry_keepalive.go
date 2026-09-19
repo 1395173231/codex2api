@@ -543,6 +543,7 @@ func readSSEStreamWithContinuousRetryKeepalive(ctx context.Context, body io.Read
 			return yield(continuousRetrySSEEvent{event: event, data: data})
 		})
 	}, func(item continuousRetrySSEEvent) bool {
+		ObserveCodexTurnStateFrame(ctx, item.data)
 		return callback(item.event, item.data)
 	})
 }

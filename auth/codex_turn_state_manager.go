@@ -113,6 +113,7 @@ func (m *CodexTurnStateManager) Reload(ctx context.Context) error {
 	m.mu.Lock()
 	m.records = records
 	m.mu.Unlock()
+	m.notifySchedulingChanged()
 	return nil
 }
 
@@ -132,7 +133,14 @@ func (m *CodexTurnStateManager) SaveConfig(ctx context.Context, cfg CodexTurnSta
 	}
 	m.publishConfig(cfg)
 	m.Wake()
+	m.notifySchedulingChanged()
 	return nil
+}
+
+func (m *CodexTurnStateManager) notifySchedulingChanged() {
+	if m != nil && m.store != nil {
+		m.store.notifySchedulerAvailability()
+	}
 }
 
 func (m *CodexTurnStateManager) Wake() {
@@ -156,6 +164,26 @@ func (m *CodexTurnStateManager) Injection(a *Account, model string) string {
 		return rec.Token
 	}
 	return ""
+}
+
+func (m *CodexTurnStateManager) DispatchEligible(a *Account, model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	cfg := m.Config()
+	if !cfg.Enabled || !cfg.SchedulingEnabled || !slices.Contains(cfg.Models, model) {
+		return true
+	}
+	if a == nil {
+		return false
+	}
+	if a.IsRelayStyle() || a.IsCodexAgentIdentity() {
+		return true
+	}
+	key := turnStateKey{a.ID(), model}
+	m.mu.RLock()
+	rec := m.records[key]
+	revoked := m.observations[key].used == rec.Token && rec.Token != ""
+	m.mu.RUnlock()
+	return !revoked && codexTicketReady(rec, a, cfg, time.Now())
 }
 
 func (m *CodexTurnStateManager) Statuses(id int64, a *Account) []CodexTurnStateStatus {
@@ -255,6 +283,7 @@ func (m *CodexTurnStateManager) Replace(ctx context.Context, a *Account, model, 
 	m.records[key] = rec
 	m.mu.Unlock()
 	m.Wake()
+	m.notifySchedulingChanged()
 	return nil
 }
 
@@ -503,22 +532,20 @@ func (m *CodexTurnStateManager) probeOnce(ctx context.Context, a *Account, model
 		m.mu.Lock()
 		m.records[turnStateKey{a.ID(), model}] = rec
 		m.mu.Unlock()
+		m.notifySchedulingChanged()
 	}
 	return err
 }
 
-// A 312-character observation is a configurable-policy miss, not an HTTP 312.
-// It only invalidates the ticket used by that attempt, never a newer replacement.
+// Any returned turn-state whose length is outside target_lengths revokes the
+// ticket used by that attempt. This is a value-length signal, not an HTTP code.
 func (m *CodexTurnStateManager) Observe(a *Account, model, used, observed string) {
 	model = strings.ToLower(strings.TrimSpace(model))
-	if len(observed) != 312 || used == "" {
+	if observed == "" || used == "" {
 		return
 	}
 	cfg := m.Config()
-	if !cfg.Enabled || a == nil || slices.Contains(cfg.TargetLengths, 312) {
-		return
-	}
-	if _, err := ParseCodexTurnStateIssuedAt(observed); err != nil {
+	if !cfg.Enabled || a == nil || slices.Contains(cfg.TargetLengths, len(observed)) {
 		return
 	}
 	key := turnStateKey{a.ID(), model}
@@ -527,6 +554,7 @@ func (m *CodexTurnStateManager) Observe(a *Account, model, used, observed string
 		m.observations[key] = turnStateObservation{a, model, used, observed}
 	}
 	m.mu.Unlock()
+	m.notifySchedulingChanged()
 	m.Wake()
 }
 
@@ -562,7 +590,7 @@ func (m *CodexTurnStateManager) invalidateObservation(ctx context.Context, event
 		return
 	}
 	// Compare the actual persisted token, even while a harvest holds a lease.
-	updated, changed, err := m.db.InvalidateCodexTurnState(ctx, event.account.ID(), event.model, event.used)
+	updated, changed, err := m.db.InvalidateCodexTurnState(ctx, event.account.ID(), event.model, event.used, len(event.observed))
 	if err != nil {
 		return
 	}
@@ -577,4 +605,7 @@ func (m *CodexTurnStateManager) invalidateObservation(ctx context.Context, event
 	}
 	m.records[key] = updated
 	m.mu.Unlock()
+	if changed {
+		m.notifySchedulingChanged()
+	}
 }

@@ -20,6 +20,7 @@ import (
 
 type CodexTurnStateSettings struct {
 	Enabled               bool     `json:"enabled"`
+	SchedulingEnabled     bool     `json:"scheduling_enabled"`
 	Models                []string `json:"models"`
 	HarvestProxyURL       string   `json:"harvest_proxy_url"`
 	TargetLengths         []int    `json:"target_lengths"`
@@ -270,6 +271,25 @@ func codexTicketReady(rec database.CodexTurnStateRecord, a *Account, cfg CodexTu
 	}
 	_, expires, err := validateCodexTicket(rec.Token, cfg.TargetLengths, time.Duration(cfg.TTLSeconds)*time.Second, now)
 	return err == nil && rec.ExpiresAt.After(now) && expires.After(now)
+}
+
+// CodexTurnStateDispatchEligible is the request-model scheduler gate. Relay
+// and Agent Identity accounts do not own harvested tickets and remain outside
+// this policy. The gate is opt-in and affects only configured models.
+func (a *Account) CodexTurnStateDispatchEligible(model string) bool {
+	if a == nil {
+		return false
+	}
+	if a.IsRelayStyle() || a.IsCodexAgentIdentity() {
+		return true
+	}
+	a.mu.RLock()
+	manager := a.codexTurnStateManager
+	a.mu.RUnlock()
+	if manager == nil {
+		return true
+	}
+	return manager.DispatchEligible(a, model)
 }
 
 type CodexTurnStateStatus struct {

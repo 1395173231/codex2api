@@ -54,7 +54,7 @@ func turnStateAPICall(r *gin.Engine, method, path, body string) *httptest.Respon
 
 func TestCodexTurnStateSettingsMaskHotReloadAndValidation(t *testing.T) {
 	h, r, _ := turnStateAPI(t)
-	w := turnStateAPICall(r, http.MethodPut, "/settings", `{"enabled":true,"harvest_proxy_url":"socks5h://private-user:private-password@localhost:1080","models":["model-a","model-b"]}`)
+	w := turnStateAPICall(r, http.MethodPut, "/settings", `{"enabled":true,"scheduling_enabled":true,"harvest_proxy_url":"socks5h://private-user:private-password@localhost:1080","models":["model-a","model-b"]}`)
 	if w.Code != 200 || strings.Contains(w.Body.String(), "private-") {
 		t.Fatalf("unsafe settings response: %d %s", w.Code, w.Body.String())
 	}
@@ -62,7 +62,7 @@ func TestCodexTurnStateSettingsMaskHotReloadAndValidation(t *testing.T) {
 		auth.CodexTurnStateSettings
 		Configured bool `json:"proxy_configured"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil || !cfg.Enabled || !cfg.Configured {
+	if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil || !cfg.Enabled || !cfg.SchedulingEnabled || !cfg.Configured {
 		t.Fatal("settings not enabled")
 	}
 	w = turnStateAPICall(r, http.MethodPut, "/settings", w.Body.String())

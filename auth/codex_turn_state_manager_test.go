@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,6 +88,55 @@ func TestCodexTurnStateSettingsMigratesLegacyLengths(t *testing.T) {
 	cfg, err = NormalizeCodexTurnStateSettings(cfg)
 	if err != nil || !slices.Equal(cfg.TargetLengths, []int{332, 292}) {
 		t.Fatalf("normalized lengths = %v err=%v", cfg.TargetLengths, err)
+	}
+}
+
+func TestCodexTurnStateSchedulingGateRequiresValidModelTicket(t *testing.T) {
+	m, a := turnStateManagerFixture(t, nil)
+	missing := &Account{DBID: a.ID() + 1, AccessToken: "missing-ticket", AccountID: "workspace-2", PlanType: "plus", codexTurnStateManager: m}
+	filter := m.store.WithModelCooldownFilter("model-a", nil)
+	if !filter(a) || !filter(missing) {
+		t.Fatal("scheduling gate affected accounts while disabled")
+	}
+
+	cfg := m.Config()
+	cfg.SchedulingEnabled = true
+	if err := m.SaveConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if filter(a) || filter(missing) {
+		t.Fatal("account without a valid model ticket passed scheduling")
+	}
+	if !m.store.WithModelCooldownFilter("unconfigured-model", nil)(missing) {
+		t.Fatal("unconfigured model was gated")
+	}
+	relay := &Account{DBID: missing.ID() + 1, UpstreamType: UpstreamOpenAIResponses, APIKey: "relay-key", BaseURL: "https://relay.invalid", codexTurnStateManager: m}
+	if !filter(relay) {
+		t.Fatal("relay account was incorrectly gated by harvested tickets")
+	}
+
+	ticket := fakeFernetTicket(time.Now(), 160, 3)
+	if err := m.Replace(context.Background(), a, "model-a", ticket); err != nil {
+		t.Fatal(err)
+	}
+	if !filter(a) || filter(missing) {
+		t.Fatal("scheduler did not isolate the valid-ticket account")
+	}
+	// A configured normal response length keeps the current ticket valid.
+	m.Observe(a, "model-a", ticket, fakeFernetTicket(time.Now(), 192, 4))
+	if !filter(a) {
+		t.Fatal("configured response length revoked the ticket")
+	}
+	// Any returned state outside target_lengths revokes immediately, before the
+	// asynchronous database update completes.
+	m.Observe(a, "model-a", ticket, fakeFernetTicket(time.Now(), 176, 5))
+	if filter(a) || m.Injection(a, "model-a") != "" {
+		t.Fatal("abnormal returned state remained schedulable or injectable")
+	}
+	m.invalidateObservation(context.Background(), turnStateObservation{a, "model-a", ticket, fakeFernetTicket(time.Now(), 176, 5)})
+	status := m.Statuses(a.ID(), a)[0]
+	if status.Ready || status.TokenLength != 0 || !strings.Contains(status.LastError, "length 312") {
+		t.Fatalf("invalidated status = %+v", status)
 	}
 }
 

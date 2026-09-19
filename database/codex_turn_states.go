@@ -247,18 +247,19 @@ func (db *DB) ReplaceCodexTurnState(ctx context.Context, rec CodexTurnStateRecor
 }
 
 func (db *DB) RequestCodexTurnStateRefresh(ctx context.Context, id int64, model string) (CodexTurnStateRecord, error) {
-	rec, _, err := db.markCodexTurnStateRefresh(ctx, id, model, "")
+	rec, _, err := db.markCodexTurnStateRefresh(ctx, id, model, "", "")
 	return rec, err
 }
 
-func (db *DB) InvalidateCodexTurnState(ctx context.Context, id int64, model, used string) (CodexTurnStateRecord, bool, error) {
+func (db *DB) InvalidateCodexTurnState(ctx context.Context, id int64, model, used string, observedLength int) (CodexTurnStateRecord, bool, error) {
 	if used == "" {
 		return CodexTurnStateRecord{}, false, nil
 	}
-	return db.markCodexTurnStateRefresh(ctx, id, model, used)
+	reason := fmt.Sprintf("observed turn-state length %d is not configured; refresh requested", observedLength)
+	return db.markCodexTurnStateRefresh(ctx, id, model, used, reason)
 }
 
-func (db *DB) markCodexTurnStateRefresh(ctx context.Context, id int64, model, used string) (CodexTurnStateRecord, bool, error) {
+func (db *DB) markCodexTurnStateRefresh(ctx context.Context, id int64, model, used, invalidReason string) (CodexTurnStateRecord, bool, error) {
 	rec := CodexTurnStateRecord{AccountID: id, Model: model}
 	changed := false
 	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
@@ -283,7 +284,7 @@ func (db *DB) markCodexTurnStateRefresh(ctx context.Context, id int64, model, us
 			}
 			rec.Token = ""
 			rec.ExpiresAt = time.Time{}
-			rec.LastError = "observed a 312-character turn-state; refresh requested"
+			rec.LastError = invalidReason
 		}
 		rec.RefreshRequested = true
 		rec.NextAttemptAt = time.Time{}

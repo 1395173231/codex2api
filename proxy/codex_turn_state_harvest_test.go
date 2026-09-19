@@ -120,6 +120,26 @@ func TestCodexTurnStateManagedHTTPAndWebsocketInjection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	// Every HTTP SSE frame is observed centrally. A normal returned state keeps
+	// the ticket, while an unconfigured length revokes the ticket used by this
+	// exact request before another account can be scheduled with it.
+	attempt, _, _ := prepareCodexTurnStateInjection(ctx, a, []byte(`{"model":"model-a"}`), nil, false)
+	normal := `data: {"type":"response.metadata","response":{"current_turn_state":"` + ticketB + `"}}\n\n`
+	if err := readSSEStreamWithContinuousRetryKeepalive(attempt, strings.NewReader(normal), func(string, []byte) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if a.CodexTurnStateInjection("model-a") != ticketA {
+		t.Fatal("normal returned state revoked the active ticket")
+	}
+	abnormal := strings.Repeat("x", 312)
+	stream := `data: {"type":"response.metadata","response":{"current_turn_state":"` + abnormal + `"}}\n\n`
+	if err := readSSEStreamWithContinuousRetryKeepalive(attempt, strings.NewReader(stream), func(string, []byte) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if a.CodexTurnStateInjection("model-a") != "" {
+		t.Fatal("HTTP SSE abnormal turn-state was not observed")
+	}
 }
 
 func TestCodexTurnStateHarvestMetadataAndFailure(t *testing.T) {

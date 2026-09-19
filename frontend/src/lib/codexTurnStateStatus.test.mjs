@@ -54,7 +54,18 @@ test('three locales cover all turn-state statuses and configuration fields', () 
   assert.deepEqual(flatten(locales[0]), flatten(locales[1]))
   assert.deepEqual(flatten(locales[0]), flatten(locales[2]))
   for (const locale of locales) {
+    assert.equal(typeof locale.schedulingEnabled, 'string')
+    assert.equal(typeof locale.schedulingHint, 'string')
     for (const status of ['missing', 'ready', 'refreshing', 'paused', 'expired', 'error', 'disabled']) assert.equal(typeof locale.status[status], 'string')
     for (const reason of ['rate_limited', 'credits_unavailable']) assert.equal(typeof locale.pauseReason[reason], 'string')
   }
+})
+
+test('settings expose an independent scheduling flag gated by the overall feature switch', () => {
+  const types = readFileSync(new URL('../types.ts', import.meta.url), 'utf8')
+  const settings = readFileSync(new URL('../components/CodexTurnStateSettings.tsx', import.meta.url), 'utf8')
+  assert.match(types, /interface CodexTurnStateSettings[\s\S]*scheduling_enabled: boolean/)
+  assert.match(settings, /checked=\{config\.scheduling_enabled\}/)
+  assert.match(settings, /disabled=\{busy \|\| !config\.enabled\}/)
+  assert.match(settings, /change\(\{ scheduling_enabled \}\)/)
 })

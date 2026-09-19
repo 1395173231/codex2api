@@ -2016,6 +2016,7 @@ export interface CodexEgressSummary {
 
 export interface CodexTurnStateSettings {
   enabled: boolean
+  scheduling_enabled: boolean
   models: string[]
   harvest_proxy_url: string
   proxy_configured: boolean

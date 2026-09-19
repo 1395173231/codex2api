@@ -4054,7 +4054,8 @@ func (s *Store) accountHasCachedModelCooldown(acc *Account, model string) bool {
 	return true
 }
 
-// WithModelCooldownFilter wraps a request model filter with Redis-backed model cooldown checks.
+// WithModelCooldownFilter wraps a request model filter with Redis-backed model
+// cooldown checks and the optional per-model turn-state scheduling gate.
 func (s *Store) WithModelCooldownFilter(model string, filter AccountFilter) AccountFilter {
 	key := normalizeModelCooldownKey(model)
 	if s == nil || key == "" {
@@ -4067,7 +4068,7 @@ func (s *Store) WithModelCooldownFilter(model string, filter AccountFilter) Acco
 		if filter != nil && !filter(acc) {
 			return false
 		}
-		return !s.accountHasCachedModelCooldown(acc, key)
+		return !s.accountHasCachedModelCooldown(acc, key) && acc.CodexTurnStateDispatchEligible(key)
 	}
 }
 
