@@ -89,7 +89,7 @@ export default function CodexTurnStatePanel({ accountId }: { accountId: number }
           </tr></thead>
           <tbody>{data.items.map(item => <tr key={item.model} className="border-b border-border/50 align-top">
             <td className="min-w-20 max-w-40 break-all py-2 pr-2 font-mono">{item.model}
-              <div className="mt-1 whitespace-nowrap font-sans text-muted-foreground">{item.token_length} / {item.target_length}</div>
+              <div className="mt-1 whitespace-nowrap font-sans text-muted-foreground">{item.token_length} / {item.target_lengths.join(', ')}</div>
             </td>
             <td className="max-w-48 py-2 pr-2">
               <span className={item.ready && turnStateRemainingMs(item, now) > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}>{t('turnState.status.' + turnStateDisplayStatus(item, now))}</span>

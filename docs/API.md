@@ -1717,12 +1717,12 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
 | --- | --- | --- |
 | GET | `/api/admin/settings/codex-turn-state` | 返回 CONFIGURATION.md 中列出的全部配置，另含 `proxy_configured`；代理认证信息脱敏 |
 | PUT | `/api/admin/settings/codex-turn-state` | 支持部分字段更新，校验后热生效；`clear_proxy:true` 显式清除代理 |
-| GET | `/api/admin/accounts/:id/turn-states` | 返回 `{enabled, items:[{model,token_length,target_length,issued_at,expires_at,captured_at,remaining_seconds,ready,status,last_attempt_at,next_attempt_at,attempts,last_error}]}` |
+| GET | `/api/admin/accounts/:id/turn-states` | 返回 `{enabled, items:[{model,token_length,target_lengths,issued_at,expires_at,captured_at,remaining_seconds,ready,status,last_attempt_at,next_attempt_at,attempts,last_error}]}` |
 | PUT | `/api/admin/accounts/:id/turn-states` | `{model,token}`，保存通过长度/Fernet 封装/本地时效校验的票据 |
 | DELETE | `/api/admin/accounts/:id/turn-states` | `{model}`，清除该模型票据并使旧在途写入失效；开启自动采集时后续会补采 |
 | POST | `/api/admin/accounts/:id/turn-states/refresh` | `{model}`，对已启用采集的有效账号/模型排队，返回 202 |
 
-`status` 为 `missing / ready / refreshing / expired / error / disabled`。账号列表另含不带原文的 `codex_turn_states` 摘要。预计有效期依据票据签发时间计算，不依据保存时间；长度和时间戳未构成上游验签。
+`status` 为 `missing / ready / refreshing / expired / error / disabled`。`target_lengths` 默认是 `[292,332]`，不区分订阅类型，票据命中任一长度即可。账号列表另含不带原文的 `codex_turn_states` 摘要。预计有效期依据票据签发时间计算，不依据保存时间；长度和时间戳未构成上游验签。
 
 #### GET /api/admin/usage/chart-data
 

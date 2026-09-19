@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -53,25 +54,39 @@ func turnStateManagerFixture(t *testing.T, probe CodexTurnStateProbe) (*CodexTur
 	return m, store.FindByID(id)
 }
 
-func TestCodexTurnStateFernetTimestampAndPlanLength(t *testing.T) {
+func TestCodexTurnStateFernetTimestampAndConfiguredLengths(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	for _, tc := range []struct {
-		plan         string
 		size, length int
-	}{{"plus", 160, 292}, {"pro", 160, 292}, {"team", 192, 332}, {"business", 192, 332}} {
+	}{{160, 292}, {192, 332}} {
 		token := fakeFernetTicket(now.Add(-30*time.Minute), tc.size, 1)
 		if len(token) != tc.length {
 			t.Fatal("invalid fixture length")
 		}
-		issued, expires, err := validateCodexTicket(token, DefaultCodexTurnStateSettings().TargetForPlan(tc.plan), time.Hour, now)
+		issued, expires, err := validateCodexTicket(token, []int{292, 332}, time.Hour, now)
 		if err != nil || !issued.Equal(now.Add(-30*time.Minute)) || !expires.Equal(now.Add(30*time.Minute)) {
-			t.Fatalf("plan %s: wrong validity %v", tc.plan, err)
+			t.Fatalf("length %d: wrong validity %v", tc.length, err)
 		}
 	}
-	for _, token := range []string{"gAAAAAbogus", fakeFernetTicket(now.Add(-2*time.Hour), 160, 1), fakeFernetTicket(now.Add(2*time.Minute), 160, 1), fakeFernetTicket(now, 192, 1)} {
-		if _, _, err := validateCodexTicket(token, 292, time.Hour, now); err == nil {
-			t.Fatal("invalid, expired, future or wrong-plan ticket accepted")
+	for _, token := range []string{"gAAAAAbogus", fakeFernetTicket(now.Add(-2*time.Hour), 160, 1), fakeFernetTicket(now.Add(2*time.Minute), 160, 1), fakeFernetTicket(now, 176, 1)} {
+		if _, _, err := validateCodexTicket(token, []int{292, 332}, time.Hour, now); err == nil {
+			t.Fatal("invalid, expired, future or unconfigured-length ticket accepted")
 		}
+	}
+}
+
+func TestCodexTurnStateSettingsMigratesLegacyLengths(t *testing.T) {
+	cfg, err := DecodeCodexTurnStateSettings(`{"enabled":false,"target_length":292,"team_target_length":332}`)
+	if err != nil || !slices.Equal(cfg.TargetLengths, []int{292, 332}) {
+		t.Fatalf("legacy lengths = %v err=%v", cfg.TargetLengths, err)
+	}
+	cfg, err = DecodeCodexTurnStateSettings(`{"enabled":false,"target_lengths":[332,292,332]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = NormalizeCodexTurnStateSettings(cfg)
+	if err != nil || !slices.Equal(cfg.TargetLengths, []int{332, 292}) {
+		t.Fatalf("normalized lengths = %v err=%v", cfg.TargetLengths, err)
 	}
 }
 

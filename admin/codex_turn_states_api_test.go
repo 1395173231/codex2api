@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func turnStateAPI(t *testing.T) (*Handler, *gin.Engine, int64) {
 	db := newTestAdminDB(t)
 	store := auth.NewStore(db, nil, nil)
 	t.Cleanup(store.Stop)
-	id, err := db.InsertAccountWithCredentials(context.Background(), "ticket-test", map[string]any{"access_token": "fake-test-token", "account_id": "workspace-test", "plan_type": "team"}, "")
+	id, err := db.InsertAccountWithCredentials(context.Background(), "ticket-test", map[string]any{"access_token": "fake-test-token", "account_id": "workspace-test", "plan_type": "plus"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestCodexTurnStateSettingsMaskHotReloadAndValidation(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(h.codexTurnStates.Config().HarvestProxyURL, "private-password") {
 		t.Fatal("masked resave lost proxy secret")
 	}
-	for _, body := range []string{`{"concurrency":17}`, `{"models":["*"]}`, `{"ttl_seconds":180,"refresh_before_seconds":180}`, `{"clear_proxy":true}`, `{"harvest_proxy_url":"file:///sensitive"}`} {
+	for _, body := range []string{`{"concurrency":17}`, `{"models":["*"]}`, `{"target_lengths":[]}`, `{"target_lengths":[99]}`, `{"target_lengths":[4097]}`, `{"ttl_seconds":180,"refresh_before_seconds":180}`, `{"clear_proxy":true}`, `{"harvest_proxy_url":"file:///sensitive"}`} {
 		if got := turnStateAPICall(r, http.MethodPut, "/settings", body); got.Code != 400 {
 			t.Fatalf("invalid config accepted: %s", body)
 		}
@@ -104,7 +105,7 @@ func TestCodexTurnStateModelAPIPersistsTeamTokenWithoutExposingIt(t *testing.T) 
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Items) != 2 || !result.Items[0].Ready || result.Items[0].TargetLength != 332 || result.Items[0].RemainingSeconds > 1800 || result.Items[1].Ready {
+	if len(result.Items) != 2 || !result.Items[0].Ready || !slices.Equal(result.Items[0].TargetLengths, []int{292, 332}) || result.Items[0].RemainingSeconds > 1800 || result.Items[1].Ready {
 		t.Fatalf("bad per-model summary: %+v", result.Items)
 	}
 	if w := turnStateAPICall(r, http.MethodPost, path+"/refresh", `{"model":"model-a"}`); w.Code != 202 {

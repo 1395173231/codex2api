@@ -17,3 +17,11 @@ export function validTurnStateModels(models: string[]): boolean {
 export function parseTurnStateModels(value: string): string[] {
   return [...new Set(value.split(/[\s,]+/).map(model => model.trim().toLowerCase()).filter(Boolean))]
 }
+
+export function parseTurnStateTargetLengths(value: string): number[] {
+  return [...new Set(value.split(/[\s,]+/).map(length => length.trim()).filter(Boolean).map(Number))]
+}
+
+export function validTurnStateTargetLengths(lengths: number[]): boolean {
+  return lengths.length >= 1 && lengths.length <= 8 && lengths.every(length => Number.isInteger(length) && length >= 100 && length <= 4096)
+}

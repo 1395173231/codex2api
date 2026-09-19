@@ -63,6 +63,7 @@ func (m *CodexTurnStateManager) Config() CodexTurnStateSettings {
 	defer m.mu.RUnlock()
 	cfg := m.config
 	cfg.Models = slices.Clone(cfg.Models)
+	cfg.TargetLengths = slices.Clone(cfg.TargetLengths)
 	return cfg
 }
 
@@ -91,8 +92,8 @@ func (m *CodexTurnStateManager) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cfg := DefaultCodexTurnStateSettings()
-	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+	cfg, err := DecodeCodexTurnStateSettings(raw)
+	if err != nil {
 		return errors.New("invalid persisted turn-state configuration")
 	}
 	cfg, err = NormalizeCodexTurnStateSettings(cfg)
@@ -180,11 +181,7 @@ func (m *CodexTurnStateManager) Statuses(id int64, a *Account) []CodexTurnStateS
 	result := make([]CodexTurnStateStatus, 0, len(models))
 	for _, model := range models {
 		rec := records[model]
-		plan := ""
-		if a != nil {
-			plan = a.GetPlanType()
-		}
-		status := CodexTurnStateStatus{Model: model, TargetLength: cfg.TargetForPlan(plan), TokenLength: len(rec.Token),
+		status := CodexTurnStateStatus{Model: model, TargetLengths: slices.Clone(cfg.TargetLengths), TokenLength: len(rec.Token),
 			IssuedAt: turnStateTime(rec.IssuedAt), ExpiresAt: turnStateTime(rec.ExpiresAt), CapturedAt: turnStateTime(rec.CapturedAt),
 			LastAttemptAt: turnStateTime(rec.LastAttemptAt), NextAttemptAt: turnStateTime(rec.NextAttemptAt), Attempts: rec.Attempts, LastError: rec.LastError, Status: "missing"}
 		if a != nil && codexTicketReady(rec, a, cfg, now) {
@@ -230,7 +227,7 @@ func (m *CodexTurnStateManager) Replace(ctx context.Context, a *Account, model, 
 	rec := database.CodexTurnStateRecord{AccountID: a.ID(), Model: model, Identity: codexTicketIdentity(a)}
 	token = strings.TrimSpace(token)
 	if token != "" {
-		issued, expires, err := validateCodexTicket(token, cfg.TargetForPlan(a.GetPlanType()), time.Duration(cfg.TTLSeconds)*time.Second, now)
+		issued, expires, err := validateCodexTicket(token, cfg.TargetLengths, time.Duration(cfg.TTLSeconds)*time.Second, now)
 		if err != nil {
 			return err
 		}
@@ -429,7 +426,7 @@ func (m *CodexTurnStateManager) probeOnce(ctx context.Context, a *Account, model
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	issued, expires, validationErr := validateCodexTicket(token, cfg.TargetForPlan(a.GetPlanType()), time.Duration(cfg.TTLSeconds)*time.Second, time.Now())
+	issued, expires, validationErr := validateCodexTicket(token, cfg.TargetLengths, time.Duration(cfg.TTLSeconds)*time.Second, time.Now())
 	if probeErr == nil && validationErr == nil {
 		rec.Token = token
 		rec.IssuedAt = issued
@@ -502,7 +499,7 @@ func (m *CodexTurnStateManager) Observe(a *Account, model, used, observed string
 		return
 	}
 	cfg := m.Config()
-	if !cfg.Enabled || a == nil || cfg.TargetForPlan(a.GetPlanType()) == 312 {
+	if !cfg.Enabled || a == nil || slices.Contains(cfg.TargetLengths, 312) {
 		return
 	}
 	if _, err := ParseCodexTurnStateIssuedAt(observed); err != nil {

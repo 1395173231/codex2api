@@ -7,10 +7,10 @@ import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
 import { getErrorMessage } from '../utils/error'
-import { parseTurnStateModels, validTurnStateModels } from '../lib/codexTurnStateStatus'
+import { parseTurnStateModels, parseTurnStateTargetLengths, validTurnStateModels, validTurnStateTargetLengths } from '../lib/codexTurnStateStatus'
 
 const numberFields = [
-  ['target_length', 100, 4096], ['team_target_length', 100, 4096], ['ttl_seconds', 180, 3600],
+  ['ttl_seconds', 180, 3600],
   ['refresh_before_seconds', 1, 3599], ['retry_interval_seconds', 1, 3600],
   ['attempt_timeout_seconds', 1, 120], ['max_attempts', 1, 10], ['concurrency', 1, 16],
 ] as const
@@ -19,6 +19,7 @@ export default function CodexTurnStateSettings() {
   const { t } = useTranslation()
   const [config, setConfig] = useState<Settings | null>(null)
   const [models, setModels] = useState('')
+  const [targetLengths, setTargetLengths] = useState('')
   const [clearProxy, setClearProxy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -28,7 +29,7 @@ export default function CodexTurnStateSettings() {
     let active = true
     setError('')
     api.getCodexTurnStateSettings().then(result => {
-      if (active) { setConfig(result); setModels(result.models.join(', ')); setClearProxy(false) }
+      if (active) { setConfig(result); setModels(result.models.join(', ')); setTargetLengths(result.target_lengths.join(', ')); setClearProxy(false) }
     }).catch(err => { if (active) setError(getErrorMessage(err)) })
     return () => { active = false }
   }, [reload])
@@ -38,11 +39,13 @@ export default function CodexTurnStateSettings() {
     setBusy(true); setError(''); setSaved(false)
     try {
       const normalized = parseTurnStateModels(models)
+      const normalizedTargetLengths = parseTurnStateTargetLengths(targetLengths)
       if (!validTurnStateModels(normalized)) throw new Error(t('turnState.invalidModels'))
+      if (!validTurnStateTargetLengths(normalizedTargetLengths)) throw new Error(t('turnState.invalidNumbers'))
       if (config.enabled && (clearProxy || (!config.proxy_configured && !config.harvest_proxy_url.trim()))) throw new Error(t('turnState.configRequired'))
       if (numberFields.some(([key, min, max]) => !Number.isInteger(config[key]) || config[key] < min || config[key] > max) || config.refresh_before_seconds >= config.ttl_seconds) throw new Error(t('turnState.invalidNumbers'))
-      const result = await api.updateCodexTurnStateSettings({ ...config, models: normalized, clear_proxy: clearProxy })
-      setConfig(result); setModels(result.models.join(', ')); setClearProxy(false); setSaved(true)
+      const result = await api.updateCodexTurnStateSettings({ ...config, models: normalized, target_lengths: normalizedTargetLengths, clear_proxy: clearProxy })
+      setConfig(result); setModels(result.models.join(', ')); setTargetLengths(result.target_lengths.join(', ')); setClearProxy(false); setSaved(true)
     } catch (err) { setError(getErrorMessage(err)) }
     finally { setBusy(false) }
   }
@@ -57,6 +60,7 @@ export default function CodexTurnStateSettings() {
       <div className="flex items-center justify-between gap-3"><label htmlFor="turn-state-enabled" className="text-sm">{t('turnState.enabled')}</label><Switch id="turn-state-enabled" disabled={busy} checked={config.enabled} onCheckedChange={enabled => change({ enabled })} /></div>
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="space-y-1.5 text-xs sm:col-span-2"><span>{t('turnState.models')}</span><Input disabled={busy} value={models} onChange={event => { setModels(event.target.value); setSaved(false) }} placeholder="gpt-5.5, gpt-5.4" autoComplete="off" spellCheck={false} /></label>
+        <label className="space-y-1.5 text-xs sm:col-span-2"><span>{t('turnState.config.target_lengths')}</span><Input disabled={busy} value={targetLengths} onChange={event => { setTargetLengths(event.target.value); setSaved(false) }} placeholder="292, 332" inputMode="numeric" autoComplete="off" spellCheck={false} /></label>
         <label className="space-y-1.5 text-xs sm:col-span-2"><span>{t('turnState.proxy')}</span><Input type="password" disabled={busy || clearProxy} value={config.harvest_proxy_url} onChange={event => change({ harvest_proxy_url: event.target.value })} autoComplete="off" spellCheck={false} /><span className="block text-muted-foreground">{t(config.proxy_configured ? 'turnState.proxyConfigured' : 'turnState.proxyMissing')}</span></label>
         <div className="flex items-center justify-between gap-3 sm:col-span-2"><label htmlFor="turn-state-clear-proxy" className="text-xs">{t('turnState.clearProxy')}</label><Switch id="turn-state-clear-proxy" disabled={busy || !config.proxy_configured} checked={clearProxy} onCheckedChange={value => { setClearProxy(value); setSaved(false) }} /></div>
         {numberFields.map(([key, min, max]) => <label key={key} className="space-y-1.5 text-xs"><span>{t('turnState.config.' + key)}</span><Input type="number" min={min} max={key === 'refresh_before_seconds' ? config.ttl_seconds - 1 : max} step={1} disabled={busy} value={Number.isFinite(config[key]) ? config[key] : ''} onChange={event => change({ [key]: event.target.value === '' ? NaN : Number(event.target.value) })} /></label>)}

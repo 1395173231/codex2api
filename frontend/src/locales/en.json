@@ -39,8 +39,7 @@
       "disabled": "Disabled"
     },
     "config": {
-      "target_length": "Non-Team target length",
-      "team_target_length": "Team target length",
+      "target_lengths": "Accepted token lengths (comma-separated)",
       "ttl_seconds": "Lifetime (seconds)",
       "refresh_before_seconds": "Refresh lead time (seconds)",
       "retry_interval_seconds": "Retry interval (seconds)",

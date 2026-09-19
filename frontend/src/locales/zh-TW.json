@@ -39,8 +39,7 @@
       "disabled": "已關閉"
     },
     "config": {
-      "target_length": "非 Team 目標長度",
-      "team_target_length": "Team 目標長度",
+      "target_lengths": "有效票據長度（逗號分隔）",
       "ttl_seconds": "有效期（秒）",
       "refresh_before_seconds": "提前更新（秒）",
       "retry_interval_seconds": "重試間隔（秒）",

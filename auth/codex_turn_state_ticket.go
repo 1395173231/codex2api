@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -21,8 +22,7 @@ type CodexTurnStateSettings struct {
 	Enabled               bool     `json:"enabled"`
 	Models                []string `json:"models"`
 	HarvestProxyURL       string   `json:"harvest_proxy_url"`
-	TargetLength          int      `json:"target_length"`
-	TeamTargetLength      int      `json:"team_target_length"`
+	TargetLengths         []int    `json:"target_lengths"`
 	TTLSeconds            int      `json:"ttl_seconds"`
 	RefreshBeforeSeconds  int      `json:"refresh_before_seconds"`
 	RetryIntervalSeconds  int      `json:"retry_interval_seconds"`
@@ -32,8 +32,38 @@ type CodexTurnStateSettings struct {
 }
 
 func DefaultCodexTurnStateSettings() CodexTurnStateSettings {
-	return CodexTurnStateSettings{Models: []string{"gpt-6-astra", "gpt-5.6-sol"}, TargetLength: 292, TeamTargetLength: 332,
+	return CodexTurnStateSettings{Models: []string{"gpt-6-astra", "gpt-5.6-sol"}, TargetLengths: []int{292, 332},
 		TTLSeconds: 3600, RefreshBeforeSeconds: 300, RetryIntervalSeconds: 45, AttemptTimeoutSeconds: 25, MaxAttempts: 3, Concurrency: 2}
+}
+
+// DecodeCodexTurnStateSettings migrates the pre-array target_length and
+// team_target_length fields while keeping defaults for omitted fields.
+func DecodeCodexTurnStateSettings(raw string) (CodexTurnStateSettings, error) {
+	cfg := DefaultCodexTurnStateSettings()
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return cfg, err
+	}
+	var legacy struct {
+		TargetLengths    json.RawMessage `json:"target_lengths"`
+		TargetLength     int             `json:"target_length"`
+		TeamTargetLength int             `json:"team_target_length"`
+	}
+	if err := json.Unmarshal([]byte(raw), &legacy); err != nil {
+		return cfg, err
+	}
+	if len(legacy.TargetLengths) == 0 || string(legacy.TargetLengths) == "null" {
+		lengths := make([]int, 0, 2)
+		if legacy.TargetLength > 0 {
+			lengths = append(lengths, legacy.TargetLength)
+		}
+		if legacy.TeamTargetLength > 0 && !slices.Contains(lengths, legacy.TeamTargetLength) {
+			lengths = append(lengths, legacy.TeamTargetLength)
+		}
+		if len(lengths) > 0 {
+			cfg.TargetLengths = lengths
+		}
+	}
+	return cfg, nil
 }
 
 func NormalizeCodexTurnStateModel(raw string) (string, error) {
@@ -64,11 +94,23 @@ func NormalizeCodexTurnStateSettings(cfg CodexTurnStateSettings) (CodexTurnState
 		return cfg, errors.New("configure between 1 and 32 models")
 	}
 	cfg.Models = models
+	lengths := make([]int, 0, len(cfg.TargetLengths))
+	for _, length := range cfg.TargetLengths {
+		if length < 100 || length > 4096 {
+			return cfg, fmt.Errorf("target_lengths entries must be between %d and %d", 100, 4096)
+		}
+		if !slices.Contains(lengths, length) {
+			lengths = append(lengths, length)
+		}
+	}
+	if len(lengths) == 0 || len(lengths) > 8 {
+		return cfg, errors.New("configure between 1 and 8 target_lengths")
+	}
+	cfg.TargetLengths = lengths
 	for _, field := range []struct {
 		name            string
 		value, min, max int
 	}{
-		{"target_length", cfg.TargetLength, 100, 4096}, {"team_target_length", cfg.TeamTargetLength, 100, 4096},
 		{"ttl_seconds", cfg.TTLSeconds, 180, 3600}, {"refresh_before_seconds", cfg.RefreshBeforeSeconds, 1, cfg.TTLSeconds - 1},
 		{"retry_interval_seconds", cfg.RetryIntervalSeconds, 1, 3600}, {"attempt_timeout_seconds", cfg.AttemptTimeoutSeconds, 1, 120},
 		{"max_attempts", cfg.MaxAttempts, 1, 10}, {"concurrency", cfg.Concurrency, 1, 16},
@@ -138,17 +180,9 @@ func ParseCodexTurnStateIssuedAt(token string) (time.Time, error) {
 	return time.Unix(int64(seconds), 0).UTC(), nil
 }
 
-func (cfg CodexTurnStateSettings) TargetForPlan(plan string) int {
-	plan = strings.ToLower(strings.TrimSpace(plan))
-	if plan == "team" || plan == "business" || strings.HasPrefix(plan, "team_") || strings.HasPrefix(plan, "business_") {
-		return cfg.TeamTargetLength
-	}
-	return cfg.TargetLength
-}
-
-func validateCodexTicket(token string, target int, ttl time.Duration, now time.Time) (time.Time, time.Time, error) {
-	if len(token) != target {
-		return time.Time{}, time.Time{}, fmt.Errorf("turn-state length %d; expected %d", len(token), target)
+func validateCodexTicket(token string, targets []int, ttl time.Duration, now time.Time) (time.Time, time.Time, error) {
+	if !slices.Contains(targets, len(token)) {
+		return time.Time{}, time.Time{}, fmt.Errorf("turn-state length %d; expected one of %v", len(token), targets)
 	}
 	issued, err := ParseCodexTurnStateIssuedAt(token)
 	if err != nil {
@@ -202,14 +236,14 @@ func codexTicketReady(rec database.CodexTurnStateRecord, a *Account, cfg CodexTu
 	if rec.Identity != codexTicketIdentity(a) || rec.Token == "" {
 		return false
 	}
-	_, expires, err := validateCodexTicket(rec.Token, cfg.TargetForPlan(a.GetPlanType()), time.Duration(cfg.TTLSeconds)*time.Second, now)
+	_, expires, err := validateCodexTicket(rec.Token, cfg.TargetLengths, time.Duration(cfg.TTLSeconds)*time.Second, now)
 	return err == nil && rec.ExpiresAt.After(now) && expires.After(now)
 }
 
 type CodexTurnStateStatus struct {
 	Model            string `json:"model"`
 	TokenLength      int    `json:"token_length"`
-	TargetLength     int    `json:"target_length"`
+	TargetLengths    []int  `json:"target_lengths"`
 	IssuedAt         string `json:"issued_at,omitempty"`
 	ExpiresAt        string `json:"expires_at,omitempty"`
 	CapturedAt       string `json:"captured_at,omitempty"`

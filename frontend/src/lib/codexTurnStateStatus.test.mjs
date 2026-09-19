@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { turnStateRemainingMs, turnStateDisplayStatus, parseTurnStateModels, validTurnStateModels } from './codexTurnStateStatus.ts'
+import { turnStateRemainingMs, turnStateDisplayStatus, parseTurnStateModels, parseTurnStateTargetLengths, validTurnStateModels, validTurnStateTargetLengths } from './codexTurnStateStatus.ts'
 
 const now = Date.parse('2026-09-19T10:00:00Z')
 const item = { model: 'gpt-5.5', status: 'ready', ready: true, expires_at: '2026-09-19T10:05:00Z', captured_at: '2026-09-19T10:00:00Z' }
@@ -34,6 +34,17 @@ test('models remain required while disabled and reject wildcard or oversized lis
   assert.equal(validTurnStateModels(['模型']), false)
   assert.equal(validTurnStateModels(['x'.repeat(129)]), false)
   assert.equal(validTurnStateModels(Array.from({ length: 33 }, (_, i) => 'gpt-' + i)), false)
+})
+
+test('target lengths are parsed, normalized, and validated as a small integer set', () => {
+  assert.deepEqual(parseTurnStateTargetLengths(' 292, 332\n292 '), [292, 332])
+  assert.deepEqual(parseTurnStateTargetLengths(' , '), [])
+  assert.equal(validTurnStateTargetLengths([292, 332]), true)
+  assert.equal(validTurnStateTargetLengths([]), false)
+  assert.equal(validTurnStateTargetLengths([99]), false)
+  assert.equal(validTurnStateTargetLengths([4097]), false)
+  assert.equal(validTurnStateTargetLengths([292.5]), false)
+  assert.equal(validTurnStateTargetLengths(Array.from({ length: 9 }, (_, i) => 292 + i)), false)
 })
 
 test('three locales cover all turn-state statuses and configuration fields', () => {

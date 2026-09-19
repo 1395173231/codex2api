@@ -2019,8 +2019,7 @@ export interface CodexTurnStateSettings {
   models: string[]
   harvest_proxy_url: string
   proxy_configured: boolean
-  target_length: number
-  team_target_length: number
+  target_lengths: number[]
   ttl_seconds: number
   refresh_before_seconds: number
   retry_interval_seconds: number
@@ -2032,7 +2031,7 @@ export interface CodexTurnStateSettings {
 export interface CodexTurnStateStatus {
   model: string
   token_length: number
-  target_length: number
+  target_lengths: number[]
   issued_at?: string
   expires_at?: string
   captured_at?: string
